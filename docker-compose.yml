@@ -1,0 +1,69 @@
+# ChimpFlix — single-service compose example.
+#
+# Quick start:
+#   1. `cp .env.example .env.local` and fill in PLEX_CLIENT_IDENTIFIER +
+#      SESSION_SECRET (see generation commands in the example file).
+#   2. `mkdir -p ./.app-state && sudo chown -R 1000:1000 ./.app-state`
+#      The container runs as uid 1000, so the bind mount must be
+#      writable by it.
+#   3. `docker compose up -d --build`
+#
+# To run alongside a Plex container on the same host, uncomment the
+# networks: block at the bottom. To put ChimpFlix behind a reverse proxy
+# with HTTPS, uncomment the Traefik labels and set APP_PUBLIC_ORIGIN in
+# .env.local.
+
+services:
+  chimpflix:
+    build: .
+    image: chimpflix:local
+    container_name: chimpflix
+    restart: unless-stopped
+    # `.env.local` is the same file `npm run dev` reads — single source
+    # of truth for SESSION_SECRET, PLEX_CLIENT_IDENTIFIER, etc.
+    env_file: .env.local
+    ports:
+      - "3000:3000"
+    # Persists the bootstrap auth file across container restarts.
+    # Without this, every restart pays a "first request cold" penalty.
+    # The host directory must be writable by uid 1000 — see step 2 above.
+    # Skipping this volume is fine; the app still works, just with one
+    # slow page load after each restart.
+    volumes:
+      - ./.app-state:/app/state
+    environment:
+      APP_STATE_DIR: /app/state
+    healthcheck:
+      # The home route redirects to /login when there's no session,
+      # which still counts as "Node is up and answering".
+      test: ["CMD-SHELL", "wget --quiet --spider --tries=1 http://localhost:3000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # ── Plex on the same Docker host ──────────────────────────────────
+    # Plex in bridge mode advertises its container IP as "local", which
+    # is unreachable from other containers. Sharing Plex's network fixes
+    # it — find the name with `docker network ls`.
+    # networks:
+    #   - plex_net
+    #   - default
+
+    # ── Traefik (or another reverse proxy) ────────────────────────────
+    # Uncomment if you're terminating TLS upstream. Replace the domain.
+    # Also set `APP_PUBLIC_ORIGIN=https://chimpflix.example.com` and
+    # `APP_TRUST_PROXY=1` in .env.local.
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.chimpflix.rule=Host(`chimpflix.example.com`)"
+    #   - "traefik.http.routers.chimpflix.entrypoints=websecure"
+    #   - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
+    #   - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
+
+# networks:
+#   plex_net:
+#     external: true
+#     name: plex_default  # replace with your actual Plex network name
+#   default:
+#     driver: bridge
