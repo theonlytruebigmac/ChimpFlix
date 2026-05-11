@@ -1,68 +1,60 @@
-# ChimpFlix — single-service compose example.
+# ChimpFlix — two-service compose.
 #
 # Quick start:
-#   1. `cp .env.example .env.local` and fill in PLEX_CLIENT_IDENTIFIER +
-#      SESSION_SECRET (see generation commands in the example file).
-#   2. `mkdir -p ./.app-state && sudo chown -R 1000:1000 ./.app-state`
-#      The container runs as uid 1000, so the bind mount must be
-#      writable by it.
-#   3. `docker compose up -d --build`
+#   mkdir -p ./data
+#   docker compose up -d --build
+#   open http://localhost:3000
 #
-# To run alongside a Plex container on the same host, uncomment the
-# networks: block at the bottom. To put ChimpFlix behind a reverse proxy
-# with HTTPS, uncomment the Traefik labels and set APP_PUBLIC_ORIGIN in
-# .env.local.
+# The `server` container is the Rust backend (API + WebSocket + transcoder).
+# The `web` container is the Next.js Netflix-style UI. They communicate
+# over the default compose network.
+#
+# Until Phase 2 (frontend wired to the new backend), the web container
+# still talks to a Plex server using the env vars in ./web/.env.local
+# (see ./web/.env.example).
 
 services:
-  chimpflix:
-    build: .
-    image: chimpflix:local
-    container_name: chimpflix
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: server
+    image: chimpflix-server:local
+    container_name: chimpflix-server
     restart: unless-stopped
-    # `.env.local` is the same file `npm run dev` reads — single source
-    # of truth for SESSION_SECRET, PLEX_CLIENT_IDENTIFIER, etc.
-    env_file: .env.local
-    ports:
-      - "3000:3000"
-    # Persists the bootstrap auth file across container restarts.
-    # Without this, every restart pays a "first request cold" penalty.
-    # The host directory must be writable by uid 1000 — see step 2 above.
-    # Skipping this volume is fine; the app still works, just with one
-    # slow page load after each restart.
-    volumes:
-      - ./.app-state:/app/state
     environment:
-      APP_STATE_DIR: /app/state
+      BIND_ADDR: 0.0.0.0:8080
+      DATA_DIR: /data
+      RUST_LOG: info,sqlx=warn
+    volumes:
+      - ./data:/data
+      # Mount your media here (read-only is recommended).
+      # - /path/to/movies:/media/movies:ro
+      # - /path/to/shows:/media/shows:ro
+    ports:
+      - "8080:8080"
     healthcheck:
-      # The home route redirects to /login when there's no session,
-      # which still counts as "Node is up and answering".
-      # Use 127.0.0.1 (not localhost) — inside Alpine, `localhost`
-      # resolves to ::1 first but Node binds 0.0.0.0 only, so wget would
-      # get "Connection refused" and flag the container unhealthy.
-      test: ["CMD-SHELL", "wget --quiet --spider --tries=1 http://127.0.0.1:3000/ || exit 1"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 10s
       retries: 3
 
-#     # ── Plex on the same Docker host ──────────────────────────────────
-#     # Plex in bridge mode advertises its container IP as "local", which
-#     # is unreachable from other containers. Sharing Plex's network fixes
-#     # it — find the name with `docker network ls`.
-#     networks:
-#       - t3_proxy
-
-#     # ── Traefik (or another reverse proxy) ────────────────────────────
-#     # Uncomment if you're terminating TLS upstream. Replace the domain.
-#     # Also set `APP_PUBLIC_ORIGIN=https://chimpflix.example.com` and
-#     # `APP_TRUST_PROXY=1` in .env.local.
-#     labels:
-#       - "traefik.enable=true"
-#       - "traefik.http.routers.chimpflix.rule=Host(`flix.syschimp.com`)"
-#       - "traefik.http.routers.chimpflix.entrypoints=websecure"
-#       - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
-#       - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
-
-# networks:
-#   t3_proxy:
-#     external: true
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: web
+    image: chimpflix-web:local
+    container_name: chimpflix-web
+    restart: unless-stopped
+    depends_on:
+      - server
+    env_file:
+      - path: ./web/.env.local
+        required: false
+    environment:
+      # Endpoint the frontend will use once Phase 2 lands.
+      CHIMPFLIX_API_URL: http://server:8080
+    ports:
+      - "3000:3000"

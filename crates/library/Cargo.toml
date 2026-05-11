@@ -1,0 +1,24 @@
+[package]
+name = "chimpflix-library"
+description = "Filesystem scanner, SQLite schema, and library DB accessors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chimpflix-common = { path = "../common" }
+chimpflix-metadata = { path = "../metadata" }
+chimpflix-transcoder = { path = "../transcoder" }
+
+anyhow = { workspace = true }
+futures = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+walkdir = { workspace = true }
