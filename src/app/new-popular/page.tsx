@@ -19,8 +19,13 @@ import {
 import { requireServerAuth } from "@/lib/session";
 
 export default async function NewPopularPage() {
+  const t0 = Date.now();
   const auth = await requireServerAuth();
+  const t1 = Date.now();
   const hidden = await readHiddenLibraries();
+  console.log(
+    `[perf] /new-popular auth=${t1 - t0}ms readHidden=${Date.now() - t1}ms`,
+  );
 
   return (
     <main className="relative min-h-screen bg-black">
@@ -82,7 +87,11 @@ async function NewOnBrandRail({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await recentlyAdded(auth), hidden);
+  console.log(
+    `[perf] /new-popular NewOnBrandRail recentlyAdded=${Date.now() - t0}ms`,
+  );
   if (items.length === 0) return null;
   return <Rail title={`New on ${brandName()}`} items={items} />;
 }
@@ -98,11 +107,15 @@ async function Top10Rail({
   type: "movie" | "show";
   title: string;
 }) {
+  const t0 = Date.now();
   const libs = (await sections(auth)).filter(
     (s) => s.type === type && !hidden.has(s.key),
   );
   const perLib = await Promise.all(
     libs.map((lib) => sectionTopWatched(auth, lib.key, 10)),
+  );
+  console.log(
+    `[perf] /new-popular Top10Rail(${type}) sections+topWatched=${Date.now() - t0}ms`,
   );
   const items = perLib.find((arr) => arr.length > 0) ?? [];
   if (items.length < 4) return null;
@@ -120,11 +133,15 @@ async function TopRatedRail({
   type: "movie" | "show";
   title: string;
 }) {
+  const t0 = Date.now();
   const libs = (await sections(auth)).filter(
     (s) => s.type === type && !hidden.has(s.key),
   );
   const perLib = await Promise.all(
     libs.map((lib) => sectionTopRated(auth, lib.key, 24)),
+  );
+  console.log(
+    `[perf] /new-popular TopRatedRail(${type}) sections+topRated=${Date.now() - t0}ms`,
   );
   const items = (perLib.find((arr) => arr.length > 0) ?? [])
     .filter((it) => typeof it.rating === "number" && it.rating > 0)
@@ -140,12 +157,16 @@ async function PerLibraryNew({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const libs = (await sections(auth)).filter((s) => !hidden.has(s.key));
   const data = await Promise.all(
     libs.map(async (lib) => ({
       lib,
       items: await sectionRecentlyAdded(auth, lib.key),
     })),
+  );
+  console.log(
+    `[perf] /new-popular PerLibraryNew(${libs.length} libs)=${Date.now() - t0}ms`,
   );
   return (
     <>

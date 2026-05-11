@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import { GenresDropdown } from "@/components/GenresDropdown";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
@@ -35,11 +36,17 @@ const SHOW_GENRES = [
 ];
 
 export default async function ShowsPage() {
+  const t0 = Date.now();
   const auth = await requireServerAuth();
+  const t1 = Date.now();
   const [hidden, allSections] = await Promise.all([
     readHiddenLibraries(),
     sections(auth),
   ]);
+  const t2 = Date.now();
+  console.log(
+    `[perf] /shows auth=${t1 - t0}ms top-await(hidden+sections)=${t2 - t1}ms`,
+  );
   const showLibs = allSections.filter(
     (s) => s.type === "show" && !hidden.has(s.key),
   );
@@ -63,6 +70,10 @@ export default async function ShowsPage() {
   return (
     <main className="relative">
       <TopNav />
+      <div className="relative z-20 flex items-baseline gap-4 px-12 pt-24 pb-2">
+        <h1 className="text-3xl font-bold tracking-tight">Shows</h1>
+        <GenresDropdown genres={SHOW_GENRES} type="show" />
+      </div>
       <Suspense fallback={<HeroSkeleton />}>
         <ShowsHero auth={auth} hidden={hidden} />
       </Suspense>
@@ -100,7 +111,9 @@ async function ShowsHero({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const [cw, latest] = await Promise.all([onDeck(auth), recentlyAdded(auth)]);
+  console.log(`[perf] /shows ShowsHero onDeck+recent=${Date.now() - t0}ms`);
   const continueWatching = filterHiddenItems(cw, hidden).filter(
     (it) => (it.type === "show" || it.type === "episode") && it.art,
   );
@@ -123,9 +136,11 @@ async function ContinueWatchingShows({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await onDeck(auth), hidden).filter(
     (it) => it.type === "show" || it.type === "episode",
   );
+  console.log(`[perf] /shows ContinueWatchingShows onDeck=${Date.now() - t0}ms`);
   if (items.length === 0) return null;
   return <Rail title="Continue Watching" items={items} />;
 }
@@ -137,9 +152,13 @@ async function RecentlyAddedShows({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await recentlyAdded(auth), hidden).filter(
     (it) =>
       it.type === "show" || it.type === "season" || it.type === "episode",
+  );
+  console.log(
+    `[perf] /shows RecentlyAddedShows recentlyAdded=${Date.now() - t0}ms`,
   );
   if (items.length === 0) return null;
   return <Rail title="Recently Added" items={items} />;
@@ -152,10 +171,14 @@ async function ShowLibRails({
   auth: ServerAuth;
   lib: Section;
 }) {
+  const t0 = Date.now();
   const [newItems, topItems] = await Promise.all([
     sectionRecentlyAdded(auth, lib.key),
     sectionTopWatched(auth, lib.key, 10),
   ]);
+  console.log(
+    `[perf] /shows ShowLibRails(${lib.title}) recent+top=${Date.now() - t0}ms`,
+  );
   return (
     <>
       {topItems.length >= 4 && (
@@ -177,7 +200,11 @@ async function GenreRail({
   sectionKey: string;
   genre: string;
 }) {
+  const t0 = Date.now();
   const items = await sectionByGenre(auth, sectionKey, genre, 16);
+  console.log(
+    `[perf] /shows GenreRail(${genre}) sectionByGenre=${Date.now() - t0}ms`,
+  );
   if (items.length < 4) return null;
   return (
     <Rail

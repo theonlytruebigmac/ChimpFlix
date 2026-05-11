@@ -11,7 +11,12 @@
 // Bump CACHE_VERSION whenever response shapes change in a way that would
 // poison cached entries — old caches get purged on activate.
 
-const CACHE_VERSION = "app-v1";
+// Bumped from v1 → v2 to evict caches that may have stored the
+// unauthenticated home-page redirect-to-login (Next.js returns it as a
+// 200 with an embedded `<meta refresh>` because the redirect() call
+// happens inside a streaming Suspense boundary). Old entries served
+// from cache would meta-refresh signed-in users back to /login.
+const CACHE_VERSION = "app-v2";
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMAGE_CACHE = `${CACHE_VERSION}-images`;
 const PAGE_CACHE = `${CACHE_VERSION}-pages`;
@@ -32,7 +37,7 @@ self.addEventListener("install", (event) => {
         PRECACHE_ROUTES.map(async (route) => {
           try {
             const resp = await fetch(route, { credentials: "include" });
-            if (resp.ok) await cache.put(route, resp);
+            if (isCacheable(resp)) await cache.put(route, resp);
           } catch {
             // ignore
           }
@@ -115,6 +120,20 @@ self.addEventListener("fetch", (event) => {
   }
 });
 
+// Decide whether a response is safe to store in the SW cache. Honors
+// `Cache-Control: no-store` so the unauthenticated home page — which
+// Next.js returns as HTTP 200 with an embedded `<meta refresh>`
+// redirect when redirect() is called from inside a streaming Suspense
+// boundary — never lands in PAGE_CACHE. Without this, a cached redirect
+// page would meta-refresh signed-in users back to /login on every
+// repeat visit.
+function isCacheable(resp) {
+  if (!resp || !resp.ok) return false;
+  const cc = resp.headers.get("Cache-Control") || "";
+  if (/\bno-store\b/i.test(cc)) return false;
+  return true;
+}
+
 async function cacheFirst(req, cacheName) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(req);
@@ -126,7 +145,7 @@ async function cacheFirst(req, cacheName) {
   }
   try {
     const resp = await fetch(req);
-    if (resp.ok) {
+    if (isCacheable(resp)) {
       // Clone before storing — the response body is a stream and can only
       // be consumed once.
       cache.put(req, resp.clone()).catch(() => {});
@@ -144,7 +163,7 @@ async function staleWhileRevalidate(req, cacheName) {
   const cached = await cache.match(req);
   const networkPromise = fetch(req)
     .then((resp) => {
-      if (resp.ok) cache.put(req, resp.clone()).catch(() => {});
+      if (isCacheable(resp)) cache.put(req, resp.clone()).catch(() => {});
       return resp;
     })
     .catch(() => cached || Response.error());
@@ -164,7 +183,7 @@ async function refreshIfStale(req, cache) {
   if (age < STALE_AFTER_MS) return;
   try {
     const resp = await fetch(req);
-    if (resp.ok) cache.put(req, resp.clone());
+    if (isCacheable(resp)) cache.put(req, resp.clone());
   } catch {
     // ignore — stale entry stays valid
   }

@@ -36,7 +36,10 @@ services:
     healthcheck:
       # The home route redirects to /login when there's no session,
       # which still counts as "Node is up and answering".
-      test: ["CMD-SHELL", "wget --quiet --spider --tries=1 http://localhost:3000/ || exit 1"]
+      # Use 127.0.0.1 (not localhost) — inside Alpine, `localhost`
+      # resolves to ::1 first but Node binds 0.0.0.0 only, so wget would
+      # get "Connection refused" and flag the container unhealthy.
+      test: ["CMD-SHELL", "wget --quiet --spider --tries=1 http://127.0.0.1:3000/ || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -46,24 +49,20 @@ services:
     # Plex in bridge mode advertises its container IP as "local", which
     # is unreachable from other containers. Sharing Plex's network fixes
     # it — find the name with `docker network ls`.
-    # networks:
-    #   - plex_net
-    #   - default
+    networks:
+      - t3_proxy
 
     # ── Traefik (or another reverse proxy) ────────────────────────────
     # Uncomment if you're terminating TLS upstream. Replace the domain.
     # Also set `APP_PUBLIC_ORIGIN=https://chimpflix.example.com` and
     # `APP_TRUST_PROXY=1` in .env.local.
-    # labels:
-    #   - "traefik.enable=true"
-    #   - "traefik.http.routers.chimpflix.rule=Host(`chimpflix.example.com`)"
-    #   - "traefik.http.routers.chimpflix.entrypoints=websecure"
-    #   - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
-    #   - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.chimpflix.rule=Host(`flix.syschimp.com`)"
+      - "traefik.http.routers.chimpflix.entrypoints=websecure"
+      - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
+      - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
 
-# networks:
-#   plex_net:
-#     external: true
-#     name: plex_default  # replace with your actual Plex network name
-#   default:
-#     driver: bridge
+networks:
+  t3_proxy:
+    external: true

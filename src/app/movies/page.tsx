@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import { GenresDropdown } from "@/components/GenresDropdown";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
@@ -35,11 +36,16 @@ const MOVIE_GENRES = [
 ];
 
 export default async function MoviesPage() {
+  const t0 = Date.now();
   const auth = await requireServerAuth();
+  const t1 = Date.now();
   const [hidden, allSections] = await Promise.all([
     readHiddenLibraries(),
     sections(auth),
   ]);
+  console.log(
+    `[perf] /movies auth=${t1 - t0}ms top-await(hidden+sections)=${Date.now() - t1}ms`,
+  );
   const movieLibs = allSections.filter(
     (s) => s.type === "movie" && !hidden.has(s.key),
   );
@@ -63,6 +69,10 @@ export default async function MoviesPage() {
   return (
     <main className="relative">
       <TopNav />
+      <div className="relative z-20 flex items-baseline gap-4 px-12 pt-24 pb-2">
+        <h1 className="text-3xl font-bold tracking-tight">Movies</h1>
+        <GenresDropdown genres={MOVIE_GENRES} type="movie" />
+      </div>
       <Suspense fallback={<HeroSkeleton />}>
         <MoviesHero auth={auth} hidden={hidden} />
       </Suspense>
@@ -100,7 +110,9 @@ async function MoviesHero({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const [cw, latest] = await Promise.all([onDeck(auth), recentlyAdded(auth)]);
+  console.log(`[perf] /movies MoviesHero onDeck+recent=${Date.now() - t0}ms`);
   const continueWatching = filterHiddenItems(cw, hidden).filter(
     (it) => it.type === "movie" && it.art,
   );
@@ -119,8 +131,12 @@ async function ContinueWatchingMovies({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await onDeck(auth), hidden).filter(
     (it) => it.type === "movie",
+  );
+  console.log(
+    `[perf] /movies ContinueWatchingMovies onDeck=${Date.now() - t0}ms`,
   );
   if (items.length === 0) return null;
   return <Rail title="Continue Watching" items={items} />;
@@ -133,8 +149,12 @@ async function RecentlyAddedMovies({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await recentlyAdded(auth), hidden).filter(
     (it) => it.type === "movie",
+  );
+  console.log(
+    `[perf] /movies RecentlyAddedMovies recentlyAdded=${Date.now() - t0}ms`,
   );
   if (items.length === 0) return null;
   return <Rail title="Recently Added" items={items} />;
@@ -147,10 +167,14 @@ async function MovieLibRails({
   auth: ServerAuth;
   lib: Section;
 }) {
+  const t0 = Date.now();
   const [newItems, topItems] = await Promise.all([
     sectionRecentlyAdded(auth, lib.key),
     sectionTopWatched(auth, lib.key, 10),
   ]);
+  console.log(
+    `[perf] /movies MovieLibRails(${lib.title}) recent+top=${Date.now() - t0}ms`,
+  );
   return (
     <>
       {topItems.length >= 4 && (
@@ -172,7 +196,11 @@ async function GenreRail({
   sectionKey: string;
   genre: string;
 }) {
+  const t0 = Date.now();
   const items = await sectionByGenre(auth, sectionKey, genre, 16);
+  console.log(
+    `[perf] /movies GenreRail(${genre}) sectionByGenre=${Date.now() - t0}ms`,
+  );
   if (items.length < 4) return null;
   return (
     <Rail

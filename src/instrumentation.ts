@@ -4,6 +4,7 @@
 // cold" penalty.
 
 export async function register() {
+  console.log(`[instrument] register() called runtime=${process.env.NEXT_RUNTIME}`);
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
   const [{ readBootstrapAuth }, { ensureWarmerStarted }] = await Promise.all([
@@ -12,9 +13,11 @@ export async function register() {
   ]);
 
   const auth = await readBootstrapAuth();
+  console.log(`[instrument] readBootstrapAuth → ${auth ? "found" : "missing"}`);
   if (auth) {
     // Don't await — the warmer fills the cache asynchronously while the
     // server starts accepting requests.
     ensureWarmerStarted(auth);
+    console.log(`[instrument] ensureWarmerStarted called for server ${auth.id}`);
   }
 }

@@ -26,7 +26,9 @@ const MOVIE_GENRES = ["Action", "Comedy", "Drama"];
 const SHOW_GENRES = ["Drama", "Comedy", "Animation"];
 
 export default async function Home() {
+  const t0 = Date.now();
   const auth = await requireServerAuth();
+  const t1 = Date.now();
   // sections() is the canary call — if Plex is unreachable from here
   // (LAN URL not routable, server offline, TLS issue, etc.), every
   // other rail will fail too. Catch it once and render an actionable
@@ -41,6 +43,9 @@ export default async function Home() {
   } catch (e) {
     return <ServerUnreachable error={e} serverUrl={auth.url} />;
   }
+  console.log(
+    `[perf] / auth=${t1 - t0}ms top-await(hidden+sections)=${Date.now() - t1}ms`,
+  );
   const libs = allSections.filter((s) => !hidden.has(s.key));
   const firstMovieKey = libs.find((s) => s.type === "movie")?.key ?? null;
   const firstShowKey = libs.find((s) => s.type === "show")?.key ?? null;
@@ -91,7 +96,9 @@ async function HomeHero({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const [cw, latest] = await Promise.all([onDeck(auth), recentlyAdded(auth)]);
+  console.log(`[perf] / HomeHero onDeck+recent=${Date.now() - t0}ms`);
   const continueWatching = filterHiddenItems(cw, hidden).filter((it) => it.art);
   const recentTitles = filterHiddenItems(latest, hidden).filter(
     (it) => it.art && (it.type === "movie" || it.type === "show"),
@@ -108,7 +115,9 @@ async function ContinueWatchingRail({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await onDeck(auth), hidden);
+  console.log(`[perf] / ContinueWatchingRail onDeck=${Date.now() - t0}ms`);
   if (items.length === 0) return null;
   return <Rail title="Continue Watching" items={items} />;
 }
@@ -120,7 +129,9 @@ async function RecentlyAddedRail({
   auth: ServerAuth;
   hidden: Set<string>;
 }) {
+  const t0 = Date.now();
   const items = filterHiddenItems(await recentlyAdded(auth), hidden);
+  console.log(`[perf] / RecentlyAddedRail recentlyAdded=${Date.now() - t0}ms`);
   if (items.length === 0) return null;
   return <Rail title="Recently Added" items={items} />;
 }
@@ -132,10 +143,17 @@ async function LibSectionRails({
   auth: ServerAuth;
   lib: Section;
 }) {
+  const t0 = Date.now();
   const [newItems, topItems] = await Promise.all([
     sectionRecentlyAdded(auth, lib.key),
-    sectionTopWatched(auth, lib.key, 12),
+    // Limit must match cache-warmer's tick (currently 10) so the warmer's
+    // pre-populated entry hits on this read instead of paying a fresh
+    // Plex round trip — the cache key includes the limit.
+    sectionTopWatched(auth, lib.key, 10),
   ]);
+  console.log(
+    `[perf] / LibSectionRails(${lib.title}) recent+top=${Date.now() - t0}ms`,
+  );
   return (
     <>
       {newItems.length > 0 && (
@@ -157,7 +175,11 @@ async function GenreRail({
   sectionKey: string;
   genre: string;
 }) {
+  const t0 = Date.now();
   const items = await sectionByGenre(auth, sectionKey, genre, 16);
+  console.log(
+    `[perf] / GenreRail(${genre}) sectionByGenre=${Date.now() - t0}ms`,
+  );
   if (items.length < 4) return null;
   return (
     <Rail

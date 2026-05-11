@@ -29,14 +29,16 @@ export type { ServerAuth } from "./plex";
 const SLIM_LIST = "&excludeElements=Media,Part,Stream";
 
 // Cache TTLs picked for the trade-off between stale-vs-fresh:
-//   - Per-user state (onDeck, recentlyAdded): 30s. Watch progress + new
-//     files appear quickly enough that 30s lag is invisible.
-//   - Section lists / metadata: 5 min. Stable enough that staleness is
-//     rare; fresh enough that newly-added titles still appear within a
-//     minute or two when the warmer's next tick lands.
+//   - Per-user state (onDeck, recentlyAdded): 2 min. Must exceed the
+//     warmer interval (60s) so the warmer's force-refresh keeps the
+//     entry hot before a user request hits a TTL-expired slot. Without
+//     this, every other minute of user requests would pay a Plex round
+//     trip just for the hero/continue-watching rail.
+//   - Section lists / metadata: 10 min. The warmer force-refreshes
+//     these too; the TTL is just a safety net if the warmer stops.
 //   - Sections themselves (library list): 1 hour.
-const TTL_USER_STATE = 30_000;
-const TTL_SECTION = 5 * 60_000;
+const TTL_USER_STATE = 2 * 60_000;
+const TTL_SECTION = 10 * 60_000;
 const TTL_LIBRARIES = 60 * 60_000;
 
 // Cache keys carry both the server ID and a token prefix so multi-tenant
@@ -59,14 +61,20 @@ async function fetchList(
   return items.map(mapItem);
 }
 
-export const onDeck = (auth: ServerAuth) =>
+export const onDeck = (
+  auth: ServerAuth,
+  opts: { forceRefresh?: boolean } = {},
+) =>
   getOrFetch(
     `onDeck:${ku(auth)}`,
     () => fetchList(auth, `/library/onDeck?dummy=1${SLIM_LIST}`),
-    { ttlMs: TTL_USER_STATE },
+    { ttlMs: TTL_USER_STATE, forceRefresh: opts.forceRefresh },
   );
 
-export const recentlyAdded = (auth: ServerAuth) =>
+export const recentlyAdded = (
+  auth: ServerAuth,
+  opts: { forceRefresh?: boolean } = {},
+) =>
   getOrFetch(
     `recentlyAdded:${ku(auth)}`,
     () =>
@@ -74,10 +82,14 @@ export const recentlyAdded = (auth: ServerAuth) =>
         auth,
         `/library/recentlyAdded?X-Plex-Container-Size=24${SLIM_LIST}`,
       ),
-    { ttlMs: TTL_USER_STATE },
+    { ttlMs: TTL_USER_STATE, forceRefresh: opts.forceRefresh },
   );
 
-export const sectionRecentlyAdded = (auth: ServerAuth, sectionKey: string) =>
+export const sectionRecentlyAdded = (
+  auth: ServerAuth,
+  sectionKey: string,
+  opts: { forceRefresh?: boolean } = {},
+) =>
   getOrFetch(
     `sectionRecentlyAdded:${k(auth, sectionKey)}`,
     () =>
@@ -85,7 +97,7 @@ export const sectionRecentlyAdded = (auth: ServerAuth, sectionKey: string) =>
         auth,
         `/library/sections/${encodeURIComponent(sectionKey)}/recentlyAdded?X-Plex-Container-Size=24${SLIM_LIST}`,
       ),
-    { ttlMs: TTL_SECTION },
+    { ttlMs: TTL_SECTION, forceRefresh: opts.forceRefresh },
   );
 
 export const sectionAll = (
@@ -107,6 +119,7 @@ export const sectionTopWatched = (
   auth: ServerAuth,
   sectionKey: string,
   limit = 10,
+  opts: { forceRefresh?: boolean } = {},
 ) =>
   getOrFetch(
     `sectionTopWatched:${k(auth, sectionKey, String(limit))}`,
@@ -115,13 +128,14 @@ export const sectionTopWatched = (
         auth,
         `/library/sections/${encodeURIComponent(sectionKey)}/all?sort=viewCount:desc&X-Plex-Container-Size=${limit}${SLIM_LIST}`,
       ),
-    { ttlMs: TTL_SECTION },
+    { ttlMs: TTL_SECTION, forceRefresh: opts.forceRefresh },
   );
 
 export const sectionTopRated = (
   auth: ServerAuth,
   sectionKey: string,
   limit = 10,
+  opts: { forceRefresh?: boolean } = {},
 ) =>
   getOrFetch(
     `sectionTopRated:${k(auth, sectionKey, String(limit))}`,
@@ -130,7 +144,7 @@ export const sectionTopRated = (
         auth,
         `/library/sections/${encodeURIComponent(sectionKey)}/all?sort=rating:desc&X-Plex-Container-Size=${limit}${SLIM_LIST}`,
       ),
-    { ttlMs: TTL_SECTION },
+    { ttlMs: TTL_SECTION, forceRefresh: opts.forceRefresh },
   );
 
 export const sectionByGenre = (
@@ -138,6 +152,7 @@ export const sectionByGenre = (
   sectionKey: string,
   genre: string,
   limit = 20,
+  opts: { forceRefresh?: boolean } = {},
 ) =>
   getOrFetch(
     `sectionByGenre:${k(auth, sectionKey, genre, String(limit))}`,
@@ -146,7 +161,7 @@ export const sectionByGenre = (
         auth,
         `/library/sections/${encodeURIComponent(sectionKey)}/all?genre=${encodeURIComponent(genre)}&X-Plex-Container-Size=${limit}${SLIM_LIST}`,
       ),
-    { ttlMs: TTL_SECTION },
+    { ttlMs: TTL_SECTION, forceRefresh: opts.forceRefresh },
   );
 
 export async function getMetadata(

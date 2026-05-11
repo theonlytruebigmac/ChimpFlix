@@ -41,15 +41,19 @@ export function size(): number {
  * stores the result, and returns it. Concurrent calls for the same key are
  * coalesced into a single fetch. On fetch failure, falls back to the
  * previous (stale) value if any.
+ *
+ * Pass `forceRefresh: true` to bypass the TTL check and always fetch fresh
+ * (still coalesces concurrent callers). Used by the cache warmer to keep
+ * entries hot regardless of their current freshness.
  */
 export async function getOrFetch<T>(
   key: string,
   fetcher: () => Promise<T>,
-  opts: { ttlMs: number } = { ttlMs: 60_000 },
+  opts: { ttlMs: number; forceRefresh?: boolean } = { ttlMs: 60_000 },
 ): Promise<T> {
   const now = Date.now();
   const e = store.get(key) as Entry<T> | undefined;
-  if (e && now - e.updatedAt < opts.ttlMs) return e.data;
+  if (!opts.forceRefresh && e && now - e.updatedAt < opts.ttlMs) return e.data;
 
   const existing = inFlight.get(key) as Promise<T> | undefined;
   if (existing) return existing;
