@@ -147,6 +147,19 @@ function isStateChangingPlexPath(pathname: string): boolean {
 }
 
 function originIsSameSite(req: NextRequest): boolean {
+  // Sec-Fetch-Site is the most reliable CSRF signal: browsers set it on
+  // every request including same-origin GETs that don't carry an Origin
+  // header (Firefox in particular omits Origin on plain same-origin GETs).
+  // When the header is present, trust it as authoritative — values are
+  // tamper-resistant because they're set by the browser, not page JS.
+  const fetchSite = req.headers.get("sec-fetch-site");
+  if (fetchSite) {
+    // "none" = user typed the URL or a browser-internal navigation; benign.
+    return fetchSite === "same-origin" || fetchSite === "none";
+  }
+  // Pre-2020 clients without Sec-Fetch-Site: fall back to comparing the
+  // Origin header. If the request doesn't have one either, refuse — we have
+  // no way to confirm it's same-origin.
   const origin = req.headers.get("origin");
   if (!origin) return false;
   const configured = process.env.APP_PUBLIC_ORIGIN?.trim()?.replace(/\/+$/, "");

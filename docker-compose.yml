@@ -45,24 +45,24 @@ services:
       start_period: 20s
       retries: 3
 
-    # ── Plex on the same Docker host ──────────────────────────────────
-    # Plex in bridge mode advertises its container IP as "local", which
-    # is unreachable from other containers. Sharing Plex's network fixes
-    # it — find the name with `docker network ls`.
-    networks:
-      - t3_proxy
+#     # ── Plex on the same Docker host ──────────────────────────────────
+#     # Plex in bridge mode advertises its container IP as "local", which
+#     # is unreachable from other containers. Sharing Plex's network fixes
+#     # it — find the name with `docker network ls`.
+#     networks:
+#       - t3_proxy
 
-    # ── Traefik (or another reverse proxy) ────────────────────────────
-    # Uncomment if you're terminating TLS upstream. Replace the domain.
-    # Also set `APP_PUBLIC_ORIGIN=https://chimpflix.example.com` and
-    # `APP_TRUST_PROXY=1` in .env.local.
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.chimpflix.rule=Host(`flix.syschimp.com`)"
-      - "traefik.http.routers.chimpflix.entrypoints=websecure"
-      - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
-      - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
+#     # ── Traefik (or another reverse proxy) ────────────────────────────
+#     # Uncomment if you're terminating TLS upstream. Replace the domain.
+#     # Also set `APP_PUBLIC_ORIGIN=https://chimpflix.example.com` and
+#     # `APP_TRUST_PROXY=1` in .env.local.
+#     labels:
+#       - "traefik.enable=true"
+#       - "traefik.http.routers.chimpflix.rule=Host(`flix.syschimp.com`)"
+#       - "traefik.http.routers.chimpflix.entrypoints=websecure"
+#       - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
+#       - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
 
-networks:
-  t3_proxy:
-    external: true
+# networks:
+#   t3_proxy:
+#     external: true

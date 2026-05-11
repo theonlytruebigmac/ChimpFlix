@@ -8,6 +8,11 @@ export type Prefs = {
   playbackRate: number; // 0.25..4 in practice
   autoplayNext: boolean;
   trailerMuted: boolean;
+  // ISO 639-2/T code ("eng", "spa", ...) or "off" to disable subs. Empty
+  // string means "no preference, let Plex pick its default for the item".
+  subtitleLanguage: string;
+  // ISO 639-2/T code for preferred audio language, or empty for default.
+  audioLanguage: string;
 };
 
 const KEY = "cf_prefs";
@@ -19,6 +24,8 @@ export const DEFAULT_PREFS: Prefs = {
   playbackRate: 1,
   autoplayNext: true,
   trailerMuted: true,
+  subtitleLanguage: "",
+  audioLanguage: "",
 };
 
 function clampVolume(v: unknown): number {
@@ -46,6 +53,12 @@ function read(): Prefs {
         typeof parsed.autoplayNext === "boolean" ? parsed.autoplayNext : true,
       trailerMuted:
         typeof parsed.trailerMuted === "boolean" ? parsed.trailerMuted : true,
+      subtitleLanguage:
+        typeof parsed.subtitleLanguage === "string"
+          ? parsed.subtitleLanguage
+          : "",
+      audioLanguage:
+        typeof parsed.audioLanguage === "string" ? parsed.audioLanguage : "",
     };
   } catch {
     return DEFAULT_PREFS;

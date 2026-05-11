@@ -115,6 +115,9 @@ export default async function WatchPage({
       nextLabel={nextEpisode?.title}
       nextThumb={nextEpisode?.thumb}
       markers={item.markers}
+      audioStreams={item.audioStreams}
+      subtitleStreams={item.subtitleStreams}
+      partId={item.partId}
       seasonEpisodes={seasonEpisodes.map((e) => ({
         ratingKey: e.ratingKey,
         title: e.title,

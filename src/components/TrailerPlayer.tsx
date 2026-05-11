@@ -63,6 +63,12 @@ export function TrailerPlayer({
     iv_load_policy: "3",
     playsinline: "1",
     disablekb: "1",
+    // Identifies the embedder to the IFrame API. YouTube's docs require this
+    // whenever enablejsapi=1, and on browsers that strip the Referer header
+    // for cross-origin iframes (Firefox with strict tracking protection)
+    // it's the only way to avoid the embedder.identity.missing.referrer
+    // failure that renders as "Error 153 — video player configuration error".
+    ...(typeof window !== "undefined" ? { origin: window.location.origin } : {}),
   });
   const src = `https://www.youtube-nocookie.com/embed/${videoId}?${params}`;
 

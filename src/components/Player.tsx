@@ -12,28 +12,15 @@ import {
 import type Hls from "hls.js";
 import { plexImage } from "@/lib/image";
 import { getPrefs, updatePrefs, usePrefs } from "@/lib/prefs";
-import type { Marker } from "@/lib/plex-types";
+import type { Marker, MediaStream } from "@/lib/plex-types";
 
-type Track = {
-  id: number;
-  name?: string;
-  lang?: string;
-};
-
-function trackLabel(t: Track, fallback: string): string {
-  if (t.name && t.name.trim()) return t.name;
-  if (t.lang && t.lang.trim()) return t.lang.toUpperCase();
-  return fallback;
-}
-
-// hls.js exposes audio + subtitle tracks as `MediaPlaylist` objects with
-// extra fields we don't need; reduce to a tiny shape for state.
-function formatTrack(p: {
-  id: number;
-  name?: string;
-  lang?: string;
-}): Track {
-  return { id: p.id, name: p.name, lang: p.lang };
+function streamLabel(s: MediaStream): string {
+  if (s.displayTitle && s.displayTitle.trim()) return s.displayTitle;
+  if (s.language && s.language.trim()) return s.language;
+  if (s.languageCode && s.languageCode.trim()) {
+    return s.languageCode.toUpperCase();
+  }
+  return `Track ${s.id}`;
 }
 
 // crypto.randomUUID() requires a secure context (HTTPS or localhost). Over
@@ -85,8 +72,26 @@ type PlayerProps = {
   nextLabel?: string;
   nextThumb?: string;
   markers?: Marker[];
+  audioStreams?: MediaStream[];
+  subtitleStreams?: MediaStream[];
+  // Plex Part ID (Media[0].Part[0].id). Required for the /api/subtitle
+  // endpoint to hit Plex's /library/parts/<partId> direct-fetch URL.
+  partId?: number;
   seasonEpisodes?: EpisodeSibling[];
 };
+
+// Pick the stream ID that matches the user's preferred language code, if
+// any. Returns null when the prefs are unset or no stream matches — in that
+// case the transcoder's default selection applies.
+function streamMatchingLanguage(
+  streams: MediaStream[] | undefined,
+  langCode: string,
+): number | null {
+  if (!streams || !langCode) return null;
+  const target = langCode.toLowerCase();
+  const hit = streams.find((s) => s.languageCode?.toLowerCase() === target);
+  return hit ? hit.id : null;
+}
 
 const COUNTDOWN_WINDOW_SECONDS = 10;
 
@@ -115,6 +120,9 @@ export function Player({
   nextLabel,
   nextThumb,
   markers,
+  audioStreams,
+  subtitleStreams,
+  partId,
   seasonEpisodes,
 }: PlayerProps) {
   const router = useRouter();
@@ -136,10 +144,18 @@ export function Player({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showControls, setShowControls] = useState(true);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
-  const [audioTracks, setAudioTracks] = useState<Track[]>([]);
-  const [subtitleTracks, setSubtitleTracks] = useState<Track[]>([]);
-  const [currentAudioId, setCurrentAudioId] = useState<number>(-1);
-  const [currentSubtitleId, setCurrentSubtitleId] = useState<number>(-1);
+  // Selected Plex stream IDs. `null` means "let the transcoder pick its
+  // default" (we omit the param from the URL entirely). For subtitles, -1
+  // means "explicitly off" — we send subtitleStreamID=0 to Plex which is the
+  // server's signal to disable subtitle rendering.
+  const [audioStreamId, setAudioStreamId] = useState<number | null>(() =>
+    streamMatchingLanguage(audioStreams, getPrefs().audioLanguage),
+  );
+  const [subtitleStreamId, setSubtitleStreamId] = useState<number | null>(() => {
+    const pref = getPrefs().subtitleLanguage;
+    if (pref === "off") return -1;
+    return streamMatchingLanguage(subtitleStreams, pref);
+  });
   const [tracksOpen, setTracksOpen] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [speedOpen, setSpeedOpen] = useState(false);
@@ -186,12 +202,28 @@ export function Player({
       hasMDE: "1",
       session,
     });
+    if (audioStreamId !== null) {
+      params.set("audioStreamID", String(audioStreamId));
+    }
+    // Subtitle is intentionally NOT sent to the transcoder. Some Plex servers
+    // silently drop subtitles from the HLS manifest regardless of the params
+    // we send. Instead we fetch the subtitle file separately and render it
+    // via a <track> element on the <video>, which is independent of the
+    // transcode pipeline and works on every Plex server.
     const url = `/api/plex/video/:/transcode/universal/start.m3u8?${params}`;
+
+    // When changing audio/subtitle mid-playback we want to land back at
+    // roughly the same spot. Prefer the live currentTime over the initial
+    // viewOffset so a user who paused at 0:42:10 and switched subs doesn't
+    // get yanked back to where they started the session.
+    const liveTime = video.currentTime;
+    const resumeMs =
+      liveTime > 1 ? Math.floor(liveTime * 1000) : viewOffset ?? 0;
 
     function applyResume() {
       if (!video) return;
-      if (viewOffset && viewOffset > 1000) {
-        video.currentTime = viewOffset / 1000;
+      if (resumeMs > 1000) {
+        video.currentTime = resumeMs / 1000;
       }
     }
 
@@ -232,20 +264,6 @@ export function Player({
           applyResume();
           attemptPlay();
         });
-        hls.on(HlsModule.Events.AUDIO_TRACKS_UPDATED, () => {
-          setAudioTracks(hls.audioTracks.map(formatTrack));
-          setCurrentAudioId(hls.audioTrack);
-        });
-        hls.on(HlsModule.Events.AUDIO_TRACK_SWITCHED, () => {
-          setCurrentAudioId(hls.audioTrack);
-        });
-        hls.on(HlsModule.Events.SUBTITLE_TRACKS_UPDATED, () => {
-          setSubtitleTracks(hls.subtitleTracks.map(formatTrack));
-          setCurrentSubtitleId(hls.subtitleTrack);
-        });
-        hls.on(HlsModule.Events.SUBTITLE_TRACK_SWITCH, () => {
-          setCurrentSubtitleId(hls.subtitleTrack);
-        });
         hls.on(HlsModule.Events.ERROR, (_event, data) => {
           if (data.fatal) {
             setError(`${data.type} / ${data.details}`);
@@ -276,7 +294,11 @@ export function Player({
       cancelled = true;
       cleanup();
     };
-  }, [ratingKey, viewOffset, attemptPlay]);
+    // Re-running this effect on audio change tears down hls and requests a
+    // new manifest with the chosen audioStreamID. Subtitle changes don't
+    // belong here — those are rendered via a separate <track> element and
+    // swap instantly without touching the HLS stream.
+  }, [ratingKey, viewOffset, attemptPlay, audioStreamId]);
 
   // ── Video state subscriptions ─────────────────────────────────────────────
   useEffect(() => {
@@ -340,6 +362,50 @@ export function Player({
     video.playbackRate = prefs.playbackRate;
     setPlaybackRate(prefs.playbackRate);
   }, []);
+
+  // ── Force our <track> subtitle to display ────────────────────────────────
+  // hls.js may inject its own text tracks (often empty for HLS without
+  // sidecar VTT) which compete with our React-managed <track>. The `default`
+  // attribute on <track> only wins when no other track is set, so we
+  // explicitly disable everything else and force our chosen one to "showing"
+  // whenever the subtitle selection changes.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    // The text track our <track> element added is the last one in the list
+    // (React appended it after hls.js's tracks). We walk the whole list and
+    // disable every track that isn't ours, then enable ours.
+    function applyTrackMode() {
+      if (!video) return;
+      const tracks = video.textTracks;
+      const wantsSubs = subtitleStreamId !== null && subtitleStreamId !== -1;
+      for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i];
+        // Match by label since React's <track label> propagates to the
+        // resulting TextTrack — the only reliable identifier across
+        // hls.js-injected vs React-injected tracks.
+        const isOurs =
+          wantsSubs &&
+          t.label ===
+            (subtitleStreams?.find((s) => s.id === subtitleStreamId)
+              ? streamLabel(
+                  subtitleStreams.find((s) => s.id === subtitleStreamId)!,
+                )
+              : "Subtitles");
+        t.mode = isOurs ? "showing" : "disabled";
+      }
+    }
+    applyTrackMode();
+    // hls.js / the <track> load happens asynchronously after the initial
+    // render. Watch for additions and reapply.
+    const tracks = video.textTracks;
+    tracks.addEventListener("addtrack", applyTrackMode);
+    tracks.addEventListener("change", applyTrackMode);
+    return () => {
+      tracks.removeEventListener("addtrack", applyTrackMode);
+      tracks.removeEventListener("change", applyTrackMode);
+    };
+  }, [subtitleStreamId, subtitleStreams]);
 
   // ── Fullscreen tracking ───────────────────────────────────────────────────
   useEffect(() => {
@@ -479,33 +545,45 @@ export function Player({
     }
   }, []);
 
-  const setAudioTrack = useCallback((id: number) => {
-    if (hlsRef.current) hlsRef.current.audioTrack = id;
-  }, []);
+  // Switching audio/subtitle streams requires a new transcode manifest from
+  // Plex — there's no in-stream switch when subtitles are burned into the
+  // video. The HLS effect's dependency on `audioStreamId`/`subtitleStreamId`
+  // does the heavy lifting; here we just persist the choice and update state.
+  const selectAudioStream = useCallback(
+    (id: number) => {
+      const match = audioStreams?.find((s) => s.id === id);
+      updatePrefs({ audioLanguage: match?.languageCode ?? "" });
+      setAudioStreamId(id);
+    },
+    [audioStreams],
+  );
 
-  const setSubtitleTrack = useCallback((id: number) => {
-    const hls = hlsRef.current;
-    if (!hls) return;
-    hls.subtitleTrack = id;
-    hls.subtitleDisplay = id !== -1;
-  }, []);
+  const selectSubtitleStream = useCallback(
+    (id: number) => {
+      if (id === -1) {
+        updatePrefs({ subtitleLanguage: "off" });
+      } else {
+        const match = subtitleStreams?.find((s) => s.id === id);
+        updatePrefs({ subtitleLanguage: match?.languageCode ?? "" });
+      }
+      setSubtitleStreamId(id);
+    },
+    [subtitleStreams],
+  );
 
   const toggleSubtitles = useCallback(() => {
-    const hls = hlsRef.current;
-    if (!hls) return;
-    if (hls.subtitleTrack === -1) {
-      // Pick the first available track. Most users want SDH/English first;
-      // Plex generally lists the embedded primary track at index 0.
-      const first = hls.subtitleTracks[0];
-      if (first) {
-        hls.subtitleTrack = first.id;
-        hls.subtitleDisplay = true;
-      }
+    if (subtitleStreamId === -1 || subtitleStreamId === null) {
+      // Re-enable: prefer the language the user previously chose, fall back
+      // to the first available stream.
+      const pref = getPrefs().subtitleLanguage;
+      const target =
+        streamMatchingLanguage(subtitleStreams, pref) ??
+        subtitleStreams?.[0]?.id;
+      if (target !== undefined) selectSubtitleStream(target);
     } else {
-      hls.subtitleTrack = -1;
-      hls.subtitleDisplay = false;
+      selectSubtitleStream(-1);
     }
-  }, []);
+  }, [subtitleStreamId, subtitleStreams, selectSubtitleStream]);
 
   const setVolumeValue = useCallback((value: number) => {
     const v = videoRef.current;
@@ -657,8 +735,31 @@ export function Player({
         playsInline
         autoPlay
         onClick={togglePlay}
+        crossOrigin="anonymous"
         className="h-full w-full bg-black"
-      />
+      >
+        {subtitleStreamId !== null && subtitleStreamId !== -1 && (
+          <track
+            // `key` forces a fresh <track> element when the language changes
+            // so the browser drops the previous cues and fetches the new src.
+            key={subtitleStreamId}
+            kind="subtitles"
+            src={`/api/subtitle/${subtitleStreamId}?ratingKey=${ratingKey}`}
+            srcLang={
+              subtitleStreams?.find((s) => s.id === subtitleStreamId)
+                ?.languageCode ?? "und"
+            }
+            label={
+              subtitleStreams?.find((s) => s.id === subtitleStreamId)
+                ? streamLabel(
+                    subtitleStreams.find((s) => s.id === subtitleStreamId)!,
+                  )
+                : "Subtitles"
+            }
+            default
+          />
+        )}
+      </video>
 
       {error && <ErrorOverlay message={error} />}
       {loading && !error && !autoplayBlocked && <LoadingSpinner />}
@@ -794,17 +895,18 @@ export function Player({
                   onClose={() => setEpisodesOpen(false)}
                 />
               )}
-              {(audioTracks.length > 1 || subtitleTracks.length > 0) && (
+              {((audioStreams && audioStreams.length > 1) ||
+                (subtitleStreams && subtitleStreams.length > 0)) && (
                 <TracksControl
-                  audioTracks={audioTracks}
-                  subtitleTracks={subtitleTracks}
-                  currentAudioId={currentAudioId}
-                  currentSubtitleId={currentSubtitleId}
+                  audioStreams={audioStreams ?? []}
+                  subtitleStreams={subtitleStreams ?? []}
+                  currentAudioId={audioStreamId}
+                  currentSubtitleId={subtitleStreamId}
                   open={tracksOpen}
                   onToggle={() => setTracksOpen((o) => !o)}
                   onClose={() => setTracksOpen(false)}
-                  onAudioSelect={setAudioTrack}
-                  onSubtitleSelect={setSubtitleTrack}
+                  onAudioSelect={selectAudioStream}
+                  onSubtitleSelect={selectSubtitleStream}
                 />
               )}
               <SpeedControl
@@ -877,8 +979,8 @@ function BigPlayButton({ onClick }: { onClick: () => void }) {
 }
 
 function TracksControl({
-  audioTracks,
-  subtitleTracks,
+  audioStreams,
+  subtitleStreams,
   currentAudioId,
   currentSubtitleId,
   open,
@@ -887,10 +989,11 @@ function TracksControl({
   onAudioSelect,
   onSubtitleSelect,
 }: {
-  audioTracks: Track[];
-  subtitleTracks: Track[];
-  currentAudioId: number;
-  currentSubtitleId: number;
+  audioStreams: MediaStream[];
+  subtitleStreams: MediaStream[];
+  // null = transcoder default (no explicit ID sent). For subs, -1 = off.
+  currentAudioId: number | null;
+  currentSubtitleId: number | null;
   open: boolean;
   onToggle: () => void;
   onClose: () => void;
@@ -915,6 +1018,16 @@ function TracksControl({
     };
   }, [open, onClose]);
 
+  // The "currently active" highlight has to fall back to the Plex-marked
+  // `selected` stream when the user hasn't explicitly chosen one — that's
+  // what the transcoder is actually playing.
+  const effectiveAudioId =
+    currentAudioId ?? audioStreams.find((s) => s.selected)?.id ?? null;
+  const effectiveSubtitleId =
+    currentSubtitleId ??
+    subtitleStreams.find((s) => s.selected)?.id ??
+    null;
+
   return (
     <div ref={wrapRef} className="relative">
       <IconButton
@@ -930,21 +1043,19 @@ function TracksControl({
           role="menu"
           className="absolute bottom-full right-0 mb-3 grid w-md grid-cols-2 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
         >
-          <TrackColumn
+          <StreamColumn
             label="Audio"
-            tracks={audioTracks}
-            currentId={currentAudioId}
+            streams={audioStreams}
+            currentId={effectiveAudioId}
             onSelect={onAudioSelect}
             offOption={false}
-            offLabel=""
           />
-          <TrackColumn
+          <StreamColumn
             label="Subtitles"
-            tracks={subtitleTracks}
-            currentId={currentSubtitleId}
+            streams={subtitleStreams}
+            currentId={effectiveSubtitleId}
             onSelect={onSubtitleSelect}
             offOption={true}
-            offLabel="Off"
           />
         </div>
       )}
@@ -952,20 +1063,18 @@ function TracksControl({
   );
 }
 
-function TrackColumn({
+function StreamColumn({
   label,
-  tracks,
+  streams,
   currentId,
   onSelect,
   offOption,
-  offLabel,
 }: {
   label: string;
-  tracks: Track[];
-  currentId: number;
+  streams: MediaStream[];
+  currentId: number | null;
   onSelect: (id: number) => void;
   offOption: boolean;
-  offLabel: string;
 }) {
   return (
     <div className="border-r border-white/10 last:border-r-0">
@@ -975,20 +1084,20 @@ function TrackColumn({
       <ul className="max-h-72 overflow-y-auto py-2">
         {offOption && (
           <TrackRow
-            label={offLabel}
+            label="Off"
             active={currentId === -1}
             onClick={() => onSelect(-1)}
           />
         )}
-        {tracks.map((t) => (
+        {streams.map((s) => (
           <TrackRow
-            key={t.id}
-            label={trackLabel(t, label)}
-            active={currentId === t.id}
-            onClick={() => onSelect(t.id)}
+            key={s.id}
+            label={streamLabel(s)}
+            active={currentId === s.id}
+            onClick={() => onSelect(s.id)}
           />
         ))}
-        {tracks.length === 0 && !offOption && (
+        {streams.length === 0 && !offOption && (
           <li className="px-4 py-2 text-sm text-white/50">None available</li>
         )}
       </ul>

@@ -621,7 +621,12 @@ export async function plexServer(
   // Plex defaults to XML when the client sends `Accept: */*`. We always want
   // JSON for our metadata/library calls; Plex serves m3u8 / ts from the
   // transcoder regardless of the Accept header, so this is safe.
-  headers.set("Accept", "application/json");
+  // Callers can override by setting their own Accept (e.g. the subtitle
+  // endpoint asks for */*, since Plex's universal subtitle transcoder
+  // refuses to serve text content when JSON is demanded).
+  if (!headers.has("Accept")) {
+    headers.set("Accept", "application/json");
+  }
   headers.set("X-Plex-Token", auth.accessToken);
   headers.set("X-Plex-Client-Identifier", env.plexClientIdentifier());
   headers.set("X-Plex-Product", env.plexProductName());

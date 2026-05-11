@@ -6,6 +6,21 @@ export type Marker = {
   endMs: number;
 };
 
+// A single Plex audio or subtitle stream. We keep just enough to label it in
+// the picker UI and pass its ID back to Plex's transcoder. `language` is the
+// human label ("English"), `languageCode` is the ISO 639-2 short code
+// ("eng") which is what we match against user prefs.
+export type MediaStream = {
+  id: number;
+  language?: string;
+  languageCode?: string;
+  codec?: string;
+  displayTitle?: string;
+  forced?: boolean;
+  default?: boolean;
+  selected?: boolean;
+};
+
 export type MediaItem = {
   ratingKey: string;
   key: string;
@@ -32,6 +47,14 @@ export type MediaItem = {
   leafCount?: number;
   markers?: Marker[];
   librarySectionID?: string;
+  // Populated only when the source Plex response includes Media/Part/Stream
+  // (i.e. single-item metadata fetches, not the slimmed list endpoints).
+  audioStreams?: MediaStream[];
+  subtitleStreams?: MediaStream[];
+  // ID of the first Part in the first Media block. Needed to hit Plex's
+  // /library/parts/<partId> endpoints (subtitle download, file info). Plex
+  // exposes it on every leaf metadata item.
+  partId?: number;
 };
 
 export type Section = {
@@ -53,6 +76,23 @@ type MarkerNode = {
   startTimeOffset?: number;
   endTimeOffset?: number;
 };
+// Plex's per-track stream descriptor. `streamType` is 1=video, 2=audio,
+// 3=subtitle. The same node shape is reused across all three.
+type StreamNode = {
+  id?: number | string;
+  streamType?: number | string;
+  language?: string;
+  languageCode?: string;
+  languageTag?: string;
+  codec?: string;
+  displayTitle?: string;
+  extendedDisplayTitle?: string;
+  forced?: boolean | number | string;
+  default?: boolean | number | string;
+  selected?: boolean | number | string;
+};
+type PartNode = { id?: number | string; Stream?: StreamNode[] };
+type MediaNode = { Part?: PartNode[] };
 export type MetadataNode = {
   ratingKey?: string | number;
   key?: string;
@@ -71,6 +111,7 @@ export type MetadataNode = {
   Writer?: Tag[];
   Role?: RoleTag[];
   Marker?: MarkerNode[];
+  Media?: MediaNode[];
   parentTitle?: string;
   parentRatingKey?: string | number;
   grandparentTitle?: string;
@@ -80,6 +121,44 @@ export type MetadataNode = {
   leafCount?: number;
   librarySectionID?: string | number;
 };
+
+// Plex serializes booleans inconsistently — sometimes true, sometimes "1",
+// sometimes 1. Normalize them all to a real boolean for the UI.
+function asBool(v: unknown): boolean {
+  return v === true || v === 1 || v === "1";
+}
+
+function mapStream(s: StreamNode): MediaStream {
+  return {
+    id: Number(s.id ?? 0),
+    language: s.language,
+    // Plex sometimes uses `languageCode` (older) and `languageTag` (newer).
+    // Either is fine for matching against user prefs since we lowercase both.
+    languageCode: s.languageCode ?? s.languageTag,
+    codec: s.codec,
+    // Prefer the extended title ("English (SDH)" vs. "English") since the
+    // suffix distinguishes forced/SDH variants from the regular track.
+    displayTitle: s.extendedDisplayTitle ?? s.displayTitle,
+    forced: asBool(s.forced),
+    default: asBool(s.default),
+    selected: asBool(s.selected),
+  };
+}
+
+function extractStreams(
+  node: MetadataNode,
+  streamType: 2 | 3,
+): MediaStream[] | undefined {
+  // We only look at the first Media/Part since Plex's transcoder also
+  // addresses them by mediaIndex/partIndex 0 — picking from a different part
+  // would need wider plumbing.
+  const part = node.Media?.[0]?.Part?.[0];
+  const streams = part?.Stream;
+  if (!Array.isArray(streams)) return undefined;
+  const filtered = streams.filter((s) => Number(s.streamType) === streamType);
+  if (filtered.length === 0) return undefined;
+  return filtered.map(mapStream);
+}
 
 export function mapItem(d: MetadataNode): MediaItem {
   return {
@@ -130,6 +209,14 @@ export function mapItem(d: MetadataNode): MediaItem {
           endMs: m.endTimeOffset,
         }))
       : undefined,
+    audioStreams: extractStreams(d, 2),
+    subtitleStreams: extractStreams(d, 3),
+    partId: (() => {
+      const raw = d.Media?.[0]?.Part?.[0]?.id;
+      if (raw === undefined) return undefined;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : undefined;
+    })(),
   };
 }
 
