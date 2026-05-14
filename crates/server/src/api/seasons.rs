@@ -14,7 +14,10 @@ pub async fn get_one(
     user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<SeasonDetail>, ApiError> {
-    let detail = queries::get_season_detail(&state.pool, id, user.id)
+    let acc = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    let detail = queries::get_season_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(detail))

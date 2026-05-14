@@ -14,9 +14,13 @@ pub use models::*;
 pub use scanner::run_scan;
 
 pub use crate::models::{
-    CreateInviteInput, Episode, EpisodeDetail, EpisodeListed, Invite, ItemDetail, ListedItem,
-    LoginInput, MediaFileLocator, MediaFileSummary, MediaStreamSummary, OnDeckEntry,
-    OnDeckResponse, PlayStateBatch, PlayStateForItem, PlayStateUpdate, RegisterInput,
-    ScrobbleRequest, Season, SeasonDetail, SeasonSummary, SessionRow, SetupInput, User, UserRole,
-    UserWithSecret,
+    AgentInfo, AuditLogEntry, CreateInviteInput, Episode, EpisodeDetail, EpisodeListed, Invite,
+    ItemDetail, LibraryAgent, ListedItem, LoginInput, MediaFileLocator, MediaFileSummary,
+    MediaStreamSummary, NewAuditEntry, NewOptimizedVersion, NewScheduledTask, NewTranscoderPreset,
+    NewWebhook, OnDeckEntry, OnDeckResponse, OptimizedVersion, PlayStateBatch, PlayStateForItem,
+    PlayStateUpdate, RegisterInput, ScanJob, ScheduledTask, ScheduledTaskUpdate, ScrobbleRequest,
+    Season, SeasonDetail, SeasonSummary, ServerSettings, ServerSettingsUpdate, SessionRow,
+    SetupInput, TaskRun, TranscoderPreset, TranscoderPresetUpdate, User, UserRole, UserWithSecret,
+    Webhook, WebhookDelivery, WebhookUpdate,
 };
+pub use crate::queries::{AccessMatrixEntry, LibraryStats, SessionSummary};

@@ -11,7 +11,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
 use crate::auth::AuthUser;
-use crate::events::Event;
+use crate::events::{Event, SessionsEvent};
 use crate::state::AppState;
 
 pub async fn handler(
@@ -26,13 +26,27 @@ async fn run(state: AppState, mut socket: WebSocket) {
     debug!("ws connection opened");
     let mut rx = state.hub.subscribe();
 
+    // Push the current active-sessions list immediately so freshly-
+    // connected dashboards don't have to wait for the next change.
+    let initial = SessionsEvent::snapshot(state.transcoder.list_sessions());
+    if let Ok(json) = serde_json::to_string(&initial) {
+        if socket
+            .send(Message::Text(Utf8Bytes::from(json)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             recv = rx.recv() => {
                 match recv {
                     Ok(event) => {
                         let json = match serialize(&event) {
-                            Ok(s) => s,
+                            Ok(Some(s)) => s,
+                            Ok(None) => continue,
                             Err(e) => {
                                 warn!(error = %e, "serialize event failed");
                                 continue;
@@ -68,8 +82,12 @@ async fn run(state: AppState, mut socket: WebSocket) {
     debug!("ws connection closed");
 }
 
-fn serialize(event: &Event) -> anyhow::Result<String> {
+fn serialize(event: &Event) -> anyhow::Result<Option<String>> {
     match event {
-        Event::Scan(scan) => Ok(serde_json::to_string(scan)?),
+        Event::Scan(scan) => Ok(Some(serde_json::to_string(scan)?)),
+        Event::Sessions(s) => Ok(Some(serde_json::to_string(s)?)),
+        // Webhook events are an internal pub/sub variant; not forwarded
+        // to WebSocket clients today.
+        Event::Webhook(_) => Ok(None),
     }
 }

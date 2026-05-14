@@ -1,13 +1,13 @@
 # Rust
 /target/
 
-# Next.js (web/)
-/web/node_modules/
-/web/.next/
-/web/out/
-/web/coverage/
-/web/*.tsbuildinfo
-/web/next-env.d.ts
+# Node / Next.js (covers both root and web/)
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
 
 # Env files (real config) — keep .env.example checked in
 .env

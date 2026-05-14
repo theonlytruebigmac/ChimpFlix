@@ -21,10 +21,14 @@ chimpflix-transcoder = { path = "../transcoder" }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 axum = { workspace = true }
+chrono = { workspace = true }
+cron = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+libc = { workspace = true }
 rand_core = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

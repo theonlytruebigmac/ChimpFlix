@@ -1,10 +1,14 @@
 //! ffmpeg/ffprobe orchestration for probing and HLS transcoding.
 
+pub mod capabilities;
+pub mod markers;
 pub mod probe;
 pub mod session;
 
+pub use capabilities::{TranscoderCapabilities, detect_capabilities};
+pub use markers::{DetectedMarker, MarkerKind, detect_markers};
 pub use probe::{ProbeResult, ProbeStream, StreamKind, probe};
-pub use session::{Session, TranscodeManager};
+pub use session::{Session, SessionSnapshot, TranscodeManager};
 
 #[derive(Debug, Clone)]
 pub struct FfmpegConfig {

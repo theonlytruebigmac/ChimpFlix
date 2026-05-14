@@ -49,29 +49,60 @@ pub struct LibraryCounts {
 
 pub async fn server_info(
     State(state): State<AppState>,
-    _user: crate::auth::AuthUser,
+    user: crate::auth::AuthUser,
 ) -> Result<Json<ServerInfoResponse>, ApiError> {
     use sqlx::Row;
 
-    let libraries = queries::list_libraries(&state.pool).await?.len() as i64;
-    let movies: i64 = sqlx::query("SELECT COUNT(*) AS n FROM items WHERE kind = 'movie'")
-        .fetch_one(&state.pool)
+    let acc = queries::user_library_filter(&state.pool, user.id, user.role)
         .await
-        .map_err(|e| ApiError::Internal(e.into()))?
-        .try_get("n")
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    let shows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM items WHERE kind = 'show'")
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?
-        .try_get("n")
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    let episodes: i64 = sqlx::query("SELECT COUNT(*) AS n FROM episodes")
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?
-        .try_get("n")
-        .map_err(|e| ApiError::Internal(e.into()))?;
+        .map_err(ApiError::Internal)?;
+    let libs = queries::list_libraries(&state.pool, acc.as_deref()).await?;
+    let libraries = libs.len() as i64;
+    // For non-owners, scope item/episode counts to libraries they can see.
+    // Two phrasings of the same filter: bare `library_id` for queries
+    // against `items`, and `i.library_id` for the JOIN against `i`.
+    let render_filter = |col: &str| -> String {
+        match &acc {
+            None => "1=1".to_string(),
+            Some(ids) if ids.is_empty() => format!("{col} = 0"),
+            Some(ids) => format!(
+                "{col} IN ({})",
+                ids.iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        }
+    };
+    let item_filter = render_filter("library_id");
+    let join_filter = render_filter("i.library_id");
+    let movies: i64 = sqlx::query(&format!(
+        "SELECT COUNT(*) AS n FROM items WHERE kind = 'movie' AND {item_filter}",
+    ))
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .try_get("n")
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let shows: i64 = sqlx::query(&format!(
+        "SELECT COUNT(*) AS n FROM items WHERE kind = 'show' AND {item_filter}",
+    ))
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .try_get("n")
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let episodes: i64 = sqlx::query(&format!(
+        "SELECT COUNT(*) AS n FROM episodes e \
+         JOIN seasons s ON s.id = e.season_id \
+         JOIN items i ON i.id = s.show_id \
+         WHERE {join_filter}",
+    ))
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .try_get("n")
+    .map_err(|e| ApiError::Internal(e.into()))?;
 
     Ok(Json(ServerInfoResponse {
         version: env!("CARGO_PKG_VERSION"),

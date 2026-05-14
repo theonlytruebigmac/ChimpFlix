@@ -1,0 +1,80 @@
+import { notFound } from "next/navigation";
+import { Card } from "@/components/Card";
+import { ModalRoot } from "@/components/ModalRoot";
+import { TopNav } from "@/components/TopNav";
+import {
+  ChimpFlixApiError,
+  collections as collectionsApi,
+} from "@/lib/chimpflix-api";
+import { adaptItem } from "@/lib/chimpflix-adapt";
+import { requireUser } from "@/lib/chimpflix-server";
+
+export default async function CollectionPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  await requireUser(`/collection/${id}`);
+  const idNum = Number.parseInt(id, 10);
+  if (!Number.isFinite(idNum) || idNum <= 0) notFound();
+
+  let detail;
+  try {
+    detail = await collectionsApi.get(idNum);
+  } catch (e) {
+    if (e instanceof ChimpFlixApiError && e.status === 404) notFound();
+    throw e;
+  }
+
+  const items = detail.items.map(adaptItem);
+  const backdrop = detail.backdrop_path ?? detail.poster_path ?? null;
+
+  return (
+    <main className="relative min-h-screen bg-background">
+      <TopNav />
+
+      {/* Header banner with backdrop, name, and overview. Mirrors the
+          modal hero treatment but at page scale. */}
+      <section className="relative h-[40vh] min-h-72 w-full overflow-hidden">
+        {backdrop && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={backdrop}
+            alt=""
+            className="zf-fade-in absolute inset-0 h-full w-full object-cover"
+          />
+        )}
+        <div className="pointer-events-none absolute inset-0 bg-linear-to-r from-black/95 via-black/55 to-transparent" />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-72 bg-linear-to-t from-(--color-background) via-(--color-background)/70 to-transparent" />
+        <div className="relative z-10 flex h-full max-w-2xl flex-col justify-end px-12 pb-12 pt-28">
+          <div className="mb-2 text-xs font-bold tracking-[0.35em] text-(--color-accent)">
+            COLLECTION
+          </div>
+          <h1 className="mb-4 text-5xl font-black uppercase leading-[0.95] tracking-tight drop-shadow-lg">
+            {detail.name}
+          </h1>
+          {detail.overview && (
+            <p className="line-clamp-4 text-base leading-relaxed text-white/90 drop-shadow">
+              {detail.overview}
+            </p>
+          )}
+          <div className="mt-3 text-sm text-white/60">
+            {detail.item_count} {detail.item_count === 1 ? "title" : "titles"}
+          </div>
+        </div>
+      </section>
+
+      <div className="relative z-20 px-12 pb-24">
+        <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+          {items.map((it) => (
+            <li key={it.ratingKey}>
+              <Card item={it} />
+            </li>
+          ))}
+        </ul>
+      </div>
+      <ModalRoot />
+    </main>
+  );
+}

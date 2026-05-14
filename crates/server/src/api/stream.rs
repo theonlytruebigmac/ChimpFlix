@@ -26,16 +26,38 @@ use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
 
+/// Reject the request if the user can't see the library this file belongs
+/// to. Returns 404 (not 403) so we don't leak that the file exists.
+async fn ensure_file_accessible(
+    state: &AppState,
+    user: &AuthUser,
+    file_id: i64,
+) -> Result<(), ApiError> {
+    let acc = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    let Some(allowed) = acc else { return Ok(()) };
+    let lib_id = queries::media_file_library_id(&state.pool, file_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    if !allowed.contains(&lib_id) {
+        return Err(ApiError::NotFound);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Direct play (HTTP Range)
 // ---------------------------------------------------------------------------
 
 pub async fn direct(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(file_id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    ensure_file_accessible(&state, &user, file_id).await?;
     let locator = queries::get_media_file_locator(&state.pool, file_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -158,6 +180,14 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     pub start_position_ms: i64,
     pub client: ClientCapabilities,
+    /// 0-indexed among the file's audio streams. None means "let ffmpeg
+    /// pick" (default behavior — usually first audio).
+    #[serde(default)]
+    pub audio_index: Option<u32>,
+    /// 0-indexed among the file's subtitle streams. When set, subs are
+    /// burned in and the response will always be a transcode session.
+    #[serde(default)]
+    pub subtitle_index: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -195,6 +225,7 @@ pub async fn create_session(
     user: AuthUser,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    ensure_file_accessible(&state, &user, req.media_file_id).await?;
     let locator = queries::get_media_file_locator(&state.pool, req.media_file_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -234,7 +265,14 @@ pub async fn create_session(
         })
         .collect();
 
-    let mode = decide_mode(&stream_pairs, container.as_deref(), bit_rate, &req.client);
+    // Any subtitle selection forces transcode (we burn it in); ditto for
+    // a non-default audio choice since direct play can't remap tracks.
+    let needs_transcode = req.subtitle_index.is_some() || req.audio_index.is_some();
+    let mode = if needs_transcode {
+        PlayMode::Transcode
+    } else {
+        decide_mode(&stream_pairs, container.as_deref(), bit_rate, &req.client)
+    };
 
     match mode {
         PlayMode::Direct => Ok((
@@ -251,6 +289,39 @@ pub async fn create_session(
             }),
         )),
         PlayMode::Transcode => {
+            // Enforce the operator's concurrent-transcode cap. The setting
+            // is hot-reloaded, so we re-read it each time rather than
+            // capturing it at startup. Race window between len() and
+            // start() is acceptable — worst case we let in one extra.
+            let max_concurrent = state.settings.read().await.transcoder_max_concurrent;
+            let current = state.transcoder.list_sessions().len() as i64;
+            if current >= max_concurrent {
+                return Err(ApiError::TooManyRequests(format!(
+                    "transcoder is at capacity ({current}/{max_concurrent} concurrent sessions)"
+                )));
+            }
+
+            // Look up the codec of the chosen subtitle stream so the
+            // transcoder can pick the right filter path (text vs picture
+            // burn-in). `subtitle_index` is 0-indexed among subtitle
+            // streams, so we ORDER BY stream_index and OFFSET.
+            let subtitle_codec: Option<String> = if let Some(si) = req.subtitle_index {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT codec FROM media_streams
+                     WHERE media_file_id = ? AND kind = 'subtitle'
+                     ORDER BY stream_index ASC
+                     LIMIT 1 OFFSET ?",
+                )
+                .bind(req.media_file_id)
+                .bind(si as i64)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| ApiError::Internal(e.into()))?
+                .flatten()
+            } else {
+                None
+            };
+
             let session = state
                 .transcoder
                 .start(
@@ -259,6 +330,9 @@ pub async fn create_session(
                     req.start_position_ms,
                     duration_ms,
                     user.id,
+                    req.audio_index,
+                    req.subtitle_index,
+                    subtitle_codec.as_deref(),
                 )
                 .await
                 .map_err(ApiError::Internal)?;

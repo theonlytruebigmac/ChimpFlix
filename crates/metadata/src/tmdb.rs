@@ -66,17 +66,22 @@ impl TmdbClient {
             debug!(query, year, "no TMDB movie match");
             return Ok(None);
         };
+        self.fetch_movie(hit.id).await.map(Some)
+    }
 
+    /// Fetch a movie by TMDB id — used both internally after a search and
+    /// by Fix Match's "apply candidate" path.
+    pub async fn fetch_movie(&self, tmdb_id: i64) -> Result<TmdbMovie> {
         let detail: RawMovieDetail = self
             .get(
-                &format!("/movie/{}", hit.id),
+                &format!("/movie/{tmdb_id}"),
                 &[
                     ("language", "en-US".to_string()),
                     ("append_to_response", "external_ids".to_string()),
                 ],
             )
             .await?;
-        Ok(Some(TmdbMovie::from_raw(detail)))
+        Ok(TmdbMovie::from_raw(detail))
     }
 
     pub async fn lookup_show(&self, query: &str, year: Option<i32>) -> Result<Option<TmdbShow>> {
@@ -93,17 +98,289 @@ impl TmdbClient {
             debug!(query, year, "no TMDB show match");
             return Ok(None);
         };
+        self.fetch_show(hit.id).await.map(Some)
+    }
 
+    pub async fn fetch_show(&self, tmdb_id: i64) -> Result<TmdbShow> {
         let detail: RawShowDetail = self
             .get(
-                &format!("/tv/{}", hit.id),
+                &format!("/tv/{tmdb_id}"),
                 &[
                     ("language", "en-US".to_string()),
                     ("append_to_response", "external_ids".to_string()),
                 ],
             )
             .await?;
-        Ok(Some(TmdbShow::from_raw(detail)))
+        Ok(TmdbShow::from_raw(detail))
+    }
+
+    /// Multi-candidate search for Fix Match. Returns up to ~10 hits
+    /// each with enough preview info (title, year, summary, poster) to
+    /// render a Plex-style picker without a follow-up round-trip per
+    /// candidate.
+    pub async fn search_candidates(
+        &self,
+        kind: TmdbKind,
+        query: &str,
+        year: Option<i32>,
+    ) -> Result<Vec<TmdbCandidate>> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("query", query.to_string()),
+            ("language", "en-US".to_string()),
+        ];
+        let path = match kind {
+            TmdbKind::Movie => {
+                if let Some(y) = year {
+                    params.push(("year", y.to_string()));
+                }
+                "/search/movie"
+            }
+            TmdbKind::Show => {
+                if let Some(y) = year {
+                    params.push(("first_air_date_year", y.to_string()));
+                }
+                "/search/tv"
+            }
+        };
+        let raw: SearchPage<RawCandidate> = self.get(path, &params).await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .take(10)
+            .map(|c| c.into_candidate(kind))
+            .collect())
+    }
+
+    /// Cast + crew for the movie/show. Returns up to ~20 cast and the
+    /// top-level crew roles (director, writer, producer) so the modal
+    /// can render Plex-style "Cast & Crew" without splitting on the
+    /// frontend.
+    pub async fn fetch_credits(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+    ) -> Result<TmdbCredits> {
+        let path = match kind {
+            TmdbKind::Movie => format!("/movie/{tmdb_id}/credits"),
+            TmdbKind::Show => format!("/tv/{tmdb_id}/credits"),
+        };
+        let raw: RawCredits = self
+            .get(&path, &[("language", "en-US".to_string())])
+            .await?;
+        let cast: Vec<TmdbCastMember> = raw
+            .cast
+            .into_iter()
+            .take(20)
+            .map(|c| TmdbCastMember {
+                tmdb_person_id: c.id,
+                name: c.name,
+                character: nonempty(c.character),
+                profile_path: nonempty(c.profile_path),
+                order: c.order.unwrap_or(0),
+            })
+            .collect();
+        let crew: Vec<TmdbCrewMember> = raw
+            .crew
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.job.as_str(),
+                    "Director" | "Writer" | "Screenplay" | "Producer" | "Executive Producer"
+                )
+            })
+            .map(|c| TmdbCrewMember {
+                tmdb_person_id: c.id,
+                name: c.name,
+                job: c.job,
+                department: c.department,
+                profile_path: nonempty(c.profile_path),
+            })
+            .collect();
+        Ok(TmdbCredits { cast, crew })
+    }
+
+    /// Full detail for a TMDB collection (franchise). Provides the
+    /// overview field and the list of member movies. Called on first
+    /// encounter of any movie that belongs to the collection.
+    pub async fn fetch_collection(&self, tmdb_id: i64) -> Result<TmdbCollection> {
+        let raw: RawCollectionDetail = self
+            .get(
+                &format!("/collection/{tmdb_id}"),
+                &[("language", "en-US".to_string())],
+            )
+            .await?;
+        Ok(TmdbCollection {
+            tmdb_id: raw.id,
+            name: raw.name,
+            overview: nonempty(raw.overview),
+            poster_path: nonempty(raw.poster_path),
+            backdrop_path: nonempty(raw.backdrop_path),
+            parts: raw
+                .parts
+                .into_iter()
+                .map(|p| TmdbCollectionPart {
+                    tmdb_id: p.id,
+                    title: p.title.or(p.original_title).unwrap_or_default(),
+                    year: p.release_date.as_deref().and_then(parse_year),
+                })
+                .collect(),
+        })
+    }
+
+    /// Public reviews for the title. We pull only the first page (20
+    /// reviews) since the modal's Reviews section caps display anyway.
+    /// `rating` is a 1-10 scale on TMDB when the author chose to rate,
+    /// or `None` when they only left a text review.
+    pub async fn fetch_reviews(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+    ) -> Result<Vec<TmdbReview>> {
+        let path = match kind {
+            TmdbKind::Movie => format!("/movie/{tmdb_id}/reviews"),
+            TmdbKind::Show => format!("/tv/{tmdb_id}/reviews"),
+        };
+        let raw: RawReviews = self
+            .get(&path, &[("language", "en-US".to_string())])
+            .await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .map(|r| {
+                let rating = r.author_details.as_ref().and_then(|d| d.rating);
+                let avatar = r
+                    .author_details
+                    .as_ref()
+                    .and_then(|d| d.avatar_path.clone())
+                    .map(|p| tmdb_avatar_url(&p));
+                TmdbReview {
+                    source_id: r.id,
+                    author: r.author,
+                    author_url: nonempty(r.url),
+                    avatar_url: avatar,
+                    rating: rating.map(|f| f.round() as i32),
+                    body: nonempty(r.content),
+                    created_at: r.created_at.as_deref().and_then(parse_iso8601_ms),
+                }
+            })
+            .collect())
+    }
+
+    /// All videos (trailers, teasers, featurettes, behind-the-scenes,
+    /// clips) for the movie/show, filtered to YouTube since that's the
+    /// only source we currently surface in the player.
+    pub async fn fetch_videos(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+    ) -> Result<Vec<TmdbVideo>> {
+        let path = match kind {
+            TmdbKind::Movie => format!("/movie/{tmdb_id}/videos"),
+            TmdbKind::Show => format!("/tv/{tmdb_id}/videos"),
+        };
+        let raw: RawVideos = self
+            .get(&path, &[("language", "en-US".to_string())])
+            .await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .filter(|v| v.site.eq_ignore_ascii_case("YouTube"))
+            .filter(|v| !v.key.trim().is_empty())
+            .map(|v| TmdbVideo {
+                key: v.key,
+                name: v.name,
+                kind: v.r#type,
+                official: v.official,
+                published_at: v.published_at,
+            })
+            .collect())
+    }
+
+    /// TMDB ids of titles similar to the given one. We pull the first page
+    /// only — 20 candidates is plenty for the modal's rail. The caller is
+    /// expected to intersect with the local library so we never surface
+    /// titles the user doesn't have.
+    pub async fn lookup_similar(
+        &self,
+        tmdb_id: i64,
+        is_show: bool,
+    ) -> Result<Vec<i64>> {
+        let path = if is_show {
+            format!("/tv/{tmdb_id}/similar")
+        } else {
+            format!("/movie/{tmdb_id}/similar")
+        };
+        let resp: SimilarResults = self
+            .get(&path, &[("language", "en-US".to_string())])
+            .await?;
+        Ok(resp.results.into_iter().map(|r| r.id).collect())
+    }
+
+    /// Look up the first YouTube trailer for an item. Returns `None` if
+    /// TMDB has no trailer or the entry has none on YouTube. Picks an
+    /// official trailer when one exists, otherwise the first trailer-typed
+    /// entry.
+    pub async fn lookup_trailer(
+        &self,
+        tmdb_id: i64,
+        is_show: bool,
+    ) -> Result<Option<String>> {
+        let path = if is_show {
+            format!("/tv/{tmdb_id}/videos")
+        } else {
+            format!("/movie/{tmdb_id}/videos")
+        };
+        let resp: RawVideos = self
+            .get(&path, &[("language", "en-US".to_string())])
+            .await?;
+        let mut trailers: Vec<&RawVideo> = resp
+            .results
+            .iter()
+            .filter(|v| v.site.eq_ignore_ascii_case("YouTube"))
+            .filter(|v| v.r#type.eq_ignore_ascii_case("Trailer"))
+            .collect();
+        // Prefer official trailers, then anything trailer-typed.
+        trailers.sort_by_key(|v| if v.official { 0 } else { 1 });
+        Ok(trailers.first().map(|v| v.key.clone()))
+    }
+
+    /// Poster candidates for the item. We don't restrict by language —
+    /// the Plex parity here is that users want to *see* every poster TMDB
+    /// has and pick one. TMDB returns posters in roughly preference order;
+    /// we pass them through unchanged so the highest-vote ones land first.
+    pub async fn fetch_posters(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+    ) -> Result<Vec<TmdbPoster>> {
+        let path = match kind {
+            TmdbKind::Movie => format!("/movie/{tmdb_id}/images"),
+            TmdbKind::Show => format!("/tv/{tmdb_id}/images"),
+        };
+        // include_image_language=null gets the language-agnostic posters
+        // (no embedded text) on top of the localized ones.
+        let raw: RawImages = self
+            .get(
+                &path,
+                &[
+                    ("include_image_language", "en,null".to_string()),
+                ],
+            )
+            .await?;
+        Ok(raw
+            .posters
+            .into_iter()
+            .filter(|p| !p.file_path.trim().is_empty())
+            .map(|p| TmdbPoster {
+                thumb_url: tmdb_image_url(&p.file_path, "w342"),
+                full_url: tmdb_image_url(&p.file_path, "original"),
+                file_path: p.file_path,
+                language: p.iso_639_1,
+                width: p.width,
+                height: p.height,
+                vote_average: p.vote_average,
+            })
+            .collect())
     }
 
     pub async fn fetch_season(&self, show_id: i64, season_number: i32) -> Result<TmdbSeason> {
@@ -167,6 +444,19 @@ pub fn tmdb_image_url(path: &str, size: &str) -> String {
     format!("{TMDB_IMAGE_BASE}/{size}{path}")
 }
 
+/// Avatar URL helper. TMDB review authors with a TMDB-hosted avatar return
+/// `avatar_path = "/abc.jpg"`, which we feed through the regular image
+/// pipeline. Authors with a Gravatar return `avatar_path = "/https://..."` —
+/// the leading slash is bogus and the URL is already absolute. Detect that
+/// and return as-is.
+fn tmdb_avatar_url(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    tmdb_image_url(path, "w185")
+}
+
 // ---------------------------------------------------------------------------
 // Public domain types
 // ---------------------------------------------------------------------------
@@ -185,6 +475,37 @@ pub struct TmdbMovie {
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
     pub genres: Vec<String>,
+    /// TMDB collection (franchise) this movie belongs to, if any. Used to
+    /// group sequels in the modal and on a dedicated /collection page.
+    pub collection: Option<TmdbCollectionStub>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCollectionStub {
+    pub tmdb_id: i64,
+    pub name: String,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+}
+
+/// Full collection detail: name, overview, and the parts (member movies).
+/// We use this to backfill the overview which the `belongs_to_collection`
+/// stub doesn't include.
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCollection {
+    pub tmdb_id: i64,
+    pub name: String,
+    pub overview: Option<String>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    pub parts: Vec<TmdbCollectionPart>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCollectionPart {
+    pub tmdb_id: i64,
+    pub title: String,
+    pub year: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +536,83 @@ pub struct TmdbEpisode {
     pub runtime_min: Option<i32>,
     pub still_path: Option<String>,
     pub air_date: Option<String>,
+}
+
+/// Whether an operation targets the /movie or /tv namespace. Used by the
+/// shared search/credits/videos endpoints to avoid duplicating each method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmdbKind {
+    Movie,
+    Show,
+}
+
+/// Compact preview of one TMDB hit for Fix Match's candidate picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCandidate {
+    pub tmdb_id: i64,
+    pub kind: &'static str, // "movie" | "show"
+    pub title: String,
+    pub year: Option<i32>,
+    pub summary: Option<String>,
+    pub poster_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCredits {
+    pub cast: Vec<TmdbCastMember>,
+    pub crew: Vec<TmdbCrewMember>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCastMember {
+    pub tmdb_person_id: i64,
+    pub name: String,
+    pub character: Option<String>,
+    pub profile_path: Option<String>,
+    pub order: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbCrewMember {
+    pub tmdb_person_id: i64,
+    pub name: String,
+    pub job: String,
+    pub department: String,
+    pub profile_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbVideo {
+    pub key: String,    // YouTube video id
+    pub name: String,
+    pub kind: String,   // "Trailer" | "Teaser" | "Featurette" | "Behind the Scenes" | "Clip"
+    pub official: bool,
+    pub published_at: Option<String>, // ISO 8601, e.g. "2024-03-15T12:00:00.000Z"
+}
+
+/// One poster candidate from the TMDB `/images` endpoint. `thumb_url` is
+/// a w342 preview suitable for a grid; `full_url` is the `original` size
+/// the server downloads when the user picks one.
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbPoster {
+    pub file_path: String,
+    pub thumb_url: String,
+    pub full_url: String,
+    pub language: Option<String>,
+    pub width: i32,
+    pub height: i32,
+    pub vote_average: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbReview {
+    pub source_id: String,
+    pub author: String,
+    pub author_url: Option<String>,
+    pub avatar_url: Option<String>,
+    pub rating: Option<i32>,
+    pub body: Option<String>,
+    pub created_at: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +651,18 @@ struct RawMovieDetail {
     #[serde(default)]
     genres: Vec<RawGenre>,
     external_ids: Option<RawExternalIds>,
+    #[serde(default)]
+    belongs_to_collection: Option<RawCollectionStub>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCollectionStub {
+    id: i64,
+    name: String,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +718,12 @@ impl TmdbMovie {
             .imdb_id
             .clone()
             .or_else(|| raw.external_ids.and_then(|e| e.imdb_id));
+        let collection = raw.belongs_to_collection.map(|c| TmdbCollectionStub {
+            tmdb_id: c.id,
+            name: c.name,
+            poster_path: nonempty(c.poster_path),
+            backdrop_path: nonempty(c.backdrop_path),
+        });
         Self {
             tmdb_id: raw.id,
             imdb_id: nonempty(imdb_id),
@@ -321,6 +737,7 @@ impl TmdbMovie {
             poster_path: nonempty(raw.poster_path),
             backdrop_path: nonempty(raw.backdrop_path),
             genres: raw.genres.into_iter().map(|g| g.name).collect(),
+            collection,
         }
     }
 }
@@ -344,6 +761,182 @@ impl TmdbShow {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SimilarResults {
+    results: Vec<SimilarHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimilarHit {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVideos {
+    results: Vec<RawVideo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawImages {
+    #[serde(default)]
+    posters: Vec<RawPoster>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPoster {
+    file_path: String,
+    #[serde(default)]
+    iso_639_1: Option<String>,
+    #[serde(default)]
+    width: i32,
+    #[serde(default)]
+    height: i32,
+    #[serde(default)]
+    vote_average: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVideo {
+    key: String,
+    site: String,
+    #[serde(rename = "type")]
+    r#type: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    official: bool,
+    #[serde(default)]
+    published_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCandidate {
+    id: i64,
+    // TMDB uses `title` for movies, `name` for shows. Both serdes default
+    // to empty so the unused one for the active kind doesn't fail parsing.
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    first_air_date: Option<String>,
+}
+
+impl RawCandidate {
+    fn into_candidate(self, kind: TmdbKind) -> TmdbCandidate {
+        let (title, date) = match kind {
+            TmdbKind::Movie => (
+                self.title.unwrap_or_default(),
+                self.release_date,
+            ),
+            TmdbKind::Show => (
+                self.name.unwrap_or_default(),
+                self.first_air_date,
+            ),
+        };
+        TmdbCandidate {
+            tmdb_id: self.id,
+            kind: match kind {
+                TmdbKind::Movie => "movie",
+                TmdbKind::Show => "show",
+            },
+            title,
+            year: date.as_deref().and_then(parse_year),
+            summary: nonempty(self.overview),
+            poster_path: nonempty(self.poster_path),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCredits {
+    #[serde(default)]
+    cast: Vec<RawCastMember>,
+    #[serde(default)]
+    crew: Vec<RawCrewMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCastMember {
+    id: i64,
+    name: String,
+    #[serde(default)]
+    character: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
+    #[serde(default)]
+    order: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCrewMember {
+    id: i64,
+    name: String,
+    job: String,
+    department: String,
+    #[serde(default)]
+    profile_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCollectionDetail {
+    id: i64,
+    name: String,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    parts: Vec<RawCollectionPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCollectionPart {
+    id: i64,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    original_title: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReviews {
+    #[serde(default)]
+    results: Vec<RawReview>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReview {
+    id: String,
+    author: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    author_details: Option<RawReviewAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReviewAuthor {
+    #[serde(default)]
+    avatar_path: Option<String>,
+    #[serde(default)]
+    rating: Option<f64>,
+}
+
 fn parse_year(s: &str) -> Option<i32> {
     let year_str: String = s.chars().take(4).collect();
     year_str.parse().ok()
@@ -351,4 +944,31 @@ fn parse_year(s: &str) -> Option<i32> {
 
 fn nonempty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.is_empty())
+}
+
+/// Parse an ISO 8601 timestamp like `2024-03-15T12:00:00.000Z` to epoch ms.
+/// Returns None on any malformed input so callers can just skip the field.
+fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    let (date, rest) = s.split_once('T')?;
+    let time = rest.split(['Z', '+', '.']).next()?;
+    let mut date_parts = date.split('-');
+    let y: i32 = date_parts.next()?.parse().ok()?;
+    let m: u32 = date_parts.next()?.parse().ok()?;
+    let d: u32 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.split(':');
+    let hh: u32 = time_parts.next()?.parse().ok()?;
+    let mm: u32 = time_parts.next()?.parse().ok()?;
+    let ss: u32 = time_parts.next().unwrap_or("0").parse().ok()?;
+    fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y } as i64;
+        let m = m as i64;
+        let d = d as i64;
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    }
+    let days = days_from_civil(y, m, d);
+    Some(days * 86_400_000 + hh as i64 * 3_600_000 + mm as i64 * 60_000 + ss as i64 * 1_000)
 }

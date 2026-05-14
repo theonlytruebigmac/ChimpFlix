@@ -1,7 +1,12 @@
 @import "tailwindcss";
 
 @theme inline {
-  --color-background: #000000;
+  /* Page sits a touch darker than the Netflix #141414 reference so the
+     rails read as recessed and cards (which use --color-surface) get a
+     subtle "lift" against the page. The hero bottom gradient fades to
+     --color-background directly, so this also defines the colour the hero
+     dissolves into — keep them in sync. */
+  --color-background: #0d0d0d;
   --color-foreground: #ffffff;
   --color-accent: #e50914;
   --color-accent-hover: #f6121d;

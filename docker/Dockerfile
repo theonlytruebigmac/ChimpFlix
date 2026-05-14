@@ -27,11 +27,13 @@ RUN --mount=type=cache,target=/build/target \
 # ---- Web builder -----------------------------------------------------------
 FROM node:22-bookworm-slim AS web-build
 WORKDIR /build
-ENV NEXT_TELEMETRY_DISABLED=1
+ARG CHIMPFLIX_API_URL=http://server:8080
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    CHIMPFLIX_API_URL=${CHIMPFLIX_API_URL}
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web ./
-RUN npm run build
+RUN mkdir -p public && npm run build
 
 # ---- Server runtime --------------------------------------------------------
 FROM debian:bookworm-slim AS server

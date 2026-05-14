@@ -1,149 +1,186 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import { ApiClientError, chimpflix } from "@/lib/api";
-import { Brand } from "@/components/Brand";
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { brandNameUpper } from "@/lib/env";
+import { auth, ChimpFlixApiError } from "@/lib/chimpflix-api";
 
-type Mode = "loading" | "login" | "setup";
+type Mode = "login" | "setup" | "register";
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginContent />
+    </Suspense>
+  );
+}
+
+function LoginContent() {
   const router = useRouter();
-  const [mode, setMode] = useState<Mode>("loading");
+  const search = useSearchParams();
+  const next = search.get("next") || "/";
+  const invite = search.get("invite")?.trim() ?? "";
+
+  const [mode, setMode] = useState<Mode | null>(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
 
-  // Decide what to render: first-run setup form, normal login, or
-  // a banner if the server is unreachable.
+  // First-run detection. Priority: invite link → register form, otherwise
+  // the server's setup-needed flag chooses between setup vs login.
   useEffect(() => {
+    if (invite) {
+      setMode("register");
+      return;
+    }
     let cancelled = false;
-    chimpflix.auth
+    auth
       .status()
       .then((s) => {
-        if (cancelled) return;
-        setMode(s.setup_needed ? "setup" : "login");
+        if (!cancelled) setMode(s.setup_needed ? "setup" : "login");
       })
       .catch((e) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
-        setMode("login");
+        if (!cancelled) {
+          setError(
+            e instanceof ChimpFlixApiError
+              ? `Server unreachable (${e.status})`
+              : "Server unreachable",
+          );
+          setMode("login");
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [invite]);
 
-  async function onSubmit(e: FormEvent) {
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setSubmitting(true);
+    setBusy(true);
     try {
       if (mode === "setup") {
-        await chimpflix.auth.setup({ username, password });
+        await auth.setup({
+          username: username.trim(),
+          password,
+          display_name: displayName.trim() || undefined,
+        });
+      } else if (mode === "register") {
+        await auth.register({
+          code: invite,
+          username: username.trim(),
+          password,
+          display_name: displayName.trim() || undefined,
+        });
       } else {
-        await chimpflix.auth.login({ username, password });
+        await auth.login({ username: username.trim(), password });
       }
-      router.replace("/");
-    } catch (err) {
-      if (err instanceof ApiClientError) {
-        setError(err.message);
+      router.push(next);
+      router.refresh();
+    } catch (e) {
+      if (e instanceof ChimpFlixApiError) {
+        try {
+          const parsed = JSON.parse(e.body) as { error?: string };
+          setError(parsed.error ?? `Error ${e.status}`);
+        } catch {
+          setError(`Error ${e.status}`);
+        }
       } else {
-        setError(err instanceof Error ? err.message : String(err));
+        setError("Network error");
       }
     } finally {
-      setSubmitting(false);
+      setBusy(false);
     }
   }
 
+  if (mode === null) {
+    return (
+      <main className="flex min-h-dvh items-center justify-center bg-background text-white">
+        <div className="text-white/50">Loading…</div>
+      </main>
+    );
+  }
+
   return (
-    <div className="relative min-h-screen overflow-hidden bg-black">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(70,12,16,0.55)_0%,rgba(0,0,0,0.95)_55%,#000_100%)]"
-      />
+    <main className="flex min-h-dvh items-center justify-center bg-background px-4 text-white">
+      <div className="w-full max-w-sm">
+        <h1 className="mb-2 text-3xl font-black tracking-tight text-(--color-accent)">
+          {brandNameUpper()}
+        </h1>
+        <h2 className="mb-6 text-lg text-white/80">
+          {mode === "setup"
+            ? "Create the owner account"
+            : mode === "register"
+              ? "Create your account"
+              : "Sign in to continue"}
+        </h2>
 
-      <header className="relative z-10">
-        <div className="px-8 py-5 sm:px-12">
-          <Brand size="lg" />
-        </div>
-      </header>
+        <form className="space-y-3" onSubmit={onSubmit}>
+          <label className="block">
+            <span className="mb-1 block text-sm text-white/70">Username</span>
+            <input
+              type="text"
+              autoComplete="username"
+              required
+              autoFocus
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+            />
+          </label>
 
-      <main className="relative z-10 mx-auto w-full max-w-md px-6 pt-12 sm:pt-20">
-        {mode === "loading" ? (
-          <p className="text-white/55">Loading…</p>
-        ) : mode === "setup" ? (
-          <>
-            <h1 className="mb-2 text-4xl font-bold leading-tight tracking-tight sm:text-[2.75rem]">
-              First-run setup
-            </h1>
-            <p className="mb-10 text-base text-(--color-muted)">
-              Create the owner account for this ChimpFlix server.
-            </p>
-          </>
-        ) : (
-          <>
-            <h1 className="mb-2 text-4xl font-bold leading-tight tracking-tight sm:text-[2.75rem]">
-              Sign in
-            </h1>
-            <p className="mb-10 text-base text-(--color-muted)">
-              Access your ChimpFlix library.
-            </p>
-          </>
-        )}
-
-        {(mode === "login" || mode === "setup") && (
-          <form onSubmit={onSubmit} className="space-y-4">
-            <div>
-              <label className="mb-2 block text-sm font-medium text-white/70">
-                Username
-              </label>
+          {(mode === "setup" || mode === "register") && (
+            <label className="block">
+              <span className="mb-1 block text-sm text-white/70">
+                Display name <span className="text-white/40">(optional)</span>
+              </span>
               <input
                 type="text"
-                autoComplete="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-                className="block w-full rounded-md border border-white/15 bg-(--color-surface) px-3 py-3 text-white placeholder-white/40 focus:border-(--color-accent) focus:outline-none"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
               />
+            </label>
+          )}
+
+          <label className="block">
+            <span className="mb-1 block text-sm text-white/70">Password</span>
+            <input
+              type="password"
+              autoComplete={
+                mode === "setup" || mode === "register"
+                  ? "new-password"
+                  : "current-password"
+              }
+              required
+              minLength={8}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+            />
+          </label>
+
+          {error && (
+            <div className="rounded bg-red-500/10 px-3 py-2 text-sm text-red-300 ring-1 ring-red-500/30">
+              {error}
             </div>
-            <div>
-              <label className="mb-2 block text-sm font-medium text-white/70">
-                Password
-              </label>
-              <input
-                type="password"
-                autoComplete={
-                  mode === "setup" ? "new-password" : "current-password"
-                }
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                minLength={mode === "setup" ? 8 : undefined}
-                className="block w-full rounded-md border border-white/15 bg-(--color-surface) px-3 py-3 text-white placeholder-white/40 focus:border-(--color-accent) focus:outline-none"
-              />
-              {mode === "setup" && (
-                <p className="mt-1 text-xs text-white/45">
-                  Minimum 8 characters.
-                </p>
-              )}
-            </div>
-            {error && <p className="text-sm text-(--color-accent)">{error}</p>}
-            <button
-              type="submit"
-              disabled={submitting}
-              className="w-full rounded-md bg-(--color-accent) py-3.5 text-lg font-semibold text-white shadow-md transition-colors hover:bg-(--color-accent-hover) disabled:opacity-60"
-            >
-              {submitting
-                ? "…"
-                : mode === "setup"
-                  ? "Create owner"
-                  : "Sign in"}
-            </button>
-          </form>
-        )}
-      </main>
-    </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full rounded bg-(--color-accent) px-3 py-2 font-semibold text-white transition disabled:opacity-50"
+          >
+            {busy
+              ? "…"
+              : mode === "setup" || mode === "register"
+                ? "Create account"
+                : "Sign in"}
+          </button>
+        </form>
+      </div>
+    </main>
   );
 }

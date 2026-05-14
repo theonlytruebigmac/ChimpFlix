@@ -158,6 +158,46 @@ pub async fn me(
     Ok(Json(AuthResponse { user: full }))
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateMeInput {
+    /// Double-Option semantics on the wire: missing key = leave as-is,
+    /// explicit null = clear, value = set. serde gives us this via
+    /// `Option<Option<T>>` with `deserialize_with` + serde_with — but to
+    /// keep deps light we treat empty strings as "clear" here.
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub default_audio_lang: Option<String>,
+    pub default_subtitle_lang: Option<String>,
+}
+
+pub async fn update_me(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(input): Json<UpdateMeInput>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let normalize = |v: Option<String>| {
+        v.map(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    };
+    let patch = queries::UserSelfUpdate {
+        display_name: normalize(input.display_name),
+        avatar_url: normalize(input.avatar_url),
+        default_audio_lang: normalize(input.default_audio_lang),
+        default_subtitle_lang: normalize(input.default_subtitle_lang),
+    };
+    let updated = queries::update_user_self(&state.pool, user.id, patch)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(AuthResponse { user: updated }))
+}
+
 // ---------------------------------------------------------------------------
 // Register (with invite)
 // ---------------------------------------------------------------------------
@@ -262,6 +302,69 @@ pub async fn revoke_invite(
     } else {
         Err(ApiError::NotFound)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Users (owner-only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct UsersListResponse {
+    pub users: Vec<User>,
+}
+
+pub async fn list_users(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+) -> Result<Json<UsersListResponse>, ApiError> {
+    let users = queries::list_users(&state.pool)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(UsersListResponse { users }))
+}
+
+pub async fn delete_user(
+    State(state): State<AppState>,
+    OwnerAuth(owner): OwnerAuth,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    if id == owner.id {
+        return Err(ApiError::validation("cannot delete the owner account"));
+    }
+    let removed = queries::delete_user(&state.pool, id)
+        .await
+        .map_err(ApiError::Internal)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound)
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateUserInput {
+    pub role: UserRole,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserResponse {
+    pub user: User,
+}
+
+pub async fn update_user(
+    State(state): State<AppState>,
+    OwnerAuth(owner): OwnerAuth,
+    Path(id): Path<i64>,
+    Json(input): Json<UpdateUserInput>,
+) -> Result<Json<UserResponse>, ApiError> {
+    if id == owner.id {
+        return Err(ApiError::validation("cannot change your own role"));
+    }
+    let user = queries::set_user_role(&state.pool, id, input.role)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(UserResponse { user }))
 }
 
 // ---------------------------------------------------------------------------
