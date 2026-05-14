@@ -1,37 +1,13 @@
-# Build artifacts
-target/
-**/target/
-**/node_modules/
-web/.next/
-web/out/
-
-# Runtime state
-data/
-.app-state/
-
-# Git and docs
-.git/
-.gitignore
-docs/
-
-# Env (build context must not bake host secrets)
+node_modules
+.next
+.git
 .env
 .env.local
 .env.*.local
-!web/.env.example
-
-# IDE / editor
-.vscode/
-.idea/
-*.swp
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Misc
-*.pem
-.vercel
+.app-admin-token
+.app-state
+npm-debug.log*
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
