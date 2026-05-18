@@ -38,7 +38,7 @@ pub async fn list_available(
     _owner: OwnerAuth,
 ) -> Result<Json<AgentsListResponse>, ApiError> {
     Ok(Json(AgentsListResponse {
-        agents: build_registry(&state),
+        agents: build_registry(&state).await,
     }))
 }
 
@@ -76,7 +76,7 @@ pub async fn set_for_library(
     }
 
     // Reject duplicate agent_name entries and unknown agents.
-    let registry = build_registry(&state);
+    let registry = build_registry(&state).await;
     let known: std::collections::HashSet<&str> =
         registry.iter().map(|a| a.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
@@ -120,23 +120,62 @@ pub async fn set_for_library(
     Ok(Json(LibraryAgentsResponse { agents }))
 }
 
-fn build_registry(state: &AppState) -> Vec<AgentInfo> {
+async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
     // The set of agents we ship today. `configured` reflects whether the
-    // client is actually constructed on AppState (TMDB requires a token);
-    // disabled agents can still be listed for the owner to see, but won't
-    // produce metadata when run.
+    // client is actually constructed on AppState (TMDB and TVDB require
+    // tokens); disabled agents can still be listed for the owner to see,
+    // but won't produce metadata when run.
+    let tmdb_configured = state.tmdb.read().await.is_some();
+    let tvdb_configured = state.tvdb.read().await.is_some();
+    let anilist_configured = state.anilist.read().await.is_some();
+    let opensubtitles_configured = state.opensubtitles.read().await.is_some();
+    let trakt_configured = state.trakt.read().await.is_some();
     vec![
         AgentInfo {
             name: "tmdb".into(),
             display_name: "The Movie Database".into(),
             supported_kinds: vec!["movie".into(), "show".into()],
-            configured: state.tmdb.is_some(),
+            configured: tmdb_configured,
+        },
+        AgentInfo {
+            name: "tvdb".into(),
+            display_name: "TheTVDB".into(),
+            supported_kinds: vec!["movie".into(), "show".into()],
+            configured: tvdb_configured,
         },
         AgentInfo {
             name: "tvmaze".into(),
             display_name: "TVmaze".into(),
             supported_kinds: vec!["show".into()],
             configured: state.tvmaze.is_some(),
+        },
+        AgentInfo {
+            name: "anilist".into(),
+            display_name: "AniList".into(),
+            // AniList is anime-only; agents.rs uses `supported_kinds` to
+            // gate which agents the per-library picker offers, so we
+            // tag it `show` (anime resolves to ItemKind::Show) and rely
+            // on the seed defaults to enable it only for anime libraries.
+            supported_kinds: vec!["show".into()],
+            configured: anilist_configured,
+        },
+        AgentInfo {
+            name: "opensubtitles".into(),
+            display_name: "OpenSubtitles".into(),
+            // Subtitle agents apply to anything playable; expose both
+            // kinds so the per-library picker offers it everywhere.
+            supported_kinds: vec!["movie".into(), "show".into()],
+            configured: opensubtitles_configured,
+        },
+        AgentInfo {
+            name: "trakt".into(),
+            display_name: "Trakt".into(),
+            // Trakt is a sync target, not a per-library metadata agent
+            // — but listing it here keeps the configured-status visible
+            // alongside the metadata providers. Users link/unlink
+            // individually from /settings/integrations.
+            supported_kinds: vec!["movie".into(), "show".into()],
+            configured: trakt_configured,
         },
     ]
 }

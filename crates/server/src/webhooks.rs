@@ -56,7 +56,7 @@ pub fn spawn(state: AppState) {
 }
 
 async fn fan_out(state: &AppState, evt: WebhookEvent) {
-    let hooks = match queries::list_webhooks(&state.pool).await {
+    let hooks = match queries::list_webhooks(&state.pool, &state.vault).await {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %format!("{e:#}"), "failed to list webhooks");
@@ -261,7 +261,7 @@ async fn retry_pending(state: &AppState) -> anyhow::Result<()> {
         let webhook_id: i64 = row.try_get("webhook_id").unwrap_or(0);
         let payload: String = row.try_get("payload_json").unwrap_or_default();
         let attempts: i64 = row.try_get("attempts").unwrap_or(0);
-        let Some(hook) = queries::get_webhook(&state.pool, webhook_id).await? else {
+        let Some(hook) = queries::get_webhook(&state.pool, &state.vault, webhook_id).await? else {
             continue;
         };
         let st = state.clone();

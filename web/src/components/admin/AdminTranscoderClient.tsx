@@ -6,20 +6,27 @@ import {
   type DashboardSession,
   type ServerSettings,
   type TranscoderCapabilities,
+  type TranscoderEncoderPreset,
   type TranscoderHwAccel,
+  type TranscoderHwStrictness,
   type TranscoderPreset,
 } from "@/lib/chimpflix-api";
 
 const HW_ACCEL_OPTIONS: ReadonlyArray<{
   value: TranscoderHwAccel;
   label: string;
+  /// Name of the encoder ffmpeg must have for this option to be
+  /// usable. `null` for software (always works) and `auto` (picks
+  /// whichever HW encoder is present, falls back to software).
   requires: string | null;
 }> = [
+  { value: "auto", label: "Auto (best available)", requires: null },
   { value: "none", label: "Software (libx264)", requires: null },
-  { value: "vaapi", label: "VAAPI (Linux Intel/AMD)", requires: "vaapi" },
-  { value: "nvenc", label: "NVENC (NVIDIA)", requires: "cuda" },
-  { value: "qsv", label: "Quick Sync (Intel)", requires: "qsv" },
-  { value: "videotoolbox", label: "VideoToolbox (macOS)", requires: "videotoolbox" },
+  { value: "nvenc", label: "NVENC (NVIDIA)", requires: "h264_nvenc" },
+  { value: "qsv", label: "Quick Sync (Intel)", requires: "h264_qsv" },
+  { value: "vaapi", label: "VAAPI (Linux Intel/AMD)", requires: "h264_vaapi" },
+  { value: "videotoolbox", label: "VideoToolbox (macOS)", requires: "h264_videotoolbox" },
+  { value: "amf", label: "AMF (AMD)", requires: "h264_amf" },
 ];
 
 interface Props {
@@ -37,6 +44,12 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
   );
   const [ceiling, setCeiling] = useState<number | "">(
     settings.transcoder_quality_ceiling_kbps ?? "",
+  );
+  const [encoderPreset, setEncoderPreset] = useState<TranscoderEncoderPreset>(
+    settings.transcoder_encoder_preset,
+  );
+  const [hwStrictness, setHwStrictness] = useState<TranscoderHwStrictness>(
+    settings.transcoder_hw_strictness,
   );
   const [allPresets, setAllPresets] = useState(presets);
   const [showAdd, setShowAdd] = useState(false);
@@ -111,7 +124,9 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
     hwAccel !== settings.transcoder_hw_accel ||
     maxConcurrent !== settings.transcoder_max_concurrent ||
     (ceiling === "" ? null : Number(ceiling)) !==
-      settings.transcoder_quality_ceiling_kbps;
+      settings.transcoder_quality_ceiling_kbps ||
+    encoderPreset !== settings.transcoder_encoder_preset ||
+    hwStrictness !== settings.transcoder_hw_strictness;
 
   async function saveSettings() {
     setBusy(true);
@@ -122,11 +137,15 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
         transcoder_hw_accel: hwAccel,
         transcoder_max_concurrent: maxConcurrent,
         transcoder_quality_ceiling_kbps: ceiling === "" ? null : Number(ceiling),
+        transcoder_encoder_preset: encoderPreset,
+        transcoder_hw_strictness: hwStrictness,
       });
       Object.assign(settings, {
         transcoder_hw_accel: hwAccel,
         transcoder_max_concurrent: maxConcurrent,
         transcoder_quality_ceiling_kbps: ceiling === "" ? null : Number(ceiling),
+        transcoder_encoder_preset: encoderPreset,
+        transcoder_hw_strictness: hwStrictness,
       });
       setSaved(true);
     } catch (e) {
@@ -159,9 +178,14 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
               className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
             >
               {HW_ACCEL_OPTIONS.map((opt) => {
+                // Each option requires a SPECIFIC encoder name
+                // (`h264_nvenc`, `h264_qsv`, …) — the hwaccel decoder
+                // list is a different thing and not what we care about
+                // for encoding. Check against the encoder list so the
+                // dropdown only enables options that will actually run.
                 const available =
                   opt.requires == null ||
-                  capabilities.hwaccels.includes(opt.requires);
+                  capabilities.h264_encoders.includes(opt.requires);
                 return (
                   <option
                     key={opt.value}
@@ -176,10 +200,18 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
             </select>
             <p className="mt-1 text-xs text-white/50">
               ffmpeg {capabilities.ffmpeg_version ?? "?"} —{" "}
-              {capabilities.hwaccels.length === 0
-                ? "no hwaccels detected"
-                : capabilities.hwaccels.join(", ")}
+              {capabilities.h264_encoders.length === 0
+                ? "no h264 encoders detected"
+                : capabilities.h264_encoders.join(", ")}
             </p>
+            {hwAccel === "auto" && (
+              <p className="mt-1 text-xs text-white/50">
+                Will pick:{" "}
+                <span className="font-medium text-white/80">
+                  {pickAutoLabel(capabilities.h264_encoders)}
+                </span>
+              </p>
+            )}
           </Field>
           <Field
             label="Max concurrent transcodes"
@@ -210,6 +242,38 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
               className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
             />
           </Field>
+          <Field
+            label="Encoder preset"
+            hint="Speed–quality dial: speed shaves CPU, quality spends more cycles for finer detail. Applied to whichever encoder is active above."
+          >
+            <select
+              value={encoderPreset}
+              onChange={(e) =>
+                setEncoderPreset(e.target.value as TranscoderEncoderPreset)
+              }
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            >
+              <option value="speed">Speed (lowest CPU)</option>
+              <option value="balanced">Balanced (default)</option>
+              <option value="quality">Quality (slower)</option>
+            </select>
+          </Field>
+          <Field
+            label="Hardware strictness"
+            hint="How aggressively to enforce HW use. Require HW refuses sessions that need software fallback for any stage (decode / filter / encode)."
+          >
+            <select
+              value={hwStrictness}
+              onChange={(e) =>
+                setHwStrictness(e.target.value as TranscoderHwStrictness)
+              }
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            >
+              <option value="auto">Auto (HW where possible, SW fallback)</option>
+              <option value="prefer_hw">Prefer HW (warn on fallback)</option>
+              <option value="require_hw">Require HW (refuse fallback)</option>
+            </select>
+          </Field>
         </div>
         <div className="mt-4 flex items-center gap-3">
           <button
@@ -225,9 +289,9 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
         </div>
         <details className="mt-4 text-xs text-white/50">
           <summary className="cursor-pointer hover:text-white/70">
-            Capability detail
+            Capability detail (probed at startup)
           </summary>
-          <div className="mt-2 grid grid-cols-2 gap-3">
+          <div className="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
             <div>
               <div className="text-white/40">H.264 hardware encoders</div>
               <div className="mt-0.5 font-mono">
@@ -244,7 +308,18 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
                   : "none"}
               </div>
             </div>
+            <DecoderRow label="NVDEC (CUDA) decoders" list={capabilities.decoders.cuda} />
+            <DecoderRow label="VAAPI decoders" list={capabilities.decoders.vaapi} />
+            <DecoderRow label="QSV decoders" list={capabilities.decoders.qsv} />
+            <DecoderRow label="VideoToolbox decoders" list={capabilities.decoders.videotoolbox} />
           </div>
+          <p className="mt-3 text-[11px] text-white/40">
+            Decoder support is probed at server start by running a
+            one-frame test through each hwaccel — so this reflects
+            what your actual card can do (NVDEC AV1 needs Ampere+,
+            AV1 in VAAPI needs RDNA2+), not the codec list the
+            ffmpeg build was compiled with.
+          </p>
         </details>
       </section>
 
@@ -529,4 +604,33 @@ function formatRelative(ms: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return m > 0 ? `${h}h ${m}m ago` : `${h}h ago`;
+}
+
+/// One row of the "decoders probed at startup" detail. Empty list
+/// means either the hwaccel isn't present or every codec probe
+/// failed (no driver, no card, missing libavcodec encoder for the
+/// probe's test stream). Either way the user gets a clear "none"
+/// signal.
+function DecoderRow({ label, list }: { label: string; list: string[] }) {
+  return (
+    <div>
+      <div className="text-white/40">{label}</div>
+      <div className="mt-0.5 font-mono">
+        {list.length > 0 ? list.join(", ") : "none"}
+      </div>
+    </div>
+  );
+}
+
+/// Mirror of HwAccel::auto_pick in the Rust transcoder — when the
+/// operator sets the dropdown to "Auto", show which concrete encoder
+/// will actually run. Keep priorities in sync if the backend's
+/// `auto_pick` changes.
+function pickAutoLabel(encoders: string[]): string {
+  if (encoders.includes("h264_nvenc")) return "NVIDIA NVENC";
+  if (encoders.includes("h264_qsv")) return "Intel QuickSync";
+  if (encoders.includes("h264_videotoolbox")) return "Apple VideoToolbox";
+  if (encoders.includes("h264_vaapi")) return "VAAPI";
+  if (encoders.includes("h264_amf")) return "AMD AMF";
+  return "Software (libx264)";
 }

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  admin as adminApi,
   auth as authApi,
   ChimpFlixApiError,
   type User,
@@ -48,6 +49,41 @@ export function SettingsUsersClient({ currentUserId }: Props) {
           setMessage(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
         } catch {
           setMessage(`Failed: HTTP ${e.status}`);
+        }
+      } else {
+        setMessage("Failed: network error");
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function resetTwoFactor(id: number, label: string) {
+    if (
+      !window.confirm(
+        `Reset 2FA for "${label}"? They'll be able to log in with just their password until they re-enroll.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(id);
+    setMessage(null);
+    try {
+      await adminApi.resetUserTwoFactor(id);
+      setMessage(`2FA reset for "${label}".`);
+    } catch (e) {
+      if (e instanceof ChimpFlixApiError) {
+        if (e.status === 404) {
+          setMessage(`"${label}" had no 2FA enrolled.`);
+        } else {
+          try {
+            const parsed = JSON.parse(e.body) as {
+              error?: { message?: string };
+            };
+            setMessage(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
+          } catch {
+            setMessage(`Failed: HTTP ${e.status}`);
+          }
         }
       } else {
         setMessage("Failed: network error");
@@ -129,7 +165,7 @@ export function SettingsUsersClient({ currentUserId }: Props) {
               </div>
             </div>
             {u.id !== currentUserId && (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap justify-end gap-2">
                 <button
                   type="button"
                   onClick={() =>
@@ -139,6 +175,17 @@ export function SettingsUsersClient({ currentUserId }: Props) {
                   className="rounded bg-white/10 px-3 py-1.5 text-xs font-medium transition hover:bg-white/15 disabled:opacity-50"
                 >
                   {u.role === "owner" ? "Demote to user" : "Promote to owner"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    resetTwoFactor(u.id, u.display_name ?? u.username)
+                  }
+                  disabled={busy === u.id}
+                  title="Wipe this user's TOTP enrollment + recovery codes. Use when they've lost their authenticator device."
+                  className="rounded bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200 transition hover:bg-amber-500/25 disabled:opacity-50"
+                >
+                  Reset 2FA
                 </button>
                 {u.role !== "owner" && (
                   <button

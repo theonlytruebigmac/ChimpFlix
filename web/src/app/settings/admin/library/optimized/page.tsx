@@ -1,5 +1,6 @@
 import { admin as adminApi } from "@/lib/chimpflix-api";
 import { AdminOptimizedClient } from "@/components/admin/AdminOptimizedClient";
+import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 
 export default async function AdminOptimizedPage() {
   const [versions, presets] = await Promise.all([
@@ -8,16 +9,20 @@ export default async function AdminOptimizedPage() {
   ]);
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">
-          Optimized Versions
-        </h1>
-        <p className="mt-1 text-sm text-white/60">
-          Pre-transcoded copies of source media. Queue a (file × preset)
-          pair and the scheduled task <code className="rounded bg-white/10 px-1">optimize_versions</code>{" "}
-          will produce a direct-playable file.
-        </p>
-      </header>
+      <AdminPageHeader
+        eyebrow="Library"
+        title="Optimized Versions"
+        description={
+          <>
+            Pre-transcoded copies of source media. Queue a (file × preset)
+            pair and the scheduled task{" "}
+            <code className="rounded bg-white/10 px-1.5 py-0.5 text-[11px]">
+              optimize_versions
+            </code>{" "}
+            will produce a direct-playable file.
+          </>
+        }
+      />
       <AdminOptimizedClient
         initial={versions.versions}
         presets={presets.presets}

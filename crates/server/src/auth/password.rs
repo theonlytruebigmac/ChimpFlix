@@ -1,5 +1,7 @@
 //! argon2id password hashing.
 
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use argon2::password_hash::{PasswordHash, SaltString};
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
@@ -13,6 +15,24 @@ pub fn hash(password: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("hash password: {e}"))?
         .to_string();
     Ok(hash)
+}
+
+/// Lazily-initialized dummy hash for constant-time login responses.
+/// The login handler verifies user-supplied passwords against THIS hash
+/// when the username doesn't exist — without it, the timing of "user not
+/// found" (skip argon2) vs "user found" (run argon2) leaks whether a
+/// username is registered. We compute it once on first use; subsequent
+/// calls just hand back the same string.
+pub fn dummy_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        // Random throwaway value — what's hashed doesn't matter, only
+        // that the resulting string is a valid argon2 hash so verify()
+        // takes the same path as a real one.
+        let mut buf = [0u8; 32];
+        OsRng.fill_bytes(&mut buf);
+        hash(&hex::encode(buf)).expect("dummy hash generation must succeed")
+    })
 }
 
 /// Constant-time verify. Returns false for any malformed or non-matching

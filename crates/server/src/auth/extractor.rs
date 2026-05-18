@@ -20,6 +20,10 @@ pub struct AuthUser {
     #[allow(dead_code)]
     pub username: String,
     pub role: UserRole,
+    /// Row id of the session that authenticated this request. Used by
+    /// "sign out of all OTHER devices" and by session-rotation paths
+    /// that want to spare the current session.
+    pub session_id: i64,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -60,6 +64,7 @@ impl FromRequestParts<AppState> for AuthUser {
             id: user.id,
             username: user.username,
             role: user.role,
+            session_id: session.id,
         })
     }
 }

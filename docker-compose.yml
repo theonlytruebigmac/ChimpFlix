@@ -1,17 +1,14 @@
 # ChimpFlix — two-service compose.
 #
 # Quick start:
+#   cp .env.example .env.local            # then fill in values
 #   mkdir -p ./data
 #   docker compose up -d --build
 #   open http://localhost:3000
 #
 # The `server` container is the Rust backend (API + WebSocket + transcoder).
-# The `web` container is the Next.js Netflix-style UI. They communicate
-# over the default compose network.
-#
-# Until Phase 2 (frontend wired to the new backend), the web container
-# still talks to a Plex server using the env vars in ./web/.env.local
-# (see ./web/.env.example).
+# The `web` container is the Next.js UI. They communicate over the
+# default compose network and both read `./.env.local` via `env_file:`.
 
 services:
   server:
@@ -29,13 +26,53 @@ services:
       BIND_ADDR: 0.0.0.0:8080
       DATA_DIR: /data
       RUST_LOG: info,sqlx=warn
+      # NVIDIA Container Toolkit hints. `video` enables NVENC, `compute`
+      # is required for the libcuda init the encoder does internally,
+      # `utility` lets ffmpeg call into nvidia-smi for capability probing.
+      # Without these, the NVENC libraries are installed in the container
+      # but can't find the host driver and fail at session start.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
     volumes:
       - ./data:/data
       # Mount your media here (read-only is recommended).
       - /mnt/archive/movies:/media/movies:ro
       - /mnt/archive/tv:/media/shows:ro
+      - /mnt/archive/anime:/media/anime:ro
     ports:
       - "8080:8080"
+    # GPU passthrough. Pick one (or both — different runtime keys,
+    # they coexist) depending on the host hardware:
+    #
+    # ── NVIDIA (NVENC / NVDEC) ──────────────────────────────────
+    # Requires `nvidia-container-toolkit` on the host + the docker
+    # daemon configured to know about the `nvidia` runtime
+    # (`nvidia-ctk runtime configure --runtime=docker` + restart).
+    # Without those host-side prerequisites the deploy block below
+    # is a no-op and the container falls back to CPU encoding —
+    # the in-process smoke test detects this at startup and drops
+    # NVENC from the admin UI's encoder list automatically.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+    #
+    # ── AMD / Intel (VAAPI + Quick Sync) ────────────────────────
+    # Mount the DRI render node from the host. The `mesa-va-drivers`
+    # and `intel-media-va-driver-non-free` packages baked into the
+    # image provide the userspace; the kernel side comes from the
+    # host (amdgpu / i915). Uncomment to enable. `card0` is for
+    # render-node-less older drivers; `renderD128` is the modern
+    # path and what our VAAPI hint uses.
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
+    #   - /dev/dri/card0:/dev/dri/card0
+    # group_add:
+    #   - "video"   # operator host's `video` group GID, usually 44
+    #   - "render"  # newer distros split out renderD* into a 'render' group, usually 109
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
@@ -48,25 +85,24 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: web
+      # Build-time args. NEXT_PUBLIC_* + APP_PUBLIC_ORIGIN are baked into
+      # the client bundle; runtime changes via env_file won't take effect
+      # until the image is rebuilt (`docker compose build web`).
       args:
         CHIMPFLIX_API_URL: http://server:8080
+        NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-ChimpFlix}
+        NEXT_PUBLIC_BRAND_NAME_UPPER: ${NEXT_PUBLIC_BRAND_NAME_UPPER:-}
+        APP_PUBLIC_ORIGIN: ${APP_PUBLIC_ORIGIN:-}
     image: chimpflix-web:local
     container_name: chimpflix-web
     restart: unless-stopped
     depends_on:
       - server
     env_file:
-      # Plex + branding + TMDB vars for the existing Netflix-clone frontend.
       - path: ./.env.local
-        required: false
-      # Optional web-local override file.
-      - path: ./web/.env.local
         required: false
     environment:
       # Runtime endpoint for /api/v1/* rewrites in next.config.ts.
       CHIMPFLIX_API_URL: http://server:8080
-    volumes:
-      # Persists Plex bootstrap auth file so restarts don't pay cold-start cost.
-      - ./.app-state:/app/state
     ports:
       - "3000:3000"

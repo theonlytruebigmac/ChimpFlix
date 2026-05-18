@@ -18,24 +18,19 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
-use chimpflix_library::UserRole;
 use sqlx::Executor;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::api::error::ApiError;
-use crate::auth::AuthUser;
+use crate::auth::OwnerAuth;
 use crate::state::AppState;
 
 pub async fn backup(
     State(state): State<AppState>,
-    user: AuthUser,
+    _owner: OwnerAuth,
 ) -> Result<Response, ApiError> {
-    if !matches!(user.role, UserRole::Owner) {
-        return Err(ApiError::Forbidden);
-    }
-
     let backups_dir = state.data_dir.join("backups");
     fs::create_dir_all(&backups_dir)
         .await

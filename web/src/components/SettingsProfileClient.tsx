@@ -36,6 +36,7 @@ export function SettingsProfileClient({ initial }: Props) {
   const [subtitleLang, setSubtitleLang] = useState(
     initial.default_subtitle_lang ?? "",
   );
+  const [notifyEmail, setNotifyEmail] = useState(initial.notify_via_email);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -49,13 +50,23 @@ export function SettingsProfileClient({ initial }: Props) {
         avatar_url: avatarUrl,
         default_audio_lang: audioLang,
         default_subtitle_lang: subtitleLang,
+        notify_via_email: notifyEmail,
       });
       setUser(updated);
       setMessage("Saved.");
       window.setTimeout(() => setMessage(null), 2500);
     } catch (e) {
       if (e instanceof ChimpFlixApiError) {
-        setMessage(`Failed: HTTP ${e.status}`);
+        // Surface the server's validation message (e.g. "email is
+        // already in use by another account") instead of bare HTTP.
+        let detail = `HTTP ${e.status}`;
+        try {
+          const parsed = JSON.parse(e.body) as {
+            error?: { message?: string };
+          };
+          if (parsed.error?.message) detail = parsed.error.message;
+        } catch {}
+        setMessage(`Failed: ${detail}`);
       } else {
         setMessage("Failed: network error");
       }
@@ -74,6 +85,7 @@ export function SettingsProfileClient({ initial }: Props) {
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder={user.username}
+            maxLength={64}
             className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
           />
         </label>
@@ -127,6 +139,26 @@ export function SettingsProfileClient({ initial }: Props) {
             </select>
           </label>
         </div>
+      </div>
+
+      <div className="border-t border-white/10 pt-4">
+        <h3 className="mb-3 text-sm font-semibold">Notifications</h3>
+        <label className="flex items-start gap-3 text-xs">
+          <input
+            type="checkbox"
+            checked={notifyEmail}
+            onChange={(e) => setNotifyEmail(e.target.checked)}
+            disabled={!user.email}
+            className="mt-1"
+          />
+          <div>
+            <div className="text-white">Email me when I get a notification</div>
+            <div className="mt-0.5 text-white/50">
+              Mirrors the in-app bell to your email. Requires an email on
+              your profile and SMTP configured by the admin.
+            </div>
+          </div>
+        </label>
       </div>
 
       <div className="flex items-center gap-3 pt-1">

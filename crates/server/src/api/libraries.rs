@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chimpflix_library::queries;
 use chimpflix_library::{Library, LibraryUpdate, NewLibrary, ScanEmitter, ScanEvent, ScanJob};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::api::error::ApiError;
 use crate::auth::{AuthUser, OwnerAuth};
@@ -100,7 +100,9 @@ pub async fn trigger_scan(
 
     let pool = state.pool.clone();
     let ffmpeg = state.ffmpeg.clone();
-    let tmdb = state.tmdb.clone();
+    let tmdb = state.tmdb_snapshot().await;
+    let tvdb = state.tvdb_snapshot().await;
+    let anilist = state.anilist_snapshot().await;
     let tvmaze = state.tvmaze.clone();
     let hub = state.hub.clone();
 
@@ -132,9 +134,12 @@ pub async fn trigger_scan(
         hub.publish(Event::Scan(event));
     });
 
+    let cache_root = state.transcoder.cache_root().to_path_buf();
     tokio::spawn(async move {
         if let Err(e) = chimpflix_library::run_scan(
-            pool, ffmpeg, tmdb, tvmaze, library_id, job_id, emitter,
+            pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job_id,
+            Some(cache_root),
+            emitter,
         )
         .await
         {
@@ -143,6 +148,308 @@ pub async fn trigger_scan(
     });
 
     Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+// ---------------------------------------------------------------------------
+// Per-library stats (owner-only)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct LibraryStatsResponse {
+    pub library_id: i64,
+    pub items: i64,
+    pub episodes: i64,
+    pub files: i64,
+    pub total_bytes: i64,
+    pub orphan_files: i64,
+    pub last_scanned_at: Option<i64>,
+}
+
+/// At-a-glance numbers for one library — items, episodes, files,
+/// total size on disk, orphan-pending count, and last successful
+/// scan timestamp. Used by the admin library card so the operator
+/// can see the library's shape without drilling into individual
+/// items.
+pub async fn library_stats(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+    Path(library_id): Path<i64>,
+) -> Result<Json<LibraryStatsResponse>, ApiError> {
+    let _library = queries::get_library(&state.pool, library_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let s = queries::single_library_stats(&state.pool, library_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(LibraryStatsResponse {
+        library_id: s.library_id,
+        items: s.items,
+        episodes: s.episodes,
+        files: s.files,
+        total_bytes: s.total_bytes,
+        orphan_files: s.orphan_files,
+        last_scanned_at: s.last_scanned_at,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Per-library verify / purge (owner-only)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct VerifyResponse {
+    pub library_id: i64,
+    pub files_checked: usize,
+    pub files_missing: usize,
+    pub newly_marked_removed: u64,
+    pub still_missing: usize,
+    pub returned_files: usize,
+    /// Total soft-deleted rows for this library after the verify run.
+    /// Used by the admin UI to surface "N orphan(s) pending purge"
+    /// even if this particular verify didn't change anything.
+    pub orphan_count: i64,
+}
+
+/// Run the verify pass for one library synchronously and return the
+/// report. Pairs with the scheduled `verify_libraries` task — that
+/// one runs across the whole instance on a weekly cadence; this
+/// one is the operator's "I want to check this library now" path.
+pub async fn verify_library(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+    Path(library_id): Path<i64>,
+) -> Result<Json<VerifyResponse>, ApiError> {
+    let _library = queries::get_library(&state.pool, library_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let report = queries::verify_library(&state.pool, library_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    let orphan_count = queries::count_removed_media_files(&state.pool, library_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(VerifyResponse {
+        library_id: report.library_id,
+        files_checked: report.files_checked,
+        files_missing: report.files_missing,
+        newly_marked_removed: report.newly_marked_removed,
+        still_missing: report.still_missing,
+        returned_files: report.returned_files,
+        orphan_count,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct PurgeQuery {
+    /// Override the default 7-day grace window for this run. Useful
+    /// when the operator wants to immediately reap a library after
+    /// confirming the files are genuinely gone (e.g., decommissioned
+    /// drive). `Some(0)` purges everything currently marked removed.
+    #[serde(default)]
+    pub grace_days: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+pub struct PurgeResponse {
+    pub files_purged: u64,
+    pub episodes_purged: u64,
+    pub seasons_purged: u64,
+    pub items_purged: u64,
+}
+
+/// Immediately purge soft-deleted files for this library. The
+/// scheduled `purge_removed_files` task runs daily across the whole
+/// instance; this endpoint lets the operator trigger it on demand
+/// for a single library — e.g., after manually verifying their
+/// removed files are gone for good.
+///
+/// NOTE: the underlying query is currently instance-wide, not per-
+/// library — purge sweeps every expired row regardless of library.
+/// Returning per-library counts here would require a more targeted
+/// purge; for now the response is the global count, scoped only by
+/// the cutoff the caller asked for.
+pub async fn purge_library(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+    Path(library_id): Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<PurgeQuery>,
+) -> Result<Json<PurgeResponse>, ApiError> {
+    let _library = queries::get_library(&state.pool, library_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let grace_days = q.grace_days.unwrap_or(7).max(0);
+    let cutoff_ms = chimpflix_common::now_ms() - grace_days * 86_400_000;
+    let report = queries::purge_removed_media_files(&state.pool, cutoff_ms)
+        .await
+        .map_err(ApiError::Internal)?;
+    evict_subtitle_caches(state.transcoder.cache_root(), &report.purged_paths).await;
+    Ok(Json(PurgeResponse {
+        files_purged: report.files_purged,
+        episodes_purged: report.episodes_purged,
+        seasons_purged: report.seasons_purged,
+        items_purged: report.items_purged,
+    }))
+}
+
+/// Best-effort cleanup of per-file WebVTT subtitle caches for files
+/// that were just hard-deleted. Fires off the eviction asynchronously
+/// since the cache lives on disk and could be 100s of entries for a
+/// bulk-purge; we don't block the HTTP response on it.
+async fn evict_subtitle_caches(cache_root: &std::path::Path, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let cache_root = cache_root.to_path_buf();
+    let paths: Vec<String> = paths.to_vec();
+    tokio::spawn(async move {
+        for p in paths {
+            let _ = chimpflix_transcoder::evict_text_subs_cache(
+                &cache_root,
+                std::path::Path::new(&p),
+            )
+            .await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Per-library on-demand maintenance (owner-only)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct LibraryJobQueued {
+    /// Number of items / files that will be processed in the
+    /// background. Lets the UI show "Queued: 47 items" instead of
+    /// a vague "queued" toast.
+    pub queued: usize,
+}
+
+/// Re-run TMDB / TVDB metadata refresh for every item in this
+/// library. Equivalent to the scheduled `refresh_metadata` task with
+/// `library_id` set, but runs immediately and doesn't write a task
+/// row. Spawns a background task; the response returns the queued
+/// count before the work starts.
+pub async fn refresh_metadata(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+    Path(library_id): Path<i64>,
+) -> Result<(StatusCode, Json<LibraryJobQueued>), ApiError> {
+    let _library = queries::get_library(&state.pool, library_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let Some(tmdb) = state.tmdb_snapshot().await else {
+        // No TMDB credential — nothing to refresh.
+        return Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued: 0 })));
+    };
+    let tvdb = state.tvdb_snapshot().await;
+    let tvmaze = state.tvmaze.clone();
+    let item_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM items WHERE library_id = ?")
+            .bind(library_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let queued = item_ids.len();
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        for item_id in item_ids {
+            match chimpflix_library::scanner::refresh_item_metadata(
+                &pool,
+                &tmdb,
+                tvdb.as_ref(),
+                tvmaze.as_ref(),
+                item_id,
+                None,
+            )
+            .await
+            {
+                Ok(()) => ok += 1,
+                Err(_) => err += 1,
+            }
+        }
+        info!(library_id, ok, err, "library refresh_metadata completed");
+    });
+    Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued })))
+}
+
+/// Generate scrub-preview sprite tiles for every media file in this
+/// library that doesn't already have one. Sequential because each
+/// sprite-gen pegs a CPU core. The standard `generate_previews`
+/// scheduled task does the same thing on a batch-of-N cadence;
+/// this endpoint just kicks the whole library at once for the
+/// "I want previews on everything NOW" path.
+pub async fn generate_previews(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+    Path(library_id): Path<i64>,
+) -> Result<(StatusCode, Json<LibraryJobQueued>), ApiError> {
+    let _library = queries::get_library(&state.pool, library_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Batch = 0 means "no per-call cap" inside the query.
+    let candidates =
+        queries::list_media_files_needing_previews(&state.pool, Some(library_id), 0)
+            .await
+            .map_err(ApiError::Internal)?;
+    let queued = candidates.len();
+    if queued == 0 {
+        return Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued: 0 })));
+    }
+
+    let pool = state.pool.clone();
+    let ffmpeg = state.ffmpeg.clone();
+    let dir = state.data_dir.join("previews");
+    tokio::spawn(async move {
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            warn!(error = %e, "could not create previews dir");
+            return;
+        }
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        for cand in &candidates {
+            let duration = cand.duration_ms.unwrap_or(0);
+            let output = dir.join(format!("{}.jpg", cand.id));
+            match chimpflix_transcoder::generate_sprite(
+                &ffmpeg,
+                std::path::Path::new(&cand.path),
+                &output,
+                duration,
+                chimpflix_transcoder::DEFAULT_INTERVAL_S,
+                chimpflix_transcoder::DEFAULT_TILE_WIDTH,
+            )
+            .await
+            {
+                Ok(info) => {
+                    if queries::record_preview_sprite(
+                        &pool,
+                        queries::PreviewSpriteRecord {
+                            media_file_id: cand.id,
+                            path: info.path.to_string_lossy().into_owned(),
+                            interval_ms: info.interval_ms,
+                            tile_width: i64::from(info.tile_width),
+                            tile_height: i64::from(info.tile_height),
+                            tile_cols: i64::from(info.tile_cols),
+                            tile_count: i64::from(info.tile_count),
+                        },
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        ok += 1;
+                    } else {
+                        err += 1;
+                    }
+                }
+                Err(_) => err += 1,
+            }
+        }
+        info!(library_id, ok, err, "library generate_previews completed");
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued })))
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { brandName, brandNameUpper } from "@/lib/env";
+import { auth as authApi } from "@/lib/chimpflix-api";
 
 // Global error boundary — catches any uncaught error from a server
 // component render or client effect under the root layout. Shows the
@@ -16,12 +18,28 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const router = useRouter();
+  const [signingOut, setSigningOut] = useState(false);
+
   useEffect(() => {
     // Mirror to the browser console for devtools-based diagnosis.
     // Production server logs still hold the full stack — this is the
     // client-side breadcrumb.
     console.error(`${brandName()} render error:`, error);
   }, [error]);
+
+  async function signOut() {
+    setSigningOut(true);
+    try {
+      await authApi.logout();
+    } catch {
+      // Best-effort — if logout fails the cookie may already be expired
+      // or the server unreachable. Either way, get the user to /login
+      // so they can recover.
+    }
+    router.push("/login");
+    router.refresh();
+  }
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-background px-6 text-center text-white">
@@ -47,19 +65,19 @@ export default function GlobalError({
           Try again
         </button>
         <Link
-          href="/select-server"
+          href="/"
           className="rounded-md border border-white/30 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-white"
         >
-          Switch server
+          Go home
         </Link>
-        <form action="/api/auth/logout" method="post">
-          <button
-            type="submit"
-            className="rounded-md border border-white/30 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-white"
-          >
-            Sign out
-          </button>
-        </form>
+        <button
+          type="button"
+          onClick={signOut}
+          disabled={signingOut}
+          className="rounded-md border border-white/30 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-white disabled:opacity-50"
+        >
+          {signingOut ? "Signing out…" : "Sign out"}
+        </button>
       </div>
     </div>
   );

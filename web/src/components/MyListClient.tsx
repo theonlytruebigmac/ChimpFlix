@@ -21,8 +21,11 @@ interface ApiItem {
   rating_audience: number | null;
   tmdb_id: number | null;
   imdb_id: string | null;
+  tvdb_id: number | null;
+  anilist_id: number | null;
   poster_path: string | null;
   backdrop_path: string | null;
+  logo_path: string | null;
   added_at: number;
   updated_at: number;
   play_state: {

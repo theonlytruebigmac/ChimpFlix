@@ -1,24 +1,28 @@
 import Link from "next/link";
 import { admin as adminApi } from "@/lib/chimpflix-api";
+import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 
 export default async function AdminAgentsPage() {
   const { agents } = await adminApi.agents.list();
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">Metadata Agents</h1>
-        <p className="mt-1 text-sm text-white/60">
-          Available metadata providers. Set the priority order per library
-          on the{" "}
-          <Link
-            href="/admin/library/libraries"
-            className="text-white underline hover:text-white/80"
-          >
-            Libraries
-          </Link>{" "}
-          page.
-        </p>
-      </header>
+      <AdminPageHeader
+        eyebrow="Library"
+        title="Metadata Agents"
+        description={
+          <>
+            Available metadata providers. Set the priority order per library
+            on the{" "}
+            <Link
+              href="/settings/admin/library/libraries"
+              className="text-white underline hover:text-white/80"
+            >
+              Libraries
+            </Link>{" "}
+            page.
+          </>
+        }
+      />
       <div className="overflow-hidden rounded-lg border border-white/10">
         <table className="w-full text-sm">
           <thead className="bg-white/5 text-left text-xs uppercase tracking-wider text-white/40">

@@ -27,6 +27,7 @@ export function adaptItem(item: Item | ListedItem): MediaItem {
     summary: item.summary ?? undefined,
     thumb: item.poster_path ?? undefined,
     art: item.backdrop_path ?? undefined,
+    logo: item.logo_path ?? undefined,
     year: item.year ?? undefined,
     duration: item.duration_ms ?? undefined,
     rating: item.rating_audience ?? undefined,

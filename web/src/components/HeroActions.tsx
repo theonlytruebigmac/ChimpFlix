@@ -2,9 +2,12 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { openModal } from "@/lib/modal";
 import { prefetchPlay } from "@/lib/play-prefetch";
+import { cancelPrewarm, prewarmFor } from "@/lib/prewarm";
+import { detectClientCapabilities } from "@/lib/client-caps";
+import { getPrefs } from "@/lib/prefs";
 
 export function HeroActions({
   playRatingKey,
@@ -27,12 +30,59 @@ export function HeroActions({
     router.prefetch(`/watch/${playRatingKey}`);
   }, [router, playRatingKey]);
 
+  // Hover-time session pre-warm — see TitleModalClient for the same
+  // pattern. The hero's Play button is the highest-conviction click
+  // surface in the app (one tap from landing on the home page) so the
+  // user-experience win for the cached case is biggest here.
+  const prewarmTimerRef = useRef<number | null>(null);
+  const startPrewarm = () => {
+    if (prewarmTimerRef.current !== null) return;
+    prewarmTimerRef.current = window.setTimeout(() => {
+      prewarmTimerRef.current = null;
+      try {
+        const caps = detectClientCapabilities();
+        prewarmFor(
+          playRatingKey,
+          {
+            supported_video_codecs: caps.video,
+            supported_audio_codecs: caps.audio,
+            supported_containers: caps.containers,
+          },
+          getPrefs().audioNormalize,
+        );
+      } catch {
+        // Best-effort.
+      }
+    }, 250);
+  };
+  const cancelPendingPrewarm = () => {
+    if (prewarmTimerRef.current !== null) {
+      window.clearTimeout(prewarmTimerRef.current);
+      prewarmTimerRef.current = null;
+    }
+  };
+  useEffect(() => {
+    return () => {
+      cancelPendingPrewarm();
+      void cancelPrewarm();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div className="flex gap-3">
       <Link
         href={`/watch/${playRatingKey}`}
-        onMouseEnter={prefetchPlay}
-        onFocus={prefetchPlay}
+        onMouseEnter={() => {
+          prefetchPlay();
+          startPrewarm();
+        }}
+        onMouseLeave={cancelPendingPrewarm}
+        onFocus={() => {
+          prefetchPlay();
+          startPrewarm();
+        }}
+        onBlur={cancelPendingPrewarm}
         className="inline-flex items-center gap-2 rounded-md bg-white px-7 py-2.5 text-base font-bold text-black transition-colors hover:bg-white/85"
       >
         <PlayIcon /> Play

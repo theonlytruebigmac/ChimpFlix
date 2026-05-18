@@ -1,4 +1,5 @@
 import { admin as adminApi } from "@/lib/chimpflix-api";
+import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 import { AdminTranscoderClient } from "@/components/admin/AdminTranscoderClient";
 
 export default async function AdminTranscoderPage() {
@@ -9,12 +10,11 @@ export default async function AdminTranscoderPage() {
   ]);
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">Transcoder</h1>
-        <p className="mt-1 text-sm text-white/60">
-          Hardware acceleration, concurrency, and quality presets.
-        </p>
-      </header>
+      <AdminPageHeader
+        eyebrow="Server"
+        title="Transcoder"
+        description="Hardware acceleration, concurrency, and quality presets."
+      />
       <AdminTranscoderClient
         capabilities={caps.capabilities}
         presets={presets.presets}

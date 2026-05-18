@@ -3,6 +3,7 @@ import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
+import { Top10Rail } from "@/components/Top10Rail";
 import { TopNav } from "@/components/TopNav";
 import { pickHeroIndex } from "@/lib/hero";
 import {
@@ -25,22 +26,41 @@ export default async function Home() {
   const [{ libraries: allLibs }, { library_ids: hiddenIds }] =
     await Promise.all([librariesApi.list(), prefsApi.hiddenLibraries()]);
   const hidden = new Set(hiddenIds);
-  const libs = allLibs.filter((l) => !hidden.has(l.id));
+  const libs = allLibs.filter(
+    (l) => l.visibility !== "hidden" && !hidden.has(l.id),
+  );
   const firstMovieLib = libs.find((l) => l.kind === "movies");
   const firstShowLib = libs.find((l) => l.kind === "shows");
+  // Global rails (Hero / Recently Added) intersect against this set so
+  // hidden / user-hidden libraries don't leak in.
+  const visibleLibIds = libs.map((l) => l.id);
 
   return (
     <main className="relative">
       <TopNav />
       <Suspense fallback={<HeroSkeleton />}>
-        <HomeHero />
+        <HomeHero visibleLibIds={visibleLibIds} />
       </Suspense>
       <div className="relative z-20 space-y-1 pb-24 pt-4">
         <Suspense fallback={<RailSkeleton title="Continue Watching" />}>
           <ContinueWatchingRail />
         </Suspense>
         <Suspense fallback={<RailSkeleton title="Recently Added" />}>
-          <RecentlyAddedRail />
+          <RecentlyAddedRail visibleLibIds={visibleLibIds} />
+        </Suspense>
+        <Suspense fallback={null}>
+          <Top10TrendingRail
+            kind="movie"
+            title="Top 10 Movies This Week"
+            visibleLibIds={visibleLibIds}
+          />
+        </Suspense>
+        <Suspense fallback={null}>
+          <Top10TrendingRail
+            kind="show"
+            title="Top 10 Shows This Week"
+            visibleLibIds={visibleLibIds}
+          />
         </Suspense>
         {libs.map((lib) => (
           <Suspense
@@ -68,10 +88,16 @@ export default async function Home() {
   );
 }
 
-async function HomeHero() {
+async function HomeHero({ visibleLibIds }: { visibleLibIds: number[] }) {
+  // On-deck is whatever the user is in the middle of — never something
+  // they explicitly hid via prefs, so we skip the library filter there.
+  // The "recent" fallback pool needs the filter to avoid surfacing fresh
+  // imports from a hidden library as a hero card.
   const [deckRes, latest] = await Promise.all([
     playStateApi.onDeck(),
-    itemsApi.list({ page_size: 12 }),
+    visibleLibIds.length === 0
+      ? Promise.resolve({ items: [] as Awaited<ReturnType<typeof itemsApi.list>>["items"] })
+      : itemsApi.list({ page_size: 12, library_ids: visibleLibIds }),
   ]);
   const onDeck = deckRes.items
     .map(adaptOnDeck)
@@ -94,11 +120,43 @@ async function ContinueWatchingRail() {
   return <Rail title="Continue Watching" items={items} />;
 }
 
-async function RecentlyAddedRail() {
-  const res = await itemsApi.list({ page_size: RAIL_PAGE_SIZE });
+async function RecentlyAddedRail({
+  visibleLibIds,
+}: {
+  visibleLibIds: number[];
+}) {
+  if (visibleLibIds.length === 0) return null;
+  const res = await itemsApi.list({
+    page_size: RAIL_PAGE_SIZE,
+    library_ids: visibleLibIds,
+  });
   const items = res.items.map(adaptItem);
   if (items.length === 0) return null;
   return <Rail title="Recently Added" items={items} />;
+}
+
+async function Top10TrendingRail({
+  kind,
+  title,
+  visibleLibIds,
+}: {
+  kind: "movie" | "show";
+  title: string;
+  visibleLibIds: number[];
+}) {
+  // No-op render when TMDB isn't wired or the refresh task hasn't run.
+  // The endpoint returns 200 with an empty array in those cases, so we
+  // just bail without surfacing an error to the user.
+  if (visibleLibIds.length === 0) return null;
+  try {
+    const res = await itemsApi.trending(kind, 10, visibleLibIds);
+    const entries = res.items
+      .map(({ rank, ...item }) => ({ rank, item: adaptItem(item) }));
+    if (entries.length === 0) return null;
+    return <Top10Rail title={title} items={entries} />;
+  } catch {
+    return null;
+  }
 }
 
 async function LibSectionRail({ lib }: { lib: Library }) {

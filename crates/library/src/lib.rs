@@ -19,8 +19,8 @@ pub use crate::models::{
     MediaStreamSummary, NewAuditEntry, NewOptimizedVersion, NewScheduledTask, NewTranscoderPreset,
     NewWebhook, OnDeckEntry, OnDeckResponse, OptimizedVersion, PlayStateBatch, PlayStateForItem,
     PlayStateUpdate, RegisterInput, ScanJob, ScheduledTask, ScheduledTaskUpdate, ScrobbleRequest,
-    Season, SeasonDetail, SeasonSummary, ServerSettings, ServerSettingsUpdate, SessionRow,
-    SetupInput, TaskRun, TranscoderPreset, TranscoderPresetUpdate, User, UserRole, UserWithSecret,
-    Webhook, WebhookDelivery, WebhookUpdate,
+    Season, SeasonDetail, SeasonSummary, SecretMetadata, ServerSettings, ServerSettingsUpdate,
+    SessionRow, SetupInput, TaskRun, TranscoderPreset, TranscoderPresetUpdate, User, UserRole,
+    UserWithSecret, Webhook, WebhookDelivery, WebhookUpdate,
 };
-pub use crate::queries::{AccessMatrixEntry, LibraryStats, SessionSummary};
+pub use crate::queries::{AccessMatrixEntry, LibraryStats, SessionSummary, Tag};

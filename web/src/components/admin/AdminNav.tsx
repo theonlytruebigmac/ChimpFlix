@@ -20,48 +20,53 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
   {
     title: "Status",
     items: [
-      { href: "/admin", label: "Dashboard" },
-      { href: "/admin/status/alerts", label: "Alerts" },
+      { href: "/settings/admin", label: "Dashboard" },
+      { href: "/settings/admin/status/alerts", label: "Alerts" },
     ],
     disabled: [],
   },
   {
     title: "Server",
     items: [
-      { href: "/admin/server/general", label: "General" },
-      { href: "/admin/server/network", label: "Network" },
-      { href: "/admin/server/transcoder", label: "Transcoder" },
-      { href: "/admin/server/webhooks", label: "Webhooks" },
-      { href: "/admin/server/privacy", label: "Privacy" },
+      { href: "/settings/admin/server/general", label: "General" },
+      { href: "/settings/admin/server/network", label: "Network" },
+      { href: "/settings/admin/server/transcoder", label: "Transcoder" },
+      { href: "/settings/admin/server/credentials", label: "Credentials" },
+      { href: "/settings/admin/server/email", label: "Email" },
+      { href: "/settings/admin/server/webhooks", label: "Webhooks" },
+      { href: "/settings/admin/server/privacy", label: "Privacy" },
     ],
     disabled: [],
   },
   {
     title: "Library",
     items: [
-      { href: "/admin/library/libraries", label: "Libraries" },
-      { href: "/admin/library/agents", label: "Metadata Agents" },
-      { href: "/admin/library/scheduled-tasks", label: "Scheduled Tasks" },
-      { href: "/admin/library/optimized", label: "Optimized Versions" },
+      { href: "/settings/admin/library/libraries", label: "Libraries" },
+      { href: "/settings/admin/library/agents", label: "Metadata Agents" },
+      { href: "/settings/admin/library/scheduled-tasks", label: "Scheduled Tasks" },
+      { href: "/settings/admin/library/optimized", label: "Optimized Versions" },
     ],
     disabled: [],
   },
   {
     title: "Users",
     items: [
-      { href: "/admin/users/users", label: "Users" },
-      { href: "/admin/users/invites", label: "Invites" },
-      { href: "/admin/users/access", label: "Access" },
-      { href: "/admin/users/devices", label: "Devices" },
+      { href: "/settings/admin/users/users", label: "Users" },
+      { href: "/settings/admin/users/invites", label: "Invites" },
+      { href: "/settings/admin/users/access", label: "Access" },
+      { href: "/settings/admin/users/groups", label: "Groups" },
+      { href: "/settings/admin/users/devices", label: "Devices" },
     ],
     disabled: [],
   },
   {
     title: "Maintenance",
     items: [
-      { href: "/admin/maintenance/audit", label: "Audit Log" },
-      { href: "/admin/maintenance/backup", label: "Backup" },
-      { href: "/admin/maintenance/logs", label: "Logs" },
+      { href: "/settings/admin/maintenance", label: "Overview" },
+      { href: "/settings/admin/maintenance/audit", label: "Audit Log" },
+      { href: "/settings/admin/maintenance/backup", label: "Backup" },
+      { href: "/settings/admin/maintenance/logs", label: "Logs" },
+      { href: "/settings/admin/maintenance/health", label: "Library Health" },
     ],
     disabled: [],
   },
@@ -81,7 +86,7 @@ export function AdminNav() {
             {group.items.map((item) => {
               const isActive =
                 item.href === pathname ||
-                (item.href !== "/admin" && pathname.startsWith(item.href));
+                (item.href !== "/settings/admin" && pathname.startsWith(item.href));
               const isDisabled = group.disabled?.includes(item.href) ?? false;
               const base =
                 "block rounded-md px-3 py-1.5 transition-colors";

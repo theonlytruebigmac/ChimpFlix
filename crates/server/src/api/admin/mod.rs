@@ -7,13 +7,17 @@
 //! handler signature. Mutating handlers append to `audit_log` via the
 //! helper in this module.
 
+pub mod access_groups;
 pub mod agents;
 pub mod audit;
 pub mod backup;
 pub mod dashboard;
+pub mod email;
+pub mod health;
 pub mod maintenance;
 pub mod network;
 pub mod optimized;
+pub mod secrets;
 pub mod settings;
 pub mod tasks;
 pub mod transcoder;

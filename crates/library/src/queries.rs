@@ -10,23 +10,25 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use chimpflix_common::now_ms;
 use chimpflix_metadata::{
-    TmdbCastMember, TmdbCollection, TmdbCollectionStub, TmdbCredits, TmdbCrewMember, TmdbEpisode,
-    TmdbMovie, TmdbShow, TmdbVideo, TvMazeShow, tmdb_image_url,
+    AniListShow, TmdbCastMember, TmdbCollection, TmdbCollectionStub, TmdbCredits, TmdbCrewMember,
+    TmdbEpisode, TmdbMovie, TmdbShow, TmdbVideo, TvMazeShow, TvdbMovie, TvdbShow, tmdb_image_url,
 };
 use chimpflix_transcoder::ProbeStream;
+use serde::Serialize;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
 use crate::models::{
-    AuditLogEntry, Credit, Episode, EpisodeDetail, EpisodeListed, Extra, Invite, Item, ItemDetail,
-    ItemEdit, ItemFilter, ItemKind, ItemPage, Library, LibraryAgent, LibraryUpdate, ListedItem,
-    Marker, MediaFileLocator, MediaFileSummary, MediaStreamSummary, NewAuditEntry, NewLibrary,
-    NewOptimizedVersion, NewScheduledTask, NewTranscoderPreset, NewWebhook, OnDeckEntry,
-    OnDeckResponse, OptimizedVersion, Person, PlayStateBatch, PlayStateForItem, Review,
-    ReviewsSummary, ScanJob, ScheduledTask, ScheduledTaskUpdate, Season, SeasonDetail,
-    SeasonSummary, ServerSettings, ServerSettingsUpdate, SessionRow, TaskRun, TranscoderPreset,
-    TranscoderPresetUpdate, User, UserRole, UserWithSecret, Webhook, WebhookDelivery, WebhookUpdate,
-    make_sort_title,
+    AccessGroup, AccessGroupDetail, AccessGroupUpdate, AuditLogEntry, Credit, Episode,
+    EpisodeDetail, EpisodeListed, ExternalSubtitle, Extra, Invite, Item, ItemDetail, ItemEdit,
+    ItemFilter, ItemKind, ItemPage, Library, LibraryAgent, LibraryUpdate, ListedItem, Marker,
+    MediaFileLocator, MediaFileSummary, MediaStreamSummary, NewAccessGroup, NewAuditEntry,
+    NewExternalSubtitle, NewLibrary, NewOptimizedVersion, NewScheduledTask, NewTranscoderPreset,
+    NewWebhook, Notification, OnDeckEntry, OnDeckResponse, OptimizedVersion, Person,
+    PlayStateBatch, PlayStateForItem, Review, ReviewsSummary, ScanJob, ScheduledTask,
+    ScheduledTaskUpdate, Season, SeasonDetail, SeasonSummary, SecretMetadata, ServerSettings,
+    ServerSettingsUpdate, SessionRow, TaskRun, TranscoderPreset, TranscoderPresetUpdate, User,
+    UserRole, UserWithSecret, Webhook, WebhookDelivery, WebhookUpdate, make_sort_title,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,8 +82,10 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
     .execute(&mut *tx)
     .await?;
 
-    // Seed the default metadata agent chain. Movies: TMDB only. Shows:
-    // TMDB primary, TVMaze fallback. Owners can reorder/disable later via
+    // Seed the default metadata agent chain. Movies: TMDB + TVDB.
+    // Shows: TMDB + TVMaze + TVDB. Anime: TMDB + TVDB (TVMaze isn't an
+    // anime catalogue, and the AniList agent will join the chain once it
+    // ships). Owners can reorder/disable later via
     // /admin/libraries/{id}/agents.
     sqlx::query(
         "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
@@ -94,6 +98,35 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
         sqlx::query(
             "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
              VALUES (?, 'tvmaze', 1, 1, '{}')",
+        )
+        .bind(lib_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
+         VALUES (?, 'tvdb', 2, 1, '{}')",
+    )
+    .bind(lib_id)
+    .execute(&mut *tx)
+    .await?;
+    if matches!(input.kind, crate::models::LibraryKind::Anime) {
+        // AniList is the primary metadata source for anime; priority 0
+        // puts it ahead of TMDB so the per-library agent picker reflects
+        // the actual scan order.
+        sqlx::query(
+            "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
+             VALUES (?, 'anilist', 0, 1, '{}')",
+        )
+        .bind(lib_id)
+        .execute(&mut *tx)
+        .await?;
+        // Drop the TMDB priority below AniList so the chain in the UI
+        // matches what the scanner actually does (AniList primary,
+        // TMDB+TVDB backfill).
+        sqlx::query(
+            "UPDATE library_agents SET priority = 1
+             WHERE library_id = ? AND agent_name = 'tmdb'",
         )
         .bind(lib_id)
         .execute(&mut *tx)
@@ -598,8 +631,10 @@ pub async fn list_watch_history(
 
 /// Build a per-request filter describing which libraries this user can see.
 /// Owners get `None` (no filter, full access). Non-owners get a `Some(Vec<i64>)`
-/// of the library IDs in their `library_access` rows; an empty Vec means
-/// they're locked out of everything.
+/// of the library IDs accessible to them — the UNION of direct
+/// `library_access` rows and group-derived rows (via `user_access_groups`
+/// → `access_group_libraries`). An empty Vec means the user is locked
+/// out of everything.
 pub async fn user_library_filter(
     pool: &SqlitePool,
     user_id: i64,
@@ -609,8 +644,15 @@ pub async fn user_library_filter(
         return Ok(None);
     }
     let rows = sqlx::query(
-        "SELECT library_id FROM library_access WHERE user_id = ? ORDER BY library_id",
+        "SELECT library_id FROM library_access WHERE user_id = ?
+         UNION
+         SELECT agl.library_id
+           FROM access_group_libraries agl
+           JOIN user_access_groups uag ON uag.group_id = agl.group_id
+          WHERE uag.user_id = ?
+         ORDER BY library_id",
     )
+    .bind(user_id)
     .bind(user_id)
     .fetch_all(pool)
     .await?;
@@ -864,6 +906,107 @@ pub async fn find_listed_items_by_tmdb_ids(
                 item: Item::from_row(row)?,
                 play_state: PlayStateForItem::from_columns(row)?,
             })
+        })
+        .collect()
+}
+
+/// Overwrite the cached trending list for one (source, media_kind)
+/// slice. Wrapped in a transaction so the rail can't observe a torn
+/// half-old half-new state mid-refresh. Returns the number of entries
+/// written so the caller can log it.
+pub async fn replace_trending(
+    pool: &SqlitePool,
+    source: &str,
+    media_kind: &str,
+    entries: &[crate::TrendingEntry],
+) -> Result<usize> {
+    let now = chimpflix_common::now_ms();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM trending_cache WHERE source = ? AND media_kind = ?")
+        .bind(source)
+        .bind(media_kind)
+        .execute(&mut *tx)
+        .await?;
+    for entry in entries {
+        sqlx::query(
+            "INSERT INTO trending_cache \
+             (source, media_kind, rank, tmdb_id, title, poster_path, fetched_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(source)
+        .bind(media_kind)
+        .bind(entry.rank)
+        .bind(entry.tmdb_id)
+        .bind(&entry.title)
+        .bind(&entry.poster_path)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(entries.len())
+}
+
+/// Trending entries that exist in this server's library, ordered by
+/// trending rank. Source is hard-coded to TMDB for now — when a second
+/// provider is added the query will take a source parameter and pick
+/// the freshest one. `kind` is matched as a string ("movie" / "show")
+/// against `items.kind`.
+pub async fn list_trending_in_library(
+    pool: &SqlitePool,
+    kind: ItemKind,
+    user_id: i64,
+    limit: i64,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<(i64, ListedItem)>> {
+    let lib_filter = library_filter_sql("i.library_id", accessible);
+    // Mirrors ITEM_SELECT but adds `tc.rank` to the projection so the
+    // caller can render rank badges (and we keep the natural ORDER BY
+    // ranking). The shared ITEM_SELECT constant is geometry-locked for
+    // Item::from_row, so we re-spell it here rather than mutate it.
+    let sql = format!(
+        "SELECT i.*, \
+            (SELECT source_url FROM images \
+                WHERE item_id = i.id AND kind = 'poster' \
+                ORDER BY is_primary DESC, id ASC LIMIT 1) AS poster_path, \
+            (SELECT source_url FROM images \
+                WHERE item_id = i.id AND kind = 'backdrop' \
+                ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path, \
+            ps.position_ms     AS ps_position_ms, \
+            ps.duration_ms     AS ps_duration_ms, \
+            ps.watched         AS ps_watched, \
+            ps.view_count      AS ps_view_count, \
+            ps.last_played_at  AS ps_last_played_at, \
+            tc.rank            AS trending_rank \
+         FROM items i \
+         INNER JOIN trending_cache tc \
+           ON tc.tmdb_id = i.tmdb_id \
+          AND tc.source = 'tmdb' \
+          AND tc.media_kind = ? \
+         LEFT JOIN play_state ps \
+           ON ps.item_id = i.id AND ps.user_id = ? \
+         WHERE i.kind = ? AND {lib_filter} \
+         ORDER BY tc.rank ASC \
+         LIMIT ?",
+    );
+    let rows = sqlx::query(&sql)
+        .bind(kind.as_str())   // tc.media_kind
+        .bind(user_id)         // ps.user_id
+        .bind(kind.as_str())   // i.kind
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| -> Result<(i64, ListedItem)> {
+            use sqlx::Row;
+            let rank: i64 = row.try_get("trending_rank")?;
+            Ok((
+                rank,
+                ListedItem {
+                    item: Item::from_row(row)?,
+                    play_state: PlayStateForItem::from_columns(row)?,
+                },
+            ))
         })
         .collect()
 }
@@ -1201,7 +1344,7 @@ const MEDIA_FILE_SUMMARY_COLS: &str = "
 pub async fn list_files_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<MediaFileSummary>> {
     let sql = format!(
         "SELECT {MEDIA_FILE_SUMMARY_COLS} FROM media_files
-         WHERE item_id = ? ORDER BY id ASC"
+         WHERE item_id = ? AND removed_at IS NULL ORDER BY id ASC"
     );
     let rows = sqlx::query(&sql).bind(item_id).fetch_all(pool).await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -1217,7 +1360,7 @@ pub async fn list_files_for_episode(
 ) -> Result<Vec<MediaFileSummary>> {
     let sql = format!(
         "SELECT {MEDIA_FILE_SUMMARY_COLS} FROM media_files
-         WHERE episode_id = ? ORDER BY id ASC"
+         WHERE episode_id = ? AND removed_at IS NULL ORDER BY id ASC"
     );
     let rows = sqlx::query(&sql).bind(episode_id).fetch_all(pool).await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -1335,7 +1478,7 @@ async fn list_streams_for_file(
     media_file_id: i64,
 ) -> Result<Vec<MediaStreamSummary>> {
     let rows = sqlx::query(
-        "SELECT stream_index, kind, codec, language, channels, is_default, is_forced
+        "SELECT stream_index, kind, codec, language, title, channels, is_default, is_forced
          FROM media_streams
          WHERE media_file_id = ?
          ORDER BY stream_index ASC",
@@ -1350,6 +1493,7 @@ async fn list_streams_for_file(
             kind: r.try_get("kind")?,
             codec: r.try_get::<Option<String>, _>("codec").ok().flatten(),
             language: r.try_get::<Option<String>, _>("language").ok().flatten(),
+            title: r.try_get::<Option<String>, _>("title").ok().flatten(),
             channels: r.try_get::<Option<i32>, _>("channels").ok().flatten(),
             is_default: r.try_get::<i64, _>("is_default")? != 0,
             is_forced: r.try_get::<i64, _>("is_forced")? != 0,
@@ -1362,11 +1506,17 @@ pub async fn get_media_file_locator(
     pool: &SqlitePool,
     id: i64,
 ) -> Result<Option<MediaFileLocator>> {
-    let Some(r) =
-        sqlx::query("SELECT id, path, size_bytes, container FROM media_files WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?
+    // Soft-deleted rows (removed_at IS NOT NULL) intentionally return
+    // None here. The stream handler treats that as 404 — the row
+    // hangs around for the grace period purely for "this user
+    // already watched it" history reasons.
+    let Some(r) = sqlx::query(
+        "SELECT id, path, size_bytes, container FROM media_files
+         WHERE id = ? AND removed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
     else {
         return Ok(None);
     };
@@ -1415,6 +1565,7 @@ pub async fn complete_setup(
     username: &str,
     password_hash: &str,
     display_name: Option<&str>,
+    email: Option<&str>,
 ) -> Result<User> {
     let now = now_ms();
     let row = sqlx::query(
@@ -1423,6 +1574,7 @@ pub async fn complete_setup(
                password_hash = ?,
                role          = 'owner',
                display_name  = ?,
+               email         = ?,
                updated_at    = ?
          WHERE id = 1 AND username = '_default'
          RETURNING *",
@@ -1430,6 +1582,7 @@ pub async fn complete_setup(
     .bind(username)
     .bind(password_hash)
     .bind(display_name)
+    .bind(email)
     .bind(now)
     .fetch_optional(pool)
     .await?
@@ -1475,8 +1628,10 @@ pub async fn set_user_role(
 pub struct UserSelfUpdate {
     pub display_name: Option<Option<String>>,
     pub avatar_url: Option<Option<String>>,
+    pub email: Option<Option<String>>,
     pub default_audio_lang: Option<Option<String>>,
     pub default_subtitle_lang: Option<Option<String>>,
+    pub notify_via_email: Option<bool>,
 }
 
 /// Patch the caller's own profile/prefs. Each field is double-Option: `None`
@@ -1494,11 +1649,17 @@ pub async fn update_user_self(
     if patch.avatar_url.is_some() {
         sets.push("avatar_path = ?");
     }
+    if patch.email.is_some() {
+        sets.push("email = ?");
+    }
     if patch.default_audio_lang.is_some() {
         sets.push("default_audio_lang = ?");
     }
     if patch.default_subtitle_lang.is_some() {
         sets.push("default_subtitle_lang = ?");
+    }
+    if patch.notify_via_email.is_some() {
+        sets.push("notify_via_email = ?");
     }
     if sets.is_empty() {
         return find_user_by_id(pool, user_id).await;
@@ -1515,15 +1676,151 @@ pub async fn update_user_self(
     if let Some(v) = patch.avatar_url {
         q = q.bind(v);
     }
+    if let Some(v) = patch.email {
+        q = q.bind(v);
+    }
     if let Some(v) = patch.default_audio_lang {
         q = q.bind(v);
     }
     if let Some(v) = patch.default_subtitle_lang {
         q = q.bind(v);
     }
+    if let Some(v) = patch.notify_via_email {
+        q = q.bind(i64::from(v));
+    }
     q = q.bind(chimpflix_common::now_ms()).bind(user_id);
     let res = q.fetch_optional(pool).await?;
     res.as_ref().map(User::from_row).transpose()
+}
+
+// ─── Email-change tokens (Phase 28) ────────────────────────────────────────
+
+pub async fn create_email_change_token(
+    pool: &SqlitePool,
+    user_id: i64,
+    new_email: &str,
+    code_hash: &str,
+    expires_at: i64,
+) -> Result<i64> {
+    let now = now_ms();
+    // Wipe any in-flight token for this user so they only have one
+    // outstanding at a time — avoids "which link do I click" confusion.
+    sqlx::query("DELETE FROM email_change_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    let row = sqlx::query(
+        "INSERT INTO email_change_tokens
+            (user_id, new_email, code_hash, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(new_email)
+    .bind(code_hash)
+    .bind(now)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+/// Look up an active token. Returns (token_id, user_id, new_email).
+pub async fn find_active_email_change_token(
+    pool: &SqlitePool,
+    code_hash: &str,
+) -> Result<Option<(i64, i64, String)>> {
+    let now = now_ms();
+    let Some(row) = sqlx::query(
+        "SELECT id, user_id, new_email FROM email_change_tokens
+          WHERE code_hash = ?
+            AND consumed_at IS NULL
+            AND expires_at > ?",
+    )
+    .bind(code_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.try_get("id")?,
+        row.try_get("user_id")?,
+        row.try_get("new_email")?,
+    )))
+}
+
+/// Apply the change: mark token consumed + write the new email to the
+/// user row. One transaction so a unique-index collision on email
+/// rolls back the token consumption too.
+pub async fn consume_email_change(
+    pool: &SqlitePool,
+    token_id: i64,
+    user_id: i64,
+    new_email: &str,
+) -> Result<()> {
+    let now = now_ms();
+    let mut tx = pool.begin().await?;
+    let res = sqlx::query(
+        "UPDATE email_change_tokens
+            SET consumed_at = ?
+          WHERE id = ? AND consumed_at IS NULL",
+    )
+    .bind(now)
+    .bind(token_id)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("email-change token already consumed");
+    }
+    sqlx::query("UPDATE users SET email = ?, updated_at = ? WHERE id = ?")
+        .bind(new_email)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replace the user's password hash. Caller is responsible for hashing
+/// the plaintext (via the argon2 helper) and for any session-rotation
+/// that should follow. We bump `updated_at` so the touch_audit pattern
+/// still works.
+pub async fn update_user_password(
+    pool: &SqlitePool,
+    user_id: i64,
+    new_hash: &str,
+) -> Result<bool> {
+    let now = now_ms();
+    let res = sqlx::query(
+        "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(new_hash)
+    .bind(now)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Lookup by email (case-insensitive). Used by password-reset request to
+/// resolve the user before issuing a token. Returns None for unknown
+/// emails — the caller MUST treat that identically to "user found,
+/// token issued" to avoid leaking which addresses are registered.
+pub async fn find_user_by_email(
+    pool: &SqlitePool,
+    email: &str,
+) -> Result<Option<User>> {
+    let Some(row) = sqlx::query("SELECT * FROM users WHERE email = ? COLLATE NOCASE")
+        .bind(email)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(User::from_row(&row)?))
 }
 
 pub async fn find_user_by_id(pool: &SqlitePool, id: i64) -> Result<Option<User>> {
@@ -1560,17 +1857,19 @@ pub async fn create_user(
     password_hash: &str,
     role: UserRole,
     display_name: Option<&str>,
+    email: Option<&str>,
 ) -> Result<User> {
     let now = now_ms();
     let row = sqlx::query(
-        "INSERT INTO users (username, password_hash, role, display_name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        "INSERT INTO users (username, password_hash, role, display_name, email, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(username)
     .bind(password_hash)
     .bind(role.as_str())
     .bind(display_name)
+    .bind(email)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -1657,6 +1956,430 @@ pub async fn cleanup_expired_sessions(pool: &SqlitePool) -> Result<u64> {
         .bind(now)
         .execute(pool)
         .await?;
+    Ok(res.rows_affected())
+}
+
+/// Wipe every session for a user — used by password reset (so a recovered
+/// account boots all other devices) and by admin "sign out everywhere".
+pub async fn delete_sessions_for_user(pool: &SqlitePool, user_id: i64) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Wipe every session for a user EXCEPT the one identified by `keep_id`.
+/// Used by the user-facing "sign out of all other devices" action and
+/// by 2FA enroll/disable rotation (keep the request's session alive).
+pub async fn delete_sessions_for_user_except(
+    pool: &SqlitePool,
+    user_id: i64,
+    keep_id: i64,
+) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM sessions WHERE user_id = ? AND id != ?")
+        .bind(user_id)
+        .bind(keep_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+// ─── Password reset tokens (Phase 23) ──────────────────────────────────────
+//
+// Same design as invites: plaintext token shown once via email, only the
+// SHA-256 hash persisted. Single-use, short-lived (default 1h), and any
+// successful redemption wipes all existing sessions for the user via
+// `delete_sessions_for_user`.
+
+pub async fn create_password_reset_token(
+    pool: &SqlitePool,
+    user_id: i64,
+    code_hash: &str,
+    expires_at: i64,
+    requested_ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<i64> {
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO password_reset_tokens
+            (user_id, code_hash, requested_ip, user_agent, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(code_hash)
+    .bind(requested_ip)
+    .bind(user_agent)
+    .bind(now)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+/// Look up an active token by hash. Returns None for expired, consumed,
+/// or unknown tokens — callers MUST surface identical "invalid or
+/// expired" errors for all three to avoid leaking which case matched.
+pub async fn find_active_password_reset_token(
+    pool: &SqlitePool,
+    code_hash: &str,
+) -> Result<Option<(i64, i64)>> {
+    let now = now_ms();
+    let Some(row) = sqlx::query(
+        "SELECT id, user_id FROM password_reset_tokens
+          WHERE code_hash = ?
+            AND consumed_at IS NULL
+            AND expires_at > ?",
+    )
+    .bind(code_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((row.try_get("id")?, row.try_get("user_id")?)))
+}
+
+/// Mark a token consumed + update the user's password + wipe sessions in
+/// a single transaction so a partial failure can't leave the account
+/// half-reset.
+pub async fn consume_password_reset(
+    pool: &SqlitePool,
+    token_id: i64,
+    user_id: i64,
+    new_password_hash: &str,
+) -> Result<u64> {
+    let now = now_ms();
+    let mut tx = pool.begin().await?;
+    let res = sqlx::query(
+        "UPDATE password_reset_tokens
+            SET consumed_at = ?
+          WHERE id = ? AND consumed_at IS NULL",
+    )
+    .bind(now)
+    .bind(token_id)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("reset token already consumed");
+    }
+    sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(new_password_hash)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    let sessions = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(sessions.rows_affected())
+}
+
+/// House-cleaning. The scheduler can call this periodically; not
+/// strictly required for correctness since `find_active_*` filters by
+/// expires_at, but keeps the table from growing unbounded.
+pub async fn cleanup_expired_password_reset_tokens(pool: &SqlitePool) -> Result<u64> {
+    let now = now_ms();
+    let res = sqlx::query("DELETE FROM password_reset_tokens WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Trim audit_log to a retention window. Defaults applied at the
+/// caller (currently 90 days). Returns the row count removed.
+pub async fn cleanup_old_audit_log(
+    pool: &SqlitePool,
+    older_than_ms: i64,
+) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM audit_log WHERE created_at < ?")
+        .bind(older_than_ms)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+// ─── TOTP / 2FA (Phase 24) ─────────────────────────────────────────────────
+//
+// Storage shape mirrors the vault: encrypted secret BLOB + nonce, with
+// NULL nonce meaning plaintext mode. Callers always supply the secret
+// plaintext + let the vault encrypt it before persisting. Recovery
+// codes use the same SHA-256-hashed-at-rest pattern as invites.
+
+#[derive(Debug, Clone)]
+pub struct UserTotpRecord {
+    pub user_id: i64,
+    pub secret_enc: Vec<u8>,
+    pub secret_nonce: Option<Vec<u8>>,
+    pub verified_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Upsert the user's TOTP secret. Always resets `verified_at` to NULL
+/// because the new secret hasn't been proven to belong to a real
+/// authenticator yet — the user must POST a code through the verify
+/// endpoint to flip the row to "active".
+pub async fn upsert_user_totp(
+    pool: &SqlitePool,
+    user_id: i64,
+    secret_enc: &[u8],
+    secret_nonce: Option<&[u8]>,
+) -> Result<()> {
+    let now = now_ms();
+    sqlx::query(
+        "INSERT INTO user_totp (user_id, secret_enc, secret_nonce, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+             secret_enc   = excluded.secret_enc,
+             secret_nonce = excluded.secret_nonce,
+             verified_at  = NULL,
+             created_at   = excluded.created_at",
+    )
+    .bind(user_id)
+    .bind(secret_enc)
+    .bind(secret_nonce)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark the user's TOTP enrollment as verified. Idempotent; calling
+/// twice just refreshes the timestamp.
+pub async fn mark_user_totp_verified(pool: &SqlitePool, user_id: i64) -> Result<()> {
+    let now = now_ms();
+    sqlx::query("UPDATE user_totp SET verified_at = ? WHERE user_id = ?")
+        .bind(now)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_user_totp(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<UserTotpRecord>> {
+    let Some(row) = sqlx::query("SELECT * FROM user_totp WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(UserTotpRecord {
+        user_id: row.try_get("user_id")?,
+        secret_enc: row.try_get("secret_enc")?,
+        secret_nonce: row.try_get::<Option<Vec<u8>>, _>("secret_nonce").ok().flatten(),
+        verified_at: row.try_get::<Option<i64>, _>("verified_at").ok().flatten(),
+        created_at: row.try_get("created_at")?,
+    }))
+}
+
+/// Remove the user's TOTP enrollment + all recovery codes. Used by the
+/// user-initiated disable flow and by the admin "reset 2FA" action.
+pub async fn delete_user_totp(pool: &SqlitePool, user_id: i64) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let res = sqlx::query("DELETE FROM user_totp WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Replace any existing recovery codes with a fresh set. Called as the
+/// last step of enrollment + by the "regenerate recovery codes" action.
+pub async fn replace_recovery_codes(
+    pool: &SqlitePool,
+    user_id: i64,
+    code_hashes: &[String],
+) -> Result<()> {
+    let now = now_ms();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for h in code_hashes {
+        sqlx::query(
+            "INSERT INTO user_recovery_codes (user_id, code_hash, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(h)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Atomically mark a recovery code consumed. Returns true if a row was
+/// updated (a valid, unused code); false otherwise. We never reveal
+/// which case applied — caller surfaces a generic "invalid code".
+pub async fn consume_recovery_code(
+    pool: &SqlitePool,
+    user_id: i64,
+    code_hash: &str,
+) -> Result<bool> {
+    let now = now_ms();
+    let res = sqlx::query(
+        "UPDATE user_recovery_codes
+            SET consumed_at = ?
+          WHERE user_id = ? AND code_hash = ? AND consumed_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .bind(code_hash)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn count_unused_recovery_codes(pool: &SqlitePool, user_id: i64) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM user_recovery_codes
+          WHERE user_id = ? AND consumed_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("n")?)
+}
+
+// ─── Notifications (Phase 25) ──────────────────────────────────────────────
+
+/// Users with `role = 'owner'`. Used by `fan_out_notification` so any
+/// "all admins" event lands in every owner's inbox.
+pub async fn list_owner_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
+    let rows = sqlx::query("SELECT id FROM users WHERE role = 'owner'")
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|r| r.try_get::<i64, _>("id").map_err(Into::into))
+        .collect()
+}
+
+pub async fn insert_notification(
+    pool: &SqlitePool,
+    user_id: i64,
+    kind: &str,
+    payload_json: &str,
+) -> Result<i64> {
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO notifications (user_id, kind, payload_json, created_at)
+         VALUES (?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(kind)
+    .bind(payload_json)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+/// Recent notifications for the user, newest first. Combine read + unread
+/// up to `limit` rows so the UI can render a single chronological list.
+pub async fn list_notifications(
+    pool: &SqlitePool,
+    user_id: i64,
+    limit: i64,
+) -> Result<Vec<Notification>> {
+    let rows = sqlx::query(
+        "SELECT * FROM notifications
+          WHERE user_id = ?
+          ORDER BY created_at DESC
+          LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(Notification::from_row).collect()
+}
+
+pub async fn count_unread_notifications(pool: &SqlitePool, user_id: i64) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM notifications
+          WHERE user_id = ? AND read_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("n")?)
+}
+
+pub async fn mark_notification_read(
+    pool: &SqlitePool,
+    user_id: i64,
+    notification_id: i64,
+) -> Result<bool> {
+    let now = now_ms();
+    let res = sqlx::query(
+        "UPDATE notifications
+            SET read_at = ?
+          WHERE id = ? AND user_id = ? AND read_at IS NULL",
+    )
+    .bind(now)
+    .bind(notification_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Record a successful login. Shifts `last_login_*` into
+/// `previous_login_*` and overwrites with the new value, so the
+/// post-login screen can show "Last signed in <previous> from <ip>".
+/// Best-effort: callers log on failure but never fail the login.
+pub async fn record_user_login(
+    pool: &SqlitePool,
+    user_id: i64,
+    ip: Option<&str>,
+) -> Result<()> {
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE users
+            SET previous_login_at = last_login_at,
+                previous_login_ip = last_login_ip,
+                last_login_at     = ?,
+                last_login_ip     = ?
+          WHERE id = ?",
+    )
+    .bind(now)
+    .bind(ip)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_all_notifications_read(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<u64> {
+    let now = now_ms();
+    let res = sqlx::query(
+        "UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected())
 }
 
@@ -1784,29 +2507,311 @@ pub async fn access_matrix(pool: &SqlitePool) -> Result<Vec<AccessMatrixEntry>> 
     Ok(out)
 }
 
+// ─── Access groups (Phase 27) ──────────────────────────────────────────────
+
+const ACCESS_GROUP_LIST_SQL: &str = "
+SELECT g.*,
+       (SELECT COUNT(*) FROM user_access_groups WHERE group_id = g.id)
+           AS member_count,
+       (SELECT COUNT(*) FROM access_group_libraries WHERE group_id = g.id)
+           AS library_count
+  FROM access_groups g";
+
+pub async fn list_access_groups(pool: &SqlitePool) -> Result<Vec<AccessGroup>> {
+    let sql = format!("{ACCESS_GROUP_LIST_SQL} ORDER BY g.name COLLATE NOCASE");
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    rows.iter().map(AccessGroup::from_row_with_counts).collect()
+}
+
+pub async fn create_access_group(
+    pool: &SqlitePool,
+    input: NewAccessGroup,
+) -> Result<AccessGroup> {
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        anyhow::bail!("name must not be empty");
+    }
+    let description = input.description.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let now = now_ms();
+    sqlx::query(
+        "INSERT INTO access_groups (name, description, created_at, updated_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&name)
+    .bind(description.as_deref())
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.name = ?");
+    let row = sqlx::query(&sql).bind(&name).fetch_one(pool).await?;
+    AccessGroup::from_row_with_counts(&row)
+}
+
+pub async fn get_access_group_detail(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<AccessGroupDetail>> {
+    let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.id = ?");
+    let Some(row) = sqlx::query(&sql).bind(id).fetch_optional(pool).await? else {
+        return Ok(None);
+    };
+    let group = AccessGroup::from_row_with_counts(&row)?;
+
+    let member_rows = sqlx::query(
+        "SELECT user_id FROM user_access_groups WHERE group_id = ? ORDER BY user_id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    let member_ids: Result<Vec<i64>> = member_rows
+        .iter()
+        .map(|r| Ok(r.try_get::<i64, _>("user_id")?))
+        .collect();
+
+    let lib_rows = sqlx::query(
+        "SELECT library_id FROM access_group_libraries WHERE group_id = ? ORDER BY library_id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    let library_ids: Result<Vec<i64>> = lib_rows
+        .iter()
+        .map(|r| Ok(r.try_get::<i64, _>("library_id")?))
+        .collect();
+
+    Ok(Some(AccessGroupDetail {
+        group,
+        member_ids: member_ids?,
+        library_ids: library_ids?,
+    }))
+}
+
+pub async fn update_access_group(
+    pool: &SqlitePool,
+    id: i64,
+    patch: AccessGroupUpdate,
+) -> Result<Option<AccessGroup>> {
+    let mut sets: Vec<&str> = Vec::new();
+    if patch.name.is_some() {
+        sets.push("name = ?");
+    }
+    if patch.description.is_some() {
+        sets.push("description = ?");
+    }
+    if sets.is_empty() {
+        let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.id = ?");
+        let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
+        return row.as_ref().map(AccessGroup::from_row_with_counts).transpose();
+    }
+    sets.push("updated_at = ?");
+    let sql = format!("UPDATE access_groups SET {} WHERE id = ?", sets.join(", "));
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = patch.name {
+        q = q.bind(v.trim().to_string());
+    }
+    if let Some(v) = patch.description {
+        q = q.bind(v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
+    q = q.bind(now_ms()).bind(id);
+    let res = q.execute(pool).await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.id = ?");
+    let row = sqlx::query(&sql).bind(id).fetch_one(pool).await?;
+    Ok(Some(AccessGroup::from_row_with_counts(&row)?))
+}
+
+pub async fn delete_access_group(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM access_groups WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Replace the group's library set atomically.
+pub async fn set_access_group_libraries(
+    pool: &SqlitePool,
+    group_id: i64,
+    library_ids: &[i64],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM access_group_libraries WHERE group_id = ?")
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    for lib in library_ids {
+        sqlx::query(
+            "INSERT INTO access_group_libraries (group_id, library_id) VALUES (?, ?)",
+        )
+        .bind(group_id)
+        .bind(lib)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE access_groups SET updated_at = ? WHERE id = ?")
+        .bind(now_ms())
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replace the group's member set atomically.
+pub async fn set_access_group_members(
+    pool: &SqlitePool,
+    group_id: i64,
+    user_ids: &[i64],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_access_groups WHERE group_id = ?")
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    for uid in user_ids {
+        sqlx::query(
+            "INSERT INTO user_access_groups (user_id, group_id) VALUES (?, ?)",
+        )
+        .bind(uid)
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE access_groups SET updated_at = ? WHERE id = ?")
+        .bind(now_ms())
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Groups this user is a member of. Useful for the user-detail view in
+/// the admin UI and for displaying "you're in groups: X, Y" to the user.
+pub async fn list_user_group_ids(pool: &SqlitePool, user_id: i64) -> Result<Vec<i64>> {
+    let rows = sqlx::query(
+        "SELECT group_id FROM user_access_groups WHERE user_id = ? ORDER BY group_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| Ok(r.try_get::<i64, _>("group_id")?))
+        .collect()
+}
+
+/// Replace the user's group memberships atomically. Mirror of
+/// [`set_access_group_members`] from the other direction so the admin
+/// can manage from either side.
+pub async fn set_user_groups(
+    pool: &SqlitePool,
+    user_id: i64,
+    group_ids: &[i64],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_access_groups WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for gid in group_ids {
+        sqlx::query(
+            "INSERT INTO user_access_groups (user_id, group_id) VALUES (?, ?)",
+        )
+        .bind(user_id)
+        .bind(gid)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Library IDs this user has access to through groups only (excluding
+/// direct `library_access` grants). Used by the admin user-detail view
+/// to distinguish "granted directly" vs "via group X".
+pub async fn list_user_group_library_ids(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<i64>> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT agl.library_id
+           FROM access_group_libraries agl
+           JOIN user_access_groups uag ON uag.group_id = agl.group_id
+          WHERE uag.user_id = ?
+          ORDER BY agl.library_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| Ok(r.try_get::<i64, _>("library_id")?))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Invites
 // ---------------------------------------------------------------------------
 
+/// Create an invite. The caller passes the SHA-256 hash of the plaintext
+/// token — the plaintext never reaches the DB. Library + group pre-binding
+/// is inserted as part of the same transaction so an orphan invite (with
+/// libraries/groups that no longer exist) is impossible.
 pub async fn create_invite(
     pool: &SqlitePool,
-    code: &str,
+    code_hash: &str,
     created_by: i64,
     expires_at: Option<i64>,
+    email: Option<&str>,
+    library_ids: &[i64],
+    group_ids: &[i64],
 ) -> Result<Invite> {
     let now = now_ms();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query(
-        "INSERT INTO invites (code, created_by, expires_at, created_at)
-         VALUES (?, ?, ?, ?)
+        "INSERT INTO invites (code_hash, created_by, expires_at, email, created_at)
+         VALUES (?, ?, ?, ?, ?)
          RETURNING *",
     )
-    .bind(code)
+    .bind(code_hash)
     .bind(created_by)
     .bind(expires_at)
+    .bind(email)
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Invite::from_row(&row)
+    let invite = Invite::from_row(&row)?;
+    for lib_id in library_ids {
+        sqlx::query("INSERT INTO invite_libraries (invite_id, library_id) VALUES (?, ?)")
+            .bind(invite.id)
+            .bind(lib_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for group_id in group_ids {
+        sqlx::query("INSERT INTO invite_groups (invite_id, group_id) VALUES (?, ?)")
+            .bind(invite.id)
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(invite)
+}
+
+/// Group IDs pre-bound to the invite. Mirror of [`invite_library_ids`].
+pub async fn invite_group_ids(pool: &SqlitePool, invite_id: i64) -> Result<Vec<i64>> {
+    let rows = sqlx::query(
+        "SELECT group_id FROM invite_groups WHERE invite_id = ? ORDER BY group_id",
+    )
+    .bind(invite_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| Ok(r.try_get::<i64, _>("group_id")?))
+        .collect()
 }
 
 pub async fn list_invites(pool: &SqlitePool) -> Result<Vec<Invite>> {
@@ -1816,9 +2821,25 @@ pub async fn list_invites(pool: &SqlitePool) -> Result<Vec<Invite>> {
     rows.iter().map(Invite::from_row).collect()
 }
 
-pub async fn find_invite_by_code(pool: &SqlitePool, code: &str) -> Result<Option<Invite>> {
-    let Some(row) = sqlx::query("SELECT * FROM invites WHERE code = ?")
-        .bind(code)
+/// Pre-bound library IDs for the given invite. Order matches library_id ASC.
+pub async fn invite_library_ids(pool: &SqlitePool, invite_id: i64) -> Result<Vec<i64>> {
+    let rows = sqlx::query(
+        "SELECT library_id FROM invite_libraries WHERE invite_id = ? ORDER BY library_id",
+    )
+    .bind(invite_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| r.try_get::<i64, _>("library_id").map_err(Into::into))
+        .collect()
+}
+
+pub async fn find_invite_by_code_hash(
+    pool: &SqlitePool,
+    code_hash: &str,
+) -> Result<Option<Invite>> {
+    let Some(row) = sqlx::query("SELECT * FROM invites WHERE code_hash = ?")
+        .bind(code_hash)
         .fetch_optional(pool)
         .await?
     else {
@@ -1827,30 +2848,91 @@ pub async fn find_invite_by_code(pool: &SqlitePool, code: &str) -> Result<Option
     Ok(Some(Invite::from_row(&row)?))
 }
 
-pub async fn consume_invite(pool: &SqlitePool, code: &str, user_id: i64) -> Result<()> {
+/// Consume the invite + grant any pre-bound library access in a single
+/// transaction. The invite is identified by its `code_hash`; the plain-
+/// text token is hashed at the API edge and never reaches this layer.
+pub async fn consume_invite(
+    pool: &SqlitePool,
+    code_hash: &str,
+    user_id: i64,
+) -> Result<()> {
     let now = now_ms();
+    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE invites
             SET consumed_by = ?, consumed_at = ?
-          WHERE code = ?
+          WHERE code_hash = ?
             AND consumed_by IS NULL
             AND (expires_at IS NULL OR expires_at > ?)",
     )
     .bind(user_id)
     .bind(now)
-    .bind(code)
+    .bind(code_hash)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!("invite is invalid, expired, or already consumed");
     }
+    // Grant any pre-bound libraries. ON CONFLICT IGNORE keeps the call
+    // idempotent if a library row already exists (e.g. retry after a
+    // partial transaction in an earlier version).
+    sqlx::query(
+        "INSERT INTO library_access (user_id, library_id)
+         SELECT ?, il.library_id
+           FROM invite_libraries il
+           JOIN invites i ON i.id = il.invite_id
+          WHERE i.code_hash = ?
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(code_hash)
+    .execute(&mut *tx)
+    .await?;
+    // Fan out pre-bound group memberships the same way. The user's
+    // effective library set automatically picks up the group's
+    // libraries through `user_library_filter`'s UNION.
+    sqlx::query(
+        "INSERT INTO user_access_groups (user_id, group_id)
+         SELECT ?, ig.group_id
+           FROM invite_groups ig
+           JOIN invites i ON i.id = ig.invite_id
+          WHERE i.code_hash = ?
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(code_hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-pub async fn revoke_invite(pool: &SqlitePool, code: &str) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM invites WHERE code = ? AND consumed_by IS NULL")
-        .bind(code)
+/// Mark the invite as sent. Called after the SMTP relay accepts the
+/// invite email — purely informational so the admin UI can show whether
+/// each invite was emailed vs. only copy-linked.
+pub async fn mark_invite_sent(pool: &SqlitePool, invite_id: i64) -> Result<()> {
+    sqlx::query("UPDATE invites SET sent_at = ? WHERE id = ?")
+        .bind(now_ms())
+        .bind(invite_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn revoke_invite_by_hash(pool: &SqlitePool, code_hash: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM invites WHERE code_hash = ? AND consumed_by IS NULL")
+        .bind(code_hash)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Revoke by `invite_id`. The admin UI uses this because the plaintext
+/// code isn't recoverable from the list endpoint.
+pub async fn revoke_invite_by_id(pool: &SqlitePool, invite_id: i64) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM invites WHERE id = ? AND consumed_by IS NULL")
+        .bind(invite_id)
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
@@ -2096,6 +3178,332 @@ pub async fn existing_media_files(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Library verify / orphan cleanup
+// ---------------------------------------------------------------------------
+
+/// One media_file row that the verify pass needs to consider —
+/// path on disk so we can stat() it, plus the current removed_at
+/// state so we know whether marking-missing is a state change.
+#[derive(Debug, Clone)]
+pub struct MediaFileVerifyRow {
+    pub id: i64,
+    pub path: String,
+    pub removed_at: Option<i64>,
+}
+
+/// Pull every media_file row that belongs to the given library —
+/// including soft-deleted ones, so the verify pass can re-mark them
+/// (cheap idempotent update) and so a re-appeared file gets its
+/// removed_at cleared by the same write path the scanner uses.
+pub async fn list_media_files_for_verify(
+    pool: &SqlitePool,
+    library_id: i64,
+) -> Result<Vec<MediaFileVerifyRow>> {
+    let rows = sqlx::query(
+        "SELECT mf.id, mf.path, mf.removed_at
+         FROM media_files mf
+         LEFT JOIN items i_movie ON mf.item_id = i_movie.id
+         LEFT JOIN episodes ep ON mf.episode_id = ep.id
+         LEFT JOIN seasons s ON ep.season_id = s.id
+         LEFT JOIN items i_show ON s.show_id = i_show.id
+         WHERE i_movie.library_id = ?1 OR i_show.library_id = ?1",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(MediaFileVerifyRow {
+            id: row.try_get("id")?,
+            path: row.try_get("path")?,
+            removed_at: row.try_get::<Option<i64>, _>("removed_at").ok().flatten(),
+        });
+    }
+    Ok(out)
+}
+
+/// Soft-delete the given media_file ids by stamping `removed_at`.
+/// Idempotent: re-marking an already-removed row is a no-op (we
+/// preserve the *first* removal timestamp so the purge grace
+/// window doesn't reset on every verify run).
+pub async fn mark_media_files_removed(pool: &SqlitePool, ids: &[i64]) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let now = now_ms();
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "UPDATE media_files SET removed_at = ?
+         WHERE id IN ({placeholders}) AND removed_at IS NULL"
+    );
+    let mut q = sqlx::query(&sql).bind(now);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let r = q.execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+/// Result of a verify pass against a single library. Surfaced to
+/// the admin UI so the operator can see what happened without
+/// trawling through the scheduler log.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VerifyReport {
+    pub library_id: i64,
+    pub files_checked: usize,
+    pub files_missing: usize,
+    pub newly_marked_removed: u64,
+    /// Files we expected to still be missing (already had
+    /// removed_at set on entry) that still aren't on disk. Useful
+    /// for "did anything come back?" inspection.
+    pub still_missing: usize,
+    /// Files that had removed_at set but were on disk this pass —
+    /// the scanner is what actually clears removed_at; verify just
+    /// counts so the operator sees there's pending resurrection
+    /// work for the next scan to do.
+    pub returned_files: usize,
+}
+
+/// Stat each media_file in the library and soft-delete the ones
+/// whose underlying path no longer exists. Does NOT hard-delete —
+/// the row stays around with `removed_at` set so a purge pass can
+/// reap it after a grace window (defends against transient mount
+/// failures eating an entire library).
+pub async fn verify_library(
+    pool: &SqlitePool,
+    library_id: i64,
+) -> Result<VerifyReport> {
+    let rows = list_media_files_for_verify(pool, library_id).await?;
+    let mut report = VerifyReport {
+        library_id,
+        files_checked: rows.len(),
+        ..Default::default()
+    };
+    let mut missing_ids: Vec<i64> = Vec::new();
+    for row in &rows {
+        // tokio::fs::metadata is async + per-file slow on cold
+        // caches; for libraries with tens of thousands of files
+        // this loop dominates verify runtime. Acceptable for now
+        // — verify is a background task, not a hot path.
+        let exists = tokio::fs::metadata(&row.path).await.is_ok();
+        match (exists, row.removed_at) {
+            (false, None) => {
+                report.files_missing += 1;
+                missing_ids.push(row.id);
+            }
+            (false, Some(_)) => {
+                report.files_missing += 1;
+                report.still_missing += 1;
+            }
+            (true, Some(_)) => {
+                report.returned_files += 1;
+                // Don't clear removed_at here — let the next
+                // scanner pass do it via the upsert path so the
+                // file gets a fresh probe + size/mtime refresh.
+                // Listing the file as "returned" is enough signal.
+            }
+            (true, None) => {}
+        }
+    }
+    report.newly_marked_removed = mark_media_files_removed(pool, &missing_ids).await?;
+    Ok(report)
+}
+
+/// Hard-delete media_files whose `removed_at` is older than the
+/// grace window. Cascades via the existing FK chains:
+/// `media_streams`, `markers`, `preview_sprites` rows attached to
+/// these files vanish automatically (`ON DELETE CASCADE`).
+///
+/// After the file delete, sweep parent rows that have been left
+/// childless:
+///   * Episodes with zero media_files
+///   * Seasons with zero episodes
+///   * Items (movies) with zero media_files
+///   * Items (shows) with zero seasons
+/// Each parent delete also cascades to its own children.
+///
+/// Returns the count of each tier removed so the admin UI can
+/// surface what the cleanup did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PurgeReport {
+    pub files_purged: u64,
+    pub episodes_purged: u64,
+    pub seasons_purged: u64,
+    pub items_purged: u64,
+    /// Paths of the hard-deleted files. Caller uses these to evict
+    /// per-file caches (WebVTT subtitle cache, future thumbnail
+    /// caches) that won't be cleaned by the DB cascade. Not
+    /// serialized — internal-only.
+    #[serde(skip)]
+    pub purged_paths: Vec<String>,
+}
+
+pub async fn purge_removed_media_files(
+    pool: &SqlitePool,
+    older_than_ms: i64,
+) -> Result<PurgeReport> {
+    let mut report = PurgeReport::default();
+
+    // Collect paths first so we can hand them back for cache eviction.
+    // The DELETE below removes the rows but cascading FK relationships
+    // do not touch the transcoder's on-disk WebVTT cache — that's a
+    // separate filesystem responsibility.
+    let path_rows = sqlx::query_scalar::<_, String>(
+        "SELECT path FROM media_files WHERE removed_at IS NOT NULL AND removed_at < ?",
+    )
+    .bind(older_than_ms)
+    .fetch_all(pool)
+    .await?;
+    report.purged_paths = path_rows;
+
+    // Hard-delete the soft-deleted files past the grace window.
+    let r = sqlx::query(
+        "DELETE FROM media_files WHERE removed_at IS NOT NULL AND removed_at < ?",
+    )
+    .bind(older_than_ms)
+    .execute(pool)
+    .await?;
+    report.files_purged = r.rows_affected();
+
+    // Now sweep orphaned parents. Order matters: episodes first,
+    // then seasons (depend on episodes being gone), then items
+    // (depend on either files or seasons being gone). Each step
+    // also cascades to its own children — e.g. episode delete
+    // takes any leftover markers / images / external subtitles
+    // attached to that episode.
+    let r = sqlx::query(
+        "DELETE FROM episodes
+         WHERE NOT EXISTS (SELECT 1 FROM media_files WHERE episode_id = episodes.id)",
+    )
+    .execute(pool)
+    .await?;
+    report.episodes_purged = r.rows_affected();
+
+    let r = sqlx::query(
+        "DELETE FROM seasons
+         WHERE NOT EXISTS (SELECT 1 FROM episodes WHERE season_id = seasons.id)",
+    )
+    .execute(pool)
+    .await?;
+    report.seasons_purged = r.rows_affected();
+
+    // Items split by kind: movies are orphans when their files are
+    // gone; shows are orphans when their seasons are gone.
+    let r = sqlx::query(
+        "DELETE FROM items
+         WHERE (kind = 'movie' AND NOT EXISTS (SELECT 1 FROM media_files WHERE item_id = items.id))
+            OR (kind = 'show'  AND NOT EXISTS (SELECT 1 FROM seasons WHERE show_id = items.id))",
+    )
+    .execute(pool)
+    .await?;
+    report.items_purged = r.rows_affected();
+
+    Ok(report)
+}
+
+/// At-a-glance numbers for a single library — for the admin UI's
+/// library card. Pulled in one round-trip (one query per stat
+/// because SQLite doesn't have efficient single-query aggregation
+/// across the kind=movie / kind=show split). Costs ~1ms per
+/// library; the admin page hits these once per render.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LibraryDetailStats {
+    pub library_id: i64,
+    pub items: i64,
+    pub episodes: i64,
+    pub files: i64,
+    /// Total size in bytes of all (non-removed) media files. Soft-
+    /// deleted files are excluded — they're not actually on disk.
+    pub total_bytes: i64,
+    /// Soft-deleted file count, surfaced separately so the UI can
+    /// badge "N orphan(s) pending" alongside the live total.
+    pub orphan_files: i64,
+    /// Wall-clock time (ms) of the most recent successful scan job.
+    /// None means the library has never been scanned successfully.
+    pub last_scanned_at: Option<i64>,
+}
+
+pub async fn single_library_stats(
+    pool: &SqlitePool,
+    library_id: i64,
+) -> Result<LibraryDetailStats> {
+    let mut s = LibraryDetailStats {
+        library_id,
+        ..Default::default()
+    };
+
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM items WHERE library_id = ?")
+        .bind(library_id)
+        .fetch_one(pool)
+        .await?;
+    s.items = row.try_get::<i64, _>("n").unwrap_or(0);
+
+    // Episodes belong to a show via seasons → show item.
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM episodes e
+         JOIN seasons s ON s.id = e.season_id
+         JOIN items i ON i.id = s.show_id
+         WHERE i.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_one(pool)
+    .await?;
+    s.episodes = row.try_get::<i64, _>("n").unwrap_or(0);
+
+    // Files: present + total bytes, joined either via item (movie)
+    // or via episode → season → show item.
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(mf.size_bytes), 0) AS bytes
+         FROM media_files mf
+         LEFT JOIN items i_movie ON mf.item_id = i_movie.id
+         LEFT JOIN episodes ep ON mf.episode_id = ep.id
+         LEFT JOIN seasons s ON ep.season_id = s.id
+         LEFT JOIN items i_show ON s.show_id = i_show.id
+         WHERE mf.removed_at IS NULL
+           AND (i_movie.library_id = ?1 OR i_show.library_id = ?1)",
+    )
+    .bind(library_id)
+    .fetch_one(pool)
+    .await?;
+    s.files = row.try_get::<i64, _>("n").unwrap_or(0);
+    s.total_bytes = row.try_get::<i64, _>("bytes").unwrap_or(0);
+
+    s.orphan_files = count_removed_media_files(pool, library_id).await?;
+
+    let row = sqlx::query(
+        "SELECT MAX(finished_at) AS last_at FROM scan_jobs
+         WHERE library_id = ? AND status = 'succeeded'",
+    )
+    .bind(library_id)
+    .fetch_one(pool)
+    .await?;
+    s.last_scanned_at = row.try_get::<Option<i64>, _>("last_at").ok().flatten();
+
+    Ok(s)
+}
+
+/// Count soft-deleted files for a library — used by the admin UI
+/// to show a "N orphan(s) pending purge" badge per library card.
+pub async fn count_removed_media_files(pool: &SqlitePool, library_id: i64) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM media_files mf
+         LEFT JOIN items i_movie ON mf.item_id = i_movie.id
+         LEFT JOIN episodes ep ON mf.episode_id = ep.id
+         LEFT JOIN seasons s ON ep.season_id = s.id
+         LEFT JOIN items i_show ON s.show_id = i_show.id
+         WHERE mf.removed_at IS NOT NULL
+           AND (i_movie.library_id = ?1 OR i_show.library_id = ?1)",
+    )
+    .bind(library_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("n").unwrap_or(0))
+}
+
 pub async fn upsert_item(
     pool: &SqlitePool,
     library_id: i64,
@@ -2212,7 +3620,13 @@ pub async fn upsert_media_file(
             width      = excluded.width,
             height     = excluded.height,
             hdr_format = excluded.hdr_format,
-            scanned_at = excluded.scanned_at
+            scanned_at = excluded.scanned_at,
+            -- A file that previously had `removed_at` set is back on
+            -- disk (the scanner only emits an upsert when it sees a
+            -- candidate file). Clear the soft-delete marker so the
+            -- row reappears in listings; preserves the existing id
+            -- so play_state / markers / preview sprites stay linked.
+            removed_at = NULL
          RETURNING id",
     )
     .bind(input.item_id)
@@ -2337,6 +3751,16 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
     let rating_audience = pick(&locked, "rating_audience", meta.rating_audience).flatten();
     let duration_ms = meta.runtime_min.map(|m| (m as i64) * 60_000);
 
+    // Logo art: we resolve the TMDB-relative path to a fully-qualified
+    // URL (matching how poster/backdrop are persisted via store_image)
+    // so the frontend doesn't need to know the TMDB image base. `w500`
+    // is plenty for the modal hero — most title-treatment logos are
+    // ≤ 1500px wide at original; w500 keeps payload light.
+    let logo_url = meta
+        .logo_path
+        .as_deref()
+        .map(|p| tmdb_image_url(p, "w500"));
+
     sqlx::query(
         "UPDATE items SET
             title = COALESCE(?, title),
@@ -2349,6 +3773,7 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
             rating_audience = COALESCE(?, rating_audience),
             tmdb_id = ?,
             imdb_id = COALESCE(?, imdb_id),
+            logo_path = COALESCE(?, logo_path),
             refreshed_at = ?,
             updated_at = ?
          WHERE id = ?",
@@ -2366,6 +3791,7 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
     .bind(rating_audience)
     .bind(meta.tmdb_id)
     .bind(meta.imdb_id.as_deref())
+    .bind(logo_url.as_deref())
     .bind(now)
     .bind(now)
     .bind(item_id)
@@ -2413,6 +3839,10 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
     let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
     let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
     let year = pick(&locked, "year", meta.year).flatten();
+    let logo_url = meta
+        .logo_path
+        .as_deref()
+        .map(|p| tmdb_image_url(p, "w500"));
 
     sqlx::query(
         "UPDATE items SET
@@ -2423,6 +3853,7 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
             year = COALESCE(?, year),
             tmdb_id = ?,
             imdb_id = COALESCE(?, imdb_id),
+            logo_path = COALESCE(?, logo_path),
             refreshed_at = ?,
             updated_at = ?
          WHERE id = ?",
@@ -2436,6 +3867,7 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
     .bind(year)
     .bind(meta.tmdb_id)
     .bind(meta.imdb_id.as_deref())
+    .bind(logo_url.as_deref())
     .bind(now)
     .bind(now)
     .bind(item_id)
@@ -2727,6 +4159,203 @@ pub async fn apply_show_metadata_tvmaze(
         }
     }
 
+    Ok(())
+}
+
+/// Apply AniList show metadata as the **primary** source for an anime
+/// item. Distinct from `apply_show_metadata_tvmaze`/`_tvdb` which only
+/// fill nulls — here we overwrite null-or-stale columns with AniList's
+/// canonical values for fields AniList owns (anilist_id, original_title,
+/// summary, year, duration_ms), while still honoring per-item locks.
+pub async fn apply_show_metadata_anilist(
+    pool: &SqlitePool,
+    item_id: i64,
+    meta: &AniListShow,
+) -> Result<()> {
+    let now = now_ms();
+    let locked = fetch_locked_fields(pool, item_id).await?;
+    let title = pick(&locked, "title", Some(meta.title.clone())).flatten();
+    let sort_title = title.as_deref().map(make_sort_title);
+    let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
+    let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
+    let year = pick(&locked, "year", meta.year).flatten();
+    let anilist_id = pick(&locked, "anilist_id", Some(meta.anilist_id)).flatten();
+    // AniList exposes per-episode runtime in minutes; we store an item-
+    // level duration as a rough hint for the UI when no media file has
+    // been probed yet.
+    let duration_ms = pick(
+        &locked,
+        "duration_ms",
+        meta.episode_duration_minutes.map(|m| i64::from(m) * 60_000),
+    )
+    .flatten();
+
+    sqlx::query(
+        "UPDATE items SET
+            title = COALESCE(?, title),
+            sort_title = COALESCE(?, sort_title),
+            original_title = COALESCE(?, original_title),
+            summary = COALESCE(?, summary),
+            year = COALESCE(?, year),
+            duration_ms = COALESCE(?, duration_ms),
+            anilist_id = COALESCE(?, anilist_id),
+            refreshed_at = ?,
+            updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&title)
+    .bind(&sort_title)
+    .bind(&original_title)
+    .bind(&summary)
+    .bind(year)
+    .bind(duration_ms)
+    .bind(anilist_id)
+    .bind(now)
+    .bind(now)
+    .bind(item_id)
+    .execute(pool)
+    .await?;
+
+    if !is_locked(&locked, "genres") {
+        apply_genres_additive(pool, item_id, &meta.genres).await?;
+    }
+    if !is_locked(&locked, "poster") {
+        if let Some(p) = &meta.poster_url {
+            store_image_if_missing(pool, Some(item_id), None, "poster", "anilist", p).await?;
+        }
+    }
+    if !is_locked(&locked, "backdrop") {
+        if let Some(p) = &meta.backdrop_url {
+            store_image_if_missing(pool, Some(item_id), None, "backdrop", "anilist", p).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply TVDB show metadata using the same "fill nulls only" merge
+/// policy as TVMaze. Distinct query from `apply_show_metadata_tvmaze`
+/// because TVDB has its own column projection (notably original_title
+/// and the show's own tvdb_id is authoritative when set).
+pub async fn apply_show_metadata_tvdb(
+    pool: &SqlitePool,
+    item_id: i64,
+    meta: &TvdbShow,
+) -> Result<()> {
+    let now = now_ms();
+    let locked = fetch_locked_fields(pool, item_id).await?;
+    let title = pick(&locked, "title", meta.title.clone());
+    let sort_title = title.as_deref().map(make_sort_title);
+    let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
+    let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
+    let year = pick(&locked, "year", meta.year).flatten();
+    let imdb_id = pick(&locked, "imdb_id", meta.imdb_id.clone()).flatten();
+    let tvdb_id = pick(&locked, "tvdb_id", Some(meta.tvdb_id)).flatten();
+
+    sqlx::query(
+        "UPDATE items SET
+            title = COALESCE(title, ?),
+            sort_title = COALESCE(sort_title, ?),
+            original_title = COALESCE(original_title, ?),
+            summary = COALESCE(summary, ?),
+            year = COALESCE(year, ?),
+            imdb_id = COALESCE(imdb_id, ?),
+            tvdb_id = COALESCE(tvdb_id, ?),
+            refreshed_at = ?,
+            updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&title)
+    .bind(&sort_title)
+    .bind(&original_title)
+    .bind(&summary)
+    .bind(year)
+    .bind(&imdb_id)
+    .bind(tvdb_id)
+    .bind(now)
+    .bind(now)
+    .bind(item_id)
+    .execute(pool)
+    .await?;
+
+    if !is_locked(&locked, "genres") {
+        apply_genres_additive(pool, item_id, &meta.genres).await?;
+    }
+    if !is_locked(&locked, "poster") {
+        if let Some(p) = &meta.poster_url {
+            store_image_if_missing(pool, Some(item_id), None, "poster", "tvdb", p).await?;
+        }
+    }
+    if !is_locked(&locked, "backdrop") {
+        if let Some(p) = &meta.backdrop_url {
+            store_image_if_missing(pool, Some(item_id), None, "backdrop", "tvdb", p).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn apply_movie_metadata_tvdb(
+    pool: &SqlitePool,
+    item_id: i64,
+    meta: &TvdbMovie,
+) -> Result<()> {
+    let now = now_ms();
+    let locked = fetch_locked_fields(pool, item_id).await?;
+    let title = pick(&locked, "title", meta.title.clone());
+    let sort_title = title.as_deref().map(make_sort_title);
+    let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
+    let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
+    let year = pick(&locked, "year", meta.year).flatten();
+    let imdb_id = pick(&locked, "imdb_id", meta.imdb_id.clone()).flatten();
+    let tvdb_id = pick(&locked, "tvdb_id", Some(meta.tvdb_id)).flatten();
+    // TVDB runtime is in minutes; the items schema stores duration in ms.
+    let duration_ms = pick(
+        &locked,
+        "duration_ms",
+        meta.runtime_minutes.map(|m| i64::from(m) * 60_000),
+    )
+    .flatten();
+
+    sqlx::query(
+        "UPDATE items SET
+            title = COALESCE(title, ?),
+            sort_title = COALESCE(sort_title, ?),
+            original_title = COALESCE(original_title, ?),
+            summary = COALESCE(summary, ?),
+            year = COALESCE(year, ?),
+            duration_ms = COALESCE(duration_ms, ?),
+            imdb_id = COALESCE(imdb_id, ?),
+            tvdb_id = COALESCE(tvdb_id, ?),
+            refreshed_at = ?,
+            updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&title)
+    .bind(&sort_title)
+    .bind(&original_title)
+    .bind(&summary)
+    .bind(year)
+    .bind(duration_ms)
+    .bind(&imdb_id)
+    .bind(tvdb_id)
+    .bind(now)
+    .bind(now)
+    .bind(item_id)
+    .execute(pool)
+    .await?;
+
+    if !is_locked(&locked, "genres") {
+        apply_genres_additive(pool, item_id, &meta.genres).await?;
+    }
+    if !is_locked(&locked, "poster") {
+        if let Some(p) = &meta.poster_url {
+            store_image_if_missing(pool, Some(item_id), None, "poster", "tvdb", p).await?;
+        }
+    }
+    if !is_locked(&locked, "backdrop") {
+        if let Some(p) = &meta.backdrop_url {
+            store_image_if_missing(pool, Some(item_id), None, "backdrop", "tvdb", p).await?;
+        }
+    }
     Ok(())
 }
 
@@ -3587,6 +5216,60 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.transcoder_encoder_preset {
+        sqlx::query("UPDATE server_settings SET transcoder_encoder_preset = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.transcoder_hw_strictness {
+        sqlx::query("UPDATE server_settings SET transcoder_hw_strictness = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.email_smtp_host {
+        sqlx::query("UPDATE server_settings SET email_smtp_host = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.email_smtp_port {
+        sqlx::query("UPDATE server_settings SET email_smtp_port = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.email_smtp_username {
+        sqlx::query("UPDATE server_settings SET email_smtp_username = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.email_smtp_security {
+        sqlx::query("UPDATE server_settings SET email_smtp_security = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.email_from_address {
+        sqlx::query("UPDATE server_settings SET email_from_address = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.email_from_name {
+        sqlx::query("UPDATE server_settings SET email_from_name = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.totp_enforcement {
+        sqlx::query("UPDATE server_settings SET totp_enforcement = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.extras_json {
         sqlx::query("UPDATE server_settings SET extras_json = ? WHERE id = 1")
             .bind(v)
@@ -3789,32 +5472,56 @@ pub async fn delete_optimized_version(pool: &SqlitePool, id: i64) -> Result<Opti
 // Webhooks
 // ---------------------------------------------------------------------------
 
-pub async fn list_webhooks(pool: &SqlitePool) -> Result<Vec<Webhook>> {
+pub async fn list_webhooks(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+) -> Result<Vec<Webhook>> {
     let rows = sqlx::query("SELECT * FROM webhooks ORDER BY id ASC")
         .fetch_all(pool)
         .await?;
-    rows.iter().map(Webhook::from_row).collect()
+    rows.iter().map(|row| Webhook::from_row(row, vault)).collect()
 }
 
-pub async fn get_webhook(pool: &SqlitePool, id: i64) -> Result<Option<Webhook>> {
+pub async fn get_webhook(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+    id: i64,
+) -> Result<Option<Webhook>> {
     let row = sqlx::query("SELECT * FROM webhooks WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await?;
-    row.as_ref().map(Webhook::from_row).transpose()
+    row.as_ref()
+        .map(|row| Webhook::from_row(row, vault))
+        .transpose()
 }
 
-pub async fn create_webhook(pool: &SqlitePool, input: NewWebhook) -> Result<Webhook> {
+pub async fn create_webhook(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+    input: NewWebhook,
+) -> Result<Webhook> {
     let now = now_ms();
     let mask = serde_json::to_string(&input.event_mask)?;
+    let encrypted = input
+        .secret
+        .as_deref()
+        .map(|s| vault.encrypt_str(s))
+        .transpose()?;
+    let (secret_enc, secret_nonce) = match encrypted {
+        Some(blob) => (Some(blob.value), blob.nonce),
+        None => (None, None),
+    };
     let id: i64 = sqlx::query(
-        "INSERT INTO webhooks (name, url, secret, event_mask, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO webhooks
+         (name, url, secret_enc, secret_nonce, event_mask, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(&input.name)
     .bind(&input.url)
-    .bind(input.secret.as_deref())
+    .bind(secret_enc)
+    .bind(secret_nonce)
     .bind(&mask)
     .bind(i64::from(input.enabled))
     .bind(now)
@@ -3822,13 +5529,14 @@ pub async fn create_webhook(pool: &SqlitePool, input: NewWebhook) -> Result<Webh
     .fetch_one(pool)
     .await?
     .try_get("id")?;
-    get_webhook(pool, id)
+    get_webhook(pool, vault, id)
         .await?
         .context("inserted webhook disappeared")
 }
 
 pub async fn update_webhook(
     pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
     id: i64,
     update: WebhookUpdate,
 ) -> Result<Option<Webhook>> {
@@ -3851,12 +5559,28 @@ pub async fn update_webhook(
             .await?;
     }
     if let Some(v) = &update.secret {
-        sqlx::query("UPDATE webhooks SET secret = ?, updated_at = ? WHERE id = ?")
-            .bind(v.as_deref())
-            .bind(now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // `Option<Option<String>>` semantics: outer Some = "we're touching
+        // this field", inner None = "clear it". Encrypt the new value when
+        // present; either way, clear the legacy plaintext column so a
+        // half-migrated row doesn't keep an old plaintext copy around.
+        let (enc, nonce) = match v {
+            Some(s) => {
+                let blob = vault.encrypt_str(s)?;
+                (Some(blob.value), blob.nonce)
+            }
+            None => (None, None),
+        };
+        sqlx::query(
+            "UPDATE webhooks
+             SET secret_enc = ?, secret_nonce = ?, secret = NULL, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(enc)
+        .bind(nonce)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(v) = &update.event_mask {
         let s = serde_json::to_string(v)?;
@@ -3876,7 +5600,7 @@ pub async fn update_webhook(
             .await?;
     }
     tx.commit().await?;
-    get_webhook(pool, id).await
+    get_webhook(pool, vault, id).await
 }
 
 pub async fn delete_webhook(pool: &SqlitePool, id: i64) -> Result<bool> {
@@ -4297,6 +6021,771 @@ fn parse_air_date_to_ms(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86_400_000)
+}
+
+// ─── Trakt sync (Phase 15) ─────────────────────────────────────────────────
+//
+// Per-user OAuth tokens (device-flow minted) and per-user ratings. The
+// tokens table is upserted on link, deleted on unlink. Ratings have a
+// uniqueness constraint per (user, item) and per (user, episode) so
+// duplicate inserts no-op.
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TraktTokensRow {
+    pub user_id: i64,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub scope: Option<String>,
+    pub expires_at: i64,
+    pub linked_at: i64,
+    pub last_synced_at: Option<i64>,
+}
+
+pub async fn upsert_trakt_tokens(
+    pool: &SqlitePool,
+    user_id: i64,
+    access_token: &str,
+    refresh_token: &str,
+    scope: Option<&str>,
+    expires_at: i64,
+) -> Result<()> {
+    let now = now_ms();
+    sqlx::query(
+        "INSERT INTO user_trakt_tokens
+            (user_id, access_token, refresh_token, scope, expires_at, linked_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+            access_token = excluded.access_token,
+            refresh_token = excluded.refresh_token,
+            scope = excluded.scope,
+            expires_at = excluded.expires_at",
+    )
+    .bind(user_id)
+    .bind(access_token)
+    .bind(refresh_token)
+    .bind(scope)
+    .bind(expires_at)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_trakt_tokens(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<TraktTokensRow>> {
+    let row = sqlx::query(
+        "SELECT * FROM user_trakt_tokens WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some(TraktTokensRow {
+        user_id: row.try_get("user_id")?,
+        access_token: row.try_get("access_token")?,
+        refresh_token: row.try_get("refresh_token")?,
+        scope: row.try_get::<Option<String>, _>("scope").ok().flatten(),
+        expires_at: row.try_get("expires_at")?,
+        linked_at: row.try_get("linked_at")?,
+        last_synced_at: row.try_get::<Option<i64>, _>("last_synced_at").ok().flatten(),
+    }))
+}
+
+pub async fn delete_trakt_tokens(pool: &SqlitePool, user_id: i64) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM user_trakt_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn update_trakt_last_synced(
+    pool: &SqlitePool,
+    user_id: i64,
+    when_ms: i64,
+) -> Result<()> {
+    sqlx::query("UPDATE user_trakt_tokens SET last_synced_at = ? WHERE user_id = ?")
+        .bind(when_ms)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_trakt_linked_user_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
+    let rows = sqlx::query("SELECT user_id FROM user_trakt_tokens")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().filter_map(|r| r.try_get("user_id").ok()).collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserRatingRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub item_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    pub rating: i32,
+    pub rated_at: i64,
+}
+
+pub async fn set_user_rating(
+    pool: &SqlitePool,
+    user_id: i64,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+    rating: i32,
+) -> Result<UserRatingRow> {
+    if !(1..=10).contains(&rating) {
+        anyhow::bail!("rating must be between 1 and 10");
+    }
+    if item_id.is_some() == episode_id.is_some() {
+        anyhow::bail!("exactly one of item_id or episode_id is required");
+    }
+    let now = now_ms();
+    // SQLite can't ON CONFLICT against a partial-unique-index target
+    // cleanly, so do a transactional upsert by hand.
+    let mut tx = pool.begin().await?;
+    let existing = if let Some(id) = item_id {
+        sqlx::query("SELECT id FROM user_ratings WHERE user_id = ? AND item_id = ?")
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        sqlx::query("SELECT id FROM user_ratings WHERE user_id = ? AND episode_id = ?")
+            .bind(user_id)
+            .bind(episode_id.unwrap())
+            .fetch_optional(&mut *tx)
+            .await?
+    };
+    let id: i64 = if let Some(row) = existing {
+        let rid: i64 = row.try_get("id")?;
+        sqlx::query("UPDATE user_ratings SET rating = ?, rated_at = ? WHERE id = ?")
+            .bind(rating)
+            .bind(now)
+            .bind(rid)
+            .execute(&mut *tx)
+            .await?;
+        rid
+    } else {
+        sqlx::query(
+            "INSERT INTO user_ratings (user_id, item_id, episode_id, rating, rated_at)
+             VALUES (?, ?, ?, ?, ?)
+             RETURNING id",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .bind(episode_id)
+        .bind(rating)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("id")?
+    };
+    tx.commit().await?;
+    Ok(UserRatingRow {
+        id,
+        user_id,
+        item_id,
+        episode_id,
+        rating,
+        rated_at: now,
+    })
+}
+
+pub async fn delete_user_rating(
+    pool: &SqlitePool,
+    user_id: i64,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+) -> Result<bool> {
+    let res = if let Some(id) = item_id {
+        sqlx::query("DELETE FROM user_ratings WHERE user_id = ? AND item_id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(pool)
+            .await?
+    } else if let Some(id) = episode_id {
+        sqlx::query("DELETE FROM user_ratings WHERE user_id = ? AND episode_id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(pool)
+            .await?
+    } else {
+        anyhow::bail!("one of item_id or episode_id is required");
+    };
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn get_user_rating_for_item(
+    pool: &SqlitePool,
+    user_id: i64,
+    item_id: i64,
+) -> Result<Option<i32>> {
+    let row = sqlx::query(
+        "SELECT rating FROM user_ratings WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user_id)
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.try_get::<i32, _>("rating").unwrap_or(0)))
+}
+
+pub async fn get_user_rating_for_episode(
+    pool: &SqlitePool,
+    user_id: i64,
+    episode_id: i64,
+) -> Result<Option<i32>> {
+    let row = sqlx::query(
+        "SELECT rating FROM user_ratings WHERE user_id = ? AND episode_id = ?",
+    )
+    .bind(user_id)
+    .bind(episode_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.try_get::<i32, _>("rating").unwrap_or(0)))
+}
+
+// ─── Tags (Phase 14) ───────────────────────────────────────────────────────
+//
+// Plain operator-managed labels. Distinct from `genres`, which the
+// metadata pipeline writes; tags are never touched by enrichment so a
+// user's `rewatch` label survives every refresh.
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+}
+
+pub async fn list_tags(pool: &SqlitePool) -> Result<Vec<Tag>> {
+    let rows = sqlx::query("SELECT id, name FROM tags ORDER BY name COLLATE NOCASE")
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(Tag {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn list_tags_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<Tag>> {
+    let rows = sqlx::query(
+        "SELECT t.id, t.name
+         FROM tags t
+         JOIN item_tags it ON it.tag_id = t.id
+         WHERE it.item_id = ?
+         ORDER BY t.name COLLATE NOCASE",
+    )
+    .bind(item_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(Tag {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn add_tag_to_item(
+    pool: &SqlitePool,
+    item_id: i64,
+    name: &str,
+) -> Result<Tag> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("tag name must not be empty");
+    }
+    // Upsert the tag, then bind to the item. The COLLATE NOCASE unique
+    // index dedupes case-only variants ("Rewatch" vs "rewatch").
+    let id: i64 = sqlx::query(
+        "INSERT INTO tags (name) VALUES (?)
+         ON CONFLICT(name) DO UPDATE SET name = excluded.name
+         RETURNING id",
+    )
+    .bind(trimmed)
+    .fetch_one(pool)
+    .await?
+    .try_get("id")?;
+    sqlx::query("INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?, ?)")
+        .bind(item_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(Tag {
+        id,
+        name: trimmed.to_string(),
+    })
+}
+
+pub async fn remove_tag_from_item(
+    pool: &SqlitePool,
+    item_id: i64,
+    tag_id: i64,
+) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM item_tags WHERE item_id = ? AND tag_id = ?")
+        .bind(item_id)
+        .bind(tag_id)
+        .execute(pool)
+        .await?;
+    // Garbage-collect tags no other item references — keeps the tag
+    // list curated to what's actually in use.
+    sqlx::query(
+        "DELETE FROM tags WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM item_tags WHERE tag_id = tags.id)",
+    )
+    .bind(tag_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+// ─── Preview sprites ───────────────────────────────────────────────────────
+//
+// One scrub-preview sprite per media_file. Dimensions live on the row so
+// the player can compute tile offsets without an extra round trip.
+
+#[derive(Debug, Clone)]
+pub struct PreviewSpriteRecord {
+    pub media_file_id: i64,
+    pub path: String,
+    pub interval_ms: i64,
+    pub tile_width: i64,
+    pub tile_height: i64,
+    pub tile_cols: i64,
+    pub tile_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaFileForPreview {
+    pub id: i64,
+    pub path: String,
+    pub duration_ms: Option<i64>,
+}
+
+/// Return media files in the given library (or globally if `None`) that
+/// have a non-null duration and no preview sprite yet.
+pub async fn list_media_files_needing_previews(
+    pool: &SqlitePool,
+    library_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<MediaFileForPreview>> {
+    let rows = if let Some(lid) = library_id {
+        sqlx::query(
+            "SELECT mf.id AS id, mf.path AS path, mf.duration_ms AS duration_ms
+             FROM media_files mf
+             LEFT JOIN items i ON i.id = mf.item_id
+             LEFT JOIN episodes e ON e.id = mf.episode_id
+             LEFT JOIN seasons s ON s.id = e.season_id
+             WHERE mf.preview_sprite_path IS NULL
+               AND mf.duration_ms IS NOT NULL
+               AND (i.library_id = ? OR s.show_id IN
+                    (SELECT id FROM items WHERE library_id = ?))
+             LIMIT ?",
+        )
+        .bind(lid)
+        .bind(lid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT id, path, duration_ms FROM media_files
+             WHERE preview_sprite_path IS NULL AND duration_ms IS NOT NULL
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.iter()
+        .map(|row| {
+            Ok(MediaFileForPreview {
+                id: row.try_get("id")?,
+                path: row.try_get("path")?,
+                duration_ms: row.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+            })
+        })
+        .collect()
+}
+
+pub async fn record_preview_sprite(
+    pool: &SqlitePool,
+    record: PreviewSpriteRecord,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE media_files SET
+            preview_sprite_path = ?,
+            preview_interval_ms = ?,
+            preview_tile_width = ?,
+            preview_tile_height = ?,
+            preview_tile_cols = ?,
+            preview_tile_count = ?
+         WHERE id = ?",
+    )
+    .bind(&record.path)
+    .bind(record.interval_ms)
+    .bind(record.tile_width)
+    .bind(record.tile_height)
+    .bind(record.tile_cols)
+    .bind(record.tile_count)
+    .bind(record.media_file_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_preview_sprite(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Option<PreviewSpriteRecord>> {
+    let row = sqlx::query(
+        "SELECT id, preview_sprite_path, preview_interval_ms,
+                preview_tile_width, preview_tile_height,
+                preview_tile_cols, preview_tile_count
+         FROM media_files WHERE id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let path: Option<String> = row.try_get("preview_sprite_path").ok().flatten();
+    let Some(path) = path else { return Ok(None) };
+    Ok(Some(PreviewSpriteRecord {
+        media_file_id: row.try_get("id")?,
+        path,
+        interval_ms: row.try_get("preview_interval_ms")?,
+        tile_width: row.try_get("preview_tile_width")?,
+        tile_height: row.try_get("preview_tile_height")?,
+        tile_cols: row.try_get("preview_tile_cols")?,
+        tile_count: row.try_get("preview_tile_count")?,
+    }))
+}
+
+// ─── External subtitles ────────────────────────────────────────────────────
+//
+// One row per fetched/uploaded subtitle file. Embedded subtitle streams
+// live on media_streams; this is the parallel surface for OpenSubtitles
+// and (later) operator uploads. UNIQUE(source, source_file_id) lets the
+// fetch task re-run without inserting duplicates.
+
+fn row_to_external_subtitle(row: &SqliteRow) -> Result<ExternalSubtitle> {
+    Ok(ExternalSubtitle {
+        id: row.try_get("id")?,
+        item_id: row.try_get::<Option<i64>, _>("item_id").ok().flatten(),
+        episode_id: row.try_get::<Option<i64>, _>("episode_id").ok().flatten(),
+        language: row.try_get("language")?,
+        source: row.try_get("source")?,
+        source_file_id: row.try_get::<Option<String>, _>("source_file_id").ok().flatten(),
+        file_path: row.try_get("file_path")?,
+        forced: row.try_get::<i64, _>("forced")? != 0,
+        sdh: row.try_get::<i64, _>("sdh")? != 0,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+pub async fn insert_external_subtitle(
+    pool: &SqlitePool,
+    input: NewExternalSubtitle,
+) -> Result<ExternalSubtitle> {
+    let now = now_ms();
+    let id: i64 = sqlx::query(
+        "INSERT INTO external_subtitles
+         (item_id, episode_id, language, source, source_file_id, file_path, forced, sdh, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source, source_file_id) DO UPDATE SET
+             file_path = excluded.file_path,
+             item_id = excluded.item_id,
+             episode_id = excluded.episode_id,
+             language = excluded.language,
+             forced = excluded.forced,
+             sdh = excluded.sdh
+         RETURNING id",
+    )
+    .bind(input.item_id)
+    .bind(input.episode_id)
+    .bind(&input.language)
+    .bind(&input.source)
+    .bind(&input.source_file_id)
+    .bind(&input.file_path)
+    .bind(i64::from(input.forced))
+    .bind(i64::from(input.sdh))
+    .bind(now)
+    .fetch_one(pool)
+    .await?
+    .try_get("id")?;
+    sqlx::query("SELECT * FROM external_subtitles WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map(|row| row_to_external_subtitle(&row))?
+}
+
+pub async fn list_external_subtitles_for_item(
+    pool: &SqlitePool,
+    item_id: i64,
+) -> Result<Vec<ExternalSubtitle>> {
+    let rows = sqlx::query(
+        "SELECT * FROM external_subtitles WHERE item_id = ?
+         ORDER BY language, forced DESC, sdh DESC, id",
+    )
+    .bind(item_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(row_to_external_subtitle).collect()
+}
+
+pub async fn list_external_subtitles_for_episode(
+    pool: &SqlitePool,
+    episode_id: i64,
+) -> Result<Vec<ExternalSubtitle>> {
+    let rows = sqlx::query(
+        "SELECT * FROM external_subtitles WHERE episode_id = ?
+         ORDER BY language, forced DESC, sdh DESC, id",
+    )
+    .bind(episode_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(row_to_external_subtitle).collect()
+}
+
+pub async fn get_external_subtitle(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<ExternalSubtitle>> {
+    let row = sqlx::query("SELECT * FROM external_subtitles WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(row_to_external_subtitle).transpose()
+}
+
+// ─── Credential vault ──────────────────────────────────────────────────────
+//
+// Persistence for chimpflix_common::Vault's "named secrets" surface. The
+// crypto lives in the vault crate; this module only stores ciphertext +
+// nonce, with NULL nonce signalling plaintext mode.
+
+pub async fn vault_get(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+    name: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT value_enc, nonce FROM secrets WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("load secret {name}"))?;
+    let Some(row) = row else { return Ok(None) };
+    let value_enc: Vec<u8> = row.try_get("value_enc")?;
+    let nonce: Option<Vec<u8>> = row.try_get("nonce").ok().flatten();
+    let blob = chimpflix_common::EncryptedBlob {
+        value: value_enc,
+        nonce,
+    };
+    let plaintext = vault
+        .decrypt_str(&blob)
+        .with_context(|| format!("decrypt secret {name}"))?;
+    Ok(Some(plaintext))
+}
+
+pub async fn vault_set(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+    name: &str,
+    plaintext: &str,
+    updated_by: Option<i64>,
+) -> Result<()> {
+    let blob = vault
+        .encrypt_str(plaintext)
+        .with_context(|| format!("encrypt secret {name}"))?;
+    sqlx::query(
+        "INSERT INTO secrets (name, value_enc, nonce, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET
+             value_enc  = excluded.value_enc,
+             nonce      = excluded.nonce,
+             updated_at = excluded.updated_at,
+             updated_by = excluded.updated_by",
+    )
+    .bind(name)
+    .bind(blob.value)
+    .bind(blob.nonce)
+    .bind(now_ms())
+    .bind(updated_by)
+    .execute(pool)
+    .await
+    .with_context(|| format!("upsert secret {name}"))?;
+    Ok(())
+}
+
+pub async fn vault_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM secrets WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await
+        .with_context(|| format!("delete secret {name}"))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// List metadata for every stored secret, decrypting only enough to
+/// compute the masked `last4`. Returns rows sorted by name.
+pub async fn vault_list_metadata(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+) -> Result<Vec<SecretMetadata>> {
+    let rows = sqlx::query(
+        "SELECT name, value_enc, nonce, updated_at, updated_by
+         FROM secrets ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .context("list secrets")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let value_enc: Vec<u8> = row.try_get("value_enc")?;
+        let nonce: Option<Vec<u8>> = row.try_get("nonce").ok().flatten();
+        let blob = chimpflix_common::EncryptedBlob {
+            value: value_enc,
+            nonce,
+        };
+        let last4 = match vault.decrypt_str(&blob) {
+            Ok(plain) => masked_last4(&plain),
+            // A decrypt failure here usually means the master key changed
+            // out from under existing rows. Don't surface raw error to the
+            // UI — show "????" so the operator knows the slot is broken
+            // but the listing call still succeeds.
+            Err(_) => "????".to_string(),
+        };
+        out.push(SecretMetadata {
+            name,
+            set: true,
+            last4,
+            updated_at: row.try_get("updated_at")?,
+            updated_by: row.try_get("updated_by").ok().flatten(),
+        });
+    }
+    Ok(out)
+}
+
+/// Re-encrypt rows that were stored in plaintext mode (`nonce IS NULL`)
+/// after the operator turned encryption on. Without this, the first
+/// `vault_get` for any plaintext row would fail with a mismatched-mode
+/// error and crash startup. No-op when the vault is itself in plaintext
+/// mode. Returns (named_secrets_upgraded, webhook_secrets_upgraded).
+pub async fn upgrade_plaintext_secrets(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+) -> Result<(usize, usize)> {
+    if !vault.is_encrypted() {
+        return Ok((0, 0));
+    }
+
+    let mut named = 0;
+    let rows = sqlx::query("SELECT name, value_enc FROM secrets WHERE nonce IS NULL")
+        .fetch_all(pool)
+        .await
+        .context("scan secrets for plaintext rows")?;
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let plaintext: Vec<u8> = row.try_get("value_enc")?;
+        let blob = vault.encrypt(&plaintext)?;
+        sqlx::query(
+            "UPDATE secrets SET value_enc = ?, nonce = ?, updated_at = ? WHERE name = ?",
+        )
+        .bind(blob.value)
+        .bind(blob.nonce)
+        .bind(now_ms())
+        .bind(&name)
+        .execute(pool)
+        .await
+        .with_context(|| format!("re-encrypt secret {name}"))?;
+        named += 1;
+    }
+
+    let mut hooks = 0;
+    let rows = sqlx::query(
+        "SELECT id, secret_enc FROM webhooks
+         WHERE secret_enc IS NOT NULL AND secret_nonce IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .context("scan webhooks for plaintext-encoded secrets")?;
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let plaintext: Vec<u8> = row.try_get("secret_enc")?;
+        let blob = vault.encrypt(&plaintext)?;
+        sqlx::query(
+            "UPDATE webhooks SET secret_enc = ?, secret_nonce = ? WHERE id = ?",
+        )
+        .bind(blob.value)
+        .bind(blob.nonce)
+        .bind(id)
+        .execute(pool)
+        .await
+        .with_context(|| format!("re-encrypt webhook secret id={id}"))?;
+        hooks += 1;
+    }
+
+    Ok((named, hooks))
+}
+
+/// One-shot migration from the legacy plaintext `webhooks.secret` column
+/// into the encrypted `secret_enc`/`secret_nonce` pair. Idempotent —
+/// re-runs are no-ops once every row is converted. Returns the number of
+/// rows migrated this call.
+pub async fn backfill_webhook_secrets(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+) -> Result<usize> {
+    let rows = sqlx::query(
+        "SELECT id, secret FROM webhooks
+         WHERE secret IS NOT NULL AND secret_enc IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .context("scan webhooks for plaintext secrets")?;
+
+    let mut count = 0;
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let secret: String = row.try_get("secret")?;
+        let blob = vault.encrypt_str(&secret)?;
+        sqlx::query(
+            "UPDATE webhooks
+             SET secret_enc = ?, secret_nonce = ?, secret = NULL
+             WHERE id = ?",
+        )
+        .bind(blob.value)
+        .bind(blob.nonce)
+        .bind(id)
+        .execute(pool)
+        .await
+        .with_context(|| format!("backfill webhook secret id={id}"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn masked_last4(plaintext: &str) -> String {
+    let chars: Vec<char> = plaintext.chars().collect();
+    if chars.len() <= 4 {
+        "*".repeat(chars.len().max(1))
+    } else {
+        chars[chars.len() - 4..].iter().collect()
+    }
 }
 
 #[cfg(test)]

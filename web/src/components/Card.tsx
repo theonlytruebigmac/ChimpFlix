@@ -128,130 +128,125 @@ function HoverPanel({
   const { inList, toggle: toggleMyList } = useMyListItem(modalKey);
 
   return (
-    <div className="space-y-2.5 bg-(--color-surface) p-3">
-      <div className="line-clamp-1 text-sm font-medium">{label}</div>
-
-      <div className="flex items-center gap-2">
+    <div className="space-y-2 bg-(--color-surface) px-3 py-3">
+      {/*
+        Title — Netflix bakes the title into the card image art so they
+        omit it from the hover panel, but we don't generate per-title
+        logo art so we keep a thin one-liner here. Sized smaller than
+        the meta below so it stays a label, not a heading.
+      */}
+      <div className="line-clamp-1 text-[0.78rem] font-semibold text-white">
+        {label}
+      </div>
+      {/*
+        Button row, Netflix order: filled Play (white) → outlined +
+        (My List) → outlined thumbs-up (like) → flex-spacer → outlined
+        chevron (More info). Same 7-w-7 size across the row keeps the
+        rhythm tight; the Play button is the only filled one so the
+        eye lands there first.
+      */}
+      <div className="flex items-center gap-1.5">
         <Link
           href={`/watch/${item.ratingKey}`}
           aria-label="Play"
           onMouseEnter={prefetchPlay}
           onFocus={prefetchPlay}
-          className="flex h-8 w-8 items-center justify-center rounded-full bg-white text-black transition-colors hover:bg-white/85"
+          className="flex h-7 w-7 items-center justify-center rounded-full bg-white text-black transition-colors hover:bg-white/85"
         >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="currentColor"
-            aria-hidden
-          >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
             <path d="M6 4l14 8-14 8V4z" />
           </svg>
         </Link>
-        <button
-          type="button"
+        <CircleButton
+          aria-label={inList ? "Remove from My List" : "Add to My List"}
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
             toggleMyList();
           }}
-          aria-label={inList ? "Remove from My List" : "Add to My List"}
-          className="flex h-8 w-8 items-center justify-center rounded-full border border-white/40 text-white transition-colors hover:border-white"
         >
           {inList ? (
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="3"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
               <polyline points="20 6 9 17 4 12" />
             </svg>
           ) : (
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              aria-hidden
-            >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
               <line x1="12" y1="5" x2="12" y2="19" />
               <line x1="5" y1="12" x2="19" y2="12" />
             </svg>
           )}
-        </button>
-        <button
-          type="button"
-          aria-label="Mark as liked"
-          className="flex h-8 w-8 items-center justify-center rounded-full border border-white/40 text-white transition-colors hover:border-white"
-        >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            aria-hidden
-          >
+        </CircleButton>
+        <CircleButton aria-label="Mark as liked">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
             <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3" />
           </svg>
-        </button>
-        <button
-          type="button"
-          onClick={() => openModal(modalKey)}
+        </CircleButton>
+        <CircleButton
+          className="ml-auto"
           aria-label="More info"
-          className="ml-auto flex h-8 w-8 items-center justify-center rounded-full border border-white/40 text-white transition-colors hover:border-white"
+          onClick={() => openModal(modalKey)}
         >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            aria-hidden
-          >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
             <polyline points="6 9 12 15 18 9" />
           </svg>
-        </button>
+        </CircleButton>
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+      {/*
+        Meta row, Netflix order: maturity chip (with thin outline),
+        runtime / season count, "HD" chip on the right. Sits tight
+        against the buttons.
+      */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.7rem] text-white/90">
         {item.contentRating && (
           <span className="rounded border border-white/40 px-1.5 py-px font-medium">
             {item.contentRating}
           </span>
         )}
-        {seasonCount !== undefined && seasonCount > 0 && (
-          <span>
-            {seasonCount} Season{seasonCount > 1 ? "s" : ""}
-          </span>
-        )}
-        {!isShow && item.duration && (
-          <span>{formatRuntime(item.duration)}</span>
-        )}
-        {item.year && <span className="text-white/70">{item.year}</span>}
+        {seasonCount !== undefined && seasonCount > 0 ? (
+          <span>{seasonCount} Season{seasonCount > 1 ? "s" : ""}</span>
+        ) : null}
+        {!isShow && item.duration && <span>{formatRuntime(item.duration)}</span>}
+        <span className="rounded border border-white/40 px-1.5 py-px text-[0.65rem] font-semibold tracking-wider">
+          HD
+        </span>
       </div>
 
+      {/*
+        Mood / genre line — 3 items max, separated by dots. Netflix
+        uses curated mood tags ("Suspenseful · Witty · Family-Friendly");
+        we fall back to genres because we don't generate mood tags
+        locally.
+      */}
       {item.genres && item.genres.length > 0 && (
-        <div className="flex flex-wrap items-center gap-x-1.5 text-xs text-white/90">
+        <div className="flex flex-wrap items-center gap-x-1.5 text-[0.7rem] text-white/85">
           {item.genres.slice(0, 3).map((g, i) => (
             <span key={g} className="flex items-center gap-1.5">
-              {i > 0 && <span className="text-white/40">•</span>}
+              {i > 0 && <span className="text-white/35">•</span>}
               {g}
             </span>
           ))}
         </div>
       )}
     </div>
+  );
+}
+
+/// Small round button used throughout the hover panel. White outline,
+/// transparent fill, hover brightens the border. Sized 7×7 so the
+/// row fits without crowding the filled Play button.
+function CircleButton({
+  children,
+  className = "",
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      type="button"
+      {...props}
+      className={`flex h-7 w-7 items-center justify-center rounded-full border border-white/40 text-white transition-colors hover:border-white ${className}`}
+    >
+      {children}
+    </button>
   );
 }

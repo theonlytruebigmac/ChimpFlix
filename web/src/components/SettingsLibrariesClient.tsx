@@ -14,6 +14,17 @@ interface Props {
   initial: Library[];
 }
 
+function kindLabel(kind: LibraryKind): string {
+  switch (kind) {
+    case "movies":
+      return "Movies";
+    case "shows":
+      return "Shows";
+    case "anime":
+      return "Anime";
+  }
+}
+
 export function SettingsLibrariesClient({ initial }: Props) {
   const [libs, setLibs] = useState(initial);
   const [busy, setBusy] = useState<number | "create" | null>(null);
@@ -188,8 +199,7 @@ export function SettingsLibrariesClient({ initial }: Props) {
                 <div className="flex-1">
                   <div className="font-medium">{lib.name}</div>
                   <div className="text-xs text-white/55">
-                    {lib.kind === "movies" ? "Movies" : "Shows"} ·{" "}
-                    {lib.paths.join(", ")}
+                    {kindLabel(lib.kind)} · {lib.paths.join(", ")}
                   </div>
                   {lib.last_scan_at && (
                     <div className="mt-0.5 text-xs text-white/40">
@@ -412,8 +422,7 @@ function EditLibraryForm({
       className="rounded-md border border-white/10 bg-white/5 p-4"
     >
       <div className="mb-3 text-xs text-white/50">
-        Editing &ldquo;{lib.name}&rdquo; · kind is fixed (
-        {lib.kind === "movies" ? "Movies" : "Shows"})
+        Editing &ldquo;{lib.name}&rdquo; · kind is fixed ({kindLabel(lib.kind)})
       </div>
       <label className="block text-xs">
         <span className="mb-1 block text-white/60">Name</span>
@@ -506,6 +515,7 @@ function AddLibraryForm({
           >
             <option value="movies">Movies</option>
             <option value="shows">Shows</option>
+            <option value="anime">Anime</option>
           </select>
         </label>
       </div>

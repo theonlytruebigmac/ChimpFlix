@@ -112,6 +112,6 @@ pub async fn server_info(
             shows,
             episodes,
         },
-        tmdb_enabled: state.tmdb.is_some(),
+        tmdb_enabled: state.tmdb.read().await.is_some(),
     }))
 }

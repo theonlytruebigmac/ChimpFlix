@@ -30,14 +30,92 @@ async fn access(state: &AppState, user: &AuthUser) -> Result<Option<Vec<i64>>, A
         .map_err(ApiError::Internal)
 }
 
+/// Combine the role-based access list with an optional request-supplied
+/// `library_ids` filter. Either alone restricts; both together restrict
+/// to the intersection. Owners (acc = None) accept the request set
+/// verbatim.
+fn restrict_access(acc: Option<Vec<i64>>, requested: Option<Vec<i64>>) -> Option<Vec<i64>> {
+    match (acc, requested) {
+        (None, None) => None,
+        (None, Some(req)) => Some(req),
+        (Some(allowed), None) => Some(allowed),
+        (Some(allowed), Some(req)) => {
+            let allowed_set: std::collections::HashSet<i64> = allowed.into_iter().collect();
+            Some(req.into_iter().filter(|id| allowed_set.contains(id)).collect())
+        }
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     user: AuthUser,
-    Query(filter): Query<ItemFilter>,
+    Query(mut filter): Query<ItemFilter>,
 ) -> Result<Json<ItemPage>, ApiError> {
     let acc = access(&state, &user).await?;
-    let page = queries::list_items(&state.pool, filter, user.id, acc.as_deref()).await?;
+    let effective = restrict_access(acc, filter.library_ids.take());
+    let page = queries::list_items(&state.pool, filter, user.id, effective.as_deref()).await?;
     Ok(Json(page))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrendingQuery {
+    /// `movie` or `show`; defaults to `movie`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// 1-50. Defaults to 10 (the Top 10 rail wants exactly 10).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Same shape as `ItemFilter::library_ids` — `?library_ids=1,2,3`.
+    /// Lets browse surfaces apply the user's visibility prefs without
+    /// the trending endpoint needing to know about prefs directly.
+    #[serde(
+        default,
+        deserialize_with = "chimpflix_library::deserialize_csv_i64s"
+    )]
+    pub library_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrendingItem {
+    pub rank: i64,
+    #[serde(flatten)]
+    pub item: ListedItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrendingResponse {
+    pub items: Vec<TrendingItem>,
+}
+
+/// Top N items in this library that are also on TMDB's global weekly
+/// trending list, ordered by trending rank (1 = most trending). Empty
+/// when TMDB isn't configured or the `refresh_trending` task hasn't
+/// run yet, or when the library doesn't intersect the global list.
+pub async fn trending(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<TrendingQuery>,
+) -> Result<Json<TrendingResponse>, ApiError> {
+    let kind = match q.kind.as_deref().unwrap_or("movie") {
+        "show" => ItemKind::Show,
+        _ => ItemKind::Movie,
+    };
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    let acc = access(&state, &user).await?;
+    let effective = restrict_access(acc, q.library_ids);
+    let rows = queries::list_trending_in_library(
+        &state.pool,
+        kind,
+        user.id,
+        limit,
+        effective.as_deref(),
+    )
+    .await?;
+    let items = rows
+        .into_iter()
+        .map(|(rank, item)| TrendingItem { rank, item })
+        .collect();
+    Ok(Json(TrendingResponse { items }))
 }
 
 pub async fn get_one(
@@ -70,7 +148,8 @@ pub async fn trailer(
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
-    let Some(tmdb) = &state.tmdb else {
+    let tmdb_snapshot = state.tmdb_snapshot().await;
+    let Some(tmdb) = tmdb_snapshot.as_ref() else {
         return Ok(Json(TrailerResponse { video_id: None }));
     };
     let Some(tmdb_id) = detail.item.tmdb_id else {
@@ -102,7 +181,8 @@ pub async fn similar(
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
-    let Some(tmdb) = &state.tmdb else {
+    let tmdb_snapshot = state.tmdb_snapshot().await;
+    let Some(tmdb) = tmdb_snapshot.as_ref() else {
         return Ok(Json(SimilarResponse { items: Vec::new() }));
     };
     let Some(tmdb_id) = detail.item.tmdb_id else {
@@ -173,7 +253,8 @@ pub async fn tmdb_posters(
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
-    let Some(tmdb) = &state.tmdb else {
+    let tmdb_snapshot = state.tmdb_snapshot().await;
+    let Some(tmdb) = tmdb_snapshot.as_ref() else {
         return Ok(Json(TmdbPostersResponse { posters: Vec::new() }));
     };
     let Some(tmdb_id) = detail.item.tmdb_id else {
@@ -314,11 +395,20 @@ pub async fn refresh(
     if !matches!(user.role, chimpflix_library::UserRole::Owner) {
         return Err(ApiError::Forbidden);
     }
-    let Some(tmdb) = &state.tmdb else {
+    let tmdb_snapshot = state.tmdb_snapshot().await;
+    let Some(tmdb) = tmdb_snapshot.as_ref() else {
         return Err(ApiError::validation("TMDB enrichment is disabled"));
     };
+    let tvdb_snapshot = state.tvdb_snapshot().await;
     let acc = access(&state, &user).await?;
-    scanner::refresh_item_metadata(&state.pool, tmdb, state.tvmaze.as_ref(), id, None)
+    scanner::refresh_item_metadata(
+        &state.pool,
+        tmdb,
+        tvdb_snapshot.as_ref(),
+        state.tvmaze.as_ref(),
+        id,
+        None,
+    )
         .await
         .map_err(ApiError::Internal)?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
@@ -347,7 +437,8 @@ pub async fn match_search(
     if !matches!(user.role, chimpflix_library::UserRole::Owner) {
         return Err(ApiError::Forbidden);
     }
-    let Some(tmdb) = &state.tmdb else {
+    let tmdb_snapshot = state.tmdb_snapshot().await;
+    let Some(tmdb) = tmdb_snapshot.as_ref() else {
         return Err(ApiError::validation("TMDB enrichment is disabled"));
     };
     let acc = access(&state, &user).await?;
@@ -379,13 +470,16 @@ pub async fn match_apply(
     if !matches!(user.role, chimpflix_library::UserRole::Owner) {
         return Err(ApiError::Forbidden);
     }
-    let Some(tmdb) = &state.tmdb else {
+    let tmdb_snapshot = state.tmdb_snapshot().await;
+    let Some(tmdb) = tmdb_snapshot.as_ref() else {
         return Err(ApiError::validation("TMDB enrichment is disabled"));
     };
+    let tvdb_snapshot = state.tvdb_snapshot().await;
     let acc = access(&state, &user).await?;
     scanner::refresh_item_metadata(
         &state.pool,
         tmdb,
+        tvdb_snapshot.as_ref(),
         state.tvmaze.as_ref(),
         id,
         Some(input.tmdb_id),

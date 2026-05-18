@@ -31,7 +31,7 @@ pub async fn list(
     State(state): State<AppState>,
     _owner: OwnerAuth,
 ) -> Result<Json<WebhooksListResponse>, ApiError> {
-    let webhooks = queries::list_webhooks(&state.pool)
+    let webhooks = queries::list_webhooks(&state.pool, &state.vault)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(WebhooksListResponse {
@@ -47,7 +47,7 @@ pub async fn create(
     Json(input): Json<NewWebhook>,
 ) -> Result<(StatusCode, Json<WebhookResponse>), ApiError> {
     validate_new(&input)?;
-    let webhook = queries::create_webhook(&state.pool, input.clone())
+    let webhook = queries::create_webhook(&state.pool, &state.vault, input.clone())
         .await
         .map_err(ApiError::Internal)?;
     audit(&state, actor.id, &headers, "webhook.create", webhook.id, &input).await;
@@ -67,7 +67,7 @@ pub async fn update(
     if let Some(ref mask) = input.event_mask {
         validate_event_mask(mask)?;
     }
-    let webhook = queries::update_webhook(&state.pool, id, input.clone())
+    let webhook = queries::update_webhook(&state.pool, &state.vault, id, input.clone())
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
@@ -97,7 +97,7 @@ pub async fn test_fire(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let hook = queries::get_webhook(&state.pool, id)
+    let hook = queries::get_webhook(&state.pool, &state.vault, id)
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;

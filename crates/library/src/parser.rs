@@ -32,6 +32,7 @@ pub fn classify(file_path: &Path, root: &Path, kind: LibraryKind) -> Option<Clas
     match kind {
         LibraryKind::Movies => classify_movie(file_path),
         LibraryKind::Shows => classify_episode(file_path, root),
+        LibraryKind::Anime => classify_anime(file_path, root),
     }
 }
 
@@ -127,6 +128,82 @@ fn parse_season_episode(stem: &str) -> Option<(i32, i32, Option<String>)> {
         return Some((s, e, Some(after.to_string()).filter(|s| !s.is_empty())));
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Anime episodes
+// ---------------------------------------------------------------------------
+//
+// Anime libraries differ from generic shows in two ways:
+//
+//   1. Filenames usually carry an *absolute* episode number rather than
+//      season+episode. We map these onto season 1 so the existing schema
+//      (which requires a season_id) just works; the AniList agent will
+//      eventually split long-runners back into proper seasons during
+//      enrichment.
+//
+//   2. Fansub release tags live in the filename: `[Group] Title - 12.mkv`,
+//      `[SubsPlease] Title - 234 (1080p).mkv`, and so on. We use the
+//      parent directory as the canonical show title and only look to the
+//      filename for the episode number.
+
+static ANIME_EPISODE_NUM: LazyLock<Regex> = LazyLock::new(|| {
+    // Episode number that's either:
+    //   - "- 12", "- 12v2" (the most common form after fansub tags)
+    //   - "EP12", "Ep 12", "E12" (no season marker)
+    //   - bare "12" at the end of the stem
+    // We require at least one digit and allow an optional version suffix
+    // (e.g. v2). Order matters — the dash-anchored form is more specific
+    // and must match first.
+    Regex::new(
+        r"(?ix)
+        (?:
+            \s-\s*(?P<ep1>\d{1,4})(?:v\d+)?\b
+          | \bEP?\s*(?P<ep2>\d{1,4})(?:v\d+)?\b
+          | \b(?P<ep3>\d{1,4})(?:v\d+)?\s*$
+        )",
+    )
+    .unwrap()
+});
+
+fn classify_anime(file_path: &Path, root: &Path) -> Option<Classification> {
+    // Prefer the standard S01E02 path when it's present — many users
+    // organize anime that way, and we want to honor it.
+    if let Some(c) = classify_episode(file_path, root) {
+        return Some(c);
+    }
+
+    // Otherwise: the first path component below the root is the show
+    // directory; the filename carries an absolute episode number we map
+    // to season 1.
+    let rel = file_path.strip_prefix(root).ok()?;
+    let mut comps = rel.components();
+    let show_dir = comps.next()?.as_os_str().to_str()?;
+    let (show_title_raw, show_year) =
+        parse_title_with_year(show_dir).unwrap_or_else(|| (show_dir.to_string(), None));
+
+    let stem = file_path.file_stem()?.to_str()?;
+    // Strip fansub-tag brackets before regex matching so the trailing
+    // "[1080p]" or "[CRC32]" can't be misread as the episode number.
+    let cleaned = strip_brackets(stem);
+    let cleaned = cleaned.trim();
+    let caps = ANIME_EPISODE_NUM.captures(cleaned)?;
+    let episode: i32 = caps
+        .name("ep1")
+        .or_else(|| caps.name("ep2"))
+        .or_else(|| caps.name("ep3"))?
+        .as_str()
+        .parse()
+        .ok()?;
+
+    Some(Classification::Episode {
+        show_sort_title: make_sort_title(&show_title_raw),
+        show_title: show_title_raw,
+        show_year,
+        season: 1,
+        episode,
+        title: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +388,67 @@ mod tests {
     fn rejects_no_episode_tag() {
         let p = PathBuf::from("/s/Severance/randomfile.mkv");
         assert!(classify(&p, Path::new("/s"), LibraryKind::Shows).is_none());
+    }
+
+    #[test]
+    fn anime_fansub_with_dash() {
+        let p =
+            PathBuf::from("/a/Frieren Beyond Journey's End/[SubsPlease] Frieren - 28 (1080p) [ABCD1234].mkv");
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+            Classification::Episode {
+                show_title,
+                season,
+                episode,
+                ..
+            } => {
+                assert_eq!(show_title, "Frieren Beyond Journey's End");
+                assert_eq!(season, 1);
+                assert_eq!(episode, 28);
+            }
+            _ => panic!("expected episode"),
+        }
+    }
+
+    #[test]
+    fn anime_version_suffix_stripped() {
+        let p = PathBuf::from("/a/Bocchi the Rock/Bocchi - 12v2.mkv");
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+            Classification::Episode { episode, .. } => assert_eq!(episode, 12),
+            _ => panic!("expected episode"),
+        }
+    }
+
+    #[test]
+    fn anime_absolute_long_runner() {
+        // One Piece-style absolute numbering past 1000.
+        let p = PathBuf::from("/a/One Piece/One Piece - 1100.mkv");
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+            Classification::Episode { season, episode, .. } => {
+                assert_eq!(season, 1);
+                assert_eq!(episode, 1100);
+            }
+            _ => panic!("expected episode"),
+        }
+    }
+
+    #[test]
+    fn anime_with_season_episode_tag_uses_show_parser() {
+        // When the file does carry S01E05, prefer that over the absolute
+        // path so users who organize anime by season aren't surprised.
+        let p = PathBuf::from("/a/Attack on Titan/Season 4/Attack.on.Titan.S04E28.mkv");
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+            Classification::Episode { season, episode, .. } => {
+                assert_eq!(season, 4);
+                assert_eq!(episode, 28);
+            }
+            _ => panic!("expected episode"),
+        }
+    }
+
+    #[test]
+    fn anime_rejects_no_episode_number() {
+        let p = PathBuf::from("/a/Bleach/notes.mkv");
+        assert!(classify(&p, Path::new("/a"), LibraryKind::Anime).is_none());
     }
 
     #[test]

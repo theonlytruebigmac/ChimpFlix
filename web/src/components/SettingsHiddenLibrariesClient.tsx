@@ -62,27 +62,33 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
 
   return (
     <div>
-      <p className="mb-3 text-xs text-white/55">
+      <p className="mb-3 text-xs text-white/50">
         Hidden libraries are excluded from your home page and browse rails.
       </p>
-      <ul className="space-y-2">
+      <ul className="divide-y divide-white/5 border-y border-white/5">
         {libraries.map((lib) => {
           const isHidden = hidden.has(lib.id);
           return (
             <li key={lib.id}>
-              <label className="flex cursor-pointer items-center gap-3 rounded p-2 text-sm hover:bg-white/5">
-                <input
-                  type="checkbox"
-                  checked={isHidden}
-                  onChange={() => toggle(lib.id)}
-                  disabled={busy}
-                  className="h-4 w-4 accent-(--color-accent)"
-                />
-                <span className={isHidden ? "text-white/60" : "text-white"}>
-                  {lib.name}
+              <label className="flex cursor-pointer items-center justify-between gap-3 py-3 text-sm transition-colors hover:bg-white/2">
+                <span className="flex items-baseline gap-2">
+                  <span className={isHidden ? "text-white/55" : "text-white"}>
+                    {lib.name}
+                  </span>
+                  <span className="text-xs text-white/40">
+                    {lib.kind === "movies" ? "Movies" : "Shows"}
+                  </span>
                 </span>
-                <span className="text-xs text-white/45">
-                  ({lib.kind === "movies" ? "Movies" : "Shows"})
+                <span className="relative inline-flex h-6 w-11 shrink-0 items-center">
+                  <input
+                    type="checkbox"
+                    checked={isHidden}
+                    onChange={() => toggle(lib.id)}
+                    disabled={busy}
+                    className="peer sr-only"
+                  />
+                  <span className="absolute inset-0 rounded-full bg-white/15 transition-colors peer-checked:bg-(--color-accent)" />
+                  <span className="absolute left-0.5 inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform peer-checked:translate-x-5" />
                 </span>
               </label>
             </li>

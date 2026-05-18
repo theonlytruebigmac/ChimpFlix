@@ -1,14 +1,22 @@
 //! ffmpeg/ffprobe orchestration for probing and HLS transcoding.
 
 pub mod capabilities;
+pub mod hwaccel;
 pub mod markers;
+pub mod previews;
 pub mod probe;
 pub mod session;
 
 pub use capabilities::{TranscoderCapabilities, detect_capabilities};
+pub use hwaccel::{EncoderPreset, HwAccel};
 pub use markers::{DetectedMarker, MarkerKind, detect_markers};
-pub use probe::{ProbeResult, ProbeStream, StreamKind, probe};
-pub use session::{Session, SessionSnapshot, TranscodeManager};
+pub use previews::{DEFAULT_INTERVAL_S, DEFAULT_TILE_WIDTH, SpriteInfo, generate_sprite};
+pub use probe::{GopProbe, ProbeResult, ProbeStream, StreamKind, probe, probe_gop, probe_subtitle_codec};
+pub use session::{
+    AudioTreatment, ContainerFormat, HLS_SEGMENT_DURATION_S, Session, SessionSnapshot,
+    SubExtractionStatus, TranscodeManager, VideoTreatment, WebVttSidecar,
+    evict_text_subs_cache, is_text_subtitle_codec, scan_prewarm_text_subs,
+};
 
 #[derive(Debug, Clone)]
 pub struct FfmpegConfig {

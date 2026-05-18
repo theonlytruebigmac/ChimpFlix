@@ -29,6 +29,9 @@ export type MediaItem = {
   summary?: string;
   thumb?: string;
   art?: string;
+  /// Transparent title-treatment logo (TMDB-relative path). When set,
+  /// the modal hero swaps the plain text H1 for the logo image.
+  logo?: string;
   year?: number;
   duration?: number;
   viewOffset?: number;

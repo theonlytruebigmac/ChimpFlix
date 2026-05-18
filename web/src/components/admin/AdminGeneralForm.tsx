@@ -5,6 +5,7 @@ import {
   admin as adminApi,
   type ServerSettings,
   type ServerSettingsUpdate,
+  type TotpEnforcement,
 } from "@/lib/chimpflix-api";
 
 interface Props {
@@ -19,6 +20,9 @@ export function AdminGeneralForm({ initial }: Props) {
   const [serverName, setServerName] = useState(initial.server_name);
   const [publicUrl, setPublicUrl] = useState(initial.public_url ?? "");
   const [telemetry, setTelemetry] = useState(initial.telemetry_opt_in);
+  const [totpEnforcement, setTotpEnforcement] = useState<TotpEnforcement>(
+    initial.totp_enforcement,
+  );
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -26,7 +30,8 @@ export function AdminGeneralForm({ initial }: Props) {
   const dirty =
     serverName !== initial.server_name ||
     (publicUrl || null) !== (initial.public_url ?? null) ||
-    telemetry !== initial.telemetry_opt_in;
+    telemetry !== initial.telemetry_opt_in ||
+    totpEnforcement !== initial.totp_enforcement;
 
   async function save() {
     setSaving(true);
@@ -40,6 +45,9 @@ export function AdminGeneralForm({ initial }: Props) {
       if (telemetry !== initial.telemetry_opt_in) {
         patch.telemetry_opt_in = telemetry;
       }
+      if (totpEnforcement !== initial.totp_enforcement) {
+        patch.totp_enforcement = totpEnforcement;
+      }
       await adminApi.settings.patch(patch);
       setSavedAt(Date.now());
       // Reflect the new "saved" baseline so dirty-checks reset.
@@ -47,6 +55,7 @@ export function AdminGeneralForm({ initial }: Props) {
         server_name: serverName,
         public_url: publicUrl.trim() || null,
         telemetry_opt_in: telemetry,
+        totp_enforcement: totpEnforcement,
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -85,6 +94,25 @@ export function AdminGeneralForm({ initial }: Props) {
             placeholder="https://chimpflix.example.com"
             className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
           />
+        </Field>
+      </Section>
+
+      <Section title="Security">
+        <Field
+          label="Two-factor enforcement"
+          hint="`required` forces every account to enroll TOTP before login completes. `optional` lets users enroll themselves. `disabled` blocks new enrollments — existing 2FA stays active until the user disables it."
+        >
+          <select
+            value={totpEnforcement}
+            onChange={(e) =>
+              setTotpEnforcement(e.target.value as TotpEnforcement)
+            }
+            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+          >
+            <option value="optional">Optional (default)</option>
+            <option value="required">Required for all users</option>
+            <option value="disabled">Disabled — block new enrollments</option>
+          </select>
         </Field>
       </Section>
 

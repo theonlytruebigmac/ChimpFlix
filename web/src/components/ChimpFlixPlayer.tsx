@@ -15,7 +15,105 @@ import {
   stream as streamApi,
   playState as playStateApi,
 } from "@/lib/chimpflix-api";
-import { getPrefs, updatePrefs, usePrefs } from "@/lib/prefs";
+import { detectClientCapabilities } from "@/lib/client-caps";
+import {
+  cssFontFamilyForSubtitlePref,
+  getPrefs,
+  prefsToAssStyle,
+  updatePrefs,
+  usePrefs,
+} from "@/lib/prefs";
+import { consumePrewarm } from "@/lib/prewarm";
+
+export interface QualityChoice {
+  label: string;
+  /// `null` = let the server decide (defaults). Otherwise the player
+  /// will ask the transcoder to scale to this height and target this
+  /// video bitrate (audio bitrate is fixed at 192k regardless).
+  height: number | null;
+  bitrate_bps: number | null;
+}
+
+/// Fixed quality ladder, ordered high → low. "Auto" sits at the top so
+/// picker scrolling matches user expectations.
+const QUALITY_OPTIONS: QualityChoice[] = [
+  { label: "Auto", height: null, bitrate_bps: null },
+  { label: "1080p", height: 1080, bitrate_bps: 5_000_000 },
+  { label: "720p", height: 720, bitrate_bps: 2_500_000 },
+  { label: "480p", height: 480, bitrate_bps: 1_200_000 },
+  { label: "240p", height: 240, bitrate_bps: 400_000 },
+];
+
+/// Subtitle appearance preferences. Applied via injected `<style>`
+/// using `::cue` selectors, so the same WebVTT sidecar renders
+/// differently per user / preference without re-extracting the
+/// file. Stored to localStorage so it persists across sessions and
+/// files.
+export interface SubtitleAppearance {
+  /// CSS font-size in pixels. 24 looks right at 1080p; we expose a
+  /// stepped list rather than a continuous slider because cue
+  /// rendering rounds anyway and steps are easier to dial in.
+  fontSizePx: number;
+  /// Foreground (text) color. Hex including the leading #.
+  textColor: string;
+  /// Background rgba, applied to the cue box. Includes alpha so
+  /// "fully transparent" (text-shadow only) is a valid pick.
+  backgroundColor: string;
+  /// Edge style for the glyphs. Outline is the safest pick over
+  /// busy backgrounds; shadow looks cleaner on dark cinema content;
+  /// none lets the cue box do all the contrast work.
+  edge: "none" | "outline" | "shadow";
+  /// Bottom inset as a percentage of the player height. 5-15 is
+  /// the typical range; higher pushes subs closer to the middle
+  /// of the frame (useful on phones held in portrait).
+  bottomInsetPct: number;
+}
+
+const DEFAULT_SUBTITLE_APPEARANCE: SubtitleAppearance = {
+  fontSizePx: 24,
+  textColor: "#ffffff",
+  backgroundColor: "rgba(0,0,0,0.55)",
+  edge: "outline",
+  bottomInsetPct: 8,
+};
+
+const FONT_SIZE_PRESETS: { label: string; px: number }[] = [
+  { label: "S", px: 18 },
+  { label: "M", px: 24 },
+  { label: "L", px: 32 },
+  { label: "XL", px: 42 },
+];
+const TEXT_COLOR_PRESETS: { label: string; value: string }[] = [
+  { label: "White", value: "#ffffff" },
+  { label: "Yellow", value: "#ffe066" },
+  { label: "Cyan", value: "#7dd3fc" },
+  { label: "Green", value: "#a3e635" },
+];
+const BG_PRESETS: { label: string; value: string }[] = [
+  { label: "None", value: "rgba(0,0,0,0)" },
+  { label: "Light", value: "rgba(0,0,0,0.35)" },
+  { label: "Medium", value: "rgba(0,0,0,0.55)" },
+  { label: "Solid", value: "rgba(0,0,0,0.85)" },
+];
+
+const OFFSET_STORAGE_PREFIX = "chimpflix:subtitle:offset:";
+const APPEARANCE_STORAGE_KEY = "chimpflix:subtitle:appearance";
+
+export interface VersionChoice {
+  media_file_id: number;
+  /// Pre-formatted label for the picker, e.g. "4K HDR · HEVC" or
+  /// "1080p". The watch page builds this from MediaFileSummary so the
+  /// player stays string-pure.
+  label: string;
+  /// Audio tracks for this specific file. Indices are 0-based among the
+  /// file's audio streams. Each version may have different audio (a
+  /// 4K release commonly bundles more language dubs than the 1080p).
+  audioTracks: StreamChoice[];
+  /// Embedded subtitle tracks for this specific file, plus the same
+  /// external subs that apply to every version (their URLs aren't file
+  /// scoped). Lets the picker show the right rows after a switch.
+  subtitleTracks: StreamChoice[];
+}
 
 export interface StreamChoice {
   // 0-indexed among that kind's streams in the file. Pass straight to the
@@ -23,6 +121,18 @@ export interface StreamChoice {
   idx: number;
   label: string;
   language?: string | null;
+  /// Raw codec name from ffprobe (lowercase). Used by the watch-page
+  /// auto-picker to skip picture-based subtitles (PGS, DVD, VobSub)
+  /// that need a heavyweight overlay path the user almost never
+  /// wants by default — the user can still select them manually
+  /// from the picker if they're the only option.
+  codec?: string | null;
+  /// When set, this is an external subtitle (`external_subtitles` row).
+  /// The player renders it via an HTML5 `<track>` instead of asking the
+  /// transcoder to burn it in — works for direct-play and HLS without
+  /// the subtitle-burn fallback. Transcode-burn for external subs is
+  /// queued as a follow-up.
+  externalUrl?: string;
 }
 
 export interface PlayerMarker {
@@ -62,8 +172,28 @@ interface Props {
   subtitleTracks?: StreamChoice[];
   audioIndex?: number;
   subtitleIndex?: number;
+  /// When set, seed the player with an external subtitle as the initial
+  /// selection (overrides `subtitleIndex`). Used so a saved-language
+  /// preference can target an OpenSubtitles-fetched track on first
+  /// load, not just the embedded streams.
+  externalSubtitleUrl?: string;
   markers?: PlayerMarker[];
   seasonEpisodes?: EpisodeSibling[];
+  previewManifest?: PreviewManifest;
+  /// When the same title has multiple media files (4K + 1080p, etc.)
+  /// the player exposes a Version picker. Initial `mediaFileId` is
+  /// treated as the active one; switching versions just swaps the id
+  /// the session is built against, preserving playback position.
+  versions?: VersionChoice[];
+}
+
+export interface PreviewManifest {
+  sprite_url: string;
+  interval_ms: number;
+  tile_width: number;
+  tile_height: number;
+  tile_cols: number;
+  tile_count: number;
 }
 
 const PLAY_STATE_INTERVAL_MS = 10_000;
@@ -116,8 +246,11 @@ export function ChimpFlixPlayer({
   subtitleTracks,
   audioIndex,
   subtitleIndex,
+  externalSubtitleUrl,
   markers,
   seasonEpisodes,
+  previewManifest,
+  versions,
 }: Props) {
   const router = useRouter();
   const [prefs] = usePrefs();
@@ -126,14 +259,42 @@ export function ChimpFlixPlayer({
   const hideTimerRef = useRef<number | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const scrobbledRef = useRef(false);
+  /// Backend session id for the currently-mounted HLS stream. The
+  /// session-creation effect sets this; the pause/resume + scrub
+  /// pre-warm + bandwidth-downgrade hooks read it. `null` for a
+  /// direct-play session (no transcoder session to pause/resume).
+  const activeSessionIdRef = useRef<string | null>(null);
   // Captured the resume position so a track switch mid-playback comes back
   // to roughly where the user was, not the original startPositionMs.
+  // Always source-time (file timeline), not HLS media-time.
   const liveTimeMsRef = useRef<number>(startPositionMs);
+  // The source-time at which the current session's HLS stream begins.
+  // 0 for direct play (file timeline == video.currentTime). For transcode,
+  // ffmpeg fast-seeks to start_position_ms and HLS.js then renders that
+  // as media-time 0 — so source-time = video.currentTime + sessionStartMs.
+  // All public reads/writes of position go through this offset.
+  const sessionStartMsRef = useRef<number>(0);
+  // Bumped when the user seeks before the current session's start. The
+  // session useEffect lists it as a dep so the bump tears the session
+  // down and creates a new one rooted at `liveTimeMsRef.current`.
+  const [resumeEpoch, setResumeEpoch] = useState(0);
 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  /// Set true when HLS.js is mid-recovery from a fatal error
+  /// (network blip, MSE decode hiccup). A subtle overlay communicates
+  /// the state to the user without the alarming "playback failed"
+  /// chrome the error path uses. Cleared after the recovery attempt
+  /// settles (success → playback resumes; failure → `error` is set).
+  const [reconnecting, setReconnecting] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(startPositionMs / 1000);
+  // End of the contiguous buffered range that contains currentTime,
+  // expressed in source-time seconds (i.e. file timeline, not HLS
+  // media-time). Drives the lighter "buffer ahead" overlay on the
+  // seekbar so users get the Netflix-style visualization of how
+  // much is already loaded past the playhead.
+  const [bufferedEnd, setBufferedEnd] = useState(0);
   // Server-provided duration is the source of truth for the time display.
   // `video.duration` only reflects what HLS has parsed so far, which on a
   // live transcoder is wildly under-counted (e.g. 15 minutes for a 2-hour
@@ -152,6 +313,332 @@ export function ChimpFlixPlayer({
   const [subtitleSel, setSubtitleSel] = useState<number | null | undefined>(
     subtitleIndex,
   );
+  /// Active media file id. Mutated by the Version picker; the session
+  /// useEffect rebuilds the HLS pipeline against the new id while
+  /// `liveTimeMsRef` preserves playback position across the swap.
+  const [activeMediaFileId, setActiveMediaFileId] = useState(mediaFileId);
+  /// Selected quality tier. Auto (default) lets the server pick; any
+  /// non-auto choice forces transcode at the chosen resolution and
+  /// bitrate. The session useEffect lists this as a dep so picking a
+  /// new tier re-rolls ffmpeg.
+  const [qualitySel, setQualitySel] = useState<QualityChoice>(
+    QUALITY_OPTIONS[0],
+  );
+  /// Snapshot of what the server actually decided to run for the
+  /// current session. Surfaced in the Quality picker so a user with
+  /// "Auto" selected can see the resolved tier (e.g. "Auto · 1080p"),
+  /// the encoder in play, and so impractical tiers (above source
+  /// height) can be greyed out. Reset on every session re-roll.
+  const [sessionStatus, setSessionStatus] = useState<{
+    height: number | null;
+    sourceHeight: number | null;
+    encoder: string | null;
+    videoTreatment: "copy" | "reencode" | null;
+    audioTreatment: "copy" | "reencode" | null;
+  } | null>(null);
+  /// User-tunable subtitle sync offset in milliseconds. Positive =
+  /// subs delayed, negative = subs advanced. Persisted per (user,
+  /// mediaFileId) so the same correction sticks on replays of the
+  /// same source. Defaults to 0 (cache-extracted WebVTT is already
+  /// shifted by the seek offset on the server side).
+  ///
+  /// Changes here flow into the session POST as
+  /// `subtitle_offset_ms`, which triggers a session restart (server
+  /// re-shifts the cached WebVTT — ~50 ms because the source is
+  /// already in the per-file cache). No HLS.js cue-time fiddling
+  /// needed.
+  const [subtitleOffsetMs, setSubtitleOffsetMs] = useState<number>(0);
+  /// Subtitle appearance preferences applied via injected ::cue CSS.
+  /// Stored under `chimpflix:subtitle:appearance` so the same look
+  /// follows the user across files. Client-only — no session
+  /// restart on change, the player just re-renders the <style> tag.
+  const [subtitleAppearance, setSubtitleAppearance] =
+    useState<SubtitleAppearance>(DEFAULT_SUBTITLE_APPEARANCE);
+  // External-subtitle selection lives alongside subtitleSel. When set,
+  // the embedded `subtitle_index` is forced off and the video gets a
+  // sibling `<track>` element. Only one path can be active at a time.
+  // We hold url + language together so the `<track>` element gets the
+  // right `srcLang` (browsers expose it via track.language and use it
+  // to honor the user's accept-language preferences).
+  const [externalSub, setExternalSub] = useState<{
+    url: string;
+    language: string | null;
+  } | null>(
+    externalSubtitleUrl
+      ? { url: externalSubtitleUrl, language: null }
+      : null,
+  );
+  const externalSubUrl = externalSub?.url ?? null;
+
+  // Hydrate subtitle prefs from localStorage. Offset is per-file
+  // (each title has its own sync drift); appearance is global
+  // (users want consistent styling across the library). Both
+  // saves are debounced via the setter writing on every change —
+  // localStorage writes are sync but tiny, so the simple approach
+  // is fine.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const offsetRaw = window.localStorage.getItem(
+        OFFSET_STORAGE_PREFIX + activeMediaFileId,
+      );
+      if (offsetRaw !== null) {
+        const n = Number.parseInt(offsetRaw, 10);
+        if (Number.isFinite(n)) setSubtitleOffsetMs(n);
+      } else {
+        // No saved value for this file — make sure we don't keep
+        // showing the previous file's offset after a version
+        // switch.
+        setSubtitleOffsetMs(0);
+      }
+      const appRaw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
+      if (appRaw) {
+        const parsed = JSON.parse(appRaw) as Partial<SubtitleAppearance>;
+        setSubtitleAppearance({ ...DEFAULT_SUBTITLE_APPEARANCE, ...parsed });
+      }
+    } catch {
+      // Corrupt localStorage or quota issue; fall back to defaults.
+    }
+  }, [activeMediaFileId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        OFFSET_STORAGE_PREFIX + activeMediaFileId,
+        String(subtitleOffsetMs),
+      );
+    } catch {
+      // Quota exceeded or private-browsing mode; ignore.
+    }
+  }, [activeMediaFileId, subtitleOffsetMs]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        APPEARANCE_STORAGE_KEY,
+        JSON.stringify(subtitleAppearance),
+      );
+    } catch {
+      // ignore
+    }
+  }, [subtitleAppearance]);
+
+  // Move WebVTT cues vertically so they (1) honor the user's
+  // bottom-inset preference, (2) auto-shift up while the player
+  // controls overlay is visible (otherwise controls cover the
+  // bottom-most line), AND (3) account for letterboxing so the
+  // user's "5% from bottom" means 5% above the visible video,
+  // not 5% above the player element. Native WebVTT positioning
+  // is element-relative — without the letterbox math, anything
+  // under ~10% from bottom on a 16:9 video in a 21:9 container
+  // lands in the bottom black bar.
+  //
+  // We operate on TextTrack.cues directly (`cue.line` +
+  // `snapToLines=false`) because that's the only standardized way
+  // to reposition WebVTT — `::cue` CSS can style the text but not
+  // place the cue box.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const applyAll = () => {
+      // Compute letterbox height as a percentage of the video
+      // ELEMENT. `videoWidth/Height` is the source resolution
+      // and zero until `loadedmetadata`; bail out cleanly until
+      // we know the aspect.
+      const elementW = v.clientWidth;
+      const elementH = v.clientHeight;
+      const vidW = v.videoWidth;
+      const vidH = v.videoHeight;
+      let letterboxBottomPct = 0;
+      if (vidW > 0 && vidH > 0 && elementW > 0 && elementH > 0) {
+        const videoAspect = vidW / vidH;
+        const elementAspect = elementW / elementH;
+        if (videoAspect > elementAspect) {
+          // Black bars top + bottom. Render height shrinks; the
+          // bottom bar is (element - rendered) / 2.
+          const renderedH = elementW / videoAspect;
+          const barTotal = elementH - renderedH;
+          letterboxBottomPct = ((barTotal / 2) / elementH) * 100;
+        }
+        // If videoAspect < elementAspect we have pillarbox (left
+        // + right bars), which doesn't affect vertical
+        // positioning, so we leave letterboxBottomPct at 0.
+      }
+      const baseBottomPct = Math.max(0, Math.min(60, subtitleAppearance.bottomInsetPct));
+      const controlsBumpPct = showControls ? 16 : 0;
+      const effectiveBottomPct = Math.min(
+        baseBottomPct + letterboxBottomPct + controlsBumpPct,
+        80,
+      );
+      const lineFromTop = 100 - effectiveBottomPct;
+
+      for (let i = 0; i < v.textTracks.length; i++) {
+        const track = v.textTracks[i];
+        const cues = track.cues;
+        if (!cues) continue;
+        for (let j = 0; j < cues.length; j++) {
+          const cue = cues[j] as VTTCue;
+          cue.snapToLines = false;
+          cue.line = lineFromTop;
+          cue.lineAlign = "end";
+        }
+      }
+    };
+    applyAll();
+
+    // Re-apply on every condition that changes the layout: new
+    // cues loading (addtrack/cuechange), video metadata
+    // arriving (loadedmetadata supplies videoWidth/Height), the
+    // player element resizing (fullscreen toggle, window
+    // resize, sidebar collapse).
+    const onAddTrack = () => applyAll();
+    const onCueChange = () => applyAll();
+    const onMeta = () => applyAll();
+    v.textTracks.addEventListener("addtrack", onAddTrack);
+    for (let i = 0; i < v.textTracks.length; i++) {
+      v.textTracks[i].addEventListener("cuechange", onCueChange);
+    }
+    v.addEventListener("loadedmetadata", onMeta);
+    v.addEventListener("resize", onMeta);
+    const ro = new ResizeObserver(() => applyAll());
+    ro.observe(v);
+    const fsHandler = () => applyAll();
+    document.addEventListener("fullscreenchange", fsHandler);
+    return () => {
+      v.textTracks.removeEventListener("addtrack", onAddTrack);
+      for (let i = 0; i < v.textTracks.length; i++) {
+        v.textTracks[i].removeEventListener("cuechange", onCueChange);
+      }
+      v.removeEventListener("loadedmetadata", onMeta);
+      v.removeEventListener("resize", onMeta);
+      ro.disconnect();
+      document.removeEventListener("fullscreenchange", fsHandler);
+    };
+  }, [showControls, subtitleAppearance.bottomInsetPct]);
+
+  // Inject a global `::cue` stylesheet so the user's appearance
+  // prefs apply to BOTH the HLS.js-managed WebVTT sidecar and any
+  // external `<track>` we render. Updated reactively on change —
+  // no session restart needed since the WebVTT cues themselves
+  // aren't styled, only the browser's renderer is.
+  //
+  // The `::cue` pseudo-element is the standard hook for styling
+  // WebVTT captions; CSS variables in here let `background-color`
+  // and `color` be controlled live without re-mounting the
+  // stylesheet.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const STYLE_ID = "chimpflix-subtitle-style";
+    let el = document.getElementById(STYLE_ID) as HTMLStyleElement | null;
+    if (!el) {
+      el = document.createElement("style");
+      el.id = STYLE_ID;
+      document.head.appendChild(el);
+    }
+    const edgeRule = (() => {
+      switch (subtitleAppearance.edge) {
+        case "outline":
+          // Multi-shadow trick to fake an outline that survives
+          // browsers that don't support text-stroke on ::cue.
+          return "text-shadow: -1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000 !important;";
+        case "shadow":
+          return "text-shadow: 2px 2px 4px rgba(0,0,0,0.85) !important;";
+        case "none":
+        default:
+          return "text-shadow: none !important;";
+      }
+    })();
+    // `!important` everywhere because the browsers' UA stylesheet
+    // for WebVTT cues uses high-specificity selectors and would
+    // otherwise win the cascade against bare `::cue`. The two-
+    // selector form (`::cue` and `video::cue`) is also a
+    // workaround for older Chrome where the un-prefixed selector
+    // didn't always apply to programmatically-created tracks
+    // (HLS.js's case). Both `background` shorthand and
+    // `background-color` are emitted because Chrome historically
+    // only honored the shorthand on ::cue.
+    const font = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    const cssBlock = `
+      background: ${subtitleAppearance.backgroundColor} !important;
+      background-color: ${subtitleAppearance.backgroundColor} !important;
+      color: ${subtitleAppearance.textColor} !important;
+      font-size: ${subtitleAppearance.fontSizePx}px !important;
+      font-family: ${font} !important;
+      line-height: 1.25 !important;
+      ${edgeRule}
+    `;
+    el.textContent = `
+      ::cue { ${cssBlock} }
+      video::cue { ${cssBlock} }
+      ::cue(c) { ${cssBlock} }
+      ::cue(v) { ${cssBlock} }
+      ::cue(i) { ${cssBlock} }
+      ::cue(b) { ${cssBlock} }
+    `;
+    return () => {
+      // Don't remove on unmount — other player instances or tab
+      // re-entries should keep the style. The element is keyed by
+      // id so re-creating is a no-op.
+    };
+  }, [subtitleAppearance]);
+
+  // <track> elements default to `disabled` until JS flips their mode —
+  // even with the `default` attribute, autoplay-policy quirks across
+  // Chrome/Firefox can leave them hidden. Force `showing` whenever an
+  // external sub becomes the active selection, and `disabled` when
+  // it's cleared so the off case behaves predictably.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const tracks = v.textTracks;
+    for (let i = 0; i < tracks.length; i++) {
+      tracks[i].mode = externalSubUrl ? "showing" : "disabled";
+    }
+  }, [externalSubUrl]);
+
+  // Inject scoped ::cue styling for the active video element so external
+  // subtitles honor the user's font/color/background prefs. ::cue can
+  // only be styled via a stylesheet (not inline), so we mount a <style>
+  // node and rewrite its rules whenever the prefs change. The
+  // `cf-cue-{id}` class scopes the rules to this one video so multiple
+  // open tabs / PiP windows don't fight each other.
+  const videoScopeRef = useRef(
+    `cf-cue-${Math.random().toString(36).slice(2, 10)}`,
+  );
+  useEffect(() => {
+    const id = videoScopeRef.current;
+    let styleEl = document.getElementById(id) as HTMLStyleElement | null;
+    if (!styleEl) {
+      styleEl = document.createElement("style");
+      styleEl.id = id;
+      document.head.appendChild(styleEl);
+    }
+    const scale = Math.max(0.5, Math.min(3, prefs.subtitleFontScale));
+    const bg = prefs.subtitleBackground;
+    const color = prefs.subtitleColor;
+    const family = cssFontFamilyForSubtitlePref(prefs.subtitleFontFamily);
+    styleEl.textContent = `
+      .${id}::cue {
+        font-size: ${scale * 100}%;
+        color: ${color};
+        background: ${bg};
+        ${family ? `font-family: ${family};` : ""}
+      }
+    `;
+    return () => {
+      // Don't remove on unmount — the same id will be reused on re-mount
+      // and removing/recreating causes a flash of unstyled cues. The
+      // style node is cheap; let it persist for the page lifetime.
+    };
+  }, [
+    prefs.subtitleBackground,
+    prefs.subtitleColor,
+    prefs.subtitleFontScale,
+    prefs.subtitleFontFamily,
+  ]);
+  const cueClass = videoScopeRef.current;
   const [tracksOpen, setTracksOpen] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [speedOpen, setSpeedOpen] = useState(false);
@@ -159,8 +646,44 @@ export function ChimpFlixPlayer({
   const [episodesOpen, setEpisodesOpen] = useState(false);
   const [pipActive, setPipActive] = useState(false);
   const [showRemaining, setShowRemaining] = useState(true);
+  /// "Stats for nerds" overlay — surfaces decoded resolution, the
+  /// active HLS level, buffer ahead, dropped frames, and the resolved
+  /// session info in one place. Toggle with `s` or via the controls
+  /// button. Off by default; the panel only samples while visible so
+  /// it carries no cost when closed.
+  const [statsOpen, setStatsOpen] = useState(false);
   // Derived: the marker (if any) that contains the current playback time.
   const activeMarkerOverlay = activeMarker(currentTime * 1000, markers);
+  // Track the intro markers we've already auto-skipped this session so
+  // a user who manually seeks back into the intro isn't yanked
+  // forward again. Keyed by the intro's start_ms which is stable
+  // across renders.
+  const skippedIntrosRef = useRef<Set<number>>(new Set());
+
+  // Tracks shown in the picker follow the active version. Versions can
+  // differ in stream layout (4K with 3 audio dubs, 1080p with 1), so
+  // we look up by id rather than reusing the initial mount's tracks.
+  const activeVersion = versions?.find(
+    (v) => v.media_file_id === activeMediaFileId,
+  );
+  const activeAudioTracks = activeVersion?.audioTracks ?? audioTracks ?? [];
+  const activeSubtitleTracks =
+    activeVersion?.subtitleTracks ?? subtitleTracks ?? [];
+
+  /// Swap the file the session is built against. Resets embedded
+  /// audio/subtitle selections — indices are 0-based within the FILE's
+  /// streams, so the same number means a different track on a version
+  /// with a different stream layout. External subs survive because
+  /// their URL is item-scoped, not file-scoped.
+  const selectVersion = useCallback(
+    (id: number) => {
+      if (id === activeMediaFileId) return;
+      setAudioSel(undefined);
+      setSubtitleSel(undefined);
+      setActiveMediaFileId(id);
+    },
+    [activeMediaFileId],
+  );
 
   const attemptPlay = useCallback(async () => {
     const v = videoRef.current;
@@ -184,6 +707,7 @@ export function ChimpFlixPlayer({
     let cancelled = false;
     let sessionId: string | null = null;
     let cleanup: () => void = () => {};
+    let keepaliveTimer: number | null = null;
 
     const resumeMs =
       liveTimeMsRef.current > 1000 ? liveTimeMsRef.current : startPositionMs;
@@ -194,19 +718,64 @@ export function ChimpFlixPlayer({
       setLoading(true);
       setError(null);
 
-      let resp;
+      let resp: Awaited<ReturnType<typeof streamApi.createSession>>;
       try {
-        resp = await streamApi.createSession({
-          media_file_id: mediaFileId,
-          start_position_ms: resumeMs,
-          audio_index: audioSel,
-          subtitle_index: subtitleSel === null ? undefined : subtitleSel,
-          client: {
-            supported_video_codecs: ["h264"],
-            supported_audio_codecs: ["aac"],
-            supported_containers: ["mp4", "ts"],
-          },
-        });
+        // Only attach a subtitle_style when we're actually burning in.
+        // The transcoder uses it as the `force_style=` argument on
+        // ffmpeg's `subtitles=` filter — for direct play or external
+        // <track> rendering it does nothing.
+        const subtitleStyle =
+          subtitleSel !== null && subtitleSel !== undefined
+            ? (prefsToAssStyle(getPrefs()) ?? undefined)
+            : undefined;
+        const livePrefs = getPrefs();
+        // Detected per-browser support — widens direct-play to HEVC on
+        // Safari, AC3 on macOS, VP9 on Chrome/Firefox, etc. Cached for
+        // the page lifetime so each session re-roll doesn't redo the
+        // canPlayType probes.
+        const clientCaps = detectClientCapabilities();
+        // Try to adopt a hover-time pre-warmed session. We only
+        // qualify on the user-hasn't-touched-anything path because
+        // the prewarm was created with default audio/subtitle/quality
+        // — any user selection would mismatch what ffmpeg is already
+        // encoding. The match contract (mediaFileId + position within
+        // tolerance) is enforced inside `consumePrewarm`.
+        const noCustomSelection =
+          audioSel === undefined &&
+          (subtitleSel === undefined || subtitleSel === null) &&
+          qualitySel.height === null &&
+          qualitySel.bitrate_bps === null;
+        const prewarmed = noCustomSelection
+          ? consumePrewarm(activeMediaFileId, resumeMs)
+          : null;
+        if (prewarmed) {
+          resp = { session: prewarmed };
+        } else {
+          resp = await streamApi.createSession({
+            media_file_id: activeMediaFileId,
+            start_position_ms: resumeMs,
+            audio_index: audioSel,
+            subtitle_index: subtitleSel === null ? undefined : subtitleSel,
+            subtitle_style: subtitleStyle,
+            quality_target:
+              qualitySel.height !== null && qualitySel.bitrate_bps !== null
+                ? {
+                    height: qualitySel.height,
+                    bitrate_bps: qualitySel.bitrate_bps,
+                  }
+                : undefined,
+            // Only send when on — omitting matches Rust's `#[serde(default)]`
+            // and keeps the request payload small on the (default) off case.
+            audio_normalize: livePrefs.audioNormalize ? true : undefined,
+            subtitle_offset_ms:
+              subtitleOffsetMs !== 0 ? subtitleOffsetMs : undefined,
+            client: {
+              supported_video_codecs: clientCaps.video,
+              supported_audio_codecs: clientCaps.audio,
+              supported_containers: clientCaps.containers,
+            },
+          });
+        }
       } catch (e) {
         if (cancelled) return;
         if (e instanceof ChimpFlixApiError && e.status === 401) {
@@ -219,21 +788,103 @@ export function ChimpFlixPlayer({
         return;
       }
 
-      // Assign sessionId BEFORE checking `cancelled`. If the user navigated
-      // away during the create-session round-trip, cleanup needs to know
-      // the id so it can DELETE the orphan transcoder — checking cancelled
-      // first would leak the session.
       sessionId = resp.session.id !== "direct" ? resp.session.id : null;
+      activeSessionIdRef.current = sessionId;
 
-      if (cancelled) return;
+      // If the user navigated away or switched versions/tracks during
+      // the round-trip, fire DELETE inline so the orphan transcoder
+      // doesn't keep encoding. The cleanup closure already ran before
+      // we got here, so it can't see this sessionId.
+      if (cancelled) {
+        if (sessionId) {
+          const id = sessionId;
+          fetch(`/api/v1/stream/sessions/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+            keepalive: true,
+            credentials: "include",
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      // Keepalive: while the player is mounted, ping the master
+      // playlist every 60s so the server's idle reaper doesn't kill
+      // the session out from under a paused user. HLS.js stops
+      // polling once its buffer is full, so a 5-minute pause would
+      // otherwise leave us with a dead session and 404 segments on
+      // resume. 60s is comfortably under the 5-minute reaper floor
+      // and the request is cheap (master.m3u8 is synthesised, not
+      // disk-read). Skipped for direct play, which has no session.
+      if (sessionId) {
+        const id = sessionId;
+        keepaliveTimer = window.setInterval(() => {
+          fetch(
+            `/api/v1/stream/sessions/${encodeURIComponent(id)}/master.m3u8`,
+            { credentials: "include" },
+          ).catch(() => {
+            // Network blip — ignore. HLS auto-recovery handles the
+            // user-visible side; we just need to keep trying.
+          });
+        }, 60_000);
+      }
       if (resp.session.duration_ms) {
         setVideoDuration(resp.session.duration_ms / 1000);
       }
 
+      // Capture what the server actually decided to run so the picker
+      // can show "Auto · 1080p · NVENC". Direct-play sessions leave
+      // everything null (the player isn't transcoding so there's
+      // nothing interesting to report).
+      setSessionStatus({
+        height: resp.session.resolved_height ?? null,
+        sourceHeight: resp.session.source_height ?? null,
+        encoder: resp.session.encoder ?? null,
+        videoTreatment: resp.session.video_treatment ?? null,
+        audioTreatment: resp.session.audio_treatment ?? null,
+      });
+
+      // Transcode sessions have ffmpeg fast-seek to resumeMs and HLS.js
+      // renders that as media-time 0. Record the offset so source-time
+      // reads can add it back. Direct play has no shift.
+      //
+      // …with one important caveat: some HLS configurations (Safari's
+      // native player, or HLS.js when the encoder writes a non-zero
+      // PROGRAM-DATE-TIME) surface `video.currentTime` already in
+      // source-time. If we then add `sessionStartMs` on top, every
+      // position read doubles and the user reports "arrow-key jumped
+      // super far". `applyResume` measures the actual currentTime
+      // after metadata loads and zeroes the offset if it detects
+      // source-time mode — this single check protects both reads
+      // (`onTimeUpdate`, `report()`) and writes (`seekBy`/`seekTo`).
+      sessionStartMsRef.current =
+        resp.session.mode === "transcode" ? resumeMs : 0;
+
       function applyResume() {
         if (!video) return;
-        if (resumeMs > 1000) {
-          video.currentTime = resumeMs / 1000;
+        if (
+          resp.session.mode === "transcode" &&
+          Number.isFinite(video.currentTime)
+        ) {
+          const observedSec = video.currentTime;
+          const expectedSrcSec = resumeMs / 1000;
+          // If the player surfaces source-time already (observed ≈
+          // expected, both > 0), drop the offset to 0 so subsequent
+          // reads treat currentTime as source-time directly. The 5s
+          // tolerance covers fast-seek landing on a keyframe near
+          // but not exactly at resumeMs.
+          if (
+            expectedSrcSec > 1 &&
+            Math.abs(observedSec - expectedSrcSec) < 5
+          ) {
+            sessionStartMsRef.current = 0;
+          }
+        }
+        // For direct play, video.currentTime is source-time, so seek to
+        // resumeMs. For transcode where currentTime is HLS-time, the
+        // ffmpeg seek already landed us at resumeMs — no extra seek.
+        const offsetSec = (resumeMs - sessionStartMsRef.current) / 1000;
+        if (offsetSec > 1) {
+          video.currentTime = offsetSec;
         }
       }
 
@@ -267,11 +918,52 @@ export function ChimpFlixPlayer({
           if (HlsModule.isSupported()) {
             const hls = new HlsModule({
               enableWorker: true,
+              // WebVTT subtitle sidecar support. When the master
+              // playlist carries an `#EXT-X-MEDIA:TYPE=SUBTITLES`
+              // group (server-side: text subs go out as sidecar
+              // instead of being burned into video), HLS.js loads
+              // the WebVTT and creates a `TextTrack` on the
+              // <video> element. `renderTextTracksNatively=true`
+              // lets the browser render the overlay itself —
+              // standard captions, no canvas tricks. Without
+              // this opt-in HLS.js leaves the track in `disabled`
+              // mode and the user sees no subs even though the
+              // sidecar is loaded. `subtitleDisplay` lives on the
+              // hls instance (not the config), so it's set on the
+              // hls object after construction below.
+              enableWebVTT: true,
+              renderTextTracksNatively: true,
+              // Keep 30 s of played-out segments in the back buffer so
+              // small back-seeks (re-watching a line of dialog) don't
+              // need to refetch. Larger back buffer trades RAM for
+              // smoother scrubbing.
               backBufferLength: 30,
-              manifestLoadingTimeOut: 6000,
-              manifestLoadingMaxRetry: 2,
-              levelLoadingTimeOut: 6000,
+              // Forward buffer targets. ffmpeg writes a 6 s segment
+              // every ~1 s on a healthy box (NVDEC + NVENC pipeline),
+              // so we can comfortably target a 60 s ahead buffer.
+              // The bigger the forward buffer, the more cushion against
+              // an ffmpeg stutter or a brief network blip — the random
+              // pauses users see are almost always "ahead buffer fell
+              // to 0 before next segment was ready".
+              maxBufferLength: 60,
+              maxMaxBufferLength: 120,
+              // Hard cap on buffer size in MB. 1080p ~5 Mbps × 60 s ≈
+              // 38 MB; 200 MB gives us headroom for spikes without
+              // letting one tab eat a gigabyte.
+              maxBufferSize: 200 * 1000 * 1000,
+              // First-manifest timeouts have to cover the server's 15s
+              // wait for ffmpeg to write `index.m3u8`. Under-budgeting
+              // here was the cause of the "Auto quality won't start"
+              // symptom — HLS.js gave up before the encoder finished
+              // bootstrapping. Variant + fragment loads stay tight so
+              // mid-playback hiccups still surface quickly.
+              manifestLoadingTimeOut: 20000,
+              manifestLoadingMaxRetry: 4,
+              manifestLoadingRetryDelay: 500,
+              levelLoadingTimeOut: 15000,
+              levelLoadingMaxRetry: 4,
               fragLoadingTimeOut: 20000,
+              fragLoadingMaxRetry: 6,
               abrEwmaDefaultEstimate: 5_000_000,
             });
             hlsRef.current = hls;
@@ -279,12 +971,89 @@ export function ChimpFlixPlayer({
             hls.attachMedia(video);
             hls.on(HlsModule.Events.MANIFEST_PARSED, () => {
               applyResume();
-              attemptPlay();
-            });
-            hls.on(HlsModule.Events.ERROR, (_e, data) => {
-              if (data.fatal) {
-                setError(`${data.type} / ${data.details}`);
+              // Belt-and-suspenders for the WebVTT sidecar: even
+              // though the master playlist marks the subtitle
+              // group DEFAULT=YES, some HLS.js versions leave it
+              // disabled until something explicitly opts in.
+              // Setting `subtitleTrack` to the first available
+              // track index here matches what every other player
+              // does ("user picked this sub, show it").
+              if (hls.subtitleTracks && hls.subtitleTracks.length > 0) {
+                hls.subtitleTrack = 0;
+                hls.subtitleDisplay = true;
               }
+              // Pre-roll warmup: wait until the player has a small
+              // forward buffer (~3s, roughly half a segment) before
+              // calling .play(). Without this, the video element will
+              // happily start playing on the first appended frame and
+              // immediately stutter when ffmpeg hasn't finished the
+              // next segment. The wait is bounded by a 4s safety
+              // timeout so a stalled session still surfaces the
+              // existing error path instead of looking frozen.
+              const WARMUP_TARGET_SEC = 3;
+              const WARMUP_TIMEOUT_MS = 4000;
+              let started = false;
+              const start = () => {
+                if (started) return;
+                started = true;
+                hls.off(HlsModule.Events.FRAG_BUFFERED, onFrag);
+                window.clearTimeout(safety);
+                attemptPlay();
+              };
+              const onFrag = () => {
+                if (video.buffered.length === 0) return;
+                const ahead = video.buffered.end(0) - video.currentTime;
+                if (ahead >= WARMUP_TARGET_SEC) start();
+              };
+              hls.on(HlsModule.Events.FRAG_BUFFERED, onFrag);
+              const safety = window.setTimeout(start, WARMUP_TIMEOUT_MS);
+            });
+            // Fatal-error recovery: HLS.js docs recommend trying
+            // `recoverMediaError()` for media errors and `startLoad()`
+            // for network errors before declaring the session dead.
+            // recoverMediaError can be called up to twice; on the
+            // second pass it ALSO swaps audio codec to handle a
+            // particularly stubborn class of MSE errors. We track
+            // recovery attempts per session so a genuinely broken
+            // stream still surfaces an error eventually instead of
+            // looping forever.
+            let mediaRecoveryAttempts = 0;
+            const MAX_MEDIA_RECOVERY = 2;
+            hls.on(HlsModule.Events.ERROR, (_e, data) => {
+              if (!data.fatal) return;
+              setReconnecting(true);
+              switch (data.type) {
+                case HlsModule.ErrorTypes.NETWORK_ERROR:
+                  // Most network errors clear on retry — segments may
+                  // be slow because ffmpeg is still encoding ahead of
+                  // playback. `startLoad()` resumes loading at the
+                  // current position with the existing buffer intact.
+                  hls.startLoad();
+                  // Clear the reconnecting overlay after a beat; if
+                  // the error returns we'll flip it back on.
+                  window.setTimeout(() => setReconnecting(false), 1500);
+                  return;
+                case HlsModule.ErrorTypes.MEDIA_ERROR:
+                  if (mediaRecoveryAttempts < MAX_MEDIA_RECOVERY) {
+                    mediaRecoveryAttempts += 1;
+                    if (mediaRecoveryAttempts === MAX_MEDIA_RECOVERY) {
+                      // Second attempt: swap codec first. The HLS.js
+                      // FAQ specifically recommends this sequence for
+                      // tough MSE decode errors.
+                      hls.swapAudioCodec();
+                    }
+                    hls.recoverMediaError();
+                    window.setTimeout(() => setReconnecting(false), 1500);
+                    return;
+                  }
+                  break;
+                default:
+                  // Mux / other errors aren't recoverable in the
+                  // generic sense — fall through to the error overlay.
+                  break;
+              }
+              setReconnecting(false);
+              setError(`${data.type} / ${data.details}`);
             });
             cleanup = () => {
               hlsRef.current = null;
@@ -329,18 +1098,25 @@ export function ChimpFlixPlayer({
       cancelled = true;
       cleanup();
       window.removeEventListener("pagehide", teardownSession);
+      if (keepaliveTimer !== null) {
+        window.clearInterval(keepaliveTimer);
+      }
       if (sessionId) {
         // Use the same keepalive path: even React unmounts can coincide
         // with the page going away (Back button after watching).
         teardownSession();
       }
+      activeSessionIdRef.current = null;
     };
     // Re-running on audio/subtitle changes tears down the existing session
     // and asks for a new one with the chosen tracks. `startPositionMs` is
     // intentionally captured once via liveTimeMsRef so a deps change here
     // doesn't restart playback from the original resume point.
+    // `resumeEpoch` is bumped by seekTo() when the user seeks before the
+    // current session's start — the HLS stream doesn't include those
+    // segments, so we need a fresh ffmpeg rooted at the new position.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mediaFileId, audioSel, subtitleSel]);
+  }, [activeMediaFileId, audioSel, subtitleSel, subtitleOffsetMs, qualitySel, resumeEpoch]);
 
   // ── Video state subscriptions ────────────────────────────────────────────
   useEffect(() => {
@@ -350,18 +1126,46 @@ export function ChimpFlixPlayer({
     const onLoadedMetadata = () => {
       // Only adopt video.duration if the server didn't give us one. Server
       // metadata is authoritative for HLS where video.duration grows over
-      // time as segments arrive.
+      // time as segments arrive. For transcode, video.duration is also
+      // HLS media-time (0 to total-sessionStart), so add the offset back
+      // to land in source-time.
       if (!durationMs && Number.isFinite(video.duration)) {
-        setVideoDuration(video.duration);
+        setVideoDuration(video.duration + sessionStartMsRef.current / 1000);
       }
     };
     const onTimeUpdate = () => {
-      setCurrentTime(video.currentTime);
-      liveTimeMsRef.current = Math.floor(video.currentTime * 1000);
+      // For transcode, video.currentTime is HLS media-time (0-based at
+      // the session start). Add the session's source-time offset so
+      // downstream consumers see file-timeline values.
+      const srcTimeSec = video.currentTime + sessionStartMsRef.current / 1000;
+      setCurrentTime(srcTimeSec);
+      liveTimeMsRef.current = Math.floor(srcTimeSec * 1000);
+    };
+    const onProgress = () => {
+      // Track the trailing edge of whatever buffered range contains
+      // currentTime. We don't sum the whole buffered set because
+      // gaps (rare with HLS, but possible after a backward seek)
+      // would mislead the UI into showing "buffered ahead" through
+      // empty regions. The range containing currentTime is the only
+      // contiguous run the user can play through without rebuffer.
+      const now = video.currentTime;
+      let end = now;
+      for (let i = 0; i < video.buffered.length; i++) {
+        if (video.buffered.start(i) <= now && video.buffered.end(i) >= now) {
+          end = video.buffered.end(i);
+          break;
+        }
+      }
+      setBufferedEnd(end + sessionStartMsRef.current / 1000);
     };
     const onPlay = () => {
       setPlaying(true);
       setAutoplayBlocked(false);
+      // Resume the backend encoder if it was paused — the previous
+      // `pause` call SIGSTOP'd ffmpeg, so we need to wake it back up
+      // before the player tries to fetch the next segment.
+      const sid = activeSessionIdRef.current;
+      if (sid) streamApi.resumeSession(sid).catch(() => {});
     };
     const onPause = () => setPlaying(false);
     const onWaiting = () => setLoading(true);
@@ -383,6 +1187,8 @@ export function ChimpFlixPlayer({
 
     video.addEventListener("loadedmetadata", onLoadedMetadata);
     video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("timeupdate", onProgress);
+    video.addEventListener("progress", onProgress);
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
     video.addEventListener("waiting", onWaiting);
@@ -393,6 +1199,8 @@ export function ChimpFlixPlayer({
     return () => {
       video.removeEventListener("loadedmetadata", onLoadedMetadata);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("timeupdate", onProgress);
+      video.removeEventListener("progress", onProgress);
       video.removeEventListener("play", onPlay);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("waiting", onWaiting);
@@ -440,19 +1248,28 @@ export function ChimpFlixPlayer({
     const video = videoRef.current;
     if (!video) return;
 
+    // Server validates that exactly one of item_id / episode_id is set, so
+    // pick the more specific one when both are passed in.
+    const target = episodeId
+      ? { episode_id: episodeId }
+      : itemId
+        ? { item_id: itemId }
+        : null;
+
     function report() {
       if (!video || video.paused || video.ended) return;
-      const positionMs = Math.floor(video.currentTime * 1000);
+      if (!target) return;
+      // Persist source-time, not HLS media-time. video.duration is HLS
+      // duration (truncated for transcode sessions) and isn't usable —
+      // prefer the server's full-file `videoDuration`.
+      const positionMs = Math.floor(
+        video.currentTime * 1000 + sessionStartMsRef.current,
+      );
       const knownDurationMs =
-        videoDuration > 0
-          ? Math.floor(videoDuration * 1000)
-          : Number.isFinite(video.duration)
-            ? Math.floor(video.duration * 1000)
-            : undefined;
+        videoDuration > 0 ? Math.floor(videoDuration * 1000) : undefined;
       playStateApi
         .update({
-          item_id: itemId,
-          episode_id: episodeId,
+          ...target,
           position_ms: positionMs,
           duration_ms: knownDurationMs,
         })
@@ -463,21 +1280,38 @@ export function ChimpFlixPlayer({
         positionMs / knownDurationMs >= SCROBBLE_THRESHOLD
       ) {
         scrobbledRef.current = true;
-        playStateApi
-          .scrobble({ item_id: itemId, episode_id: episodeId })
-          .catch(() => {});
+        playStateApi.scrobble(target).catch(() => {});
       }
     }
 
     const interval = window.setInterval(report, PLAY_STATE_INTERVAL_MS);
-    const onPause = () => report();
+    const onPause = () => {
+      report();
+      // Tell the backend to SIGSTOP its ffmpeg child while the user
+      // is paused — stops the encoder from filling the segment cache
+      // and frees the GPU for other sessions on the box. The keepalive
+      // ping continues independently so the server's idle reaper
+      // doesn't kill the session while it's paused. Fire-and-forget.
+      const sid = activeSessionIdRef.current;
+      if (sid) streamApi.pauseSession(sid).catch(() => {});
+    };
     const onEnded = () => report();
+    // Seeking is the one input where a 10 s poll can drop the user's
+    // position on reload — they scrub to 1:30:00, the polling tick
+    // hasn't fired yet, they close the tab. Without this listener the
+    // resume next time lands wherever the last interval landed (could
+    // be 10 s back, could be the original startPositionMs). The
+    // `seeked` event fires after every seek lands; the report write
+    // is cheap so we don't bother debouncing.
+    const onSeeked = () => report();
     video.addEventListener("pause", onPause);
     video.addEventListener("ended", onEnded);
+    video.addEventListener("seeked", onSeeked);
     return () => {
       window.clearInterval(interval);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("ended", onEnded);
+      video.removeEventListener("seeked", onSeeked);
       report();
     };
   }, [itemId, episodeId, videoDuration]);
@@ -494,6 +1328,66 @@ export function ChimpFlixPlayer({
     video.addEventListener("ended", onEnded);
     return () => video.removeEventListener("ended", onEnded);
   }, [nextHref, router, autoNextCancelled, prefs.autoplayNext]);
+
+  // Bandwidth-aware quality downgrade — only as a last-resort
+  // session restart. HLS.js handles the common case in-session via
+  // ABR: the master playlist advertises both the primary and
+  // fallback variants, and HLS.js picks adaptively based on its own
+  // bandwidth estimate. We only kick a server-side session restart
+  // when even the fallback variant can't keep up — meaning the
+  // client is too slow for the lowest ABR tier we ship (typically
+  // 480p / 1.2 Mbps).
+  //
+  // The threshold is HLS.js's currently-loaded level's bitrate × 0.8.
+  // When that holds for ≥ 3 consecutive samples (15 s wall clock)
+  // AND HLS.js is already pinned to the lowest level it can pick,
+  // we step the entire session down to the next quality tier below
+  // what's currently the lowest. Anything HLS.js can handle in-
+  // session is left to HLS.js.
+  useEffect(() => {
+    // Auto only. An explicit user pick respects their intent.
+    if (qualitySel.height !== null) return;
+    const resolved = sessionStatus?.height;
+    if (!resolved) return;
+    const SAMPLE_INTERVAL_MS = 5_000;
+    const REQUIRED_LOW_SAMPLES = 3;
+    let consecutiveLow = 0;
+    const tick = window.setInterval(() => {
+      const hls = hlsRef.current;
+      if (!hls) return;
+      const levels = hls.levels;
+      if (!levels || levels.length === 0) return;
+      const lowestLevelIdx = 0; // levels are sorted ascending by bitrate
+      // If HLS.js isn't already on the lowest level (or auto-picked
+      // it), let HLS.js's own ABR handle the downshift — no server
+      // restart needed.
+      const activeLevel =
+        hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel;
+      if (activeLevel !== lowestLevelIdx) return;
+      const lowestBitrate = levels[lowestLevelIdx].bitrate;
+      const bw = hls.bandwidthEstimate;
+      if (!Number.isFinite(bw) || bw <= 0) return;
+      if (bw < lowestBitrate * 0.8) {
+        consecutiveLow += 1;
+      } else {
+        consecutiveLow = 0;
+      }
+      if (consecutiveLow >= REQUIRED_LOW_SAMPLES) {
+        // Find a tier below the current resolved one. If we're
+        // already at the bottom of the picker, leave alone — the
+        // user is just on a too-slow link and a restart wouldn't
+        // help.
+        const nextDown = QUALITY_OPTIONS.find(
+          (q) => q.height !== null && q.height < resolved,
+        );
+        if (!nextDown) return;
+        window.clearInterval(tick);
+        setQualitySel(nextDown);
+      }
+    }, SAMPLE_INTERVAL_MS);
+    return () => window.clearInterval(tick);
+  }, [qualitySel.height, sessionStatus?.height]);
+
 
   // Idle-hide controls.
   const resetHide = useCallback(() => {
@@ -513,17 +1407,159 @@ export function ChimpFlixPlayer({
     else v.pause();
   }, []);
 
-  const seekBy = useCallback((delta: number) => {
-    const v = videoRef.current;
-    if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + delta));
-  }, []);
-
+  // All seek/seekBy/seekTo arguments are in SOURCE-time (file timeline).
+  // Convert to HLS media-time by subtracting the session start; if the
+  // target lands before the session start we roll the session at the
+  // new position via `resumeEpoch`.
+  //
+  // Defensive: anything not finite (NaN/Infinity) bails out early.
+  // `video.currentTime` can return NaN before metadata loads, and a
+  // single NaN propagating into a `setCurrentTime`/`seekTo` chain
+  // would land the player at an undefined position.
   const seekTo = useCallback((time: number) => {
     const v = videoRef.current;
     if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, time));
+    if (!Number.isFinite(time) || time < 0) return;
+    const sessionStartSec = sessionStartMsRef.current / 1000;
+    const offsetSec = time - sessionStartSec;
+    if (offsetSec < 0) {
+      // Backward seek before the session's encode start point: tear
+      // down + restart at the new position. ffmpeg fast-seeks (`-ss
+      // BEFORE -i`) so this is near-instant — the player shows the
+      // loading spinner for ~1 s while the new session warms up.
+      liveTimeMsRef.current = Math.max(0, Math.floor(time * 1000));
+      setResumeEpoch((e) => e + 1);
+      return;
+    }
+
+    // Forward seek past the encoded range. Without a restart, the
+    // browser sits with `readyState=HAVE_METADATA` waiting for HLS.js
+    // to produce a segment for `offsetSec` — but ffmpeg encodes
+    // linearly forward at realtime, so the segment would only land
+    // after `(offsetSec − encoded_so_far)` seconds of wall-clock
+    // wait. For anything more than a few seconds out that's a hang;
+    // restart at the new position so ffmpeg fast-seeks there.
+    //
+    // We approximate "encoded so far" using `v.buffered`'s rightmost
+    // edge — HLS.js mirrors ffmpeg's manifest into the SourceBuffer,
+    // so the right edge of the buffer is the same as the rightmost
+    // segment the encoder has finished. Anything more than 10 s past
+    // that gets a session restart; smaller forward seeks let the
+    // browser handle it natively (no flicker).
+    let bufferedEndSec = 0;
+    for (let i = 0; i < v.buffered.length; i++) {
+      bufferedEndSec = Math.max(bufferedEndSec, v.buffered.end(i));
+    }
+    if (offsetSec - bufferedEndSec > 10) {
+      liveTimeMsRef.current = Math.max(0, Math.floor(time * 1000));
+      setResumeEpoch((e) => e + 1);
+      return;
+    }
+
+    // Clamp against the HLS-side duration when known. While the stream
+    // is still being encoded `v.duration` can be 0 or Infinity — in
+    // that case skip the upper clamp so a forward seek into not-yet-
+    // available territory still triggers a buffer fetch instead of
+    // snapping to 0.
+    const hlsMax = Number.isFinite(v.duration) && v.duration > 0
+      ? v.duration
+      : Number.POSITIVE_INFINITY;
+    v.currentTime = Math.max(0, Math.min(hlsMax, offsetSec));
   }, []);
+
+  const seekBy = useCallback(
+    (delta: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      const cur = v.currentTime;
+      if (!Number.isFinite(cur)) return;
+      const srcTimeSec = cur + sessionStartMsRef.current / 1000;
+      seekTo(srcTimeSec + delta);
+    },
+    [seekTo],
+  );
+
+  // Scrub-time pre-warm. Called by ProgressBar after the user holds
+  // a drag position for ~350 ms. Fires a `createSession` at the
+  // candidate position so ffmpeg starts encoding there before the
+  // user releases. On release the regular `seekTo` flow runs; the
+  // backend's `find_compatible` lookup adopts the prewarmed session
+  // if the release lands within tolerance.
+  //
+  // Two short-circuits keep this cheap:
+  //   * If the target is already inside the current session's
+  //     buffered range, no prewarm needed — the native seek covers
+  //     it instantly.
+  //   * If the user is on Auto and a specific quality is in flight
+  //     (qualitySel not Auto), we use the explicit tier so the
+  //     prewarm parameters match what the player will request.
+  const prewarmAtPosition = useCallback(
+    (sourceTimeSec: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      if (!Number.isFinite(sourceTimeSec) || sourceTimeSec < 0) return;
+      const sessionStartSec = sessionStartMsRef.current / 1000;
+      const targetHlsSec = sourceTimeSec - sessionStartSec;
+      // Already buffered? Skip — release seek will be instant.
+      let bufferedEndSec = 0;
+      for (let i = 0; i < v.buffered.length; i++) {
+        bufferedEndSec = Math.max(bufferedEndSec, v.buffered.end(i));
+      }
+      if (
+        targetHlsSec >= 0 &&
+        targetHlsSec <= bufferedEndSec &&
+        targetHlsSec >= 0
+      ) {
+        return;
+      }
+      const livePrefs = getPrefs();
+      const clientCaps = detectClientCapabilities();
+      // Fire-and-forget. The response (a new session id) doesn't
+      // need to flow back to the player — `find_compatible` on the
+      // backend will discover it when the player's eventual seek
+      // POSTs at the same position.
+      streamApi
+        .createSession({
+          media_file_id: activeMediaFileId,
+          start_position_ms: Math.floor(sourceTimeSec * 1000),
+          audio_index: audioSel,
+          subtitle_index: subtitleSel === null ? undefined : subtitleSel,
+          quality_target:
+            qualitySel.height !== null && qualitySel.bitrate_bps !== null
+              ? {
+                  height: qualitySel.height,
+                  bitrate_bps: qualitySel.bitrate_bps,
+                }
+              : undefined,
+          audio_normalize: livePrefs.audioNormalize ? true : undefined,
+          subtitle_offset_ms:
+            subtitleOffsetMs !== 0 ? subtitleOffsetMs : undefined,
+          client: {
+            supported_video_codecs: clientCaps.video,
+            supported_audio_codecs: clientCaps.audio,
+            supported_containers: clientCaps.containers,
+          },
+        })
+        .catch(() => {
+          // Best-effort; failure just means the seek-on-release
+          // takes the normal cold-start path.
+        });
+    },
+    [activeMediaFileId, audioSel, subtitleSel, qualitySel],
+  );
+
+  // Auto-skip intros. Fires once per intro per session: when the
+  // active marker changes to an "intro", we seek to its end and
+  // remember the start_ms so a user who manually scrubs back doesn't
+  // get yanked forward again. Credits markers are intentionally NOT
+  // auto-skipped — many shows put post-credits scenes in there.
+  useEffect(() => {
+    if (!prefs.autoSkipIntro) return;
+    if (!activeMarkerOverlay || activeMarkerOverlay.kind !== "intro") return;
+    if (skippedIntrosRef.current.has(activeMarkerOverlay.start_ms)) return;
+    skippedIntrosRef.current.add(activeMarkerOverlay.start_ms);
+    seekTo(activeMarkerOverlay.end_ms / 1000);
+  }, [activeMarkerOverlay, prefs.autoSkipIntro, seekTo]);
 
   const toggleMute = useCallback(() => {
     const v = videoRef.current;
@@ -560,19 +1596,37 @@ export function ChimpFlixPlayer({
     setAudioSel(idx);
   }, []);
 
-  const selectSubtitle = useCallback((idx: number | null) => {
-    // null = explicitly off; we send no subtitle_index to the server.
-    setSubtitleSel(idx);
+  const selectSubtitle = useCallback((track: StreamChoice | null) => {
+    if (track === null) {
+      // Explicitly off — clear both surfaces.
+      setSubtitleSel(null);
+      setExternalSub(null);
+      return;
+    }
+    if (track.externalUrl) {
+      // External: skip the burn-in session reload, attach a <track>.
+      setSubtitleSel(null);
+      setExternalSub({
+        url: track.externalUrl,
+        language: track.language ?? null,
+      });
+      return;
+    }
+    setExternalSub(null);
+    setSubtitleSel(track.idx);
   }, []);
 
   const toggleSubtitles = useCallback(() => {
-    if (subtitleSel === null || subtitleSel === undefined) {
-      const first = subtitleTracks?.[0]?.idx;
-      if (first !== undefined) selectSubtitle(first);
+    if (
+      (subtitleSel === null || subtitleSel === undefined) &&
+      externalSubUrl === null
+    ) {
+      const first = activeSubtitleTracks[0];
+      if (first) selectSubtitle(first);
     } else {
       selectSubtitle(null);
     }
-  }, [subtitleSel, subtitleTracks, selectSubtitle]);
+  }, [subtitleSel, externalSubUrl, activeSubtitleTracks, selectSubtitle]);
 
   const setVolumeValue = useCallback((value: number) => {
     const v = videoRef.current;
@@ -649,8 +1703,7 @@ export function ChimpFlixPlayer({
         }
         case "End": {
           e.preventDefault();
-          const v = videoRef.current;
-          if (v && v.duration) seekTo(v.duration - 1);
+          if (videoDuration > 0) seekTo(videoDuration - 1);
           resetHide();
           break;
         }
@@ -672,6 +1725,11 @@ export function ChimpFlixPlayer({
         case "p":
         case "P":
           togglePip();
+          resetHide();
+          break;
+        case "s":
+        case "S":
+          setStatsOpen((v) => !v);
           resetHide();
           break;
         case ">":
@@ -707,6 +1765,7 @@ export function ChimpFlixPlayer({
     setVolumeValue,
     setSpeed,
     resetHide,
+    videoDuration,
   ]);
 
   return (
@@ -723,12 +1782,33 @@ export function ChimpFlixPlayer({
         playsInline
         autoPlay
         onClick={togglePlay}
-        className="h-full w-full bg-black"
-      />
+        crossOrigin="anonymous"
+        className={`h-full w-full bg-black ${cueClass}`}
+      >
+        {externalSub && (
+          <track
+            kind="subtitles"
+            src={externalSub.url}
+            srcLang={externalSub.language ?? "und"}
+            default
+          />
+        )}
+      </video>
 
       {error && <ErrorOverlay message={error} />}
       {loading && !error && !autoplayBlocked && <LoadingSpinner />}
       {autoplayBlocked && !error && <BigPlayButton onClick={attemptPlay} />}
+      {reconnecting && !error && <ReconnectingOverlay />}
+
+      {statsOpen && (
+        <StatsOverlay
+          videoRef={videoRef}
+          hlsRef={hlsRef}
+          sessionStatus={sessionStatus}
+          targetHeight={sessionStatus?.height ?? null}
+          onClose={() => setStatsOpen(false)}
+        />
+      )}
 
       {activeMarkerOverlay && (
         <button
@@ -778,22 +1858,38 @@ export function ChimpFlixPlayer({
         {/* Bottom controls. */}
         <div className="pointer-events-auto absolute inset-x-0 bottom-0 bg-linear-to-t from-black/85 to-transparent px-8 pb-6 pt-16">
           <div className="flex items-center gap-3">
+            {/*
+              Current position, left of the bar. Always visible so the
+              user can see exactly where they are without having to
+              hover the bar or do mental arithmetic against the
+              remaining-time counter. Tabular-nums keeps the digits
+              from jittering as the second ticks.
+            */}
+            <span className="shrink-0 text-sm tabular-nums text-white/85">
+              {formatTime(currentTime)}
+            </span>
             <div className="grow">
               <ProgressBar
                 currentTime={currentTime}
                 duration={videoDuration}
+                bufferedEnd={bufferedEnd}
                 onSeek={seekTo}
+                onSeekHint={prewarmAtPosition}
+                previewManifest={previewManifest}
+                markers={markers}
               />
             </div>
             <button
               type="button"
               onClick={() => setShowRemaining((s) => !s)}
-              aria-label="Toggle time remaining"
+              aria-label={
+                showRemaining ? "Show total duration" : "Show time remaining"
+              }
               className="shrink-0 text-sm tabular-nums text-white/85 transition-colors hover:text-white"
             >
               {showRemaining
                 ? `-${formatTime(Math.max(0, videoDuration - currentTime))}`
-                : formatTime(currentTime)}
+                : formatTime(videoDuration)}
             </button>
           </div>
 
@@ -853,20 +1949,25 @@ export function ChimpFlixPlayer({
                   onClose={() => setEpisodesOpen(false)}
                 />
               )}
-              {(((audioTracks?.length ?? 0) > 1) ||
-                ((subtitleTracks?.length ?? 0) > 0)) && (
-                <TracksControl
-                  audioTracks={audioTracks ?? []}
-                  subtitleTracks={subtitleTracks ?? []}
-                  audioSel={audioSel}
-                  subtitleSel={subtitleSel}
-                  open={tracksOpen}
-                  onToggle={() => setTracksOpen((o) => !o)}
-                  onClose={() => setTracksOpen(false)}
-                  onAudioSelect={selectAudio}
-                  onSubtitleSelect={selectSubtitle}
-                />
-              )}
+              <TracksControl
+                audioTracks={activeAudioTracks}
+                subtitleTracks={activeSubtitleTracks}
+                versions={versions ?? []}
+                activeMediaFileId={activeMediaFileId}
+                onVersionSelect={selectVersion}
+                audioSel={audioSel}
+                subtitleSel={subtitleSel}
+                externalSubUrl={externalSubUrl}
+                qualityOptions={QUALITY_OPTIONS}
+                qualitySel={qualitySel}
+                onQualitySelect={setQualitySel}
+                sessionStatus={sessionStatus}
+                open={tracksOpen}
+                onToggle={() => setTracksOpen((o) => !o)}
+                onClose={() => setTracksOpen(false)}
+                onAudioSelect={selectAudio}
+                onSubtitleSelect={selectSubtitle}
+              />
               <SpeedControl
                 rate={playbackRate}
                 open={speedOpen}
@@ -883,6 +1984,15 @@ export function ChimpFlixPlayer({
               >
                 <PipIcon />
               </IconButton>
+              <SubtitleSettingsControl
+                offsetMs={subtitleOffsetMs}
+                onOffsetChange={setSubtitleOffsetMs}
+                appearance={subtitleAppearance}
+                onAppearanceChange={setSubtitleAppearance}
+                hasActiveSubtitle={
+                  externalSubUrl !== null || typeof subtitleSel === "number"
+                }
+              />
               <IconButton
                 onClick={toggleFullscreen}
                 aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
@@ -941,8 +2051,16 @@ function BigPlayButton({ onClick }: { onClick: () => void }) {
 function TracksControl({
   audioTracks,
   subtitleTracks,
+  versions,
+  activeMediaFileId,
+  onVersionSelect,
   audioSel,
   subtitleSel,
+  externalSubUrl,
+  qualityOptions,
+  qualitySel,
+  onQualitySelect,
+  sessionStatus,
   open,
   onToggle,
   onClose,
@@ -951,13 +2069,27 @@ function TracksControl({
 }: {
   audioTracks: StreamChoice[];
   subtitleTracks: StreamChoice[];
+  versions: VersionChoice[];
+  activeMediaFileId: number;
+  onVersionSelect: (mediaFileId: number) => void;
   audioSel?: number;
   subtitleSel?: number | null;
+  externalSubUrl: string | null;
+  qualityOptions: QualityChoice[];
+  qualitySel: QualityChoice;
+  onQualitySelect: (q: QualityChoice) => void;
+  sessionStatus: {
+    height: number | null;
+    sourceHeight: number | null;
+    encoder: string | null;
+    videoTreatment: "copy" | "reencode" | null;
+    audioTreatment: "copy" | "reencode" | null;
+  } | null;
   open: boolean;
   onToggle: () => void;
   onClose: () => void;
   onAudioSelect: (idx: number) => void;
-  onSubtitleSelect: (idx: number | null) => void;
+  onSubtitleSelect: (track: StreamChoice | null) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -977,11 +2109,18 @@ function TracksControl({
     };
   }, [open, onClose]);
 
+  // Count visible columns to size the popover. Quality + Audio + Subs
+  // are always present; Version only when there's more than one file.
+  const hasVersion = versions.length > 1;
+  const columnCount = (hasVersion ? 1 : 0) + 3;
+  const widthClass =
+    columnCount === 4 ? "w-3xl grid-cols-4" : "w-2xl grid-cols-3";
+
   return (
     <div ref={wrapRef} className="relative">
       <IconButton
         onClick={onToggle}
-        aria-label="Audio and subtitles"
+        aria-label="Audio, subtitles, and quality"
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -990,24 +2129,44 @@ function TracksControl({
       {open && (
         <div
           role="menu"
-          className="absolute bottom-full right-0 mb-3 grid w-md grid-cols-2 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
+          className={`absolute bottom-full right-0 mb-3 grid overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm ${widthClass}`}
         >
+          {hasVersion && (
+            <VersionColumn
+              versions={versions}
+              activeMediaFileId={activeMediaFileId}
+              onSelect={onVersionSelect}
+            />
+          )}
+          <QualityColumn
+            options={qualityOptions}
+            active={qualitySel}
+            onSelect={onQualitySelect}
+            sessionStatus={sessionStatus}
+          />
           <StreamColumn
             label="Audio"
             tracks={audioTracks}
-            currentIdx={audioSel}
+            isActive={(t) => audioSel === t.idx}
             offSelected={false}
-            onSelect={(idx) => {
-              if (idx !== null) onAudioSelect(idx);
+            onSelect={(t) => {
+              if (t !== null) onAudioSelect(t.idx);
             }}
             offOption={false}
           />
           <StreamColumn
             label="Subtitles"
             tracks={subtitleTracks}
-            currentIdx={subtitleSel === null ? undefined : subtitleSel}
-            offSelected={subtitleSel === null}
-            onSelect={(idx) => onSubtitleSelect(idx)}
+            isActive={(t) =>
+              t.externalUrl
+                ? externalSubUrl === t.externalUrl
+                : externalSubUrl === null && subtitleSel === t.idx
+            }
+            offSelected={
+              (subtitleSel === null || subtitleSel === undefined) &&
+              externalSubUrl === null
+            }
+            onSelect={(t) => onSubtitleSelect(t)}
             offOption={true}
           />
         </div>
@@ -1016,19 +2175,383 @@ function TracksControl({
   );
 }
 
+function QualityColumn({
+  options,
+  active,
+  onSelect,
+  sessionStatus,
+}: {
+  options: QualityChoice[];
+  active: QualityChoice;
+  onSelect: (q: QualityChoice) => void;
+  sessionStatus: {
+    height: number | null;
+    sourceHeight: number | null;
+    encoder: string | null;
+    videoTreatment: "copy" | "reencode" | null;
+    audioTreatment: "copy" | "reencode" | null;
+  } | null;
+}) {
+  // Build the "Auto · 1080p" annotation. Only meaningful when the
+  // user has Auto selected and the server actually transcoded —
+  // direct-play sessions report no resolved tier and don't need
+  // disambiguation.
+  const isAuto = active.height === null;
+  const resolvedHeight = sessionStatus?.height;
+  const autoSubLabel = isAuto && resolvedHeight ? `${resolvedHeight}p` : null;
+  const isRemux =
+    sessionStatus?.videoTreatment === "copy" &&
+    sessionStatus?.audioTreatment === "copy";
+  // Grey out tiers that exceed source resolution — the scale filter
+  // already caps at source ("scale=-2:'min(target,ih)'"), so a 1080p
+  // pick on a 720p source produces 720p output at 1080p's bitrate
+  // budget. Pointless; better to hide the choice than to lie about
+  // what'll happen.
+  const sourceHeight = sessionStatus?.sourceHeight ?? null;
+  const isImpractical = (q: QualityChoice) =>
+    sourceHeight !== null && q.height !== null && q.height > sourceHeight;
+  return (
+    <div className="border-r border-white/10">
+      <div className="border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
+        Quality
+      </div>
+      <ul className="max-h-72 overflow-y-auto py-2">
+        {options.map((q) => (
+          <TrackRow
+            key={q.label}
+            label={
+              q.label === "Auto" && autoSubLabel
+                ? `Auto · ${autoSubLabel}`
+                : q.label
+            }
+            active={
+              active.height === q.height && active.bitrate_bps === q.bitrate_bps
+            }
+            disabled={isImpractical(q)}
+            onClick={() => {
+              if (isImpractical(q)) return;
+              onSelect(q);
+            }}
+          />
+        ))}
+      </ul>
+      {sessionStatus?.encoder && (
+        <div className="border-t border-white/10 px-4 py-2 text-[0.65rem] uppercase tracking-wider text-white/45">
+          {isRemux ? "Remux · " : ""}
+          {sessionStatus.encoder}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VersionColumn({
+  versions,
+  activeMediaFileId,
+  onSelect,
+}: {
+  versions: VersionChoice[];
+  activeMediaFileId: number;
+  onSelect: (mediaFileId: number) => void;
+}) {
+  return (
+    <div className="border-r border-white/10">
+      <div className="border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
+        Version
+      </div>
+      <ul className="max-h-72 overflow-y-auto py-2">
+        {versions.map((v) => (
+          <TrackRow
+            key={v.media_file_id}
+            label={v.label}
+            active={activeMediaFileId === v.media_file_id}
+            onClick={() => onSelect(v.media_file_id)}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/// Dedicated player-controls button that opens a small popover
+/// with subtitle sync offset + appearance controls. Replaces the
+/// old stats-overlay button slot — stats are still toggleable
+/// via the `S` keybind, freeing this slot for something that
+/// gets touched more often (especially sync, which varies per
+/// title and is the #1 reason a power user wants captions
+/// settings).
+function SubtitleSettingsControl({
+  offsetMs,
+  onOffsetChange,
+  appearance,
+  onAppearanceChange,
+  hasActiveSubtitle,
+}: {
+  offsetMs: number;
+  onOffsetChange: (ms: number) => void;
+  appearance: SubtitleAppearance;
+  onAppearanceChange: (a: SubtitleAppearance) => void;
+  /// Whether a subtitle is currently selected. Drives the offset
+  /// stepper's enabled state — offset is a no-op without an
+  /// active sub.
+  hasActiveSubtitle: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e: MouseEvent) {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    }
+    function onEsc(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [open]);
+  const bump = (deltaMs: number) => {
+    const next = Math.max(-30_000, Math.min(30_000, offsetMs + deltaMs));
+    onOffsetChange(next);
+  };
+  const offsetLabel = (() => {
+    if (offsetMs === 0) return "0 s";
+    const s = (offsetMs / 1000).toFixed(offsetMs % 1000 === 0 ? 1 : 2);
+    return `${offsetMs > 0 ? "+" : ""}${s} s`;
+  })();
+  return (
+    <div ref={wrapRef} className="relative">
+      <IconButton
+        onClick={() => setOpen((o) => !o)}
+        aria-label="Subtitle sync and appearance"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Subtitle settings"
+      >
+        <SubtitleSettingsIcon />
+      </IconButton>
+      {open && (
+        <div
+          role="menu"
+          className="absolute bottom-full right-0 mb-3 w-96 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
+        >
+          <div className="border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
+            Subtitle settings
+          </div>
+          <div className="px-4 py-3">
+            <div className="mb-1 flex items-center justify-between text-[0.65rem] font-semibold uppercase tracking-wider text-white/55">
+              <span>Sync offset</span>
+              <span className="tabular-nums text-white/80">{offsetLabel}</span>
+            </div>
+            <div className="flex items-center justify-between gap-1">
+              <OffsetStep label="−1s" onClick={() => bump(-1000)} disabled={!hasActiveSubtitle} />
+              <OffsetStep label="−.5" onClick={() => bump(-500)} disabled={!hasActiveSubtitle} />
+              <OffsetStep label="−.1" onClick={() => bump(-100)} disabled={!hasActiveSubtitle} />
+              <OffsetStep
+                label="0"
+                onClick={() => onOffsetChange(0)}
+                disabled={!hasActiveSubtitle || offsetMs === 0}
+                primary
+              />
+              <OffsetStep label="+.1" onClick={() => bump(100)} disabled={!hasActiveSubtitle} />
+              <OffsetStep label="+.5" onClick={() => bump(500)} disabled={!hasActiveSubtitle} />
+              <OffsetStep label="+1s" onClick={() => bump(1000)} disabled={!hasActiveSubtitle} />
+            </div>
+            <p className="mt-1 text-[0.6rem] leading-snug text-white/40">
+              {hasActiveSubtitle
+                ? "Negative = subs earlier · positive = subs later"
+                : "Pick a subtitle to enable sync offset"}
+            </p>
+          </div>
+          <div className="border-t border-white/10 px-4 py-3">
+            <div className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/55">
+              Appearance
+            </div>
+            <SubtitleAppearancePanel value={appearance} onChange={onAppearanceChange} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OffsetStep({
+  label,
+  onClick,
+  disabled,
+  primary = false,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex-1 rounded px-1.5 py-1 text-center text-[0.7rem] tabular-nums transition-colors ${
+        primary
+          ? "bg-white/15 text-white hover:bg-white/25"
+          : "bg-white/5 text-white/85 hover:bg-white/15"
+      } disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-white/5`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function SubtitleAppearancePanel({
+  value,
+  onChange,
+}: {
+  value: SubtitleAppearance;
+  onChange: (next: SubtitleAppearance) => void;
+}) {
+  const patch = (p: Partial<SubtitleAppearance>) => onChange({ ...value, ...p });
+  return (
+    <div className="mt-3 space-y-3 text-[0.7rem]">
+      <div>
+        <div className="mb-1 text-white/55">Size</div>
+        <div className="flex gap-1">
+          {FONT_SIZE_PRESETS.map((opt) => (
+            <ApprBtn
+              key={opt.label}
+              label={opt.label}
+              active={value.fontSizePx === opt.px}
+              onClick={() => patch({ fontSizePx: opt.px })}
+            />
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="mb-1 text-white/55">Color</div>
+        <div className="flex gap-1">
+          {TEXT_COLOR_PRESETS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => patch({ textColor: opt.value })}
+              aria-label={opt.label}
+              title={opt.label}
+              className={`h-6 w-6 rounded border-2 transition-transform hover:scale-110 ${
+                value.textColor === opt.value
+                  ? "border-white"
+                  : "border-white/20"
+              }`}
+              style={{ backgroundColor: opt.value }}
+            />
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="mb-1 text-white/55">Background</div>
+        <div className="flex gap-1">
+          {BG_PRESETS.map((opt) => (
+            <ApprBtn
+              key={opt.label}
+              label={opt.label}
+              active={value.backgroundColor === opt.value}
+              onClick={() => patch({ backgroundColor: opt.value })}
+            />
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="mb-1 text-white/55">Edge</div>
+        <div className="flex gap-1">
+          {(["outline", "shadow", "none"] as const).map((e) => (
+            <ApprBtn
+              key={e}
+              label={e[0].toUpperCase() + e.slice(1)}
+              active={value.edge === e}
+              onClick={() => patch({ edge: e })}
+            />
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="mb-1 flex items-center justify-between text-white/55">
+          <span>Position</span>
+          <span className="tabular-nums text-white/80">
+            {value.bottomInsetPct}% from bottom
+          </span>
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={45}
+          step={1}
+          value={value.bottomInsetPct}
+          onChange={(e) =>
+            patch({ bottomInsetPct: Number.parseInt(e.target.value, 10) })
+          }
+          className="w-full accent-white"
+          aria-label="Subtitle vertical position"
+        />
+        <div className="mt-0.5 flex justify-between text-[0.55rem] uppercase tracking-wider text-white/40">
+          <span>Video edge</span>
+          <span>Middle</span>
+        </div>
+        <p className="mt-0.5 text-[0.55rem] leading-snug text-white/40">
+          Measured from the bottom of the visible video — letterbox is
+          accounted for automatically.
+        </p>
+      </div>
+      <div>
+        <button
+          type="button"
+          onClick={() => onChange(DEFAULT_SUBTITLE_APPEARANCE)}
+          className="text-[0.65rem] uppercase tracking-wider text-white/50 hover:text-white/85"
+        >
+          Reset to defaults
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ApprBtn({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded px-2 py-1 text-[0.65rem] uppercase tracking-wider transition-colors ${
+        active
+          ? "bg-white/20 text-white"
+          : "bg-white/5 text-white/70 hover:bg-white/15 hover:text-white"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 function StreamColumn({
   label,
   tracks,
-  currentIdx,
+  isActive,
   offSelected,
   onSelect,
   offOption,
 }: {
   label: string;
   tracks: StreamChoice[];
-  currentIdx?: number;
+  isActive: (t: StreamChoice) => boolean;
   offSelected: boolean;
-  onSelect: (idx: number | null) => void;
+  onSelect: (track: StreamChoice | null) => void;
   offOption: boolean;
 }) {
   return (
@@ -1044,12 +2567,12 @@ function StreamColumn({
             onClick={() => onSelect(null)}
           />
         )}
-        {tracks.map((t) => (
+        {tracks.map((t, i) => (
           <TrackRow
-            key={t.idx}
+            key={t.externalUrl ?? `embedded-${t.idx}-${i}`}
             label={t.label}
-            active={currentIdx === t.idx}
-            onClick={() => onSelect(t.idx)}
+            active={isActive(t)}
+            onClick={() => onSelect(t)}
           />
         ))}
         {tracks.length === 0 && !offOption && (
@@ -1064,10 +2587,15 @@ function TrackRow({
   label,
   active,
   onClick,
+  disabled = false,
 }: {
   label: string;
   active: boolean;
   onClick: () => void;
+  /// Renders the row at low opacity and blocks clicks. Used by the
+  /// Quality column to indicate tiers above source resolution that
+  /// won't actually produce sharper output.
+  disabled?: boolean;
 }) {
   return (
     <li>
@@ -1076,8 +2604,14 @@ function TrackRow({
         onClick={onClick}
         role="menuitemradio"
         aria-checked={active}
+        aria-disabled={disabled}
+        disabled={disabled}
         className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm transition-colors ${
-          active ? "text-white" : "text-white/75 hover:text-white"
+          disabled
+            ? "cursor-not-allowed text-white/30"
+            : active
+              ? "text-white"
+              : "text-white/75 hover:text-white"
         }`}
       >
         <span
@@ -1448,6 +2982,258 @@ function LoadingSpinner() {
   );
 }
 
+/// Subtler than the loading spinner: small pill at the top of the
+/// frame that says "Reconnecting…" while HLS.js retries a fatal
+/// error in the background. Avoids the alarming full-screen error
+/// chrome for transient blips that resolve in a second or two.
+function ReconnectingOverlay() {
+  return (
+    <div className="pointer-events-none absolute inset-x-0 top-20 z-10 flex justify-center">
+      <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/75 px-3 py-1.5 text-xs font-medium text-white/85 shadow-lg backdrop-blur-sm">
+        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-(--color-accent)" />
+        Reconnecting…
+      </div>
+    </div>
+  );
+}
+
+/// "Stats for nerds" panel: small, monospace, top-right of the frame.
+/// Visible-only sampling (500ms interval, torn down on close) so it
+/// adds zero cost when hidden. Mirrors the YouTube/Chrome dev-overlay
+/// convention so support reports can paste a screenshot and a
+/// developer can immediately see decoded resolution, the active HLS
+/// level, buffer ahead, dropped-frame ratio, and the resolved
+/// transcoder decisions.
+function StatsOverlay({
+  videoRef,
+  hlsRef,
+  sessionStatus,
+  targetHeight,
+  onClose,
+}: {
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  hlsRef: React.RefObject<Hls | null>;
+  sessionStatus: {
+    height: number | null;
+    sourceHeight: number | null;
+    encoder: string | null;
+    videoTreatment: "copy" | "reencode" | null;
+    audioTreatment: "copy" | "reencode" | null;
+  } | null;
+  targetHeight: number | null;
+  onClose: () => void;
+}) {
+  const [snap, setSnap] = useState<{
+    decodedWidth: number;
+    decodedHeight: number;
+    levelLabel: string | null;
+    levelBitrateKbps: number | null;
+    bandwidthKbps: number | null;
+    bufferAheadSec: number | null;
+    droppedFrames: number;
+    decodedFrames: number;
+    dropRatio: number;
+    playbackRate: number;
+    volumePct: number;
+  } | null>(null);
+
+  useEffect(() => {
+    let raf: number | null = null;
+    function sample() {
+      const v = videoRef.current;
+      const hls = hlsRef.current;
+      if (!v) {
+        raf = window.setTimeout(sample, 500);
+        return;
+      }
+      // Forward buffer: find the range containing currentTime and
+      // measure to its end. If currentTime falls in a gap (rare; HLS
+      // usually fills gaplessly), report 0.
+      let bufferAheadSec: number | null = null;
+      const now = v.currentTime;
+      for (let i = 0; i < v.buffered.length; i++) {
+        if (v.buffered.start(i) <= now && v.buffered.end(i) >= now) {
+          bufferAheadSec = v.buffered.end(i) - now;
+          break;
+        }
+      }
+
+      // getVideoPlaybackQuality is the modern spec; Safari (older) only
+      // exposes webkit-prefixed counters. Fall back if needed.
+      type LegacyVideo = HTMLVideoElement & {
+        webkitDroppedFrameCount?: number;
+        webkitDecodedFrameCount?: number;
+      };
+      const legacy = v as LegacyVideo;
+      let dropped = 0;
+      let decoded = 0;
+      if (typeof v.getVideoPlaybackQuality === "function") {
+        const q = v.getVideoPlaybackQuality();
+        dropped = q.droppedVideoFrames;
+        decoded = q.totalVideoFrames;
+      } else {
+        dropped = legacy.webkitDroppedFrameCount ?? 0;
+        decoded = legacy.webkitDecodedFrameCount ?? 0;
+      }
+      const dropRatio = decoded > 0 ? dropped / decoded : 0;
+
+      let levelLabel: string | null = null;
+      let levelBitrateKbps: number | null = null;
+      let bandwidthKbps: number | null = null;
+      if (hls) {
+        const idx = hls.currentLevel;
+        if (idx >= 0 && hls.levels && hls.levels[idx]) {
+          const lvl = hls.levels[idx];
+          const h = lvl.height ?? null;
+          levelLabel = h ? `${h}p` : `level ${idx}`;
+          levelBitrateKbps = lvl.bitrate ? Math.round(lvl.bitrate / 1000) : null;
+        } else if (idx === -1) {
+          levelLabel = "auto";
+        }
+        if (typeof hls.bandwidthEstimate === "number") {
+          bandwidthKbps = Math.round(hls.bandwidthEstimate / 1000);
+        }
+      }
+
+      setSnap({
+        decodedWidth: v.videoWidth || 0,
+        decodedHeight: v.videoHeight || 0,
+        levelLabel,
+        levelBitrateKbps,
+        bandwidthKbps,
+        bufferAheadSec,
+        droppedFrames: dropped,
+        decodedFrames: decoded,
+        dropRatio,
+        playbackRate: v.playbackRate,
+        volumePct: v.muted ? 0 : Math.round(v.volume * 100),
+      });
+      raf = window.setTimeout(sample, 500);
+    }
+    sample();
+    return () => {
+      if (raf !== null) window.clearTimeout(raf);
+    };
+  }, [videoRef, hlsRef]);
+
+  // Color the dropped-frame ratio so problem playback jumps out: green
+  // <0.5%, amber 0.5-2%, red >2%. These thresholds are the same ones
+  // Chrome's media-internals uses to call a session "unhealthy".
+  const dropColor = !snap
+    ? "text-white/70"
+    : snap.dropRatio > 0.02
+      ? "text-red-300"
+      : snap.dropRatio > 0.005
+        ? "text-amber-300"
+        : "text-emerald-300";
+
+  return (
+    <div className="pointer-events-auto absolute right-4 top-20 z-20 w-72 rounded-md border border-white/10 bg-black/85 p-3 font-mono text-xs text-white/90 shadow-xl backdrop-blur-sm">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-white/55">
+          Playback stats
+        </span>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close stats"
+          className="rounded p-0.5 text-white/55 transition-colors hover:bg-white/10 hover:text-white"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+            <path
+              d="M2 2l8 8M10 2l-8 8"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <dl className="space-y-1">
+        <StatRow label="Decoded">
+          {snap && snap.decodedWidth > 0
+            ? `${snap.decodedWidth}×${snap.decodedHeight}`
+            : "—"}
+        </StatRow>
+        <StatRow label="HLS level">
+          {snap?.levelLabel
+            ? `${snap.levelLabel}${
+                snap.levelBitrateKbps ? ` · ${snap.levelBitrateKbps} kbps` : ""
+              }`
+            : "—"}
+        </StatRow>
+        <StatRow label="Bandwidth est.">
+          {snap?.bandwidthKbps != null ? `${snap.bandwidthKbps} kbps` : "—"}
+        </StatRow>
+        <StatRow label="Buffer ahead">
+          {snap?.bufferAheadSec != null
+            ? `${snap.bufferAheadSec.toFixed(1)} s`
+            : "—"}
+        </StatRow>
+        <StatRow label="Frames" valueClassName={dropColor}>
+          {snap
+            ? `${snap.droppedFrames} dropped / ${snap.decodedFrames} (${(
+                snap.dropRatio * 100
+              ).toFixed(2)}%)`
+            : "—"}
+        </StatRow>
+        <StatRow label="Rate / vol">
+          {snap ? `${snap.playbackRate.toFixed(2)}× · ${snap.volumePct}%` : "—"}
+        </StatRow>
+      </dl>
+
+      {(sessionStatus?.encoder ||
+        sessionStatus?.sourceHeight ||
+        targetHeight) && (
+        <>
+          <div className="my-2 h-px bg-white/10" />
+          <dl className="space-y-1">
+            {sessionStatus?.sourceHeight ? (
+              <StatRow label="Source">{sessionStatus.sourceHeight}p</StatRow>
+            ) : null}
+            {targetHeight ? (
+              <StatRow label="Target">{targetHeight}p</StatRow>
+            ) : null}
+            {sessionStatus?.encoder ? (
+              <StatRow label="Encoder">{sessionStatus.encoder}</StatRow>
+            ) : null}
+            {sessionStatus?.videoTreatment ? (
+              <StatRow label="Video">
+                {sessionStatus.videoTreatment === "copy" ? "copy" : "re-encode"}
+              </StatRow>
+            ) : null}
+            {sessionStatus?.audioTreatment ? (
+              <StatRow label="Audio">
+                {sessionStatus.audioTreatment === "copy" ? "copy" : "re-encode"}
+              </StatRow>
+            ) : null}
+          </dl>
+        </>
+      )}
+
+      <div className="mt-2 text-[10px] text-white/40">Press S to toggle.</div>
+    </div>
+  );
+}
+
+function StatRow({
+  label,
+  children,
+  valueClassName = "text-white/85",
+}: {
+  label: string;
+  children: React.ReactNode;
+  valueClassName?: string;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <dt className="text-white/50">{label}</dt>
+      <dd className={`tabular-nums ${valueClassName}`}>{children}</dd>
+    </div>
+  );
+}
+
 function ErrorOverlay({ message }: { message: string }) {
   return (
     <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/85">
@@ -1468,15 +3254,44 @@ function ErrorOverlay({ message }: { message: string }) {
 function ProgressBar({
   currentTime,
   duration,
+  bufferedEnd,
   onSeek,
+  onSeekHint,
+  previewManifest,
+  markers,
 }: {
   currentTime: number;
   duration: number;
+  /// Trailing edge of the contiguous buffered range that includes
+  /// currentTime, in source-time seconds. Drives the Netflix-style
+  /// lighter overlay between the playhead and the buffer edge.
+  /// 0 means "no buffer info yet" — the overlay just doesn't render.
+  bufferedEnd: number;
   onSeek: (t: number) => void;
+  /// Fires during drag (debounced internally) at the candidate
+  /// release position. The player uses this to pre-warm an ffmpeg
+  /// session at the target so the actual seek-on-release is near-
+  /// instant. Optional — ProgressBar works without it.
+  onSeekHint?: (t: number) => void;
+  previewManifest?: PreviewManifest;
+  /// Intro / credits / chapter regions to overlay as colored
+  /// segments. Each marker spans [start_ms, end_ms] on the source
+  /// timeline; we position them as a percentage of duration.
+  markers?: PlayerMarker[];
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [hovering, setHovering] = useState(false);
   const [scrubbing, setScrubbing] = useState(false);
+  // Pointer-x within the track, in pixels from its left edge. `null`
+  // when the mouse isn't over the track. Drives both the time tooltip
+  // and the scrub-preview thumbnail rendering.
+  const [hoverX, setHoverX] = useState<number | null>(null);
+  // Scrub position WHILE dragging. The visible progress bar fill
+  // follows this so the user sees instant feedback, but the actual
+  // `onSeek` call holds off until pointerup — committing per-move
+  // would session-restart on every micromove past the buffer.
+  const [scrubTime, setScrubTime] = useState<number | null>(null);
+  const hintTimerRef = useRef<number | null>(null);
 
   const pointToTime = useCallback(
     (clientX: number): number => {
@@ -1495,27 +3310,77 @@ function ProgressBar({
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
     setScrubbing(true);
-    onSeek(pointToTime(e.clientX));
+    const initial = pointToTime(e.clientX);
+    setScrubTime(initial);
 
-    const onMove = (ev: PointerEvent) => onSeek(pointToTime(ev.clientX));
+    let lastT = initial;
+    const onMove = (ev: PointerEvent) => {
+      const t = pointToTime(ev.clientX);
+      lastT = t;
+      setScrubTime(t);
+      // Debounced pre-warm — after 350 ms of relatively stable drag
+      // position, kick off a session at that target so the eventual
+      // release seek finds segments already encoding. The 350 ms
+      // window is empirically the difference between "user is
+      // dragging through" and "user has stopped on a target".
+      if (onSeekHint) {
+        if (hintTimerRef.current !== null) {
+          window.clearTimeout(hintTimerRef.current);
+        }
+        hintTimerRef.current = window.setTimeout(() => {
+          hintTimerRef.current = null;
+          onSeekHint(t);
+        }, 350);
+      }
+    };
     const onUp = () => {
       setScrubbing(false);
+      setScrubTime(null);
+      if (hintTimerRef.current !== null) {
+        window.clearTimeout(hintTimerRef.current);
+        hintTimerRef.current = null;
+      }
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      // Commit ONCE at release — `seekTo` either does a native
+      // currentTime jump (if buffered) or tears down + restarts the
+      // session at this position. No more multi-restart cascade
+      // from intermediate drag positions.
+      onSeek(lastT);
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };
 
-  const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const onMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const track = trackRef.current;
+    if (!track) return;
+    setHoverX(e.clientX - track.getBoundingClientRect().left);
+  };
+
+  // While scrubbing, the fill follows the drag position even though
+  // we don't commit the seek until release. This is what the user
+  // expects — instant visual feedback during the drag without the
+  // session churn that would come from honoring every micromove.
+  const displayTime = scrubTime ?? currentTime;
+  const progress = duration > 0 ? (displayTime / duration) * 100 : 0;
   const expanded = hovering || scrubbing;
+  const hoverTime =
+    hoverX !== null && duration > 0
+      ? (hoverX / (trackRef.current?.getBoundingClientRect().width ?? 1)) *
+        duration
+      : null;
 
   return (
     <div
       ref={trackRef}
       onPointerDown={onPointerDown}
       onMouseEnter={() => setHovering(true)}
-      onMouseLeave={() => setHovering(false)}
+      onMouseLeave={() => {
+        setHovering(false);
+        setHoverX(null);
+      }}
+      onMouseMove={onMouseMove}
       role="slider"
       aria-label="Seek"
       aria-valuemin={0}
@@ -1528,6 +3393,55 @@ function ProgressBar({
           expanded ? "h-1.5" : "h-1"
         }`}
       >
+        {/*
+          Marker overlays sit BEHIND the progress fill so the played
+          portion still reads as the accent color, but the unplayed
+          portion shows tinted segments where intros / credits live.
+          Color picked per kind: intro is teal-ish (skip-affordance
+          familiar from Netflix), credits is amber, anything else
+          neutral. Pointer events disabled so they don't intercept
+          scrubs.
+        */}
+        {markers && duration > 0 && markers.map((m, i) => {
+          const startPct = Math.max(0, Math.min(100, (m.start_ms / 1000 / duration) * 100));
+          const endPct = Math.max(0, Math.min(100, (m.end_ms / 1000 / duration) * 100));
+          const widthPct = Math.max(0, endPct - startPct);
+          if (widthPct < 0.1) return null;
+          const cls = m.kind === "credits"
+            ? "bg-amber-400/35"
+            : m.kind === "intro"
+              ? "bg-sky-400/35"
+              : "bg-white/20";
+          return (
+            <div
+              key={`${m.kind}-${m.start_ms}-${i}`}
+              aria-hidden
+              className={`pointer-events-none absolute inset-y-0 ${cls}`}
+              style={{ left: `${startPct}%`, width: `${widthPct}%` }}
+            />
+          );
+        })}
+        {/*
+          Netflix-style buffer-ahead overlay. Sits ABOVE the marker
+          tints but BELOW the played-progress fill so the played
+          portion still shows in accent color; the unplayed-but-
+          buffered range gets a lighter white tint. We clamp at 100%
+          so an over-counted buffer (rare; HLS.js sometimes reports
+          slightly past video duration) doesn't draw past the
+          track. Hidden entirely when bufferedEnd hasn't caught up
+          to the playhead — avoids a flicker right after seek when
+          buffered ranges haven't been recomputed.
+        */}
+        {duration > 0 && bufferedEnd > displayTime && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 bg-white/45"
+            style={{
+              left: `${progress}%`,
+              width: `${Math.max(0, Math.min(100, (bufferedEnd / duration) * 100) - progress)}%`,
+            }}
+          />
+        )}
         <div
           className="absolute inset-y-0 left-0 bg-(--color-accent)"
           style={{ width: `${progress}%` }}
@@ -1539,7 +3453,70 @@ function ProgressBar({
           style={{ left: `${progress}%` }}
         />
       )}
+      {previewManifest && hoverX !== null && hoverTime !== null && (
+        <ScrubPreview
+          manifest={previewManifest}
+          timeSeconds={hoverTime}
+          hoverX={hoverX}
+        />
+      )}
+      {/*
+        When the cursor sits inside a marker region, surface its
+        label as a small pill above the bar. Useful when the scrub
+        preview is off (no sprite generated yet) and as a quick
+        affordance — "the credits start here" is much clearer than
+        "this orange tint here means something."
+      */}
+      {hoverX !== null && hoverTime !== null && (
+        (() => {
+          const hovered = activeMarker(hoverTime * 1000, markers);
+          if (!hovered) return null;
+          return (
+            <div
+              className="pointer-events-none absolute -translate-x-1/2 rounded-full border border-white/15 bg-black/85 px-2 py-0.5 text-[0.65rem] font-semibold uppercase tracking-wider text-white/85 shadow-md"
+              style={{ left: hoverX, bottom: previewManifest ? "calc(100% + 9.5rem)" : "calc(100% + 0.5rem)" }}
+            >
+              {hovered.kind}
+            </div>
+          );
+        })()
+      )}
     </div>
+  );
+}
+
+/// Floating thumbnail tracking the cursor across the scrub bar. Indexes
+/// into the precomputed sprite via CSS `background-position`; the
+/// browser never decodes a separate image per hover frame.
+function ScrubPreview({
+  manifest,
+  timeSeconds,
+  hoverX,
+}: {
+  manifest: PreviewManifest;
+  timeSeconds: number;
+  hoverX: number;
+}) {
+  const tileIndex = Math.min(
+    manifest.tile_count - 1,
+    Math.max(0, Math.floor((timeSeconds * 1000) / manifest.interval_ms)),
+  );
+  const col = tileIndex % manifest.tile_cols;
+  const row = Math.floor(tileIndex / manifest.tile_cols);
+  const offsetX = -col * manifest.tile_width;
+  const offsetY = -row * manifest.tile_height;
+  return (
+    <div
+      className="pointer-events-none absolute bottom-full mb-2 -translate-x-1/2 rounded border border-white/15 shadow-2xl"
+      style={{
+        left: hoverX,
+        width: manifest.tile_width,
+        height: manifest.tile_height,
+        backgroundImage: `url(${manifest.sprite_url})`,
+        backgroundPosition: `${offsetX}px ${offsetY}px`,
+        backgroundRepeat: "no-repeat",
+      }}
+    />
   );
 }
 
@@ -1812,6 +3789,30 @@ function CaptionsIcon() {
   );
 }
 
+function SubtitleSettingsIcon() {
+  // Captions glyph with a small gear motif at the corner — signals
+  // "subtitles, settings" without needing a tooltip.
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <rect x="2" y="5" width="16" height="14" rx="2" />
+      <line x1="5" y1="11" x2="9" y2="11" />
+      <line x1="5" y1="15" x2="13" y2="15" />
+      <circle cx="19" cy="19" r="3" fill="currentColor" stroke="none" />
+      <circle cx="19" cy="19" r="1.1" fill="black" stroke="none" />
+    </svg>
+  );
+}
+
 function SpeedIcon() {
   return (
     <svg
@@ -1828,6 +3829,27 @@ function SpeedIcon() {
       <circle cx="12" cy="13" r="8" />
       <polyline points="12 9 12 13 15 15" />
       <line x1="9" y1="3" x2="15" y2="3" />
+    </svg>
+  );
+}
+
+function StatsIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <line x1="4" y1="20" x2="4" y2="12" />
+      <line x1="10" y1="20" x2="10" y2="6" />
+      <line x1="16" y1="20" x2="16" y2="14" />
+      <line x1="20" y1="20" x2="20" y2="9" />
     </svg>
   );
 }

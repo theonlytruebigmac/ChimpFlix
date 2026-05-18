@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
-use chimpflix_metadata::{TmdbClient, TvMazeClient};
+use chimpflix_metadata::{AniListClient, TmdbClient, TvMazeClient, TvdbClient};
 use chimpflix_transcoder::FfmpegConfig;
 use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
@@ -51,6 +51,8 @@ impl AgentChain {
                 let mut set = std::collections::HashSet::new();
                 set.insert("tmdb".into());
                 set.insert("tvmaze".into());
+                set.insert("tvdb".into());
+                set.insert("anilist".into());
                 Self { enabled: set }
             }
         }
@@ -61,13 +63,23 @@ impl AgentChain {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_scan(
     pool: SqlitePool,
     ffmpeg: FfmpegConfig,
     tmdb: Option<TmdbClient>,
+    tvdb: Option<TvdbClient>,
+    anilist: Option<AniListClient>,
     tvmaze: Option<TvMazeClient>,
     library_id: i64,
     job_id: i64,
+    // Transcoder cache root, used to pre-warm the WebVTT subtitle
+    // cache as files are scanned. Pass the path the TranscodeManager
+    // was constructed with. When None, scans skip subtitle
+    // pre-warming and the cache populates lazily at session start
+    // instead — used by paths that don't have a transcoder
+    // reference handy (rare; mostly tests).
+    cache_root: Option<std::path::PathBuf>,
     emitter: ScanEmitter,
 ) -> Result<()> {
     let library = queries::get_library(&pool, library_id)
@@ -81,11 +93,14 @@ pub async fn run_scan(
         &pool,
         &ffmpeg,
         tmdb.as_ref(),
+        tvdb.as_ref(),
+        anilist.as_ref(),
         tvmaze.as_ref(),
         &library.paths,
         library.kind,
         library_id,
         job_id,
+        cache_root.as_deref(),
         &emitter,
     )
     .await;
@@ -143,15 +158,19 @@ struct Counters {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn scan_inner(
     pool: &SqlitePool,
     ffmpeg: &FfmpegConfig,
     tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    anilist: Option<&AniListClient>,
     tvmaze: Option<&TvMazeClient>,
     roots: &[String],
     library_kind: LibraryKind,
     library_id: i64,
     job_id: i64,
+    cache_root: Option<&Path>,
     emitter: &ScanEmitter,
 ) -> Result<Counters> {
     let existing = queries::existing_media_files(pool, library_id).await?;
@@ -173,6 +192,8 @@ async fn scan_inner(
             pool,
             ffmpeg,
             tmdb,
+            tvdb,
+            anilist,
             tvmaze,
             &agents,
             &existing,
@@ -180,6 +201,7 @@ async fn scan_inner(
             library_kind,
             &root,
             &path,
+            cache_root,
         )
         .await
         {
@@ -248,10 +270,13 @@ async fn collect_candidates(roots: &[String]) -> Result<Vec<(PathBuf, PathBuf)>>
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn process_file(
     pool: &SqlitePool,
     ffmpeg: &FfmpegConfig,
     tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    anilist: Option<&AniListClient>,
     tvmaze: Option<&TvMazeClient>,
     agents: &AgentChain,
     existing: &HashMap<String, i64>,
@@ -259,6 +284,7 @@ async fn process_file(
     library_kind: LibraryKind,
     root: &Path,
     path: &Path,
+    cache_root: Option<&Path>,
 ) -> Result<queries::FileOutcome> {
     let path_str = path
         .to_str()
@@ -363,6 +389,59 @@ async fn process_file(
     let (file_id, outcome) = queries::upsert_media_file(pool, input, existing_mtime).await?;
     queries::replace_media_streams(pool, file_id, &probe.streams).await?;
 
+    // Pre-warm the WebVTT subtitle cache for every text subtitle in
+    // the source. Without this, the user's first session-time pick
+    // of a sub triggers a fresh ffmpeg extraction which on a Bluray
+    // remux can take minutes — long enough to time out the /sessions
+    // HTTP request and surface "Playback failed" before any video
+    // arrives. With it, the cache is ready by the time anyone hits
+    // play, and the session-start sidecar handler is a tokio::fs
+    // read instead.
+    //
+    // Spawned per file so a slow extraction on one source doesn't
+    // hold up the scanner; the scanner moves on, the cache fills in
+    // the background. Cache-hit on already-extracted sub indices
+    // turns these into cheap no-ops on subsequent scans.
+    if let Some(cache_root) = cache_root {
+        let text_indices: Vec<u32> = probe
+            .streams
+            .iter()
+            .filter(|s| matches!(s.kind, chimpflix_transcoder::StreamKind::Subtitle))
+            .scan(0u32, |idx, s| {
+                let here = *idx;
+                *idx += 1;
+                let is_text = s
+                    .codec
+                    .as_deref()
+                    .map(chimpflix_transcoder::is_text_subtitle_codec)
+                    .unwrap_or(false);
+                Some(is_text.then_some(here))
+            })
+            .flatten()
+            .collect();
+        if !text_indices.is_empty() {
+            let ffmpeg_cfg = ffmpeg.clone();
+            let cache_root_owned = cache_root.to_path_buf();
+            let input_owned = path.to_path_buf();
+            tokio::spawn(async move {
+                if let Err(e) = chimpflix_transcoder::scan_prewarm_text_subs(
+                    &ffmpeg_cfg,
+                    &cache_root_owned,
+                    &input_owned,
+                    &text_indices,
+                )
+                .await
+                {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        path = %input_owned.display(),
+                        "scan-time webvtt prewarm failed; first session play will fall back to on-demand extraction"
+                    );
+                }
+            });
+        }
+    }
+
     if let Some(iid) = item_id {
         if let Some(d) = probe.duration_ms {
             queries::set_item_duration_if_null(pool, iid, d).await?;
@@ -371,16 +450,26 @@ async fn process_file(
 
     if let Some(hint) = movie_hint {
         let tmdb = if agents.is_enabled("tmdb") { tmdb } else { None };
-        tmdb_apply_movie(pool, tmdb, &hint).await;
+        let tvdb = if agents.is_enabled("tvdb") { tvdb } else { None };
+        tmdb_apply_movie(pool, tmdb, tvdb, &hint).await;
     }
     if let Some(hint) = show_hint {
         let tmdb = if agents.is_enabled("tmdb") { tmdb } else { None };
+        let tvdb = if agents.is_enabled("tvdb") { tvdb } else { None };
         let tvmaze = if agents.is_enabled("tvmaze") {
             tvmaze
         } else {
             None
         };
-        tmdb_apply_show(pool, tmdb, tvmaze, &hint).await;
+        // For anime libraries, AniList is the canonical primary; it runs
+        // first so its title/summary/year stick, and the show-tail
+        // enrichment treats TMDB/TVMaze/TVDB as null-fillers behind it.
+        // The agent gate still applies — owners can disable AniList per
+        // library if they prefer TMDB primary for a given catalogue.
+        if matches!(library_kind, LibraryKind::Anime) && agents.is_enabled("anilist") {
+            apply_anilist_for_show(pool, anilist, &hint).await;
+        }
+        tmdb_apply_show(pool, tmdb, tvdb, tvmaze, &hint).await;
     }
 
     Ok(outcome)
@@ -407,22 +496,46 @@ struct ShowHint {
     episode_id: i64,
 }
 
-async fn tmdb_apply_movie(pool: &SqlitePool, tmdb: Option<&TmdbClient>, hint: &MovieHint) {
-    let Some(client) = tmdb else { return };
+async fn tmdb_apply_movie(
+    pool: &SqlitePool,
+    tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    hint: &MovieHint,
+) {
+    if let Some(client) = tmdb {
+        match client.lookup_movie(&hint.title, hint.year).await {
+            Ok(Some(meta)) => {
+                let tmdb_id = meta.tmdb_id;
+                let collection = meta.collection.clone();
+                if let Err(e) = queries::apply_movie_metadata(pool, hint.id, &meta).await {
+                    warn!(error = %format!("{e:#}"), "apply movie metadata");
+                }
+                enrich_credits_and_extras(pool, client, hint.id, tmdb_id, false).await;
+                if let Some(stub) = collection {
+                    apply_collection_for_item(pool, client, hint.id, &stub).await;
+                }
+            }
+            Ok(None) => debug!(title = %hint.title, "no TMDB match"),
+            Err(e) => warn!(error = %format!("{e:#}"), title = %hint.title, "TMDB lookup failed"),
+        }
+    }
+    apply_tvdb_for_movie(pool, tvdb, hint).await;
+}
+
+async fn apply_tvdb_for_movie(
+    pool: &SqlitePool,
+    tvdb: Option<&TvdbClient>,
+    hint: &MovieHint,
+) {
+    let Some(client) = tvdb else { return };
     match client.lookup_movie(&hint.title, hint.year).await {
         Ok(Some(meta)) => {
-            let tmdb_id = meta.tmdb_id;
-            let collection = meta.collection.clone();
-            if let Err(e) = queries::apply_movie_metadata(pool, hint.id, &meta).await {
-                warn!(error = %format!("{e:#}"), "apply movie metadata");
-            }
-            enrich_credits_and_extras(pool, client, hint.id, tmdb_id, false).await;
-            if let Some(stub) = collection {
-                apply_collection_for_item(pool, client, hint.id, &stub).await;
+            if let Err(e) = queries::apply_movie_metadata_tvdb(pool, hint.id, &meta).await {
+                warn!(error = %format!("{e:#}"), "apply TVDB movie metadata");
             }
         }
-        Ok(None) => debug!(title = %hint.title, "no TMDB match"),
-        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.title, "TMDB lookup failed"),
+        Ok(None) => debug!(title = %hint.title, "no TVDB match"),
+        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.title, "TVDB movie lookup failed"),
     }
 }
 
@@ -483,6 +596,7 @@ async fn apply_collection_for_item(
 pub async fn refresh_item_metadata(
     pool: &SqlitePool,
     client: &TmdbClient,
+    tvdb: Option<&TvdbClient>,
     tvmaze: Option<&TvMazeClient>,
     item_id: i64,
     override_tmdb_id: Option<i64>,
@@ -532,11 +646,25 @@ pub async fn refresh_item_metadata(
     enrich_credits_and_extras(pool, client, item_id, tmdb_id, matches!(kind, ItemKind::Show))
         .await;
 
-    // Run TVMaze after TMDB so it only fills the holes TMDB left.
-    if matches!(kind, ItemKind::Show) {
-        if let Some(tv) = tvmaze {
-            if let Ok(Some(meta)) = tv.lookup_show(&title).await {
-                let _ = queries::apply_show_metadata_tvmaze(pool, item_id, &meta).await;
+    // Run TVMaze + TVDB after TMDB so they only fill the holes TMDB left.
+    match kind {
+        ItemKind::Show => {
+            if let Some(tv) = tvmaze {
+                if let Ok(Some(meta)) = tv.lookup_show(&title).await {
+                    let _ = queries::apply_show_metadata_tvmaze(pool, item_id, &meta).await;
+                }
+            }
+            if let Some(tv) = tvdb {
+                if let Ok(Some(meta)) = tv.lookup_show(&title, year).await {
+                    let _ = queries::apply_show_metadata_tvdb(pool, item_id, &meta).await;
+                }
+            }
+        }
+        ItemKind::Movie => {
+            if let Some(tv) = tvdb {
+                if let Ok(Some(meta)) = tv.lookup_movie(&title, year).await {
+                    let _ = queries::apply_movie_metadata_tvdb(pool, item_id, &meta).await;
+                }
             }
         }
     }
@@ -587,6 +715,7 @@ async fn enrich_credits_and_extras(
 async fn tmdb_apply_show(
     pool: &SqlitePool,
     tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
     tvmaze: Option<&TvMazeClient>,
     hint: &ShowHint,
 ) {
@@ -634,6 +763,7 @@ async fn tmdb_apply_show(
     // imdb/tvdb cross-refs we didn't get from TMDB, etc.) without ever
     // overwriting.
     apply_tvmaze_for_show(pool, tvmaze, hint).await;
+    apply_tvdb_for_show(pool, tvdb, hint).await;
 
     if let Some(show_tmdb_id) = show_tmdb_id {
         match client.fetch_season(show_tmdb_id, hint.season_number).await {
@@ -694,5 +824,83 @@ async fn apply_tvmaze_for_show(
         }
         Ok(None) => debug!(title = %hint.show_title, "no TVMaze match"),
         Err(e) => warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVMaze lookup failed"),
+    }
+}
+
+async fn apply_anilist_for_show(
+    pool: &SqlitePool,
+    anilist: Option<&AniListClient>,
+    hint: &ShowHint,
+) {
+    let Some(client) = anilist else { return };
+    // Skip the API call if we already have an anilist_id stored — re-runs
+    // of the scan shouldn't re-search every episode of every show.
+    let row = sqlx::query("SELECT anilist_id FROM items WHERE id = ?")
+        .bind(hint.show_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if let Some(row) = row {
+        let existing: Option<i64> = sqlx::Row::try_get(&row, "anilist_id").ok().flatten();
+        if existing.is_some() {
+            return;
+        }
+    }
+    match client.lookup_show(&hint.show_title, hint.show_year).await {
+        Ok(Some(meta)) => {
+            if let Err(e) =
+                queries::apply_show_metadata_anilist(pool, hint.show_id, &meta).await
+            {
+                warn!(error = %format!("{e:#}"), "apply AniList show metadata");
+            }
+        }
+        Ok(None) => debug!(title = %hint.show_title, "no AniList match"),
+        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.show_title, "AniList lookup failed"),
+    }
+}
+
+async fn apply_tvdb_for_show(
+    pool: &SqlitePool,
+    tvdb: Option<&TvdbClient>,
+    hint: &ShowHint,
+) {
+    let Some(client) = tvdb else { return };
+    // Skip the API call when nothing TVDB can contribute remains. Same
+    // null-check shape as TVMaze; original_title is the one TVDB-only
+    // field we care about over and above what TVMaze can supply.
+    let row = sqlx::query(
+        "SELECT summary, year, imdb_id, tvdb_id, original_title FROM items WHERE id = ?",
+    )
+    .bind(hint.show_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(row) = row else { return };
+    let summary: Option<String> = sqlx::Row::try_get(&row, "summary").ok().flatten();
+    let year: Option<i32> = sqlx::Row::try_get(&row, "year").ok().flatten();
+    let imdb_id: Option<String> = sqlx::Row::try_get(&row, "imdb_id").ok().flatten();
+    let tvdb_id: Option<i64> = sqlx::Row::try_get(&row, "tvdb_id").ok().flatten();
+    let original_title: Option<String> =
+        sqlx::Row::try_get(&row, "original_title").ok().flatten();
+    if summary.is_some()
+        && year.is_some()
+        && imdb_id.is_some()
+        && tvdb_id.is_some()
+        && original_title.is_some()
+    {
+        return;
+    }
+    match client.lookup_show(&hint.show_title, hint.show_year).await {
+        Ok(Some(meta)) => {
+            if let Err(e) =
+                queries::apply_show_metadata_tvdb(pool, hint.show_id, &meta).await
+            {
+                warn!(error = %format!("{e:#}"), "apply TVDB show metadata");
+            }
+        }
+        Ok(None) => debug!(title = %hint.show_title, "no TVDB show match"),
+        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVDB show lookup failed"),
     }
 }

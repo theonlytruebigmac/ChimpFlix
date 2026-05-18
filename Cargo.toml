@@ -20,11 +20,21 @@ authors = ["ChimpFlix contributors"]
 anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 cron = "0.12"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
+# Async SMTP client. Pulled with rustls (no openssl dep) and the tokio1
+# executor so it slots into the existing tokio runtime cleanly.
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1-rustls-tls",
+    "smtp-transport",
+    "builder",
+    "hostname",
+] }
 libc = "0.2"
 notify = "6"
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -36,10 +46,19 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+# Pure-Rust QR encoder. Used by the 2FA enrollment endpoint to render
+# the otpauth:// URI as an SVG the frontend can drop into an <img> tag.
+# Server-side rendering keeps the web bundle dep-free.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# RFC 6238 TOTP with the standard SHA-1 + 6-digit + 30s defaults that
+# every authenticator app (Google Authenticator, Authy, 1Password, etc.)
+# expects. otpauth:// URI generation comes from the same crate.
+totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "fs", "cors", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["trace", "fs", "cors", "compression-gzip", "limit"] }
+governor = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }

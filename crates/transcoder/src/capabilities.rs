@@ -4,13 +4,34 @@
 //! We invoke `ffmpeg -hide_banner -hwaccels` for the accel list and
 //! `ffmpeg -hide_banner -encoders` for the encoder set, scanning for the
 //! six h264/hevc hardware encoders shipped by upstream ffmpeg today.
+//!
+//! That on its own is not sufficient — the ffmpeg binary can advertise
+//! `h264_nvenc` because it was compiled with NVENC support even when the
+//! host's libcuda.so isn't reachable (the common docker-without-GPU
+//! case). To avoid letting "Auto" pick an encoder that fails at session
+//! start, we follow the listing scan with a one-frame smoke encode for
+//! each candidate. Anything that fails the smoke test is dropped from
+//! the reported list so the admin UI greys it out and `HwAccel::auto_pick`
+//! never selects it.
+//!
 //! Failures here are non-fatal — we just return an empty capability set
 //! and the UI greys out the relevant options.
 
 use serde::Serialize;
 use std::collections::HashSet;
+use std::time::Duration;
+
+use tracing::{debug, warn};
 
 use crate::FfmpegConfig;
+
+/// Per-encoder time budget for the startup smoke test. Working
+/// encoders complete in under 300 ms on every box we've tested;
+/// 3 s is generous enough to ride out a slow first-encode initial-
+/// alloc without making startup feel sluggish even if every
+/// detected encoder times out (worst case ~18 s for the 6-encoder
+/// candidate set).
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TranscoderCapabilities {
@@ -18,6 +39,39 @@ pub struct TranscoderCapabilities {
     pub hwaccels: Vec<String>,
     pub h264_encoders: Vec<String>,
     pub hevc_encoders: Vec<String>,
+    /// Per-hwaccel list of source codecs the GPU can decode in
+    /// hardware. Keyed by hwaccel name (`cuda`, `vaapi`, `qsv`,
+    /// `videotoolbox`), value is the canonical lowercase codec
+    /// names probed (`h264`, `hevc`, `vp9`, `av1`, `mpeg2video`).
+    /// Populated by [`detect_capabilities`] via the same smoke-test
+    /// pattern as the encoder list — gives the operator an honest
+    /// answer to "does my GPU actually decode this codec?" instead
+    /// of inferring from card model and trusting it.
+    pub decoders: HwDecoderCapabilities,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HwDecoderCapabilities {
+    pub cuda: Vec<String>,
+    pub vaapi: Vec<String>,
+    pub qsv: Vec<String>,
+    pub videotoolbox: Vec<String>,
+}
+
+impl HwDecoderCapabilities {
+    /// Does the named hwaccel support decoding the given source
+    /// codec? Caller passes a lowercase codec name (the same form
+    /// ffprobe stores in `media_streams.codec`).
+    pub fn supports(&self, hwaccel: &str, normalized_codec: &str) -> bool {
+        let list = match hwaccel {
+            "cuda" => &self.cuda,
+            "vaapi" => &self.vaapi,
+            "qsv" => &self.qsv,
+            "videotoolbox" => &self.videotoolbox,
+            _ => return false,
+        };
+        list.iter().any(|c| c == normalized_codec)
+    }
 }
 
 pub async fn detect_capabilities(cfg: &FfmpegConfig) -> TranscoderCapabilities {
@@ -41,17 +95,219 @@ pub async fn detect_capabilities(cfg: &FfmpegConfig) -> TranscoderCapabilities {
         "hevc_amf",
         "hevc_v4l2m2m",
     ];
-    caps.h264_encoders = h264_candidates
+    let h264_listed: Vec<String> = h264_candidates
         .iter()
         .filter(|name| encoders.contains(**name))
         .map(|s| (*s).to_string())
         .collect();
-    caps.hevc_encoders = hevc_candidates
+    let hevc_listed: Vec<String> = hevc_candidates
         .iter()
         .filter(|name| encoders.contains(**name))
         .map(|s| (*s).to_string())
         .collect();
+
+    caps.h264_encoders = filter_to_working(cfg, h264_listed).await;
+    caps.hevc_encoders = filter_to_working(cfg, hevc_listed).await;
+
+    // Decoder smoke tests: per-hwaccel, per-source-codec. Each test
+    // tries to decode a 1-frame synthetic input using the chosen
+    // hwaccel; if ffmpeg exits zero, the GPU can actually decode
+    // that codec. Catches the "card model has the silicon block but
+    // the driver/container is missing the firmware" case, and
+    // distinguishes pre-Ampere (no AV1 NVDEC) from Ampere+ (yes
+    // AV1) without us having to maintain a card-model database.
+    if caps.hwaccels.iter().any(|h| h == "cuda") {
+        caps.decoders.cuda = probe_decoders_for(cfg, "cuda").await;
+    }
+    if caps.hwaccels.iter().any(|h| h == "vaapi") {
+        caps.decoders.vaapi = probe_decoders_for(cfg, "vaapi").await;
+    }
+    if caps.hwaccels.iter().any(|h| h == "qsv") {
+        caps.decoders.qsv = probe_decoders_for(cfg, "qsv").await;
+    }
+    if caps.hwaccels.iter().any(|h| h == "videotoolbox") {
+        caps.decoders.videotoolbox = probe_decoders_for(cfg, "videotoolbox").await;
+    }
+
     caps
+}
+
+/// Codec set we care about for HW decode. Order is most-common
+/// first so the typical "h264 source" probe completes before we
+/// move on to the less-common codecs.
+const DECODER_CODECS: &[&str] = &[
+    "h264",
+    "hevc",
+    "vp9",
+    "av1",
+    "mpeg2video",
+];
+
+/// For each codec we care about, generate a 1-frame synthetic source
+/// in that codec via the corresponding libavcodec encoder, then try
+/// to decode it through the requested hwaccel. The handshake works
+/// because ffmpeg can pipe its own output back to its input — no
+/// external sample files needed.
+async fn probe_decoders_for(cfg: &FfmpegConfig, hwaccel: &str) -> Vec<String> {
+    let mut working = Vec::new();
+    for codec in DECODER_CODECS {
+        if smoke_test_decoder(cfg, hwaccel, codec).await {
+            debug!(hwaccel = %hwaccel, codec = %codec, "decoder smoke test ok");
+            working.push((*codec).to_string());
+        }
+    }
+    working
+}
+
+/// Run `ffmpeg -hwaccel X -f lavfi -i color=...,Y -c:v <encoder>
+/// -frames 1 -f rawvideo -` plus a second pipeline that takes the
+/// encoded bytes and decodes them back. If both halves succeed, the
+/// GPU can decode that codec through that hwaccel.
+///
+/// Implementation note: instead of two ffmpeg invocations + a pipe
+/// (which is fiddly to set up correctly across platforms), we use
+/// ffmpeg's `-init_hw_device` + force-decoder-name path: render a
+/// short clip with the corresponding encoder to a temp file in
+/// memory, then re-read it with the hwaccel decoder. For TS-friendly
+/// codecs (h264/hevc/mpeg2) we mux to mpegts; for everything else
+/// we use mp4 / matroska as appropriate.
+///
+/// The probe deliberately avoids producing real output — `-f null`
+/// + `-frames:v 1` keeps the test minimal. ~50ms per probe on a
+/// healthy box; up to SMOKE_TIMEOUT on a hung driver.
+async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> bool {
+    // Per-codec encoder + container shape for the test stream.
+    // We render the test through software encoders only — the goal
+    // is to produce a syntactically-valid bitstream we can hand to
+    // the HW decoder; the test isn't measuring encoder capability.
+    let (encoder, container) = match codec {
+        "h264" => ("libx264", "mpegts"),
+        "hevc" => ("libx265", "mpegts"),
+        "vp9" => ("libvpx-vp9", "webm"),
+        "av1" => ("libaom-av1", "matroska"),
+        "mpeg2video" => ("mpeg2video", "mpegts"),
+        _ => return false,
+    };
+
+    // Make a tiny test bitstream: 1-frame 64x64 black clip, ~kilobytes.
+    let tmp = std::env::temp_dir().join(format!(
+        "chimpflix_dec_probe_{hwaccel}_{codec}_{}.dat",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    let mut enc_cmd = tokio::process::Command::new(&cfg.ffmpeg);
+    enc_cmd
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .args(["-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1:r=1"])
+        .args(["-vf", "format=yuv420p"])
+        .args(["-c:v", encoder, "-frames:v", "1", "-f", container])
+        .arg(&tmp);
+    let enc_ok = matches!(
+        tokio::time::timeout(SMOKE_TIMEOUT, enc_cmd.output()).await,
+        Ok(Ok(out)) if out.status.success()
+    );
+    if !enc_ok {
+        // No way to make a sample → skip the codec. Operators
+        // without libx265/libaom-av1 in their ffmpeg build will see
+        // this for hevc/av1; that just means we can't probe those
+        // codecs, not that NVDEC won't handle them. Falls back to
+        // optimistic behavior (let pre_input_args allow the hint).
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return false;
+    }
+
+    // Try to decode it via the hwaccel.
+    let mut dec_cmd = tokio::process::Command::new(&cfg.ffmpeg);
+    dec_cmd
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if hwaccel == "vaapi" {
+        dec_cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
+    }
+    dec_cmd
+        .args(["-hwaccel", hwaccel])
+        .arg("-i")
+        .arg(&tmp)
+        .args(["-frames:v", "1", "-f", "null", "-"]);
+    let dec_ok = matches!(
+        tokio::time::timeout(SMOKE_TIMEOUT, dec_cmd.output()).await,
+        Ok(Ok(out)) if out.status.success()
+    );
+    let _ = tokio::fs::remove_file(&tmp).await;
+    dec_ok
+}
+
+/// Run a one-frame smoke encode for every candidate and keep only
+/// the ones that exit zero. Each failure logs a `warn!` with the
+/// encoder name so the operator can see which encoder ffmpeg
+/// advertised but couldn't actually start (the libcuda.so missing /
+/// VAAPI render node missing / Intel iHD driver missing cases).
+async fn filter_to_working(cfg: &FfmpegConfig, candidates: Vec<String>) -> Vec<String> {
+    let mut working = Vec::with_capacity(candidates.len());
+    for enc in candidates {
+        if smoke_test_encoder(cfg, &enc).await {
+            debug!(encoder = %enc, "encoder smoke test ok");
+            working.push(enc);
+        } else {
+            warn!(
+                encoder = %enc,
+                "hardware encoder advertised by ffmpeg but failed smoke test \
+                 (likely missing driver / device); dropping from capability list"
+            );
+        }
+    }
+    working
+}
+
+/// Try to actually run the encoder on a 1-frame synthetic input. If
+/// ffmpeg exits zero the encoder is genuinely usable; any non-zero
+/// exit or timeout means we shouldn't surface it as a choice.
+///
+/// The lavfi `color` filter generates a single 320×240 black frame
+/// — about as cheap as ffmpeg input gets, while still exercising
+/// the full encoder init path that fails when libcuda / iHD /
+/// renderD128 is missing. Output is muxed into the `null` muxer
+/// (writes nothing to stdout/disk) so the test leaves no artifacts.
+async fn smoke_test_encoder(cfg: &FfmpegConfig, encoder: &str) -> bool {
+    let mut cmd = tokio::process::Command::new(&cfg.ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    // VAAPI needs a device handle declared before the input. Other
+    // encoders accept software frames directly. We hardcode the
+    // canonical Linux DRI path; operators with a non-standard render
+    // node will still see the encoder fail the smoke test, which is
+    // the correct signal to take "Auto" off VAAPI for them.
+    if encoder.contains("_vaapi") {
+        cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
+    }
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=320x240:d=0.1:r=1",
+    ]);
+    // VAAPI insists on NV12 frames uploaded to the GPU. Other
+    // encoders are happy with plain yuv420p.
+    let vf = if encoder.contains("_vaapi") {
+        "format=nv12,hwupload"
+    } else {
+        "format=yuv420p"
+    };
+    cmd.args(["-vf", vf]);
+    cmd.args([
+        "-c:v",
+        encoder,
+        "-frames:v",
+        "1",
+        "-f",
+        "null",
+        "-",
+    ]);
+
+    match tokio::time::timeout(SMOKE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => out.status.success(),
+        Ok(Err(_)) => false, // spawn failed (ffmpeg binary missing, etc.)
+        Err(_) => false,     // timed out — encoder is hung in init
+    }
 }
 
 async fn ffmpeg_version(cfg: &FfmpegConfig) -> Option<String> {

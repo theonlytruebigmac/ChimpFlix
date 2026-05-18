@@ -1,10 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import {
   admin as adminApi,
   type DashboardResponse,
   type DashboardSession,
+  type ScheduledTask,
+  type SecretSlotView,
 } from "@/lib/chimpflix-api";
 
 interface Props {
@@ -19,8 +22,41 @@ const POLL_INTERVAL_MS = 30_000;
 
 export function AdminDashboardClient({ initial }: Props) {
   const [data, setData] = useState<DashboardResponse>(initial);
+  const [tasks, setTasks] = useState<ScheduledTask[] | null>(null);
+  const [secrets, setSecrets] = useState<SecretSlotView[] | null>(null);
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Tasks + secrets are fetched separately from the dashboard payload
+  // — same admin scope, different endpoints. Tasks refresh on the 30s
+  // cadence to keep "Up next" countdowns accurate; secrets are loaded
+  // once because they change rarely (operator action only).
+  useEffect(() => {
+    let cancelled = false;
+    async function loadTasks() {
+      try {
+        const res = await adminApi.tasks.list();
+        if (!cancelled) setTasks(res.tasks);
+      } catch {
+        if (!cancelled) setTasks([]);
+      }
+    }
+    async function loadSecrets() {
+      try {
+        const res = await adminApi.secrets.list();
+        if (!cancelled) setSecrets(res.slots);
+      } catch {
+        if (!cancelled) setSecrets([]);
+      }
+    }
+    loadTasks();
+    loadSecrets();
+    const t = setInterval(loadTasks, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -157,6 +193,8 @@ export function AdminDashboardClient({ initial }: Props) {
                   <th className="px-4 py-2">Session</th>
                   <th className="px-4 py-2">User</th>
                   <th className="px-4 py-2">File</th>
+                  <th className="px-4 py-2">Resolution</th>
+                  <th className="px-4 py-2">Encoder</th>
                   <th className="px-4 py-2">Started</th>
                   <th className="px-4 py-2">Last seen</th>
                   <th className="px-4 py-2" />
@@ -174,11 +212,25 @@ export function AdminDashboardClient({ initial }: Props) {
                     <td className="whitespace-nowrap px-4 py-2 text-white/70">
                       file #{s.media_file_id}
                     </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/60">
-                      {formatRelative(data.server.now_ms - s.created_at)}
+                    <td className="whitespace-nowrap px-4 py-2 text-xs text-white/70 tabular-nums">
+                      <ResolutionCell
+                        sourceHeight={s.source_height}
+                        targetHeight={s.target_height}
+                        bitrateBps={s.target_video_bitrate_bps}
+                      />
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2 text-xs text-white/70">
+                      <EncoderChip
+                        label={s.encoder}
+                        videoTreatment={s.video_treatment}
+                        audioTreatment={s.audio_treatment}
+                      />
                     </td>
                     <td className="whitespace-nowrap px-4 py-2 text-white/60">
-                      {formatRelative(data.server.now_ms - s.last_seen_at)}
+                      {formatAgo(data.server.now_ms - s.created_at)}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2 text-white/60">
+                      {formatAgo(data.server.now_ms - s.last_seen_at)}
                     </td>
                     <td className="whitespace-nowrap px-4 py-2 text-right">
                       <button
@@ -194,6 +246,37 @@ export function AdminDashboardClient({ initial }: Props) {
               </tbody>
             </table>
           </div>
+        )}
+      </section>
+
+      <section>
+        <SectionTitle title="Scheduled tasks" />
+        {tasks === null ? (
+          <Empty>Loading…</Empty>
+        ) : tasks.length === 0 ? (
+          <Empty>
+            No scheduled tasks. Add one under{" "}
+            <Link
+              href="/settings/admin/library/scheduled-tasks"
+              className="underline hover:text-white"
+            >
+              Library → Scheduled Tasks
+            </Link>
+            .
+          </Empty>
+        ) : (
+          <TaskSummary tasks={tasks} nowMs={data.server.now_ms} />
+        )}
+      </section>
+
+      <section>
+        <SectionTitle title="Credential vault" />
+        {secrets === null ? (
+          <Empty>Loading…</Empty>
+        ) : secrets.length === 0 ? (
+          <Empty>No credential slots registered.</Empty>
+        ) : (
+          <VaultSummary slots={secrets} />
         )}
       </section>
 
@@ -318,6 +401,223 @@ export function AdminDashboardClient({ initial }: Props) {
   );
 }
 
+function TaskSummary({
+  tasks,
+  nowMs,
+}: {
+  tasks: ScheduledTask[];
+  nowMs: number;
+}) {
+  // Two columns side-by-side: "Up next" (soonest first, enabled only)
+  // and "Recently run" (most recent last_run_at first, regardless of
+  // status). Capped at 5 each so the card stays glanceable.
+  const upNext = tasks
+    .filter((t) => t.enabled)
+    .slice()
+    .sort((a, b) => a.next_run_at - b.next_run_at)
+    .slice(0, 5);
+  const recent = tasks
+    .filter((t) => t.last_run_at !== null)
+    .slice()
+    .sort((a, b) => (b.last_run_at ?? 0) - (a.last_run_at ?? 0))
+    .slice(0, 5);
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+      <div className="rounded-lg border border-white/10 bg-white/2 p-4">
+        <div className="mb-3 text-xs font-semibold uppercase tracking-wider text-white/45">
+          Up next
+        </div>
+        {upNext.length === 0 ? (
+          <div className="text-sm text-white/45">No enabled tasks.</div>
+        ) : (
+          <ul className="space-y-1.5 text-sm">
+            {upNext.map((t) => (
+              <li
+                key={t.id}
+                className="flex items-baseline justify-between gap-3"
+              >
+                <span className="truncate text-white/85">{t.name}</span>
+                <span className="shrink-0 text-xs text-white/55">
+                  in {formatRelative(t.next_run_at - nowMs)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="rounded-lg border border-white/10 bg-white/2 p-4">
+        <div className="mb-3 text-xs font-semibold uppercase tracking-wider text-white/45">
+          Recently run
+        </div>
+        {recent.length === 0 ? (
+          <div className="text-sm text-white/45">No task runs yet.</div>
+        ) : (
+          <ul className="space-y-1.5 text-sm">
+            {recent.map((t) => (
+              <li
+                key={t.id}
+                className="flex items-baseline justify-between gap-3"
+              >
+                <span className="flex items-baseline gap-2 truncate text-white/85">
+                  <TaskDot status={t.last_status} />
+                  <span className="truncate">{t.name}</span>
+                </span>
+                <span className="shrink-0 text-xs text-white/55">
+                  {t.last_run_at ? formatAgo(nowMs - t.last_run_at) : "—"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function VaultSummary({ slots }: { slots: SecretSlotView[] }) {
+  // Hide the system-managed session_hmac slot — it's not a user-facing
+  // credential, just an internal key the server rotates. The remaining
+  // slots are the integration agents the operator chose to wire up.
+  const userSlots = slots.filter((s) => !s.managed);
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+      {userSlots.map((slot) => {
+        const set = Boolean(slot.stored?.set);
+        return (
+          <Link
+            key={slot.name}
+            href="/settings/admin/server/credentials"
+            className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/2 px-3 py-2 text-sm transition-colors hover:bg-white/5"
+          >
+            <span className="truncate text-white/85">{slot.display_name}</span>
+            <span
+              className={`flex shrink-0 items-center gap-1 text-xs ${
+                set ? "text-emerald-300" : "text-white/40"
+              }`}
+              aria-label={set ? "Configured" : "Not configured"}
+            >
+              <span
+                className={`inline-block h-1.5 w-1.5 rounded-full ${set ? "bg-emerald-400" : "bg-white/25"}`}
+              />
+              {set ? "Set" : "Empty"}
+            </span>
+          </Link>
+        );
+      })}
+    </div>
+  );
+}
+
+function TaskDot({ status }: { status: ScheduledTask["last_status"] }) {
+  const cls =
+    status === "success"
+      ? "bg-emerald-400"
+      : status === "failed"
+        ? "bg-red-400"
+        : status === "running"
+          ? "bg-blue-400 animate-pulse"
+          : "bg-white/30";
+  return <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${cls}`} />;
+}
+
+/// Render a positive elapsed `ms` as just the duration (no suffix).
+/// Used inside cells that already have "in X" / "X ago" framing
+/// supplied by the surrounding copy. For an inline "X ago" string
+/// suitable for tables, use `formatAgo` below.
+function formatRelative(ms: number): string {
+  if (ms <= 0) return "now";
+  return formatDuration(Math.floor(ms / 1000));
+}
+
+function formatAgo(ms: number): string {
+  if (ms < 0) return "just now";
+  if (ms < 1000) return "just now";
+  return `${formatDuration(Math.floor(ms / 1000))} ago`;
+}
+
+/// "Source → Target" cell with bitrate. Reads as "1080p → 720p · 2.5
+/// Mbps" so the operator can see at a glance whether the session is
+/// downscaling and how much bandwidth budget the encoder has. Bitrate
+/// is shown in Mbps once the value is large enough to round cleanly;
+/// kbps otherwise.
+function ResolutionCell({
+  sourceHeight,
+  targetHeight,
+  bitrateBps,
+}: {
+  sourceHeight: number | null;
+  targetHeight: number;
+  bitrateBps: number;
+}) {
+  const target = `${targetHeight}p`;
+  const source = sourceHeight ? `${sourceHeight}p` : null;
+  const rate = bitrateBps >= 1_000_000
+    ? `${(bitrateBps / 1_000_000).toFixed(1).replace(/\.0$/, "")} Mbps`
+    : `${Math.round(bitrateBps / 1000)} kbps`;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {source && source !== target ? (
+        <>
+          <span className="text-white/55">{source}</span>
+          <span className="text-white/35">→</span>
+          <span className="text-white/85">{target}</span>
+        </>
+      ) : (
+        <span className="text-white/85">{target}</span>
+      )}
+      <span className="text-white/45">·</span>
+      <span className="text-white/55">{rate}</span>
+    </span>
+  );
+}
+
+/// Pill cluster summarising what ffmpeg is doing for one session.
+/// Three pieces: the encoder (emerald for hardware, muted for the
+/// software fallback) plus an optional copy-status badge. When both
+/// video and audio are copying it's a pure remux (no encoding at
+/// all) — the cheapest possible path; we flag that explicitly so the
+/// operator can see at a glance how light the session actually is.
+function EncoderChip({
+  label,
+  videoTreatment,
+  audioTreatment,
+}: {
+  label: string;
+  videoTreatment?: "copy" | "reencode";
+  audioTreatment?: "copy" | "reencode";
+}) {
+  const isSoftware = label.toLowerCase().includes("software");
+  const cls = isSoftware
+    ? "bg-white/10 text-white/55"
+    : "bg-emerald-500/15 text-emerald-300";
+  const vCopy = videoTreatment === "copy";
+  const aCopy = audioTreatment === "copy";
+  const copyBadge = vCopy && aCopy
+    ? { label: "Remux", title: "Both video and audio are being remuxed — no encoder running" }
+    : vCopy
+      ? { label: "V Copy", title: "Video stream is being remuxed, not re-encoded" }
+      : aCopy
+        ? { label: "A Copy", title: "Audio stream is being remuxed, not re-encoded" }
+        : null;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span
+        className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${cls}`}
+      >
+        {label}
+      </span>
+      {copyBadge && (
+        <span
+          className="inline-flex items-center rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-sky-300"
+          title={copyBadge.title}
+        >
+          {copyBadge.label}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-white/10 bg-white/2 p-4">
@@ -404,12 +704,6 @@ function formatDuration(seconds: number): string {
   const d = Math.floor(seconds / 86_400);
   const h = Math.floor((seconds % 86_400) / 3600);
   return h > 0 ? `${d}d ${h}h` : `${d}d`;
-}
-
-function formatRelative(ms: number): string {
-  if (ms < 0) return "just now";
-  if (ms < 1000) return "just now";
-  return `${formatDuration(Math.floor(ms / 1000))} ago`;
 }
 
 function formatWhen(epochMs: number): string {

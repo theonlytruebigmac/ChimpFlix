@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { brandNameUpper } from "@/lib/env";
 import {
   displayTitle,
@@ -21,6 +21,8 @@ import {
   collections as collectionsApi,
   items as itemsApi,
   playState as playStateApi,
+  ratings as ratingsApi,
+  tags as tagsApi,
   type CollectionDetail,
   type Credit,
   type Extra,
@@ -28,11 +30,15 @@ import {
   type ListedItem,
   type Review,
   type ReviewsSummary,
+  type Tag,
   type User,
 } from "@/lib/chimpflix-api";
 import { EditMetadataDialog } from "./EditMetadataDialog";
 import { FixMatchDialog } from "./FixMatchDialog";
 import { prefetchPlay } from "@/lib/play-prefetch";
+import { cancelPrewarm, prewarmFor } from "@/lib/prewarm";
+import { detectClientCapabilities } from "@/lib/client-caps";
+import { getPrefs } from "@/lib/prefs";
 import { TitleModalShell } from "./TitleModalShell";
 import { SeasonEpisodes } from "./SeasonEpisodes";
 import { TrailerPlayer } from "./TrailerPlayer";
@@ -66,6 +72,33 @@ function useTrailer(item: MediaItem): string | null {
   }, [item.ratingKey, item.type]);
 
   return videoId;
+}
+
+/// Plays the community-curated theme song for a TV show when the modal
+/// is open and no trailer is taking the audio channel. The plexapp
+/// endpoint serves MP3s by tvdb_id; ~half of shows have a theme there
+/// so we tolerate a 404 by silently doing nothing.
+function useThemeMusic(tvdbId: number | null, enabled: boolean) {
+  useEffect(() => {
+    if (!tvdbId || !enabled) return;
+    if (typeof Audio === "undefined") return;
+    const audio = new Audio(`https://tvthemes.plexapp.com/${tvdbId}.mp3`);
+    audio.loop = true;
+    audio.volume = 0.35;
+    audio.preload = "auto";
+    let teardown = () => {
+      audio.pause();
+      audio.src = "";
+    };
+    audio.addEventListener("error", () => {
+      teardown();
+    });
+    audio.play().catch(() => {
+      // Autoplay policies; the user can still trigger via interaction.
+      teardown();
+    });
+    return () => teardown();
+  }, [tvdbId, enabled]);
 }
 
 export function TitleModalClient({ ratingKey }: { ratingKey: string }) {
@@ -128,6 +161,11 @@ function TitleModalView({ data }: { data: ModalData }) {
   const isShow = item.type === "show";
   const { inList, toggle: toggleMyList } = useMyListItem(item.ratingKey);
   const trailerVideoId = useTrailer(item);
+  // Theme music: only attempt for TV shows with a tvdb_id, only when no
+  // trailer is playing (the trailer brings its own audio). The
+  // community-curated plexapp endpoint silently 404s for ~half of
+  // shows, which we tolerate by hiding the <audio> on error.
+  useThemeMusic(isShow ? detail.tvdb_id : null, !trailerVideoId);
   const backdrop = plexImage(item.art ?? item.thumb, 1920, 1080);
   const title = displayTitle(item);
   const progress =
@@ -142,6 +180,58 @@ function TitleModalView({ data }: { data: ModalData }) {
   const topCast = item.cast?.slice(0, 3) ?? [];
   const extraCast = (item.cast?.length ?? 0) > 3;
   const firstSeason = seasons[0];
+  // True when any media file has at least one subtitle stream. Drives
+  // the CC chip in the hero meta row so users know captions are
+  // available before they hit Play.
+  const hasSubtitles = detail.files.some((f) =>
+    f.streams.some((s) => s.kind === "subtitle"),
+  );
+
+  // Hover-time session pre-warm. A 250 ms debounce keeps casual
+  // pointer pass-throughs from spinning up ffmpeg — only deliberate
+  // hovers (the kind that precede a click) make it through. Cancelling
+  // on modal unmount tears down any orphan session if the user closes
+  // the modal without clicking Play.
+  const prewarmTimerRef = useRef<number | null>(null);
+  const startPrewarm = () => {
+    if (prewarmTimerRef.current !== null) return;
+    prewarmTimerRef.current = window.setTimeout(() => {
+      prewarmTimerRef.current = null;
+      try {
+        prewarmFor(
+          item.ratingKey,
+          {
+            supported_video_codecs: detectClientCapabilities().video,
+            supported_audio_codecs: detectClientCapabilities().audio,
+            supported_containers: detectClientCapabilities().containers,
+          },
+          getPrefs().audioNormalize,
+        );
+      } catch {
+        // Capability detection / pref read failures are best-effort;
+        // the player's own createSession path is the source of truth.
+      }
+    }, 250);
+  };
+  const cancelPendingPrewarm = () => {
+    if (prewarmTimerRef.current !== null) {
+      window.clearTimeout(prewarmTimerRef.current);
+      prewarmTimerRef.current = null;
+    }
+  };
+  // The pre-warm session lives in a module-level cache that
+  // outlives this component — when the user actually clicks Play
+  // and the player adopts it, we don't want to cancel. So the
+  // cleanup only fires `cancelPrewarm` if no consumption has
+  // happened. The cache module's `consumePrewarm` zeros itself
+  // out on hit, so `cancelPrewarm` becomes a no-op in that case.
+  useEffect(() => {
+    return () => {
+      cancelPendingPrewarm();
+      void cancelPrewarm();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <>
@@ -165,12 +255,41 @@ function TitleModalView({ data }: { data: ModalData }) {
         <div className="absolute inset-0 bg-linear-to-t from-surface via-surface/30 to-transparent" />
 
         <div className="absolute inset-x-0 bottom-0 p-10">
-          <div className="mb-2 text-xs font-bold tracking-[0.35em] text-(--color-accent)">
-            {brandNameUpper()}
+          {/*
+            Netflix-style eyebrow: the brand mark in red, a thin vertical
+            divider, then the kind. Sits just above the title so users
+            can tell at a glance "movie" vs "series" vs "episode".
+          */}
+          <div className="mb-2 flex items-center gap-2 text-[0.7rem] font-bold uppercase tracking-[0.3em] drop-shadow">
+            <span className="text-(--color-accent)">{brandNameUpper()}</span>
+            <span className="h-3 w-px bg-white/40" aria-hidden />
+            <span className="text-white/85">{isShow ? "Series" : "Film"}</span>
           </div>
-          <h1 className="mb-5 max-w-3xl text-5xl font-black uppercase leading-[0.95] tracking-tight drop-shadow-lg">
-            {title}
-          </h1>
+          <div className="mb-5">
+            {item.logo ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={item.logo}
+                alt={title}
+                className="zf-fade-in max-h-44 max-w-md drop-shadow-2xl sm:max-h-56 sm:max-w-lg"
+                style={{ objectFit: "contain", objectPosition: "left bottom" }}
+              />
+            ) : (
+              <h1 className="max-w-3xl text-4xl font-black uppercase leading-[0.95] tracking-tight drop-shadow-lg sm:text-5xl">
+                {title}
+              </h1>
+            )}
+            {detail.original_title &&
+              detail.original_title.trim() !== title.trim() && (
+                <div
+                  className="mt-2 max-w-3xl text-sm text-white/65 drop-shadow"
+                  lang="ja"
+                  title="Original title"
+                >
+                  {detail.original_title}
+                </div>
+              )}
+          </div>
 
           {progress !== null && remainingMs !== undefined && (
             <div className="mb-5 flex max-w-md items-center gap-3">
@@ -187,10 +306,19 @@ function TitleModalView({ data }: { data: ModalData }) {
           )}
 
           <div className="flex items-center gap-3">
-            <a
+            <Link
               href={`/watch/${item.ratingKey}`}
-              onMouseEnter={prefetchPlay}
-              onFocus={prefetchPlay}
+              prefetch
+              onMouseEnter={() => {
+                prefetchPlay();
+                startPrewarm();
+              }}
+              onMouseLeave={cancelPendingPrewarm}
+              onFocus={() => {
+                prefetchPlay();
+                startPrewarm();
+              }}
+              onBlur={cancelPendingPrewarm}
               className="inline-flex items-center gap-2 rounded-md bg-white px-7 py-2.5 text-base font-bold text-black transition-colors hover:bg-white/85"
             >
               <svg
@@ -203,7 +331,7 @@ function TitleModalView({ data }: { data: ModalData }) {
                 <path d="M6 4l14 8-14 8V4z" />
               </svg>
               {progress !== null ? "Resume" : "Play"}
-            </a>
+            </Link>
             <button
               type="button"
               onClick={toggleMyList}
@@ -265,6 +393,21 @@ function TitleModalView({ data }: { data: ModalData }) {
                 {item.contentRating}
               </span>
             )}
+            {/*
+              Netflix-style HD + CC chips. HD is universal (we always
+              transcode to H.264 ≥ 720p) so it's safe to show
+              unconditionally. CC reflects whether ANY subtitle stream
+              exists — embedded or external — so users know if captions
+              are available before they start playing.
+            */}
+            <span className="rounded border border-white/40 px-1.5 py-0.5 text-[0.65rem] font-semibold tracking-wider">
+              HD
+            </span>
+            {hasSubtitles && (
+              <span className="rounded border border-white/40 px-1.5 py-0.5 text-[0.65rem] font-semibold tracking-wider">
+                CC
+              </span>
+            )}
           </div>
           {item.summary && (
             <p className="text-base leading-relaxed text-white/95">
@@ -316,6 +459,8 @@ function TitleModalView({ data }: { data: ModalData }) {
       )}
 
       <FileInfoSection detail={detail} />
+      <RatingBar itemId={detail.id} />
+      <TagBar itemId={detail.id} />
       <ExternalLinks detail={detail} />
       {detail.collection_id != null && (
         <CollectionCard
@@ -636,7 +781,7 @@ function CollectionMemberTile({ item }: { item: ListedItem }) {
       }}
       className="w-32 shrink-0 text-left transition-transform hover:scale-[1.03]"
     >
-      <div className="aspect-[2/3] overflow-hidden rounded bg-black/50">
+      <div className="aspect-2/3 overflow-hidden rounded bg-black/50">
         {poster ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
@@ -661,9 +806,212 @@ function CollectionMemberTile({ item }: { item: ListedItem }) {
 
 // ─── External links ────────────────────────────────────────────────────────
 
-// Small chip strip linking out to the title on IMDb / TMDB. We only have
-// these ids from TMDB enrichment (and TVMaze fallback for imdb_id), so the
-// bar hides itself when no ids are set.
+// Small chip strip linking out to the title on every external service
+// we've collected an id for. Hides itself when no ids are set so the
+// border doesn't render a phantom row.
+/// Per-user 1–10 rating widget. Stars rendered as small numbered
+/// chips so the UI works without a star-glyph font. Hover previews
+/// the rating; clicking commits, clicking the current rating clears.
+/// Pushes to Trakt automatically when the user has linked their
+/// account (the server-side handler fans the call out).
+function RatingBar({ itemId }: { itemId: number }) {
+  const [rating, setRating] = useState<number | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    ratingsApi
+      .getItem(itemId)
+      .then((r) => {
+        if (!cancelled) {
+          setRating(r.rating);
+          setLoaded(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [itemId]);
+
+  async function set(value: number) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (rating === value) {
+        // Clicking the current value clears the rating.
+        await ratingsApi.deleteItem(itemId);
+        setRating(null);
+      } else {
+        const r = await ratingsApi.putItem(itemId, value);
+        setRating(r.rating ?? value);
+      }
+    } catch {
+      // ignore — UI just stays as-is
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!loaded) return null;
+  const shown = hover ?? rating ?? 0;
+
+  return (
+    <div className="border-t border-white/10 px-10 py-4">
+      <div className="flex items-center gap-3 text-xs">
+        <span className="mr-1 text-white/45">Your rating:</span>
+        <div
+          className="flex gap-0.5"
+          onMouseLeave={() => setHover(null)}
+        >
+          {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => {
+            const filled = n <= shown;
+            return (
+              <button
+                key={n}
+                type="button"
+                onMouseEnter={() => setHover(n)}
+                onClick={() => set(n)}
+                disabled={busy}
+                aria-label={`Rate ${n} out of 10`}
+                className={`h-6 w-6 rounded text-[10px] font-semibold transition-colors ${
+                  filled
+                    ? "bg-(--color-accent) text-white"
+                    : "bg-white/10 text-white/40 hover:bg-white/15"
+                }`}
+              >
+                {n}
+              </button>
+            );
+          })}
+        </div>
+        {rating !== null && (
+          <span className="text-white/55">
+            {rating}/10
+            <span className="ml-2 text-white/40">click again to clear</span>
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/// Operator-managed tag chips on the detail modal. Reads who the
+/// current user is to decide whether to show the editing affordances
+/// (add input + per-chip delete) — non-owners just see the chips.
+function TagBar({ itemId }: { itemId: number }) {
+  const [tags, setTags] = useState<Tag[] | null>(null);
+  const [isOwner, setIsOwner] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [meRes, tagsRes] = await Promise.all([
+          authApi.me().catch(() => null),
+          tagsApi.forItem(itemId),
+        ]);
+        if (cancelled) return;
+        setIsOwner(meRes?.user.role === "owner");
+        setTags(tagsRes.tags);
+      } catch {
+        if (!cancelled) setTags([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [itemId]);
+
+  async function addTag() {
+    const name = draft.trim();
+    if (!name || busy) return;
+    setBusy(true);
+    try {
+      const tag = await tagsApi.add(itemId, name);
+      setTags((current) =>
+        current && current.some((t) => t.id === tag.id)
+          ? current
+          : [...(current ?? []), tag].sort((a, b) =>
+              a.name.localeCompare(b.name),
+            ),
+      );
+      setDraft("");
+    } catch {
+      // ignore — UI just stays as-is
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeTag(tagId: number) {
+    setBusy(true);
+    try {
+      await tagsApi.remove(itemId, tagId);
+      setTags((current) => (current ?? []).filter((t) => t.id !== tagId));
+    } catch {
+      // ignore
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Hide the row entirely when there are no tags AND the viewer
+  // can't add any — no point taking up vertical space.
+  if (tags === null) return null;
+  if (tags.length === 0 && !isOwner) return null;
+
+  return (
+    <div className="border-t border-white/10 px-10 py-4">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="mr-1 text-white/45">Tags:</span>
+        {tags.map((t) => (
+          <span
+            key={t.id}
+            className="inline-flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-3 py-1"
+          >
+            {t.name}
+            {isOwner && (
+              <button
+                type="button"
+                onClick={() => removeTag(t.id)}
+                aria-label={`Remove tag ${t.name}`}
+                className="text-white/40 transition-colors hover:text-white"
+              >
+                ×
+              </button>
+            )}
+          </span>
+        ))}
+        {isOwner && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              addTag();
+            }}
+            className="inline-flex items-center gap-1"
+          >
+            <input
+              type="text"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="add tag…"
+              maxLength={64}
+              className="w-28 rounded-full border border-dashed border-white/15 bg-transparent px-3 py-1 outline-none placeholder-white/30 focus:border-white/40"
+            />
+          </form>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ExternalLinks({ detail }: { detail: ItemDetail }) {
   const isShow = detail.kind === "show";
   const tmdbUrl = detail.tmdb_id
@@ -672,15 +1020,32 @@ function ExternalLinks({ detail }: { detail: ItemDetail }) {
   const imdbUrl = detail.imdb_id
     ? `https://www.imdb.com/title/${detail.imdb_id}/`
     : null;
-  if (!tmdbUrl && !imdbUrl) return null;
+  // Letterboxd accepts either tmdb_id or imdb_id directly in the URL —
+  // the redirect server resolves either to the canonical film page.
+  // Skip for shows (Letterboxd is movies-only).
+  const letterboxdUrl =
+    !isShow && (detail.tmdb_id || detail.imdb_id)
+      ? `https://letterboxd.com/${detail.tmdb_id ? `tmdb/${detail.tmdb_id}` : `imdb/${detail.imdb_id}`}/`
+      : null;
+  const tvdbUrl = detail.tvdb_id
+    ? `https://thetvdb.com/?tab=${isShow ? "series" : "movie"}&id=${detail.tvdb_id}`
+    : null;
+  const anilistUrl = detail.anilist_id
+    ? `https://anilist.co/anime/${detail.anilist_id}`
+    : null;
+  if (!tmdbUrl && !imdbUrl && !letterboxdUrl && !tvdbUrl && !anilistUrl)
+    return null;
   return (
     <div className="border-t border-white/10 px-10 py-4">
       <div className="flex flex-wrap items-center gap-2 text-xs">
         <span className="mr-1 text-white/45">More about this title:</span>
-        {tmdbUrl && (
-          <LinkChip href={tmdbUrl} label="TMDB" />
-        )}
+        {tmdbUrl && <LinkChip href={tmdbUrl} label="TMDB" />}
         {imdbUrl && <LinkChip href={imdbUrl} label="IMDb" />}
+        {letterboxdUrl && (
+          <LinkChip href={letterboxdUrl} label="Letterboxd" />
+        )}
+        {tvdbUrl && <LinkChip href={tvdbUrl} label="TheTVDB" />}
+        {anilistUrl && <LinkChip href={anilistUrl} label="AniList" />}
       </div>
     </div>
   );

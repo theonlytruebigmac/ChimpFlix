@@ -5,8 +5,9 @@ import { useEffect } from "react";
 
 // Routes the user is most likely to visit after landing on any page. Worth
 // pre-warming during browser idle time so click-to-paint feels instant.
-// The list mirrors NavLinks, with the current page filtered out at runtime.
-const PREFETCH_ROUTES = ["/", "/movies", "/shows", "/new-popular", "/my-list"];
+// Library pages aren't included — they're dynamic and prefetching them all
+// would over-fetch for users with many libraries.
+const PREFETCH_ROUTES = ["/", "/new-popular", "/my-list"];
 
 /**
  * Idle-time route prefetcher. Mounted once at the app root so every page

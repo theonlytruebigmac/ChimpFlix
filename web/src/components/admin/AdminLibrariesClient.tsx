@@ -9,6 +9,7 @@ import {
   type EpisodeSortOrder,
   type Library,
   type LibraryAgent,
+  type LibraryStatsResult,
   type LibraryUpdateInput,
   type LibraryVisibility,
 } from "@/lib/chimpflix-api";
@@ -73,6 +74,40 @@ function LibraryCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  /// Result of the most recent verify run, surfaced inline so the
+  /// operator can see "checked N files, M missing" without opening
+  /// the scheduled-tasks history page. Reset on next run.
+  const [verifyResult, setVerifyResult] = useState<{
+    files_checked: number;
+    files_missing: number;
+    newly_marked_removed: number;
+    returned_files: number;
+    orphan_count: number;
+  } | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [purging, setPurging] = useState(false);
+  const [purgeResult, setPurgeResult] = useState<{
+    files_purged: number;
+    episodes_purged: number;
+    seasons_purged: number;
+    items_purged: number;
+  } | null>(null);
+  /// At-a-glance library stats — items / episodes / files / size /
+  /// orphans / last-scanned. Fetched on first expand so the card
+  /// header can show the headline numbers without an extra click.
+  const [stats, setStats] = useState<LibraryStatsResult | null>(null);
+  /// Per-action in-flight flags so multiple Maintenance buttons can
+  /// be hit concurrently without their spinners clobbering each
+  /// other.
+  const [running, setRunning] = useState<{
+    scan?: boolean;
+    refreshMeta?: boolean;
+    markers?: boolean;
+    previews?: boolean;
+  }>({});
+  /// Toast-style ack for fire-and-forget actions (the work happens
+  /// in the background; we want the UI to confirm we kicked it).
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!expanded || agents != null) return;
@@ -83,6 +118,134 @@ function LibraryCard({
         setError(e instanceof Error ? e.message : String(e)),
       );
   }, [expanded, agents, lib.id]);
+
+  useEffect(() => {
+    if (!expanded || stats != null) return;
+    librariesApi
+      .stats(lib.id)
+      .then(setStats)
+      .catch(() => {});
+  }, [expanded, stats, lib.id]);
+
+  async function refreshStats() {
+    try {
+      const s = await librariesApi.stats(lib.id);
+      setStats(s);
+    } catch {
+      // best-effort
+    }
+  }
+
+  async function runScan() {
+    setRunning((r) => ({ ...r, scan: true }));
+    setActionMsg(null);
+    try {
+      await librariesApi.triggerScan(lib.id);
+      setActionMsg("Scan queued.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning((r) => ({ ...r, scan: false }));
+    }
+  }
+
+  async function runRefreshMetadata() {
+    setRunning((r) => ({ ...r, refreshMeta: true }));
+    setActionMsg(null);
+    try {
+      const r = await librariesApi.refreshMetadata(lib.id);
+      setActionMsg(`Metadata refresh queued for ${r.queued} item(s).`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning((r) => ({ ...r, refreshMeta: false }));
+    }
+  }
+
+  async function runDetectMarkers() {
+    setRunning((r) => ({ ...r, markers: true }));
+    setActionMsg(null);
+    try {
+      const r = await librariesApi.detectMarkers(lib.id);
+      setActionMsg(`Marker detection queued for ${r.queued} file(s).`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning((r) => ({ ...r, markers: false }));
+    }
+  }
+
+  async function runGeneratePreviews() {
+    setRunning((r) => ({ ...r, previews: true }));
+    setActionMsg(null);
+    try {
+      const r = await librariesApi.generatePreviews(lib.id);
+      setActionMsg(
+        r.queued === 0
+          ? "All files already have previews."
+          : `Preview generation queued for ${r.queued} file(s).`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning((r) => ({ ...r, previews: false }));
+    }
+  }
+
+  async function runVerify() {
+    setVerifying(true);
+    setError(null);
+    try {
+      const r = await librariesApi.verify(lib.id);
+      setVerifyResult({
+        files_checked: r.files_checked,
+        files_missing: r.files_missing,
+        newly_marked_removed: r.newly_marked_removed,
+        returned_files: r.returned_files,
+        orphan_count: r.orphan_count,
+      });
+      void refreshStats();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  async function runPurge(immediate: boolean) {
+    if (
+      !confirm(
+        immediate
+          ? "Immediately hard-delete every orphan file row for this library, plus any episodes/seasons/items left without children? This can't be undone."
+          : "Purge orphan files older than the 7-day grace window. Files marked removed today will stay."
+      )
+    ) {
+      return;
+    }
+    setPurging(true);
+    setError(null);
+    try {
+      const r = await librariesApi.purge(lib.id, immediate ? 0 : undefined);
+      setPurgeResult(r);
+      // Refresh the verify count so the orphan badge updates.
+      try {
+        const v = await librariesApi.verify(lib.id);
+        setVerifyResult({
+          files_checked: v.files_checked,
+          files_missing: v.files_missing,
+          newly_marked_removed: v.newly_marked_removed,
+          returned_files: v.returned_files,
+          orphan_count: v.orphan_count,
+        });
+      } catch {
+        // best-effort refresh
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPurging(false);
+    }
+  }
 
   const fieldsDirty =
     sortOrder !== lib.episode_sort_order ||
@@ -112,8 +275,8 @@ function LibraryCard({
 
   return (
     <div className="rounded-lg border border-white/10 bg-white/2">
-      <div className="flex items-center justify-between gap-3 p-4">
-        <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3 p-4">
+        <div className="flex flex-wrap items-center gap-3">
           <span className="text-lg font-semibold">{lib.name}</span>
           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-white/60">
             {lib.kind}
@@ -121,6 +284,30 @@ function LibraryCard({
           <span className="text-xs text-white/40">
             {lib.paths.length} path{lib.paths.length === 1 ? "" : "s"}
           </span>
+          {stats && (
+            <>
+              <span className="text-xs text-white/55">
+                {stats.items.toLocaleString()} item
+                {stats.items === 1 ? "" : "s"}
+                {stats.episodes > 0 &&
+                  ` · ${stats.episodes.toLocaleString()} ep${stats.episodes === 1 ? "" : "s"}`}
+              </span>
+              <span className="text-xs text-white/55">
+                {formatBytes(stats.total_bytes)}
+              </span>
+              {stats.orphan_files > 0 && (
+                <span className="rounded-full bg-amber-500/20 px-2.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                  {stats.orphan_files} orphan
+                  {stats.orphan_files === 1 ? "" : "s"}
+                </span>
+              )}
+              {stats.last_scanned_at && (
+                <span className="text-xs text-white/40">
+                  scanned {formatRelativeTime(stats.last_scanned_at)}
+                </span>
+              )}
+            </>
+          )}
         </div>
         <button
           onClick={() => setExpanded((v) => !v)}
@@ -209,8 +396,193 @@ function LibraryCard({
               />
             )}
           </section>
+
+          <section>
+            <h3 className="mb-3 text-sm font-semibold uppercase tracking-wider text-white/40">
+              Actions
+            </h3>
+            <p className="mb-3 text-xs text-white/55">
+              On-demand triggers for everything the scheduler also
+              runs in the background. Scan walks the disk for new
+              files; Refresh metadata re-queries TMDB/TVDB for every
+              item; Detect markers and Generate previews populate
+              skip/scrub data. None of these block — work runs in
+              the background and the toast reports what got queued.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <ActionButton
+                label="Scan"
+                running={running.scan}
+                runningLabel="Queuing…"
+                onClick={runScan}
+              />
+              <ActionButton
+                label="Refresh metadata"
+                running={running.refreshMeta}
+                runningLabel="Queuing…"
+                onClick={runRefreshMetadata}
+              />
+              <ActionButton
+                label="Detect markers"
+                running={running.markers}
+                runningLabel="Queuing…"
+                onClick={runDetectMarkers}
+              />
+              <ActionButton
+                label="Generate previews"
+                running={running.previews}
+                runningLabel="Queuing…"
+                onClick={runGeneratePreviews}
+              />
+            </div>
+            {actionMsg && (
+              <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                {actionMsg}
+              </div>
+            )}
+          </section>
+
+          <section>
+            <h3 className="mb-3 text-sm font-semibold uppercase tracking-wider text-white/40">
+              Maintenance
+            </h3>
+            <p className="mb-3 text-xs text-white/55">
+              Verify checks every file against disk and soft-deletes
+              missing ones — watch history is preserved during the
+              grace window. Purge hard-deletes soft-deleted rows and
+              cascades to orphan episodes / seasons / items. The
+              scheduled tasks (weekly verify, daily purge after 7
+              days) run automatically; these buttons are the on-demand
+              path for "I just deleted something and want it cleaned
+              up now".
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <ActionButton
+                label="Verify now"
+                running={verifying}
+                runningLabel="Verifying…"
+                onClick={runVerify}
+              />
+              <ActionButton
+                label="Purge expired"
+                running={purging}
+                runningLabel="Purging…"
+                disabled={(stats?.orphan_files ?? 0) === 0}
+                title="Purge orphans older than the 7-day grace window."
+                onClick={() => runPurge(false)}
+              />
+              <button
+                onClick={() => runPurge(true)}
+                disabled={purging || (stats?.orphan_files ?? 0) === 0}
+                className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Hard-delete every orphan row now. Skips the grace window."
+              >
+                Purge all orphans now
+              </button>
+            </div>
+            {verifyResult && (
+              <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-white/60 md:grid-cols-4">
+                <Stat label="Checked" value={verifyResult.files_checked} />
+                <Stat
+                  label="Missing"
+                  value={verifyResult.files_missing}
+                  emphasis={verifyResult.files_missing > 0}
+                />
+                <Stat
+                  label="Newly removed"
+                  value={verifyResult.newly_marked_removed}
+                  emphasis={verifyResult.newly_marked_removed > 0}
+                />
+                <Stat
+                  label="Returned"
+                  value={verifyResult.returned_files}
+                  emphasis={verifyResult.returned_files > 0}
+                />
+              </div>
+            )}
+            {purgeResult && (
+              <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                Purged: {purgeResult.files_purged} files,{" "}
+                {purgeResult.episodes_purged} episodes,{" "}
+                {purgeResult.seasons_purged} seasons,{" "}
+                {purgeResult.items_purged} items.
+              </div>
+            )}
+          </section>
         </div>
       )}
+    </div>
+  );
+}
+
+/// Uniform action button so the Actions row doesn't look like a
+/// patchwork of Plex / shadcn / random Tailwind classes per button.
+function ActionButton({
+  label,
+  runningLabel,
+  running = false,
+  disabled = false,
+  title,
+  onClick,
+}: {
+  label: string;
+  runningLabel: string;
+  running?: boolean;
+  disabled?: boolean;
+  title?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={running || disabled}
+      title={title}
+      className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-sm font-medium text-white/85 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {running ? runningLabel : label}
+    </button>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let i = 0;
+  let n = bytes;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(i >= 2 ? 1 : 0)} ${units[i]}`;
+}
+
+function formatRelativeTime(ms: number): string {
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+function Stat({
+  label,
+  value,
+  emphasis = false,
+}: {
+  label: string;
+  value: number;
+  emphasis?: boolean;
+}) {
+  return (
+    <div className="rounded border border-white/5 bg-black/20 px-2.5 py-1.5">
+      <div className="text-[10px] uppercase tracking-wider text-white/40">
+        {label}
+      </div>
+      <div
+        className={`tabular-nums ${emphasis ? "text-amber-300" : "text-white/85"}`}
+      >
+        {value.toLocaleString()}
+      </div>
     </div>
   );
 }

@@ -4,11 +4,13 @@
 //! thing.
 
 pub mod time;
+pub mod vault;
 
 use serde::Serialize;
 use thiserror::Error;
 
 pub use time::now_ms;
+pub use vault::{EncryptedBlob, MASTER_KEY_ENV, Vault, generate_master_key_hex};
 
 /// Top-level error type. Crate-specific errors convert into this for the
 /// public API surface.

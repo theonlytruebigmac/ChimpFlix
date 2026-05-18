@@ -21,12 +21,16 @@ chimpflix-transcoder = { path = "../transcoder" }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 cron = { workspace = true }
 futures = { workspace = true }
+governor = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+lettre = { workspace = true }
 libc = { workspace = true }
+notify = { workspace = true }
 rand_core = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -37,6 +41,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+qrcode = { workspace = true }
+totp-rs = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

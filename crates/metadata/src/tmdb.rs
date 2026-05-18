@@ -52,6 +52,21 @@ impl TmdbClient {
         })
     }
 
+    /// Hit a tiny endpoint to confirm the API key is accepted. Used by the
+    /// admin credential vault "test" button. Returns the TMDB image
+    /// configuration's base URL on success purely so the caller can render
+    /// a friendly "connected" message.
+    pub async fn validate(&self) -> Result<String> {
+        let raw: serde_json::Value = self.get("/configuration", &[]).await?;
+        let base = raw
+            .get("images")
+            .and_then(|i| i.get("secure_base_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(TMDB_IMAGE_BASE)
+            .to_string();
+        Ok(base)
+    }
+
     pub async fn lookup_movie(&self, query: &str, year: Option<i32>) -> Result<Option<TmdbMovie>> {
         let mut params: Vec<(&str, String)> = vec![
             ("query", query.to_string()),
@@ -70,18 +85,65 @@ impl TmdbClient {
     }
 
     /// Fetch a movie by TMDB id — used both internally after a search and
-    /// by Fix Match's "apply candidate" path.
+    /// by Fix Match's "apply candidate" path. `images` is appended so a
+    /// single round-trip yields the title-treatment logo art for the
+    /// modal hero alongside the rest of the detail payload.
     pub async fn fetch_movie(&self, tmdb_id: i64) -> Result<TmdbMovie> {
         let detail: RawMovieDetail = self
             .get(
                 &format!("/movie/{tmdb_id}"),
                 &[
                     ("language", "en-US".to_string()),
-                    ("append_to_response", "external_ids".to_string()),
+                    ("append_to_response", "external_ids,images".to_string()),
+                    // Restrict the images response to English (or the
+                    // language-less art that many releases ship); avoids
+                    // pulling logos in 30+ languages for a payload we
+                    // only need a single pick from.
+                    ("include_image_language", "en,null".to_string()),
                 ],
             )
             .await?;
         Ok(TmdbMovie::from_raw(detail))
+    }
+
+    /// Fetch only the title-treatment logo path for a movie. Used by
+    /// the `refresh_logos` backfill task, where we already have
+    /// everything else and just need the logo column populated.
+    pub async fn fetch_movie_logo(&self, tmdb_id: i64) -> Result<Option<String>> {
+        let raw: RawImagesResponse = self
+            .get(
+                &format!("/movie/{tmdb_id}/images"),
+                &[("include_image_language", "en,null".to_string())],
+            )
+            .await?;
+        Ok(pick_logo(&raw.logos))
+    }
+
+    /// Weekly trending movies, ranked. TMDB returns up to 20 per page;
+    /// we take the first page since the Top 10 rail only needs 10.
+    pub async fn trending_movies(&self) -> Result<Vec<TmdbTrendingEntry>> {
+        let raw: SearchPage<RawTrendingEntry> = self
+            .get("/trending/movie/week", &[("language", "en-US".to_string())])
+            .await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .map(TmdbTrendingEntry::from_raw)
+            .collect())
+    }
+
+    /// Weekly trending TV shows. Same shape as `trending_movies` — the
+    /// endpoint returns mixed-shape entries but we hit the typed
+    /// `/trending/tv/week` route so the result is homogeneous.
+    pub async fn trending_shows(&self) -> Result<Vec<TmdbTrendingEntry>> {
+        let raw: SearchPage<RawTrendingEntry> = self
+            .get("/trending/tv/week", &[("language", "en-US".to_string())])
+            .await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .map(TmdbTrendingEntry::from_raw)
+            .collect())
     }
 
     pub async fn lookup_show(&self, query: &str, year: Option<i32>) -> Result<Option<TmdbShow>> {
@@ -107,11 +169,24 @@ impl TmdbClient {
                 &format!("/tv/{tmdb_id}"),
                 &[
                     ("language", "en-US".to_string()),
-                    ("append_to_response", "external_ids".to_string()),
+                    ("append_to_response", "external_ids,images".to_string()),
+                    ("include_image_language", "en,null".to_string()),
                 ],
             )
             .await?;
         Ok(TmdbShow::from_raw(detail))
+    }
+
+    /// Title-treatment logo path for a TV show — twin of
+    /// `fetch_movie_logo` but against `/tv/{id}/images`.
+    pub async fn fetch_show_logo(&self, tmdb_id: i64) -> Result<Option<String>> {
+        let raw: RawImagesResponse = self
+            .get(
+                &format!("/tv/{tmdb_id}/images"),
+                &[("include_image_language", "en,null".to_string())],
+            )
+            .await?;
+        Ok(pick_logo(&raw.logos))
     }
 
     /// Multi-candidate search for Fix Match. Returns up to ~10 hits
@@ -461,6 +536,26 @@ fn tmdb_avatar_url(path: &str) -> String {
 // Public domain types
 // ---------------------------------------------------------------------------
 
+/// A single entry in TMDB's trending list. Just enough info to cache it
+/// for the Top 10 rail; the row's `tmdb_id` is what we'll later JOIN
+/// against `items.tmdb_id` to find the in-library version.
+#[derive(Debug, Clone, Serialize)]
+pub struct TmdbTrendingEntry {
+    pub tmdb_id: i64,
+    pub title: String,
+    pub poster_path: Option<String>,
+}
+
+impl TmdbTrendingEntry {
+    fn from_raw(r: RawTrendingEntry) -> Self {
+        Self {
+            tmdb_id: r.id,
+            title: r.title.or(r.name).unwrap_or_default(),
+            poster_path: r.poster_path,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TmdbMovie {
     pub tmdb_id: i64,
@@ -474,6 +569,10 @@ pub struct TmdbMovie {
     pub rating_audience: Option<f64>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    /// Transparent title-treatment logo. TMDB-relative path; join with
+    /// the image base URL on the client. None when no English logo is
+    /// published or the request didn't include `images`.
+    pub logo_path: Option<String>,
     pub genres: Vec<String>,
     /// TMDB collection (franchise) this movie belongs to, if any. Used to
     /// group sequels in the modal and on a dedicated /collection page.
@@ -518,6 +617,8 @@ pub struct TmdbShow {
     pub year: Option<i32>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    /// Title-treatment logo (transparent PNG). See TmdbMovie.logo_path.
+    pub logo_path: Option<String>,
     pub genres: Vec<String>,
     pub number_of_seasons: Option<i32>,
 }
@@ -631,6 +732,19 @@ struct RawMovieHit {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawTrendingEntry {
+    id: i64,
+    /// Movies use `title`, shows use `name`; we accept either by
+    /// declaring both fields optional and reading whichever is set.
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawShowHit {
     id: i64,
 }
@@ -653,6 +767,36 @@ struct RawMovieDetail {
     external_ids: Option<RawExternalIds>,
     #[serde(default)]
     belongs_to_collection: Option<RawCollectionStub>,
+    /// Populated only when `append_to_response=images` is set on the
+    /// request. Absent for the search-result `RawMovieHit` shape.
+    #[serde(default)]
+    images: Option<RawImagesResponse>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawImagesResponse {
+    #[serde(default)]
+    logos: Vec<RawImage>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RawImage {
+    file_path: String,
+    /// Provider-reported aspect ratio. We bias slightly toward wider
+    /// logos (title-treatment art is usually 2:1 to 4:1) when ranking.
+    #[serde(default)]
+    aspect_ratio: Option<f64>,
+    /// Vote score from TMDB users. Higher = better-liked artwork.
+    /// Combined with width to break ties.
+    #[serde(default)]
+    vote_average: Option<f64>,
+    #[serde(default)]
+    width: Option<i32>,
+    /// Two-letter language code (or null for language-less art). We
+    /// already filter the response via include_image_language, but
+    /// keep the field for completeness.
+    #[serde(default)]
+    iso_639_1: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -678,6 +822,8 @@ struct RawShowDetail {
     #[serde(default)]
     genres: Vec<RawGenre>,
     external_ids: Option<RawExternalIds>,
+    #[serde(default)]
+    images: Option<RawImagesResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -724,6 +870,10 @@ impl TmdbMovie {
             poster_path: nonempty(c.poster_path),
             backdrop_path: nonempty(c.backdrop_path),
         });
+        let logo_path = raw
+            .images
+            .as_ref()
+            .and_then(|i| pick_logo(&i.logos));
         Self {
             tmdb_id: raw.id,
             imdb_id: nonempty(imdb_id),
@@ -736,6 +886,7 @@ impl TmdbMovie {
             rating_audience: raw.vote_average,
             poster_path: nonempty(raw.poster_path),
             backdrop_path: nonempty(raw.backdrop_path),
+            logo_path,
             genres: raw.genres.into_iter().map(|g| g.name).collect(),
             collection,
         }
@@ -746,6 +897,10 @@ impl TmdbShow {
     fn from_raw(raw: RawShowDetail) -> Self {
         let year = raw.first_air_date.as_deref().and_then(parse_year);
         let imdb_id = raw.external_ids.and_then(|e| e.imdb_id);
+        let logo_path = raw
+            .images
+            .as_ref()
+            .and_then(|i| pick_logo(&i.logos));
         Self {
             tmdb_id: raw.id,
             imdb_id: nonempty(imdb_id),
@@ -755,10 +910,46 @@ impl TmdbShow {
             year,
             poster_path: nonempty(raw.poster_path),
             backdrop_path: nonempty(raw.backdrop_path),
+            logo_path,
             number_of_seasons: raw.number_of_seasons,
             genres: raw.genres.into_iter().map(|g| g.name).collect(),
         }
     }
+}
+
+/// Pick the best logo from a list of TMDB image candidates. Prefers
+/// English logos, then language-less (null), then ranks by vote
+/// average × log(width) so a popular high-resolution logo wins over
+/// a less-voted small one. Returns the TMDB-relative path or None
+/// when the list is empty.
+fn pick_logo(logos: &[RawImage]) -> Option<String> {
+    if logos.is_empty() {
+        return None;
+    }
+    let mut ranked: Vec<&RawImage> = logos.iter().collect();
+    ranked.sort_by(|a, b| {
+        let lang_rank = |img: &RawImage| match img.iso_639_1.as_deref() {
+            Some("en") => 0,
+            None | Some("") => 1,
+            _ => 2,
+        };
+        let score = |img: &RawImage| -> f64 {
+            let votes = img.vote_average.unwrap_or(0.0);
+            let width_bonus = (img.width.unwrap_or(0).max(1) as f64).log10();
+            // Slightly favor wider aspect ratios — title-treatment logos
+            // typically run 2:1 to 5:1; very square images are usually
+            // less polished single-letter marks.
+            let ar_bonus = match img.aspect_ratio {
+                Some(r) if (2.0..=6.0).contains(&r) => 0.5,
+                _ => 0.0,
+            };
+            votes + width_bonus + ar_bonus
+        };
+        lang_rank(a)
+            .cmp(&lang_rank(b))
+            .then_with(|| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    ranked.first().map(|i| i.file_path.clone())
 }
 
 #[derive(Debug, Deserialize)]

@@ -9,15 +9,6 @@ import {
   type TasksListResponse,
 } from "@/lib/chimpflix-api";
 
-const CRON_PRESETS: ReadonlyArray<{ label: string; value: string }> = [
-  { label: "Every 2 minutes", value: "0 */2 * * * *" },
-  { label: "Every 30 minutes", value: "0 */30 * * * *" },
-  { label: "Hourly", value: "0 0 * * * *" },
-  { label: "Every 4 hours", value: "0 0 */4 * * *" },
-  { label: "Daily at 03:00", value: "0 0 3 * * *" },
-  { label: "Weekly (Sun 04:00)", value: "0 0 4 * * 0" },
-];
-
 export function AdminTasksClient({ initial }: { initial: TasksListResponse }) {
   const [tasks, setTasks] = useState(initial.tasks);
   const [kinds] = useState(initial.kinds);
@@ -241,25 +232,8 @@ function TaskRow({
                 className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
               />
             </Field>
-            <Field label="Cron expression" hint="5/6/7-field cron.">
-              <input
-                type="text"
-                value={cron}
-                onChange={(e) => setCron(e.target.value)}
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-              />
-              <div className="mt-1 flex flex-wrap gap-1">
-                {CRON_PRESETS.map((p) => (
-                  <button
-                    key={p.value}
-                    type="button"
-                    onClick={() => setCron(p.value)}
-                    className="rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-white/60 hover:bg-white/5"
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </div>
+            <Field label="Schedule" hint="Pick a preset or use Custom for raw cron.">
+              <CronEditor value={cron} onChange={setCron} />
             </Field>
             <Field label="Params (JSON)" hint={kindInfo?.params_schema}>
               <input
@@ -405,13 +379,8 @@ function NewTaskForm({
             className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
           />
         </Field>
-        <Field label="Cron">
-          <input
-            type="text"
-            value={cron}
-            onChange={(e) => setCron(e.target.value)}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-          />
+        <Field label="Schedule">
+          <CronEditor value={cron} onChange={setCron} />
         </Field>
         <Field label="Params (JSON)" hint={kindInfo?.params_schema}>
           <input
@@ -430,6 +399,287 @@ function NewTaskForm({
         {busy ? "Creating…" : "Create"}
       </button>
     </div>
+  );
+}
+
+/// Structured editor for our 6-field cron strings
+/// (`sec min hour dom mon dow`). Defaults to the most-common
+/// preset shapes (Hourly / Every N hours / Daily at time / Weekly
+/// on day at time / Custom raw expression). When the value can't
+/// be parsed into a known shape, the mode flips to Custom and the
+/// raw input is the source of truth.
+///
+/// Day-of-week numbering: 0 = Sunday … 6 = Saturday (cron standard).
+function CronEditor({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const parsed = parseCron(value);
+  const mode = parsed.mode;
+
+  function setMode(next: CronMode) {
+    if (next === "hourly") {
+      onChange("0 0 * * * *");
+    } else if (next === "every_n_hours") {
+      onChange("0 0 */6 * * *");
+    } else if (next === "daily") {
+      onChange("0 0 3 * * *");
+    } else if (next === "weekly") {
+      onChange("0 0 4 * * 0");
+    } else if (next === "every_n_minutes") {
+      onChange("0 */30 * * * *");
+    } else {
+      // Custom — keep the current cron as-is so the user can edit it.
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <select
+        value={mode}
+        onChange={(e) => setMode(e.target.value as CronMode)}
+        className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+      >
+        <option value="every_n_minutes">Every N minutes</option>
+        <option value="hourly">Every hour</option>
+        <option value="every_n_hours">Every N hours</option>
+        <option value="daily">Daily at time</option>
+        <option value="weekly">Weekly on day at time</option>
+        <option value="custom">Custom cron expression</option>
+      </select>
+
+      {mode === "every_n_minutes" && (
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-white/55">Every</span>
+          <NumberInput
+            value={parsed.everyMinutes ?? 30}
+            min={1}
+            max={59}
+            onChange={(n) => onChange(`0 */${n} * * * *`)}
+          />
+          <span className="text-white/55">minutes</span>
+        </div>
+      )}
+
+      {mode === "every_n_hours" && (
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-white/55">Every</span>
+          <NumberInput
+            value={parsed.everyHours ?? 6}
+            min={1}
+            max={23}
+            onChange={(n) => onChange(`0 0 */${n} * * *`)}
+          />
+          <span className="text-white/55">hours</span>
+        </div>
+      )}
+
+      {mode === "daily" && (
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-white/55">At</span>
+          <TimeInput
+            hour={parsed.hour ?? 3}
+            minute={parsed.minute ?? 0}
+            onChange={(h, m) => onChange(`0 ${m} ${h} * * *`)}
+          />
+        </div>
+      )}
+
+      {mode === "weekly" && (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-white/55">On</span>
+          <select
+            value={parsed.dayOfWeek ?? 0}
+            onChange={(e) =>
+              onChange(
+                `0 ${parsed.minute ?? 0} ${parsed.hour ?? 4} * * ${e.target.value}`,
+              )
+            }
+            className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm"
+          >
+            {DAYS.map((d, i) => (
+              <option key={i} value={i}>
+                {d}
+              </option>
+            ))}
+          </select>
+          <span className="text-white/55">at</span>
+          <TimeInput
+            hour={parsed.hour ?? 4}
+            minute={parsed.minute ?? 0}
+            onChange={(h, m) =>
+              onChange(`0 ${m} ${h} * * ${parsed.dayOfWeek ?? 0}`)
+            }
+          />
+        </div>
+      )}
+
+      {mode === "custom" && (
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+          placeholder="sec min hour day-of-month month day-of-week"
+        />
+      )}
+
+      <div className="font-mono text-[11px] text-white/40">
+        {value}
+        {parsed.summary && (
+          <span className="ml-2 font-sans text-white/55">
+            ({parsed.summary})
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+type CronMode =
+  | "every_n_minutes"
+  | "hourly"
+  | "every_n_hours"
+  | "daily"
+  | "weekly"
+  | "custom";
+
+interface ParsedCron {
+  mode: CronMode;
+  everyMinutes?: number;
+  everyHours?: number;
+  hour?: number;
+  minute?: number;
+  dayOfWeek?: number;
+  summary?: string;
+}
+
+/// Detect which of the friendly modes a raw cron string fits into.
+/// Returns `custom` for anything we don't recognise — the editor
+/// then shows the raw input box and the user can write any
+/// expression they like. The summary is a human-friendly description
+/// shown alongside the raw value so the operator can sanity-check
+/// what the cron evaluates to.
+function parseCron(value: string): ParsedCron {
+  const parts = value.trim().split(/\s+/);
+  if (parts.length !== 6) return { mode: "custom" };
+  const [sec, min, hour, dom, mon, dow] = parts;
+  if (sec !== "0" || dom !== "*" || mon !== "*") {
+    return { mode: "custom" };
+  }
+
+  // Every-N-minutes shape: `0 */N * * * *`
+  const minEvery = min.match(/^\*\/(\d+)$/);
+  if (minEvery && hour === "*" && dow === "*") {
+    return {
+      mode: "every_n_minutes",
+      everyMinutes: parseInt(minEvery[1], 10),
+      summary: `Every ${minEvery[1]} minutes`,
+    };
+  }
+
+  // Hourly shape: `0 0 * * * *`
+  if (min === "0" && hour === "*" && dow === "*") {
+    return { mode: "hourly", summary: "Every hour" };
+  }
+
+  // Every-N-hours shape: `0 0 */N * * *`
+  const hourEvery = hour.match(/^\*\/(\d+)$/);
+  if (hourEvery && min === "0" && dow === "*") {
+    return {
+      mode: "every_n_hours",
+      everyHours: parseInt(hourEvery[1], 10),
+      summary: `Every ${hourEvery[1]} hours`,
+    };
+  }
+
+  // Daily shape: `0 MM HH * * *`
+  const m = parseInt(min, 10);
+  const h = parseInt(hour, 10);
+  if (
+    !Number.isNaN(m) && !Number.isNaN(h) && dow === "*"
+    && m >= 0 && m < 60 && h >= 0 && h < 24
+  ) {
+    return {
+      mode: "daily",
+      hour: h,
+      minute: m,
+      summary: `Daily at ${pad2(h)}:${pad2(m)}`,
+    };
+  }
+
+  // Weekly shape: `0 MM HH * * D`
+  const d = parseInt(dow, 10);
+  if (
+    !Number.isNaN(m) && !Number.isNaN(h) && !Number.isNaN(d)
+    && m >= 0 && m < 60 && h >= 0 && h < 24 && d >= 0 && d < 7
+  ) {
+    return {
+      mode: "weekly",
+      hour: h,
+      minute: m,
+      dayOfWeek: d,
+      summary: `Weekly on ${DAYS[d]} at ${pad2(h)}:${pad2(m)}`,
+    };
+  }
+
+  return { mode: "custom" };
+}
+
+function pad2(n: number): string {
+  return n.toString().padStart(2, "0");
+}
+
+function NumberInput({
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  onChange: (n: number) => void;
+}) {
+  return (
+    <input
+      type="number"
+      value={value}
+      min={min}
+      max={max}
+      onChange={(e) => {
+        const n = parseInt(e.target.value, 10);
+        if (!Number.isNaN(n) && n >= min && n <= max) onChange(n);
+      }}
+      className="w-16 rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
+    />
+  );
+}
+
+function TimeInput({
+  hour,
+  minute,
+  onChange,
+}: {
+  hour: number;
+  minute: number;
+  onChange: (hour: number, minute: number) => void;
+}) {
+  return (
+    <input
+      type="time"
+      value={`${pad2(hour)}:${pad2(minute)}`}
+      onChange={(e) => {
+        const [h, m] = e.target.value.split(":").map((s) => parseInt(s, 10));
+        if (!Number.isNaN(h) && !Number.isNaN(m)) onChange(h, m);
+      }}
+      className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
+    />
   );
 }
 

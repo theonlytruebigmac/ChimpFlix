@@ -13,6 +13,13 @@ use sqlx::sqlite::SqliteRow;
 pub enum LibraryKind {
     Movies,
     Shows,
+    /// Anime libraries are show-shaped (one item = one series, with
+    /// seasons + episodes underneath) but use a different parser path —
+    /// fansub-style filenames + absolute episode numbering — and are
+    /// expected to be enriched by an anime-aware agent (AniList) once it
+    /// ships. The `item_kind()` mapping still resolves to `Show` so the
+    /// existing read APIs and player code stay agnostic.
+    Anime,
 }
 
 impl LibraryKind {
@@ -20,6 +27,7 @@ impl LibraryKind {
         match self {
             Self::Movies => "movies",
             Self::Shows => "shows",
+            Self::Anime => "anime",
         }
     }
 
@@ -27,6 +35,7 @@ impl LibraryKind {
         match s {
             "movies" => Ok(Self::Movies),
             "shows" => Ok(Self::Shows),
+            "anime" => Ok(Self::Anime),
             other => anyhow::bail!("unknown library kind: {other}"),
         }
     }
@@ -34,7 +43,7 @@ impl LibraryKind {
     pub fn item_kind(&self) -> ItemKind {
         match self {
             Self::Movies => ItemKind::Movie,
-            Self::Shows => ItemKind::Show,
+            Self::Shows | Self::Anime => ItemKind::Show,
         }
     }
 }
@@ -334,12 +343,29 @@ pub struct Webhook {
 }
 
 impl Webhook {
-    pub(crate) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
+    /// Build a `Webhook` from a DB row, decrypting `secret_enc` via the
+    /// vault. Falls back to the legacy plaintext `secret` column if the
+    /// row hasn't been backfilled yet — the startup task in main.rs
+    /// migrates legacy rows on every boot until they're all converted.
+    pub(crate) fn from_row(
+        row: &SqliteRow,
+        vault: &chimpflix_common::Vault,
+    ) -> anyhow::Result<Self> {
+        let enc_bytes: Option<Vec<u8>> =
+            row.try_get::<Option<Vec<u8>>, _>("secret_enc").ok().flatten();
+        let secret = if let Some(value) = enc_bytes {
+            let nonce: Option<Vec<u8>> =
+                row.try_get::<Option<Vec<u8>>, _>("secret_nonce").ok().flatten();
+            let blob = chimpflix_common::EncryptedBlob { value, nonce };
+            Some(vault.decrypt_str(&blob)?)
+        } else {
+            row.try_get::<Option<String>, _>("secret").ok().flatten()
+        };
         Ok(Self {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             url: row.try_get("url")?,
-            secret: row.try_get::<Option<String>, _>("secret").ok().flatten(),
+            secret,
             event_mask: row.try_get("event_mask")?,
             enabled: row.try_get::<i64, _>("enabled")? != 0,
             created_at: row.try_get("created_at")?,
@@ -576,8 +602,14 @@ pub struct Item {
     pub rating_audience: Option<f64>,
     pub tmdb_id: Option<i64>,
     pub imdb_id: Option<String>,
+    pub tvdb_id: Option<i64>,
+    pub anilist_id: Option<i64>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    /// TMDB-relative path to the transparent title-treatment logo
+    /// (e.g. `/foo.png`). The modal hero renders this instead of a
+    /// plain text title when populated.
+    pub logo_path: Option<String>,
     pub added_at: i64,
     pub updated_at: i64,
     /// Fields the user has manually edited. The enrichment pipeline skips
@@ -607,6 +639,8 @@ impl Item {
             rating_audience: row.try_get("rating_audience")?,
             tmdb_id: row.try_get("tmdb_id")?,
             imdb_id: row.try_get("imdb_id")?,
+            tvdb_id: row.try_get::<Option<i64>, _>("tvdb_id").ok().flatten(),
+            anilist_id: row.try_get::<Option<i64>, _>("anilist_id").ok().flatten(),
             poster_path: row
                 .try_get::<Option<String>, _>("poster_path")
                 .ok()
@@ -614,6 +648,11 @@ impl Item {
                 .filter(|s| !s.is_empty()),
             backdrop_path: row
                 .try_get::<Option<String>, _>("backdrop_path")
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty()),
+            logo_path: row
+                .try_get::<Option<String>, _>("logo_path")
                 .ok()
                 .flatten()
                 .filter(|s| !s.is_empty()),
@@ -660,6 +699,13 @@ impl ItemSort {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ItemFilter {
     pub library_id: Option<i64>,
+    /// Restrict results to this set of libraries (intersected with the
+    /// user's library_access). Wire format: `?library_ids=1,2,3`.
+    /// Used by browse surfaces like /new-popular to honor per-user
+    /// visibility prefs without leaking content from libraries the user
+    /// hid in their own settings.
+    #[serde(default, deserialize_with = "deserialize_csv_i64s")]
+    pub library_ids: Option<Vec<i64>>,
     pub kind: Option<ItemKind>,
     /// Case-insensitive exact genre name (e.g. "Action"). When set, only
     /// items tagged with this genre are returned.
@@ -671,6 +717,34 @@ pub struct ItemFilter {
     pub sort: Option<ItemSort>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
+}
+
+/// Serde deserializer for `?key=1,2,3` query-string fields. Empty string
+/// (`?key=`) deserializes to `Some(vec![])` so callers can distinguish
+/// "field omitted" from "field given but empty"; whitespace inside the
+/// list is trimmed.
+pub fn deserialize_csv_i64s<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        out.push(p.parse::<i64>().map_err(D::Error::custom)?);
+    }
+    Ok(Some(out))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -767,6 +841,14 @@ pub struct MediaStreamSummary {
     pub kind: String,
     pub codec: Option<String>,
     pub language: Option<String>,
+    /// Embedded track title (the `title` MKV tag — things like
+    /// "Netflix eng subrip", "SDH eng subrip", "Cantonese (Traditional,
+    /// Hong Kong) chi subrip"). Bluray + WEB-DL releases routinely
+    /// label each track this way, and using the title in the picker
+    /// gives users the same disambiguation they'd see in mpv / VLC /
+    /// Haruna. None when the track wasn't tagged with a title (very
+    /// common on raw transcodes).
+    pub title: Option<String>,
     pub channels: Option<i32>,
     pub is_default: bool,
     pub is_forced: bool,
@@ -1023,8 +1105,21 @@ pub struct User {
     pub role: UserRole,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+    pub email: Option<String>,
     pub default_audio_lang: Option<String>,
     pub default_subtitle_lang: Option<String>,
+    /// Per-user toggle for email-mirroring of in-app notifications.
+    /// Defaults to false so misconfigured SMTP can't surprise users
+    /// with mail they didn't expect.
+    pub notify_via_email: bool,
+    /// Most-recent successful login. `None` if the user has never
+    /// logged in (e.g. just-registered).
+    pub last_login_at: Option<i64>,
+    pub last_login_ip: Option<String>,
+    /// The login immediately before `last_login_at` — surfaced on the
+    /// post-login screen as a cheap anomaly check.
+    pub previous_login_at: Option<i64>,
+    pub previous_login_ip: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1043,6 +1138,7 @@ impl User {
                 .try_get::<Option<String>, _>("avatar_path")
                 .ok()
                 .flatten(),
+            email: row.try_get::<Option<String>, _>("email").ok().flatten(),
             default_audio_lang: row
                 .try_get::<Option<String>, _>("default_audio_lang")
                 .ok()
@@ -1051,8 +1147,111 @@ impl User {
                 .try_get::<Option<String>, _>("default_subtitle_lang")
                 .ok()
                 .flatten(),
+            notify_via_email: row
+                .try_get::<i64, _>("notify_via_email")
+                .ok()
+                .unwrap_or(0)
+                != 0,
+            last_login_at: row.try_get::<Option<i64>, _>("last_login_at").ok().flatten(),
+            last_login_ip: row
+                .try_get::<Option<String>, _>("last_login_ip")
+                .ok()
+                .flatten(),
+            previous_login_at: row
+                .try_get::<Option<i64>, _>("previous_login_at")
+                .ok()
+                .flatten(),
+            previous_login_ip: row
+                .try_get::<Option<String>, _>("previous_login_ip")
+                .ok()
+                .flatten(),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+/// Named bundle of library permissions that can be applied to many users
+/// at once. Effective library access for a user is the UNION of direct
+/// `library_access` rows and group-derived rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessGroup {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Number of users currently in this group. Computed at list time
+    /// for the admin overview; cheap because the join is on small
+    /// indexed tables.
+    pub member_count: i64,
+    /// Number of libraries bound to this group.
+    pub library_count: i64,
+}
+
+/// Eager-loaded variant with the joined member + library lists.
+/// Used by the group editor.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessGroupDetail {
+    #[serde(flatten)]
+    pub group: AccessGroup,
+    pub member_ids: Vec<i64>,
+    pub library_ids: Vec<i64>,
+}
+
+impl AccessGroup {
+    pub(crate) fn from_row_with_counts(row: &SqliteRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            description: row
+                .try_get::<Option<String>, _>("description")
+                .ok()
+                .flatten(),
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            member_count: row.try_get::<i64, _>("member_count").unwrap_or(0),
+            library_count: row.try_get::<i64, _>("library_count").unwrap_or(0),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewAccessGroup {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccessGroupUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub description: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Notification {
+    pub id: i64,
+    pub user_id: i64,
+    /// Stable string discriminator — `user.registered`, `user.2fa.disabled`,
+    /// etc. The frontend renders the human message from `kind` + `payload`.
+    pub kind: String,
+    pub payload_json: String,
+    pub read_at: Option<i64>,
+    pub created_at: i64,
+}
+
+impl Notification {
+    pub(crate) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            user_id: row.try_get("user_id")?,
+            kind: row.try_get("kind")?,
+            payload_json: row.try_get("payload_json")?,
+            read_at: row.try_get::<Option<i64>, _>("read_at").ok().flatten(),
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -1077,11 +1276,21 @@ pub struct SessionRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct Invite {
     pub id: i64,
-    pub code: String,
+    /// SHA-256 hex of the issued token. We never expose this to clients —
+    /// the `#[serde(skip)]` keeps it out of API responses. Plaintext code
+    /// is shown once at issuance; thereafter only the hash exists.
+    #[serde(skip)]
+    pub code_hash: String,
     pub created_by: i64,
     pub expires_at: Option<i64>,
     pub consumed_by: Option<i64>,
     pub consumed_at: Option<i64>,
+    /// Recipient email address (None = no email sent; admin shares manually).
+    pub email: Option<String>,
+    /// Epoch ms when the invite email was successfully sent. None when
+    /// email wasn't configured or send failed (admin can still copy the
+    /// link returned on create).
+    pub sent_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -1089,14 +1298,24 @@ impl Invite {
     pub(crate) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
         Ok(Self {
             id: row.try_get("id")?,
-            code: row.try_get("code")?,
+            code_hash: row.try_get("code_hash")?,
             created_by: row.try_get("created_by")?,
             expires_at: row.try_get::<Option<i64>, _>("expires_at").ok().flatten(),
             consumed_by: row.try_get::<Option<i64>, _>("consumed_by").ok().flatten(),
             consumed_at: row.try_get::<Option<i64>, _>("consumed_at").ok().flatten(),
+            email: row.try_get::<Option<String>, _>("email").ok().flatten(),
+            sent_at: row.try_get::<Option<i64>, _>("sent_at").ok().flatten(),
             created_at: row.try_get("created_at")?,
         })
     }
+}
+
+/// Hash an invite plaintext token. SHA-256 hex. Used both to write the
+/// row and to look it up on redemption.
+pub fn hash_invite_code(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(code.trim().as_bytes());
+    hex::encode(digest)
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1328,11 @@ pub struct SetupInput {
     pub password: String,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Owner's email. Optional at setup but strongly recommended — without
+    /// it the owner can't recover via the self-service password reset
+    /// flow (no address to send the reset link to).
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1130,6 +1354,20 @@ pub struct RegisterInput {
 pub struct CreateInviteInput {
     #[serde(default)]
     pub expires_in_seconds: Option<i64>,
+    /// Email to send the invite to. When set + SMTP is configured, the
+    /// server delivers the accept link directly. Either way the plain-
+    /// text code is returned in the create response so the admin can
+    /// copy/share manually if email is disabled or undeliverable.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Optional library access pre-binding. On invite acceptance these
+    /// rows are inserted into `library_access` for the new user.
+    #[serde(default)]
+    pub library_ids: Vec<i64>,
+    /// Optional access-group pre-binding. On acceptance the user is
+    /// added to each named group, inheriting the group's library set.
+    #[serde(default)]
+    pub group_ids: Vec<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1387,37 @@ pub struct ServerSettings {
     /// One of: "none" | "vaapi" | "nvenc" | "qsv" | "videotoolbox".
     pub transcoder_hw_accel: String,
     pub transcoder_quality_ceiling_kbps: Option<i64>,
+    /// One of: "speed" | "balanced" | "quality". Picks the
+    /// encoder-side speed-vs-quality preset (libx264 ultrafast/
+    /// veryfast/medium, NVENC p1/p4/p6, AMF speed/balanced/quality,
+    /// VAAPI -global_quality 28/23/18). Default `balanced` matches
+    /// behavior from before the column was introduced.
+    pub transcoder_encoder_preset: String,
+    /// One of: "auto" | "prefer_hw" | "require_hw". Controls how
+    /// aggressively the planner enforces hardware acceleration.
+    /// See the phase20 migration comment for what each mode means.
+    pub transcoder_hw_strictness: String,
+    // ---- SMTP / email (phase 21) ---------------------------------------
+    /// SMTP server hostname (e.g. "smtp.example.com"). When None, the
+    /// Mailer treats email as disabled and feature code calling
+    /// `send_*()` is a no-op.
+    pub email_smtp_host: Option<String>,
+    /// SMTP port. Conventionally 587 for STARTTLS, 465 for implicit TLS,
+    /// 25 for unencrypted (don't).
+    pub email_smtp_port: Option<i64>,
+    /// SMTP auth username. None means anonymous (rare; only useful for
+    /// local relay setups).
+    pub email_smtp_username: Option<String>,
+    /// One of: "starttls" (default) | "tls" | "none".
+    pub email_smtp_security: Option<String>,
+    /// Envelope sender address — what recipients see in their From line.
+    pub email_from_address: Option<String>,
+    /// Display name. "From: <name> <address>".
+    pub email_from_name: Option<String>,
+    /// Global TOTP policy: "disabled" | "optional" (default) | "required".
+    /// When "required", any user without verified 2FA is forced through
+    /// enrollment before login completes.
+    pub totp_enforcement: String,
     /// JSON-encoded escape-hatch storage for fields added by later phases
     /// without their own migration.
     pub extras_json: String,
@@ -1170,6 +1439,37 @@ impl ServerSettings {
                 .try_get::<Option<i64>, _>("transcoder_quality_ceiling_kbps")
                 .ok()
                 .flatten(),
+            transcoder_encoder_preset: row.try_get("transcoder_encoder_preset")?,
+            transcoder_hw_strictness: row.try_get("transcoder_hw_strictness")?,
+            email_smtp_host: row
+                .try_get::<Option<String>, _>("email_smtp_host")
+                .ok()
+                .flatten(),
+            email_smtp_port: row
+                .try_get::<Option<i64>, _>("email_smtp_port")
+                .ok()
+                .flatten(),
+            email_smtp_username: row
+                .try_get::<Option<String>, _>("email_smtp_username")
+                .ok()
+                .flatten(),
+            email_smtp_security: row
+                .try_get::<Option<String>, _>("email_smtp_security")
+                .ok()
+                .flatten(),
+            email_from_address: row
+                .try_get::<Option<String>, _>("email_from_address")
+                .ok()
+                .flatten(),
+            email_from_name: row
+                .try_get::<Option<String>, _>("email_from_name")
+                .ok()
+                .flatten(),
+            totp_enforcement: row
+                .try_get::<Option<String>, _>("totp_enforcement")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "optional".to_string()),
             extras_json: row.try_get("extras_json")?,
             updated_at: row.try_get("updated_at")?,
             updated_by: row.try_get::<Option<i64>, _>("updated_by").ok().flatten(),
@@ -1206,6 +1506,50 @@ pub struct ServerSettingsUpdate {
         deserialize_with = "deserialize_some"
     )]
     pub transcoder_quality_ceiling_kbps: Option<Option<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_encoder_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_hw_strictness: Option<String>,
+    // Email / SMTP — every nullable field uses double-Option so the admin
+    // UI can both clear and unset values without ambiguity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    pub email_smtp_host: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    pub email_smtp_port: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    pub email_smtp_username: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    pub email_smtp_security: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    pub email_from_address: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    pub email_from_name: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_enforcement: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras_json: Option<String>,
 }
@@ -1271,6 +1615,70 @@ pub struct NewAuditEntry {
     pub payload_json: Option<String>,
     pub ip: Option<String>,
     pub user_agent: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// External subtitles
+// ---------------------------------------------------------------------------
+
+/// Subtitle track fetched from an external agent or uploaded by an
+/// operator. Embedded subtitle streams live on `media_streams`; this
+/// table is the parallel surface the player merges into a single picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalSubtitle {
+    pub id: i64,
+    pub item_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    pub language: String,
+    pub source: String,
+    pub source_file_id: Option<String>,
+    pub file_path: String,
+    pub forced: bool,
+    pub sdh: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExternalSubtitle {
+    pub item_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    pub language: String,
+    pub source: String,
+    pub source_file_id: Option<String>,
+    pub file_path: String,
+    pub forced: bool,
+    pub sdh: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Trending cache (Top 10)
+// ---------------------------------------------------------------------------
+
+/// Single entry written into / read from the trending_cache table.
+/// Source is tagged at the caller (TMDB, Trakt) so the table can hold
+/// multiple providers and the query can pick a preferred one.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendingEntry {
+    pub rank: i64,
+    pub tmdb_id: i64,
+    pub title: Option<String>,
+    pub poster_path: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Credential vault metadata
+// ---------------------------------------------------------------------------
+
+/// Public-safe view of a stored secret. The plaintext value is never
+/// exposed to API callers; `last4` lets the UI render a `••••1234` masked
+/// preview, and `set` is always `true` for rows that exist.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretMetadata {
+    pub name: String,
+    pub set: bool,
+    pub last4: String,
+    pub updated_at: i64,
+    pub updated_by: Option<i64>,
 }
 
 /// Sort-friendly form of a title (leading article removed for

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { usePrefs } from "@/lib/prefs";
 
 /**
@@ -26,6 +26,16 @@ export function TrailerPlayer({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [prefs, updatePrefs] = usePrefs();
   const muted = prefs.trailerMuted;
+  // Defer mounting until the client knows window.location.origin. If we
+  // render server-side without it, YouTube sometimes refuses the embed
+  // (Error 153 "video player configuration error") before React's first
+  // client-side re-render gets a chance to swap the URL. Behind reverse
+  // proxies like Traefik this is especially likely because the very
+  // first iframe load is what YouTube validates.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   const postCommand = useCallback((func: "mute" | "unMute") => {
     iframeRef.current?.contentWindow?.postMessage(
@@ -68,27 +78,34 @@ export function TrailerPlayer({
     // for cross-origin iframes (Firefox with strict tracking protection)
     // it's the only way to avoid the embedder.identity.missing.referrer
     // failure that renders as "Error 153 — video player configuration error".
-    ...(typeof window !== "undefined" ? { origin: window.location.origin } : {}),
+    origin: mounted ? window.location.origin : "",
   });
   const src = `https://www.youtube-nocookie.com/embed/${videoId}?${params}`;
 
   return (
     <div className={`relative ${className}`}>
-      <iframe
-        ref={iframeRef}
-        src={src}
-        title="Trailer"
-        allow="autoplay; encrypted-media"
-        onLoad={onLoad}
-        className="pointer-events-none absolute inset-0 h-full w-full"
-        // Slight scale-up crops YouTube's "Watch on YouTube" overlay corners
-        // without losing meaningful video content.
-        style={{
-          border: 0,
-          transform: "scale(1.4)",
-          transformOrigin: "center",
-        }}
-      />
+      {mounted ? (
+        <iframe
+          ref={iframeRef}
+          src={src}
+          title="Trailer"
+          allow="autoplay; encrypted-media"
+          // strict-origin-when-cross-origin ensures the browser sends at
+          // least the page origin as Referer when loading the embed, even
+          // if the surrounding page or a proxy sets a more restrictive
+          // Referrer-Policy. Without this, YouTube also reports Error 153.
+          referrerPolicy="strict-origin-when-cross-origin"
+          onLoad={onLoad}
+          className="pointer-events-none absolute inset-0 h-full w-full"
+          // Slight scale-up crops YouTube's "Watch on YouTube" overlay corners
+          // without losing meaningful video content.
+          style={{
+            border: 0,
+            transform: "scale(1.4)",
+            transformOrigin: "center",
+          }}
+        />
+      ) : null}
       <button
         type="button"
         onClick={toggleMute}

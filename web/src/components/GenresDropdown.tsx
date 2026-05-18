@@ -39,7 +39,7 @@ export function GenresDropdown({
   }, [open]);
 
   const allLabel = type === "show" ? "All Shows" : "All Movies";
-  const allHref = type === "show" ? "/shows" : "/movies";
+  const allHref = "/";
 
   return (
     <div ref={containerRef} className="relative">

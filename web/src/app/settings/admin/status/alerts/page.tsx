@@ -1,16 +1,15 @@
 import { admin as adminApi } from "@/lib/chimpflix-api";
+import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 
 export default async function AdminAlertsPage() {
   const data = await adminApi.alerts({ limit: 50 });
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">Alerts</h1>
-        <p className="mt-1 text-sm text-white/60">
-          Recent warnings/errors from the server, plus the audit feed of
-          admin actions.
-        </p>
-      </header>
+      <AdminPageHeader
+        eyebrow="Status"
+        title="Alerts"
+        description="Recent warnings/errors from the server, plus the audit feed of admin actions."
+      />
 
       <section className="space-y-2 rounded-lg border border-white/10 bg-white/2 p-4">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-white/40">

@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { Card } from "@/components/Card";
 import { ModalRoot } from "@/components/ModalRoot";
+import { MoreToExploreChips } from "@/components/MoreToExploreChips";
 import { CardSkeleton } from "@/components/Skeleton";
 import { TopNav } from "@/components/TopNav";
 import { items as itemsApi } from "@/lib/chimpflix-api";
@@ -25,15 +26,17 @@ export default async function SearchPage({
         {!query ? (
           <>
             <h1 className="mb-3 text-4xl font-bold tracking-tight">Search</h1>
-            <p className="text-white/70">
-              Type a title in the box above.
+            <p className="mb-6 text-white/70">
+              Type a title in the box above, or jump into a category.
             </p>
+            <MoreToExploreChips />
           </>
         ) : (
           <>
             <h1 className="mb-2 text-4xl font-bold tracking-tight">
               Results for &ldquo;{query}&rdquo;
             </h1>
+            <MoreToExploreChips />
             <Suspense fallback={<ResultsSkeleton />}>
               <SearchResults query={query} />
             </Suspense>

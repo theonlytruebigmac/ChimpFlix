@@ -83,10 +83,24 @@ fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
     if let Some(ref s) = patch.transcoder_hw_accel {
         if !matches!(
             s.as_str(),
-            "none" | "vaapi" | "nvenc" | "qsv" | "videotoolbox"
+            "auto" | "none" | "vaapi" | "nvenc" | "qsv" | "videotoolbox" | "amf"
         ) {
             return Err(ApiError::validation(
-                "transcoder_hw_accel must be one of: none, vaapi, nvenc, qsv, videotoolbox",
+                "transcoder_hw_accel must be one of: auto, none, vaapi, nvenc, qsv, videotoolbox, amf",
+            ));
+        }
+    }
+    if let Some(ref s) = patch.transcoder_encoder_preset {
+        if !matches!(s.as_str(), "speed" | "balanced" | "quality") {
+            return Err(ApiError::validation(
+                "transcoder_encoder_preset must be one of: speed, balanced, quality",
+            ));
+        }
+    }
+    if let Some(ref s) = patch.transcoder_hw_strictness {
+        if !matches!(s.as_str(), "auto" | "prefer_hw" | "require_hw") {
+            return Err(ApiError::validation(
+                "transcoder_hw_strictness must be one of: auto, prefer_hw, require_hw",
             ));
         }
     }
@@ -129,6 +143,63 @@ fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(ApiError::validation(
                 "public_url must start with http:// or https://",
+            ));
+        }
+    }
+    if let Some(Some(ref s)) = patch.email_smtp_security {
+        if !matches!(s.as_str(), "starttls" | "tls" | "none") {
+            return Err(ApiError::validation(
+                "email_smtp_security must be one of: starttls, tls, none",
+            ));
+        }
+    }
+    if let Some(Some(port)) = patch.email_smtp_port {
+        if !(1..=65535).contains(&port) {
+            return Err(ApiError::validation(
+                "email_smtp_port must be between 1 and 65535",
+            ));
+        }
+    }
+    if let Some(Some(ref host)) = patch.email_smtp_host {
+        if host.len() > 253 {
+            return Err(ApiError::validation(
+                "email_smtp_host must be at most 253 characters",
+            ));
+        }
+        if host.contains(char::is_whitespace) {
+            return Err(ApiError::validation(
+                "email_smtp_host must not contain whitespace",
+            ));
+        }
+    }
+    if let Some(Some(ref user)) = patch.email_smtp_username {
+        if user.len() > 256 {
+            return Err(ApiError::validation(
+                "email_smtp_username must be at most 256 characters",
+            ));
+        }
+    }
+    if let Some(Some(ref addr)) = patch.email_from_address {
+        // Light-touch sanity check; lettre re-validates when building
+        // the Mailbox. Reject obvious garbage early so the UI shows a
+        // useful message instead of a generic SMTP connect failure.
+        if !addr.contains('@') || addr.len() > 320 {
+            return Err(ApiError::validation(
+                "email_from_address must look like local@domain (max 320 chars)",
+            ));
+        }
+    }
+    if let Some(Some(ref name)) = patch.email_from_name {
+        if name.len() > 128 {
+            return Err(ApiError::validation(
+                "email_from_name must be at most 128 characters",
+            ));
+        }
+    }
+    if let Some(ref s) = patch.totp_enforcement {
+        if !matches!(s.as_str(), "disabled" | "optional" | "required") {
+            return Err(ApiError::validation(
+                "totp_enforcement must be one of: disabled, optional, required",
             ));
         }
     }

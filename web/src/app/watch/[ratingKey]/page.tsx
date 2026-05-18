@@ -4,17 +4,22 @@ import {
   type EpisodeSibling,
   type PlayerMarker,
   type StreamChoice,
+  type VersionChoice,
 } from "@/components/ChimpFlixPlayer";
 import {
   ChimpFlixApiError,
   episodes as episodesApi,
+  externalSubtitles as externalSubtitlesApi,
   items as itemsApi,
+  previews as previewsApi,
   seasons as seasonsApi,
   type EpisodeDetail,
   type EpisodeListed,
+  type ExternalSubtitle,
   type ItemDetail,
   type MediaFileSummary,
   type MediaStreamSummary,
+  type PreviewManifest,
   type User,
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
@@ -46,6 +51,57 @@ interface Resolved {
   subtitleTracks: StreamChoice[];
   markers: PlayerMarker[];
   seasonEpisodes?: EpisodeSibling[];
+  previewManifest?: PreviewManifest;
+  versions?: VersionChoice[];
+}
+
+/// Format a media file as a picker label — "4K HDR · HEVC", "1080p",
+/// "720p · 12 Mbps". Tries to surface the dimension that distinguishes
+/// versions from each other (height bucket + HDR + codec). Falls back
+/// to the bitrate when resolution is unknown.
+function versionLabel(file: MediaFileSummary): string {
+  const parts: string[] = [];
+  const h = file.height ?? 0;
+  if (h >= 2000) parts.push("4K");
+  else if (h >= 1000) parts.push("1080p");
+  else if (h >= 700) parts.push("720p");
+  else if (h >= 400) parts.push("480p");
+  else if (h > 0) parts.push(`${h}p`);
+  if (file.hdr_format) parts.push("HDR");
+  const videoCodec = file.streams.find((s) => s.kind === "video")?.codec;
+  if (videoCodec) parts.push(videoCodec.toUpperCase());
+  if (parts.length === 0 && file.bit_rate) {
+    parts.push(`${Math.round(file.bit_rate / 1_000_000)} Mbps`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : `File #${file.id}`;
+}
+
+function versionsFor(
+  files: MediaFileSummary[],
+  external: ExternalSubtitle[],
+): VersionChoice[] | undefined {
+  if (files.length <= 1) return undefined;
+  return files.map((f) => {
+    const embedded = streamChoices(f.streams, "subtitle");
+    return {
+      media_file_id: f.id,
+      label: versionLabel(f),
+      audioTracks: streamChoices(f.streams, "audio"),
+      subtitleTracks: mergeExternalSubtitles(embedded, external),
+    };
+  });
+}
+
+async function maybePreviewManifest(
+  mediaFileId: number,
+): Promise<PreviewManifest | undefined> {
+  // 404 just means previews haven't been generated for this file yet;
+  // anything else (network blip, server hiccup) gets the same treatment.
+  try {
+    return await previewsApi.manifest(mediaFileId);
+  } catch {
+    return undefined;
+  }
 }
 
 function languageLabel(code: string | null | undefined): string | null {
@@ -89,21 +145,66 @@ function streamChoices(
 ): StreamChoice[] {
   const filtered = streams.filter((s) => s.kind === kind);
   return filtered.map((s, idx) => {
+    // When the source embeds a track title ("Netflix eng subrip",
+    // "SDH eng subrip", "Cantonese (Traditional, Hong Kong) chi
+    // subrip"), surface it as the primary label — that's what users
+    // see in VLC / mpv / Haruna and it's the only way to tell the
+    // half-dozen English subtitle variants of a Bluray remux apart.
+    // The language + codec become secondary tags so the user still
+    // sees the technical info when scanning the list. When there's
+    // no embedded title (most raw transcodes), we fall back to the
+    // original "Language (CODEC)" format so we don't end up with a
+    // list of "Unknown (SUBRIP)" entries.
     const lang = languageLabel(s.language) ?? "Unknown";
-    const codec = s.codec ? ` (${s.codec.toUpperCase()})` : "";
+    const codecLabel = s.codec ? s.codec.toUpperCase() : null;
     const channelTag =
       kind === "audio" && s.channels
-        ? ` · ${s.channels === 6 ? "5.1" : s.channels === 8 ? "7.1" : `${s.channels}ch`}`
-        : "";
-    const forcedTag = s.is_forced ? " · forced" : "";
-    const defaultTag = s.is_default ? " · default" : "";
+        ? `${s.channels === 6 ? "5.1" : s.channels === 8 ? "7.1" : `${s.channels}ch`}`
+        : null;
+    const forcedTag = s.is_forced ? "forced" : null;
+    const defaultTag = s.is_default ? "default" : null;
+
+    const title = s.title?.trim();
+    let label: string;
+    if (title && title.length > 0) {
+      // Use embedded title verbatim, with codec / language / dispo
+      // tags appended in a dimmer format. Keep the label short — the
+      // picker truncates at ~40 chars on narrow screens.
+      const extras = [codecLabel, channelTag, forcedTag, defaultTag]
+        .filter((t): t is string => !!t)
+        .join(" · ");
+      label = extras ? `${title} · ${extras}` : title;
+    } else {
+      const extras = [channelTag, forcedTag, defaultTag]
+        .filter((t): t is string => !!t)
+        .join(" · ");
+      const codec = codecLabel ? ` (${codecLabel})` : "";
+      label = extras ? `${lang}${codec} · ${extras}` : `${lang}${codec}`;
+    }
     return {
       idx,
-      label: `${lang}${codec}${channelTag}${forcedTag}${defaultTag}`,
+      label,
       language: s.language,
+      codec: s.codec?.toLowerCase() ?? null,
     };
   });
 }
+
+/// Subtitle codec names ffprobe emits for picture-based formats.
+/// These need the heavyweight overlay path in the transcoder and
+/// the overlay filter is fragile (blocks until the first subtitle
+/// frame appears, doesn't compose with ABR / GPU-native pipelines).
+/// We never auto-select these — the user can still pick them
+/// manually from the picker if they're the only option.
+const PICTURE_SUBTITLE_CODECS = new Set([
+  "hdmv_pgs_subtitle",
+  "pgs",
+  "dvd_subtitle",
+  "dvdsub",
+  "dvb_subtitle",
+  "vobsub",
+  "xsub",
+]);
 
 function tracksFor(file: MediaFileSummary | undefined): {
   audio: StreamChoice[];
@@ -116,10 +217,41 @@ function tracksFor(file: MediaFileSummary | undefined): {
   };
 }
 
+/// Merge OpenSubtitles-fetched tracks into the picker. Embedded streams
+/// keep their numeric `idx`; external rows use `idx = -1` and carry the
+/// `externalUrl` flag so the player knows to attach a `<track>` element
+/// instead of asking the server to burn it in.
+function mergeExternalSubtitles(
+  embedded: StreamChoice[],
+  external: ExternalSubtitle[],
+): StreamChoice[] {
+  const externalChoices: StreamChoice[] = external.map((s) => {
+    const lang = languageLabel(s.language) ?? s.language ?? "Unknown";
+    const tags: string[] = [s.source];
+    if (s.forced) tags.push("forced");
+    if (s.sdh) tags.push("SDH");
+    return {
+      idx: -1,
+      label: `${lang} · ${tags.join(", ")}`,
+      language: s.language,
+      externalUrl: `/api/v1/external-subtitles/${s.id}/file`,
+    };
+  });
+  return [...embedded, ...externalChoices];
+}
+
 async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
   const file = detail.files[0];
   if (!file) return null;
   const tracks = tracksFor(file);
+  let external: ExternalSubtitle[] = [];
+  try {
+    const r = await externalSubtitlesApi.forItem(detail.id);
+    external = r.subtitles;
+  } catch {
+    // Best-effort; an outage in OpenSubtitles shouldn't break playback.
+  }
+  const previewManifest = await maybePreviewManifest(file.id);
   return {
     mediaFileId: file.id,
     title: detail.title,
@@ -128,8 +260,10 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
     durationMs: file.duration_ms ?? detail.duration_ms ?? undefined,
     backHref: `/?title=${detail.id}`,
     audioTracks: tracks.audio,
-    subtitleTracks: tracks.subtitle,
+    subtitleTracks: mergeExternalSubtitles(tracks.subtitle, external),
     markers: file.markers ?? [],
+    previewManifest,
+    versions: versionsFor(detail.files, external),
   };
 }
 
@@ -163,6 +297,10 @@ async function resolveEpisode(
       parentTitle: `Season ${e.season_number}`,
     }),
   );
+  const external = await externalSubtitlesApi
+    .forEpisode(episode.id)
+    .then((r) => r.subtitles)
+    .catch(() => [] as ExternalSubtitle[]);
   return {
     mediaFileId: file.id,
     title: showTitle,
@@ -175,9 +313,11 @@ async function resolveEpisode(
     nextLabel: next?.title,
     nextThumb: next?.thumb,
     audioTracks: tracks.audio,
-    subtitleTracks: tracks.subtitle,
+    subtitleTracks: mergeExternalSubtitles(tracks.subtitle, external),
     markers: file.markers ?? [],
     seasonEpisodes,
+    previewManifest: await maybePreviewManifest(file.id),
+    versions: versionsFor(episode.files, external),
   };
 }
 
@@ -238,31 +378,65 @@ function parseIndex(v: string | undefined): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
-/// Pick a 0-indexed track based on the user's saved preference, matching on
-/// `language` (ISO 639-2 code). Returns undefined when the preferred
-/// language isn't available or the user has no preference set.
+/// Pick a track based on the user's saved preference, matching on
+/// `language` (ISO 639-2 code). Returns the full StreamChoice so the
+/// caller can route an external sub through `externalSubUrl` rather
+/// than the negative `idx=-1` placeholder.
 function pickByLanguage(
   tracks: StreamChoice[],
   preferredLang: string | null,
-): number | undefined {
+): StreamChoice | undefined {
   if (!preferredLang) return undefined;
   const wanted = preferredLang.toLowerCase();
-  const hit = tracks.find((t) => t.language?.toLowerCase() === wanted);
-  return hit?.idx;
+  return tracks.find((t) => t.language?.toLowerCase() === wanted);
 }
 
 function applyDefaults(
   resolved: Resolved,
   user: User,
   fromQuery: { audio?: number; subtitle?: number },
-): { audioIndex?: number; subtitleIndex?: number } {
-  const audioIndex =
-    fromQuery.audio ??
-    pickByLanguage(resolved.audioTracks, user.default_audio_lang);
-  const subtitleIndex =
-    fromQuery.subtitle ??
-    pickByLanguage(resolved.subtitleTracks, user.default_subtitle_lang);
-  return { audioIndex, subtitleIndex };
+): {
+  audioIndex?: number;
+  subtitleIndex?: number;
+  externalSubtitleUrl?: string;
+} {
+  // Audio: only embedded; idx is sufficient.
+  const audioPick = fromQuery.audio !== undefined
+    ? undefined
+    : pickByLanguage(resolved.audioTracks, user.default_audio_lang);
+  const audioIndex = fromQuery.audio ?? audioPick?.idx;
+
+  // Subtitle: an explicit query param wins; otherwise prefer an embedded
+  // match (renderable as the burned-in default), then fall back to an
+  // external match for the same language.
+  if (fromQuery.subtitle !== undefined) {
+    return { audioIndex, subtitleIndex: fromQuery.subtitle };
+  }
+  const preferred = user.default_subtitle_lang;
+  if (!preferred) return { audioIndex };
+  const wanted = preferred.toLowerCase();
+  // Skip picture-based subtitles in auto-selection. The transcoder's
+  // overlay-burn path for PGS/DVD subs blocks ffmpeg until the first
+  // subtitle frame appears (a quirk of the overlay filter), so a
+  // user landing on a movie whose PGS subs don't start for 30-60 s
+  // sees a frozen loading spinner. External text subs (WebVTT from
+  // OpenSubtitles) handle the same content without the overlay
+  // pipeline. Users can still pick PGS manually from the captions
+  // menu — this only changes the default.
+  const embedded = resolved.subtitleTracks.find(
+    (t) =>
+      !t.externalUrl
+      && t.language?.toLowerCase() === wanted
+      && !PICTURE_SUBTITLE_CODECS.has(t.codec ?? ""),
+  );
+  if (embedded) return { audioIndex, subtitleIndex: embedded.idx };
+  const external = resolved.subtitleTracks.find(
+    (t) => t.externalUrl && t.language?.toLowerCase() === wanted,
+  );
+  if (external?.externalUrl) {
+    return { audioIndex, externalSubtitleUrl: external.externalUrl };
+  }
+  return { audioIndex };
 }
 
 export default async function WatchPage({
@@ -310,10 +484,11 @@ export default async function WatchPage({
 
   if (!resolved) notFound();
 
-  const { audioIndex, subtitleIndex } = applyDefaults(resolved, user, {
-    audio: audioFromQuery,
-    subtitle: subtitleFromQuery,
-  });
+  const { audioIndex, subtitleIndex, externalSubtitleUrl } = applyDefaults(
+    resolved,
+    user,
+    { audio: audioFromQuery, subtitle: subtitleFromQuery },
+  );
 
   return (
     <ChimpFlixPlayer
@@ -332,8 +507,11 @@ export default async function WatchPage({
       subtitleTracks={resolved.subtitleTracks}
       audioIndex={audioIndex}
       subtitleIndex={subtitleIndex}
+      externalSubtitleUrl={externalSubtitleUrl}
       markers={resolved.markers}
       seasonEpisodes={resolved.seasonEpisodes}
+      previewManifest={resolved.previewManifest}
+      versions={resolved.versions}
     />
   );
 }

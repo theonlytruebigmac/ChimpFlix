@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
+use crate::trakt_sync;
 
 pub async fn update(
     State(state): State<AppState>,
@@ -68,6 +69,13 @@ pub async fn set_watched(
     }
     queries::set_watched(&state.pool, user.id, req.item_id, req.episode_id, req.watched)
         .await?;
+    // Fire-and-forget Trakt push when marking watched. Unwatch sync is
+    // intentionally one-way for now — the symmetric remove endpoint
+    // exists in the Trakt client but isn't wired here yet to avoid
+    // accidentally clobbering history during testing.
+    if req.watched {
+        push_watched_to_trakt(state.clone(), user.id, req.item_id, req.episode_id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -87,7 +95,44 @@ pub async fn scrobble(
         ));
     }
     queries::scrobble(&state.pool, user.id, req.item_id, req.episode_id).await?;
+    // Same fire-and-forget Trakt push as set_watched — scrobble is
+    // the threshold-crossing event the player emits at 90% playback.
+    push_watched_to_trakt(state.clone(), user.id, req.item_id, req.episode_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn push_watched_to_trakt(
+    state: AppState,
+    user_id: i64,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+) {
+    tokio::spawn(async move {
+        let now_iso = trakt_sync::epoch_ms_to_iso(chimpflix_common::now_ms());
+        let event = if let Some(id) = item_id {
+            let Some(tmdb_id) = trakt_sync::item_tmdb_id(&state.pool, id).await else {
+                return;
+            };
+            chimpflix_metadata::HistoryPush::Movie {
+                tmdb_id,
+                watched_at: now_iso,
+            }
+        } else if let Some(id) = episode_id {
+            let coords = trakt_sync::episode_trakt_coords(&state.pool, id).await.ok().flatten();
+            let Some((tmdb_show_id, season, episode)) = coords else {
+                return;
+            };
+            chimpflix_metadata::HistoryPush::Episode {
+                tmdb_show_id,
+                season,
+                episode,
+                watched_at: now_iso,
+            }
+        } else {
+            return;
+        };
+        trakt_sync::push_history_event(&state, user_id, event).await;
+    });
 }
 
 pub async fn on_deck(
