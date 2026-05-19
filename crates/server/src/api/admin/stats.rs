@@ -88,20 +88,32 @@ pub async fn activity(
     // global feed (no user_id) stays accessible to all admins; targeted
     // queries against an Owner's playback history require the caller
     // to also be an Owner.
+    //
+    // For non-Owner actors we collapse two distinguishable responses
+    // into one: querying an Owner's activity AND querying a
+    // non-existent user_id both return NotFound. The old code only
+    // returned 403 on the Owner case and silently emptied the result
+    // on a non-existent id, which let an Admin enumerate "does this
+    // user_id exist and are they an Owner" by probing the endpoint.
     if let Some(target_id) = q.user_id {
         if !matches!(actor.role, chimpflix_library::UserRole::Owner) {
-            if let Some(target) =
-                chimpflix_library::queries::find_user_by_id(&state.pool, target_id)
-                    .await
-                    .map_err(ApiError::Internal)?
-            {
-                if matches!(target.role, chimpflix_library::UserRole::Owner) {
-                    return Err(ApiError::Forbidden);
+            let target = chimpflix_library::queries::find_user_by_id(&state.pool, target_id)
+                .await
+                .map_err(ApiError::Internal)?;
+            match target {
+                None => return Err(ApiError::NotFound),
+                Some(t) if matches!(t.role, chimpflix_library::UserRole::Owner) => {
+                    return Err(ApiError::NotFound);
                 }
+                Some(_) => {}
             }
         }
     }
-    let limit = q.limit.unwrap_or(50);
+    // Clamp `limit` to a sane upper bound. Without this an admin
+    // (or anyone with admin token) could pass `?limit=10_000_000` and
+    // force the DB to read + serialize the entire playback_events
+    // table, stalling SQLite and consuming memory.
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let events =
         queries::list_playback_activity(&state.pool, limit, q.before, q.user_id)
             .await
@@ -159,7 +171,8 @@ pub async fn top_libraries(
     Query(q): Query<TopQuery>,
 ) -> Result<Json<LibrariesResponse>, ApiError> {
     let days = q.days.unwrap_or(30).clamp(1, 365);
-    let limit = q.limit.unwrap_or(10);
+    // Clamp to a sane upper bound — see /activity for rationale.
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let libraries = queries::top_libraries_by_plays(&state.pool, days, limit)
         .await
         .map_err(ApiError::Internal)?;
@@ -178,7 +191,8 @@ pub async fn top_platforms(
     Query(q): Query<TopQuery>,
 ) -> Result<Json<PlatformsResponse>, ApiError> {
     let days = q.days.unwrap_or(30).clamp(1, 365);
-    let limit = q.limit.unwrap_or(10);
+    // Clamp to a sane upper bound — see /activity for rationale.
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let platforms = queries::top_platforms(&state.pool, days, limit)
         .await
         .map_err(ApiError::Internal)?;
@@ -205,7 +219,8 @@ pub async fn top_users(
     Query(q): Query<TopQuery>,
 ) -> Result<Json<TopUsersResponse>, ApiError> {
     let days = q.days.unwrap_or(30).clamp(1, 365);
-    let limit = q.limit.unwrap_or(10);
+    // Clamp to a sane upper bound — see /activity for rationale.
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let users = queries::top_users_by_plays(&state.pool, since_ms(Some(days)), limit)
         .await
         .map_err(ApiError::Internal)?;
@@ -224,7 +239,8 @@ pub async fn top_items(
     Query(q): Query<TopQuery>,
 ) -> Result<Json<TopItemsResponse>, ApiError> {
     let days = q.days.unwrap_or(30).clamp(1, 365);
-    let limit = q.limit.unwrap_or(10);
+    // Clamp to a sane upper bound — see /activity for rationale.
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let items = queries::top_items_by_plays(&state.pool, since_ms(Some(days)), limit)
         .await
         .map_err(ApiError::Internal)?;

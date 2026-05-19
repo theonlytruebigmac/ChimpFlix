@@ -46,10 +46,24 @@ pub struct WebhookEvent {
 
 impl WebhookEvent {
     pub fn new(name: impl Into<String>, payload: impl Serialize) -> Self {
-        Self {
-            name: name.into(),
-            payload: serde_json::to_value(payload).unwrap_or(Value::Null),
-        }
+        let name = name.into();
+        // Serialize the payload up front. If it fails (a future event
+        // type with a non-JSON-friendly nested value), substitute
+        // `Null` so we still produce *some* event — but record the
+        // failure at error level so the operator can spot it. The
+        // previous `.unwrap_or(Value::Null)` made these silent.
+        let payload = match serde_json::to_value(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    event = %name,
+                    error = %e,
+                    "webhook event payload failed to serialize; emitting Null instead"
+                );
+                Value::Null
+            }
+        };
+        Self { name, payload }
     }
 }
 

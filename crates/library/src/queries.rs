@@ -150,10 +150,27 @@ pub async fn list_libraries(
     );
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
 
+    // Pull every library_paths row in a single query and group in
+    // memory. The old per-row `library_paths(pool, id).await?` was a
+    // classic N+1 — 20 libraries cost 21 round-trips to SQLite, and
+    // the cost showed up as a visible delay in the admin /libraries
+    // listing on cold-cache page loads.
+    let paths_filter = library_filter_sql("library_id", accessible);
+    let paths_sql = format!(
+        "SELECT library_id, path FROM library_paths WHERE {paths_filter} ORDER BY path ASC",
+    );
+    let path_rows = sqlx::query(&paths_sql).fetch_all(pool).await?;
+    let mut paths_by_lib: HashMap<i64, Vec<String>> = HashMap::new();
+    for r in &path_rows {
+        let lib_id: i64 = r.try_get("library_id")?;
+        let path: String = r.try_get("path")?;
+        paths_by_lib.entry(lib_id).or_default().push(path);
+    }
+
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let id: i64 = row.try_get("id")?;
-        let paths = library_paths(pool, id).await?;
+        let paths = paths_by_lib.remove(&id).unwrap_or_default();
         out.push(Library::from_row(row, paths)?);
     }
     Ok(out)
@@ -6790,8 +6807,28 @@ pub async fn claim_queued_optimized(
     pool: &SqlitePool,
     limit: i64,
 ) -> Result<Vec<OptimizedVersion>> {
+    // Atomically flip the chosen rows from 'queued' to 'running' inside
+    // the same statement that selects them, then return the updated
+    // rows. Same hazard as `claim_due_tasks`: a separate
+    // SELECT-then-UPDATE leaves a window where a concurrent scheduler
+    // tick can claim the same row, spawning two ffmpegs against the
+    // same output path. SQLite serializes overlapping UPDATEs, so
+    // the second tick observes 'running' for any rows the first
+    // grabbed and skips them.
+    //
+    // `mark_optimized_running` is still called afterward to record
+    // the resolved output_path — its UPDATE on `status` becomes a
+    // no-op (already 'running') but the path write is meaningful.
     let rows = sqlx::query(
-        "SELECT * FROM optimized_versions WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?",
+        "UPDATE optimized_versions
+         SET status = 'running'
+         WHERE id IN (
+             SELECT id FROM optimized_versions
+             WHERE status = 'queued'
+             ORDER BY created_at ASC
+             LIMIT ?
+         )
+         RETURNING *",
     )
     .bind(limit.clamp(1, 16))
     .fetch_all(pool)
@@ -6845,16 +6882,17 @@ pub async fn mark_optimized_finished(
 }
 
 pub async fn delete_optimized_version(pool: &SqlitePool, id: i64) -> Result<Option<String>> {
-    // Return the path so the caller can unlink the file.
-    let row = sqlx::query("SELECT output_path FROM optimized_versions WHERE id = ?")
+    // Return the path so the caller can unlink the file. Single
+    // statement so the SELECT and DELETE can't be interleaved by a
+    // concurrent caller that ALSO wants to delete this row (e.g. an
+    // admin and a scheduler cleanup both reacting to the same
+    // "finished" event). `DELETE ... RETURNING` lands the row's
+    // output_path in our hand before SQLite drops the row.
+    let row = sqlx::query("DELETE FROM optimized_versions WHERE id = ? RETURNING output_path")
         .bind(id)
         .fetch_optional(pool)
         .await?;
     let path: Option<String> = row.and_then(|r| r.try_get::<String, _>("output_path").ok());
-    sqlx::query("DELETE FROM optimized_versions WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
     Ok(path)
 }
 
@@ -7297,15 +7335,32 @@ pub async fn delete_scheduled_task(pool: &SqlitePool, id: i64) -> Result<bool> {
 }
 
 pub async fn claim_due_tasks(pool: &SqlitePool, now: i64) -> Result<Vec<ScheduledTask>> {
-    // Return tasks whose next_run_at is due and aren't currently running.
+    // Atomically claim due tasks: flip `last_status` to 'running' inside
+    // the same statement that selects them, then return the updated
+    // rows. Without atomicity, two scheduler ticks firing within the
+    // SELECT→`mark_task_running` UPDATE window could both observe the
+    // same task as not-running and dispatch it twice — duplicate scan
+    // and marker jobs racing on the same files were the failure mode.
+    //
+    // The UPDATE...WHERE id IN (SELECT ...) pattern serializes against
+    // any other UPDATE on the same rows because SQLite holds a write
+    // lock for the duration of the statement; concurrent ticks queue
+    // up and the second one sees `last_status='running'` for the rows
+    // the first already grabbed.
     let rows = sqlx::query(
-        "SELECT * FROM scheduled_tasks
-         WHERE enabled = 1
-           AND next_run_at <= ?
-           AND (last_status IS NULL OR last_status <> 'running')
-         ORDER BY next_run_at ASC
-         LIMIT 16",
+        "UPDATE scheduled_tasks
+         SET last_status = 'running', last_run_at = ?
+         WHERE id IN (
+             SELECT id FROM scheduled_tasks
+             WHERE enabled = 1
+               AND next_run_at <= ?
+               AND (last_status IS NULL OR last_status <> 'running')
+             ORDER BY next_run_at ASC
+             LIMIT 16
+         )
+         RETURNING *",
     )
+    .bind(now)
     .bind(now)
     .fetch_all(pool)
     .await?;
@@ -7413,6 +7468,33 @@ pub async fn list_task_runs(
     .fetch_all(pool)
     .await?;
     rows.iter().map(TaskRun::from_row).collect()
+}
+
+/// Count failed task_runs since the most recent success. Used by the
+/// scheduler to compute exponential backoff: a healthy task returns 0;
+/// after the first failure it returns 1, after the second consecutive
+/// failure 2, and so on. The result is bounded by SQLite's count
+/// itself (always finite) but the caller should cap the exponent it
+/// derives from it to avoid `2^N` overflow.
+pub async fn count_consecutive_task_failures(
+    pool: &SqlitePool,
+    task_id: i64,
+) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_runs
+         WHERE task_id = ?
+           AND status = 'failed'
+           AND started_at > COALESCE(
+               (SELECT MAX(started_at) FROM task_runs
+                WHERE task_id = ? AND status = 'success'),
+               0
+           )",
+    )
+    .bind(task_id)
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 fn parse_air_date_to_ms(s: &str) -> Option<i64> {

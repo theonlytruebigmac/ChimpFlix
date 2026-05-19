@@ -51,6 +51,78 @@ const STRICT_CSRF_PATHS: &[&str] = &[
     "/api/v1/auth/me/email/confirm",
 ];
 
+/// Path suffixes that skip the double-submit CSRF *token* check (but
+/// keep Origin/Referer validation). Reserved for endpoints that must be
+/// callable via `navigator.sendBeacon`, which the browser doesn't let
+/// us attach custom headers to — including `X-CSRF-Token`. These
+/// endpoints are still protected by SameSite=Lax cookies + Origin
+/// matching, and they're idempotent and scoped to the caller's own
+/// session (the handler enforces `session.user_id == user.id`), so the
+/// remaining attack surface is "an attacker can ping their own session
+/// closed", which is harmless.
+///
+/// The `/close` endpoint is the canonical case: the player uses
+/// sendBeacon on pagehide / SPA teardown to guarantee delivery during
+/// unload, and without this exemption every teardown returned 403,
+/// leaving sessions running until the idle reaper swept them — which
+/// also meant `find_compatible` adopted them on the next playback
+/// request, breaking backward seeks that should have rolled a fresh
+/// session.
+fn allows_beacon_csrf_skip(path: &str) -> bool {
+    // Match `/api/v1/stream/sessions/{id}/close` exactly. We need to
+    // be strict here because a future route ending in `/close` would
+    // otherwise accidentally inherit this exemption.
+    //
+    //   * `strip_prefix` peels off the route group.
+    //   * `strip_suffix` ensures the path *ends* with `/close`.
+    //   * We then verify the middle is a SINGLE non-empty segment —
+    //     enforced by splitting and counting, not just "no slashes".
+    //     The split-count is robust to edge cases like consecutive
+    //     slashes (`//`, `/x//`) or trailing slashes that bare
+    //     `contains` would miss.
+    let Some(rest) = path.strip_prefix("/api/v1/stream/sessions/") else {
+        return false;
+    };
+    let Some(after_id) = rest.strip_suffix("/close") else {
+        return false;
+    };
+    let segments: Vec<&str> = after_id.split('/').collect();
+    segments.len() == 1 && !segments[0].is_empty()
+}
+
+#[cfg(test)]
+mod beacon_skip_tests {
+    use super::allows_beacon_csrf_skip;
+
+    #[test]
+    fn accepts_canonical_close() {
+        assert!(allows_beacon_csrf_skip(
+            "/api/v1/stream/sessions/abc123/close"
+        ));
+    }
+    #[test]
+    fn rejects_no_session_id() {
+        assert!(!allows_beacon_csrf_skip("/api/v1/stream/sessions//close"));
+    }
+    #[test]
+    fn rejects_extra_suffix() {
+        assert!(!allows_beacon_csrf_skip(
+            "/api/v1/stream/sessions/abc/close/extra"
+        ));
+    }
+    #[test]
+    fn rejects_double_slash_in_id() {
+        assert!(!allows_beacon_csrf_skip(
+            "/api/v1/stream/sessions/abc//close"
+        ));
+    }
+    #[test]
+    fn rejects_unrelated_routes() {
+        assert!(!allows_beacon_csrf_skip("/api/v1/auth/login"));
+        assert!(!allows_beacon_csrf_skip("/api/v1/stream/sessions/abc"));
+    }
+}
+
 pub async fn layer(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -92,7 +164,13 @@ pub async fn layer(
     // the session cookie (HttpOnly) but could still issue fetch
     // requests, and (c) any header-injection that lands on the
     // mutating-route surface.
-    if !strict {
+    //
+    // Also skip for the narrow set of sendBeacon-only endpoints
+    // (currently `/stream/sessions/{id}/close`) where the browser
+    // doesn't permit custom headers. The Origin check below still
+    // runs for these.
+    let beacon_skip = allows_beacon_csrf_skip(path);
+    if !strict && !beacon_skip {
         let csrf_name = csrf_cookie_name(state.auth.cookie_secure);
         let cookie_value = cookie_header_str
             .as_deref()

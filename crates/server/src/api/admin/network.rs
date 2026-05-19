@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
 use crate::auth::OwnerAuth;
-use crate::net;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -80,46 +79,6 @@ pub async fn patch(
     headers: HeaderMap,
     Json(input): Json<NetworkUpdate>,
 ) -> Result<Json<NetworkResponse>, ApiError> {
-    if let Some(ref mode) = input.secure_connections {
-        if !matches!(mode.as_str(), "required" | "preferred" | "disabled") {
-            return Err(ApiError::validation(
-                "secure_connections must be one of: required, preferred, disabled",
-            ));
-        }
-    }
-    if let Some(Some(ref url)) = input.public_url {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(ApiError::validation(
-                "public_url must start with http:// or https://",
-            ));
-        }
-    }
-    if let Some(n) = input.transcoder_reaper_idle_threshold_ms {
-        // 5s floor — anything lower and the 60s client keepalive plus
-        // 15s reaper interval would race-kill healthy sessions. 1h
-        // ceiling so a typo can't strand sessions for a day.
-        if !(5_000..=3_600_000).contains(&n) {
-            return Err(ApiError::validation(
-                "transcoder_reaper_idle_threshold_ms must be between 5000 and 3600000",
-            ));
-        }
-    }
-    if let Some(n) = input.max_remote_streams_per_user {
-        if !(0..=64).contains(&n) {
-            return Err(ApiError::validation(
-                "max_remote_streams_per_user must be between 0 (unlimited) and 64",
-            ));
-        }
-    }
-    if let Some(ref raw) = input.lan_networks {
-        net::validate_cidr_list(raw)
-            .map_err(|e| ApiError::validation(format!("lan_networks: {e}")))?;
-    }
-    if let Some(ref raw) = input.auth_bypass_cidrs {
-        net::validate_cidr_list(raw)
-            .map_err(|e| ApiError::validation(format!("auth_bypass_cidrs: {e}")))?;
-    }
-
     let cors_serialized = input
         .cors_origins
         .as_ref()
@@ -135,6 +94,11 @@ pub async fn patch(
         auth_bypass_cidrs: input.auth_bypass_cidrs.clone(),
         ..Default::default()
     };
+    // All validation is centralized in
+    // `crate::api::admin::settings::validate` so the catch-all and
+    // network-fragment PATCH endpoints agree, and a new endpoint
+    // picks up future field checks for free.
+    crate::api::admin::settings::validate(&patch)?;
     let updated = queries::update_server_settings(&state.pool, Some(actor.id), patch)
         .await
         .map_err(ApiError::Internal)?;

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { readCsrfToken } from "@/lib/chimpflix-api";
 
 // My List is now persisted on the server. We keep a client-side Set so
 // the toggle button updates instantly while the network call is in flight.
@@ -18,6 +19,15 @@ let inflight: Promise<void> | null = null;
 function notify(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new Event(EVENT));
+}
+
+// All my-list mutations need the double-submit CSRF header — the global
+// middleware rejects mutating requests without it. Without this, every
+// add/remove returned 403 and the optimistic client cache silently
+// diverged from server state.
+function csrfHeaders(): Record<string, string> {
+  const token = readCsrfToken();
+  return token ? { "X-CSRF-Token": token } : {};
 }
 
 async function fetchList(): Promise<Set<string>> {
@@ -48,9 +58,10 @@ async function migrateLegacy(): Promise<void> {
       }
     };
     collect(parsed);
+    const headers = csrfHeaders();
     await Promise.allSettled(
       [...numericIds].map((id) =>
-        fetch(`/api/v1/my-list/${id}`, { method: "POST" }),
+        fetch(`/api/v1/my-list/${id}`, { method: "POST", headers }),
       ),
     );
   } catch {
@@ -90,7 +101,10 @@ export function addToMyList(ratingKey: string): void {
   if (cache.has(ratingKey)) return;
   cache.add(ratingKey);
   notify();
-  fetch(`/api/v1/my-list/${id}`, { method: "POST" }).catch(() => {
+  fetch(`/api/v1/my-list/${id}`, {
+    method: "POST",
+    headers: csrfHeaders(),
+  }).catch(() => {
     cache?.delete(ratingKey);
     notify();
   });
@@ -107,7 +121,10 @@ export function removeFromMyList(ratingKey: string): void {
   if (!cache || !cache.has(ratingKey)) return;
   cache.delete(ratingKey);
   notify();
-  fetch(`/api/v1/my-list/${id}`, { method: "DELETE" }).catch(() => {
+  fetch(`/api/v1/my-list/${id}`, {
+    method: "DELETE",
+    headers: csrfHeaders(),
+  }).catch(() => {
     cache?.add(ratingKey);
     notify();
   });

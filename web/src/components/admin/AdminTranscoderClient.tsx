@@ -90,41 +90,61 @@ export function AdminTranscoderClient({
   presets,
   settings,
 }: Props) {
+  // See AdminGeneralForm for rationale — keep a local baseline so
+  // save success updates it via `setBaseline` rather than mutating
+  // the `settings` prop in place.
+  const [baseline, setBaseline] = useState({
+    transcoder_hw_accel: settings.transcoder_hw_accel,
+    transcoder_max_concurrent: settings.transcoder_max_concurrent,
+    transcoder_max_cpu_concurrent: settings.transcoder_max_cpu_concurrent,
+    transcoder_quality_ceiling_kbps:
+      settings.transcoder_quality_ceiling_kbps ?? null,
+    transcoder_encoder_preset: settings.transcoder_encoder_preset,
+    transcoder_hw_strictness: settings.transcoder_hw_strictness,
+    transcoder_background_preset: settings.transcoder_background_preset,
+    transcoder_max_background_concurrent:
+      settings.transcoder_max_background_concurrent,
+    transcoder_hdr_tonemap_enabled: settings.transcoder_hdr_tonemap_enabled,
+    transcoder_hdr_tonemap_algo: settings.transcoder_hdr_tonemap_algo,
+    transcoder_hevc_encoding_mode: (settings.transcoder_hevc_encoding_mode ??
+      "off") as HevcMode,
+    transcoder_gpu_device: settings.transcoder_gpu_device ?? "auto",
+  });
   const [hwAccel, setHwAccel] = useState<TranscoderHwAccel>(
-    settings.transcoder_hw_accel,
+    baseline.transcoder_hw_accel,
   );
   const [maxConcurrent, setMaxConcurrent] = useState(
-    settings.transcoder_max_concurrent,
+    baseline.transcoder_max_concurrent,
   );
   const [maxCpuConcurrent, setMaxCpuConcurrent] = useState(
-    settings.transcoder_max_cpu_concurrent,
+    baseline.transcoder_max_cpu_concurrent,
   );
   const [ceiling, setCeiling] = useState<number | "">(
-    settings.transcoder_quality_ceiling_kbps ?? "",
+    baseline.transcoder_quality_ceiling_kbps ?? "",
   );
   const [encoderPreset, setEncoderPreset] = useState<TranscoderEncoderPreset>(
-    settings.transcoder_encoder_preset,
+    baseline.transcoder_encoder_preset,
   );
   const [hwStrictness, setHwStrictness] = useState<TranscoderHwStrictness>(
-    settings.transcoder_hw_strictness,
+    baseline.transcoder_hw_strictness,
   );
   const [backgroundPreset, setBackgroundPreset] = useState<TranscoderBackgroundPreset>(
-    settings.transcoder_background_preset,
+    baseline.transcoder_background_preset,
   );
   const [maxBackgroundConcurrent, setMaxBackgroundConcurrent] = useState(
-    settings.transcoder_max_background_concurrent,
+    baseline.transcoder_max_background_concurrent,
   );
   const [tonemapEnabled, setTonemapEnabled] = useState(
-    settings.transcoder_hdr_tonemap_enabled,
+    baseline.transcoder_hdr_tonemap_enabled,
   );
   const [tonemapAlgo, setTonemapAlgo] = useState<TonemapAlgorithm>(
-    settings.transcoder_hdr_tonemap_algo,
+    baseline.transcoder_hdr_tonemap_algo,
   );
   const [hevcMode, setHevcMode] = useState<HevcMode>(
-    (settings.transcoder_hevc_encoding_mode ?? "off") as HevcMode,
+    baseline.transcoder_hevc_encoding_mode,
   );
   const [gpuDevice, setGpuDevice] = useState<string>(
-    settings.transcoder_gpu_device ?? "auto",
+    baseline.transcoder_gpu_device,
   );
   const [allPresets, setAllPresets] = useState(presets);
   const [showAdd, setShowAdd] = useState(false);
@@ -200,19 +220,19 @@ export function AdminTranscoderClient({
   }
 
   const dirty =
-    hwAccel !== settings.transcoder_hw_accel ||
-    maxConcurrent !== settings.transcoder_max_concurrent ||
-    maxCpuConcurrent !== settings.transcoder_max_cpu_concurrent ||
+    hwAccel !== baseline.transcoder_hw_accel ||
+    maxConcurrent !== baseline.transcoder_max_concurrent ||
+    maxCpuConcurrent !== baseline.transcoder_max_cpu_concurrent ||
     (ceiling === "" ? null : Number(ceiling)) !==
-      settings.transcoder_quality_ceiling_kbps ||
-    encoderPreset !== settings.transcoder_encoder_preset ||
-    hwStrictness !== settings.transcoder_hw_strictness ||
-    backgroundPreset !== settings.transcoder_background_preset ||
-    maxBackgroundConcurrent !== settings.transcoder_max_background_concurrent ||
-    tonemapEnabled !== settings.transcoder_hdr_tonemap_enabled ||
-    tonemapAlgo !== settings.transcoder_hdr_tonemap_algo ||
-    hevcMode !== (settings.transcoder_hevc_encoding_mode ?? "off") ||
-    gpuDevice !== (settings.transcoder_gpu_device ?? "auto");
+      baseline.transcoder_quality_ceiling_kbps ||
+    encoderPreset !== baseline.transcoder_encoder_preset ||
+    hwStrictness !== baseline.transcoder_hw_strictness ||
+    backgroundPreset !== baseline.transcoder_background_preset ||
+    maxBackgroundConcurrent !== baseline.transcoder_max_background_concurrent ||
+    tonemapEnabled !== baseline.transcoder_hdr_tonemap_enabled ||
+    tonemapAlgo !== baseline.transcoder_hdr_tonemap_algo ||
+    hevcMode !== baseline.transcoder_hevc_encoding_mode ||
+    gpuDevice !== baseline.transcoder_gpu_device;
 
   async function saveSettings() {
     setBusy(true);
@@ -234,7 +254,21 @@ export function AdminTranscoderClient({
         transcoder_gpu_device: gpuDevice,
       };
       await adminApi.settings.patch(patch);
-      Object.assign(settings, patch);
+      setBaseline({
+        transcoder_hw_accel: hwAccel,
+        transcoder_max_concurrent: maxConcurrent,
+        transcoder_max_cpu_concurrent: maxCpuConcurrent,
+        transcoder_quality_ceiling_kbps:
+          ceiling === "" ? null : Number(ceiling),
+        transcoder_encoder_preset: encoderPreset,
+        transcoder_hw_strictness: hwStrictness,
+        transcoder_background_preset: backgroundPreset,
+        transcoder_max_background_concurrent: maxBackgroundConcurrent,
+        transcoder_hdr_tonemap_enabled: tonemapEnabled,
+        transcoder_hdr_tonemap_algo: tonemapAlgo,
+        transcoder_hevc_encoding_mode: hevcMode,
+        transcoder_gpu_device: gpuDevice,
+      });
       setSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

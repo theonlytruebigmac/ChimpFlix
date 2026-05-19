@@ -179,14 +179,19 @@ impl TvdbClient {
     }
 
     async fn token(&self) -> Result<String> {
-        {
-            let guard = self.token.lock().await;
-            if let Some(t) = guard.as_ref() {
-                return Ok(t.clone());
-            }
+        // Hold the lock across `login()` so concurrent callers queue
+        // up behind us instead of each racing to POST /login. The
+        // previous "check, drop, login, re-take" pattern let two
+        // parallel scans each trigger a fresh login on cold-start,
+        // wasting credentials and risking 429s from TVDB. Holding
+        // the lock costs the second caller a single round-trip's
+        // worth of wait time — acceptable since they'd have waited
+        // anyway behind their own login.
+        let mut guard = self.token.lock().await;
+        if let Some(t) = guard.as_ref() {
+            return Ok(t.clone());
         }
         let token = self.login().await?;
-        let mut guard = self.token.lock().await;
         *guard = Some(token.clone());
         Ok(token)
     }

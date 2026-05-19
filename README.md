@@ -3,11 +3,13 @@
 A self-hosted, open-source media server with a Netflix-style web UI.
 Apache 2.0 licensed.
 
-> **Status: pre-v0.1 active development.** The Rust backend was scaffolded
-> on 2026-05-11 and replaces an earlier Plex-frontend incarnation of this
-> repo. The four MVP pillars (library scan, direct-play + watch state,
-> HLS transcoding, multi-user auth) are not yet wired up — see
-> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the plan.
+> **Status: v0.1 feature-complete (2026-05-18).** All four MVP pillars
+> (library scan, direct-play + watch state, HLS transcoding, multi-user
+> auth) are wired up and running. Four phases of Plex-parity work have
+> shipped on top of that, plus HEVC + GPU pinning, smart collections,
+> pre-roll stings, two-pass loudnorm, and a Netflix-style admin
+> surface. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
+> current shape.
 
 ## What ChimpFlix is (and is not)
 
@@ -16,16 +18,23 @@ or shared lineage with Plex, Jellyfin, Emby, or any other media server.
 The goal is a fast, efficient, Rust-based backend with a polished Netflix-
 style web UI, packaged for Docker, and easy to self-host.
 
-**v0.1 scope:**
+**v0.1 scope (shipped):**
 
-- Library scan + TMDB metadata for movies and TV shows.
+- Library scan + multi-agent metadata (TMDB, TVDB, TVMaze, AniList) for
+  movies, TV shows, and anime.
 - Direct-play streaming + per-user watch state.
-- HLS transcoding via ffmpeg.
-- Multi-user authentication and per-library access control.
+- HLS transcoding via ffmpeg, including HEVC, ABR ladders, hardware
+  decode/encode (NVENC / VAAPI / QSV / VideoToolbox / AMF), HDR→SDR
+  tonemap, two-pass loudness normalization, and burned/sidecar
+  subtitle paths.
+- Multi-user authentication (with 2FA), per-library access control, and
+  a three-tier role hierarchy (Owner > Admin > User).
+- Admin surface: scheduled-task scheduler with maintenance windows,
+  webhooks, audit log, backup + restore, library health dashboard,
+  smart collections, pre-roll stings, and bulk operations.
 
 **Not in v0.1:** music libraries, photos, Live TV / DVR, plugin system,
-mobile apps, sync-to-device, remote relay streaming, hardware-accelerated
-transcoding (detected but not yet used).
+mobile apps, sync-to-device, remote relay streaming.
 
 ## Repo layout
 
@@ -47,8 +56,10 @@ chimpflix/
 ## Quick start (local dev)
 
 You'll need Rust (stable, picked up automatically via `rust-toolchain.toml`),
-Node 22, and `ffmpeg` + `ffprobe` on `PATH` (only needed once transcoding
-lands in Phase 4).
+Node 22, and `ffmpeg` + `ffprobe` on `PATH`. For hardware-accelerated
+transcoding the matching driver also needs to be installed on the host
+(NVIDIA CUDA, Intel VAAPI/QSV, etc.); software fallback works without
+any GPU.
 
 ```bash
 # Backend
@@ -91,9 +102,9 @@ The backend reads a small set of environment variables:
 | `DATA_DIR` | `./data` | Where `chimpflix.db` and caches live. |
 | `RUST_LOG` | `info,sqlx=warn` | `tracing-subscriber` filter. |
 
-Configuration for the (currently Plex-pointing) web frontend lives in
-[web/.env.example](web/.env.example) — it will be reworked when Phase 2
-swaps the frontend over to the new backend.
+Configuration for the web frontend lives in
+[web/.env.example](web/.env.example). The frontend points at the
+ChimpFlix backend directly — no Plex bridge.
 
 ## Development
 

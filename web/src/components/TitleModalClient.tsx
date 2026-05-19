@@ -1130,6 +1130,32 @@ function AdminActions({
   /// with "queued: N" and runs the work in the background, so the
   /// menu shows a quick acknowledgement and disappears.
   const [actionToast, setActionToast] = useState<string | null>(null);
+  // Handle for the 4s auto-clear timer. Tracked so a rapid second
+  // action cancels the first action's pending clear — without this,
+  // the second toast would be wiped 4s after the *first* trigger
+  // instead of 4s after itself.
+  const actionToastTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (actionToastTimerRef.current !== null) {
+        window.clearTimeout(actionToastTimerRef.current);
+        actionToastTimerRef.current = null;
+      }
+    };
+  }, []);
+  const showActionToast = useCallback((msg: string | null, autoClearMs = 4000) => {
+    setActionToast(msg);
+    if (actionToastTimerRef.current !== null) {
+      window.clearTimeout(actionToastTimerRef.current);
+      actionToastTimerRef.current = null;
+    }
+    if (msg !== null && autoClearMs > 0) {
+      actionToastTimerRef.current = window.setTimeout(() => {
+        actionToastTimerRef.current = null;
+        setActionToast(null);
+      }, autoClearMs);
+    }
+  }, []);
   // Whether the OWNING library has `allow_media_deletion = true`.
   // Fetched once on mount (per modal open). null = unknown / not yet
   // loaded; the Delete menu item only renders when true so the
@@ -1191,16 +1217,13 @@ function AdminActions({
     setOpen(false);
     try {
       const { queued } = await itemsApi.detectMarkers(detail.id);
-      setActionToast(
+      showActionToast(
         queued === 0
           ? "No files to scan."
           : `Marker detection queued for ${queued} file${queued === 1 ? "" : "s"}.`,
       );
-      // Auto-clear after a beat so the toast doesn't linger past the
-      // next modal interaction.
-      window.setTimeout(() => setActionToast(null), 4000);
     } catch (e) {
-      setActionToast(
+      showActionToast(
         e instanceof Error ? `Failed: ${e.message}` : `Failed: ${String(e)}`,
       );
     } finally {

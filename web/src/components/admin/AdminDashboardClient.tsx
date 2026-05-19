@@ -77,7 +77,11 @@ export function AdminDashboardClient({ initial }: Props) {
         }
       }
     }
-    timer = setTimeout(tick, POLL_INTERVAL_MS);
+    // Fire the first poll immediately so the dashboard paints with
+    // real data instead of staying blank for 30s. `tick()` re-arms
+    // its own setTimeout in the finally block, so a single
+    // synchronous call is enough to bootstrap the loop.
+    void tick();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);

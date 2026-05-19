@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   auth as authApi,
   ChimpFlixApiError,
@@ -29,6 +29,17 @@ export function SettingsTwoFactorClient() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // See SettingsProfileClient for rationale — track the auto-clear
+  // timer so it can be cancelled on unmount.
+  const messageTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (messageTimerRef.current !== null) {
+        window.clearTimeout(messageTimerRef.current);
+        messageTimerRef.current = null;
+      }
+    };
+  }, []);
 
   async function refresh() {
     try {
@@ -99,7 +110,13 @@ export function SettingsTwoFactorClient() {
       setPassword("");
       await refresh();
       setMessage("2FA disabled.");
-      window.setTimeout(() => setMessage(null), 2500);
+      if (messageTimerRef.current !== null) {
+        window.clearTimeout(messageTimerRef.current);
+      }
+      messageTimerRef.current = window.setTimeout(() => {
+        messageTimerRef.current = null;
+        setMessage(null);
+      }, 2500);
     } catch (e) {
       setError(parseError(e));
     } finally {

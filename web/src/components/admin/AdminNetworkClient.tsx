@@ -9,18 +9,32 @@ import {
 } from "@/lib/chimpflix-api";
 
 export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
-  const [publicUrl, setPublicUrl] = useState(initial.public_url ?? "");
-  const [origins, setOrigins] = useState(initial.cors_origins.join("\n"));
+  // See AdminGeneralForm for rationale. Track the dirty-check
+  // baseline in local state so save success doesn't have to mutate
+  // the `initial` prop in place.
+  const [baseline, setBaseline] = useState({
+    public_url: initial.public_url ?? null,
+    cors_origins: initial.cors_origins,
+    secure_connections: initial.secure_connections,
+    transcoder_reaper_idle_threshold_ms:
+      initial.transcoder_reaper_idle_threshold_ms,
+    max_remote_streams_per_user: initial.max_remote_streams_per_user,
+    lan_networks: initial.lan_networks,
+    auth_bypass_cidrs: initial.auth_bypass_cidrs,
+    bind_interface: initial.bind_interface,
+  });
+  const [publicUrl, setPublicUrl] = useState(baseline.public_url ?? "");
+  const [origins, setOrigins] = useState(baseline.cors_origins.join("\n"));
   const [secure, setSecure] = useState<SecureConnectionsMode>(
-    initial.secure_connections,
+    baseline.secure_connections,
   );
   const [reaperMs, setReaperMs] = useState(
-    initial.transcoder_reaper_idle_threshold_ms,
+    baseline.transcoder_reaper_idle_threshold_ms,
   );
-  const [remoteCap, setRemoteCap] = useState(initial.max_remote_streams_per_user);
-  const [lanNetworks, setLanNetworks] = useState(initial.lan_networks);
-  const [bypassCidrs, setBypassCidrs] = useState(initial.auth_bypass_cidrs);
-  const [bindInterface, setBindInterface] = useState(initial.bind_interface);
+  const [remoteCap, setRemoteCap] = useState(baseline.max_remote_streams_per_user);
+  const [lanNetworks, setLanNetworks] = useState(baseline.lan_networks);
+  const [bypassCidrs, setBypassCidrs] = useState(baseline.auth_bypass_cidrs);
+  const [bindInterface, setBindInterface] = useState(baseline.bind_interface);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -33,21 +47,21 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
     .filter((s) => s.length > 0);
 
   const dirty =
-    (publicUrl || null) !== (initial.public_url ?? null) ||
-    JSON.stringify(originsParsed) !== JSON.stringify(initial.cors_origins) ||
-    secure !== initial.secure_connections ||
-    reaperMs !== initial.transcoder_reaper_idle_threshold_ms ||
-    remoteCap !== initial.max_remote_streams_per_user ||
-    lanNetworks !== initial.lan_networks ||
-    bypassCidrs !== initial.auth_bypass_cidrs ||
-    bindInterface !== initial.bind_interface;
+    (publicUrl || null) !== baseline.public_url ||
+    JSON.stringify(originsParsed) !== JSON.stringify(baseline.cors_origins) ||
+    secure !== baseline.secure_connections ||
+    reaperMs !== baseline.transcoder_reaper_idle_threshold_ms ||
+    remoteCap !== baseline.max_remote_streams_per_user ||
+    lanNetworks !== baseline.lan_networks ||
+    bypassCidrs !== baseline.auth_bypass_cidrs ||
+    bindInterface !== baseline.bind_interface;
 
   // The reaper threshold is consumed at spawn time and not hot-reloaded
   // (spawn_reaper takes an i64, not a settings handle). Surface this to
   // the operator so they know why their change doesn't kick in.
   const reaperChanged =
-    reaperMs !== initial.transcoder_reaper_idle_threshold_ms;
-  const bindChanged = bindInterface !== initial.bind_interface;
+    reaperMs !== baseline.transcoder_reaper_idle_threshold_ms;
+  const bindChanged = bindInterface !== baseline.bind_interface;
 
   async function save() {
     setBusy(true);
@@ -65,7 +79,17 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
         bind_interface: bindInterface.trim(),
       };
       await adminApi.network.patch(patch);
-      Object.assign(initial, patch);
+      setBaseline({
+        public_url: patch.public_url,
+        cors_origins: patch.cors_origins,
+        secure_connections: patch.secure_connections,
+        transcoder_reaper_idle_threshold_ms:
+          patch.transcoder_reaper_idle_threshold_ms,
+        max_remote_streams_per_user: patch.max_remote_streams_per_user,
+        lan_networks: patch.lan_networks,
+        auth_bypass_cidrs: patch.auth_bypass_cidrs,
+        bind_interface: patch.bind_interface,
+      });
       setSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

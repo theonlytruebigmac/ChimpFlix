@@ -1203,11 +1203,18 @@ pub async fn variant_file(
     // from /v1/*.
     if variant == "sub" {
         if let Some(sidecar) = session.webvtt_sidecar.as_ref() {
-            // Generous timeout — beats falling back to "no subs"
-            // on a slow first extraction. Subsequent plays of
-            // the same file will hit the cache and return
-            // instantly (planned: cache_root/subs/<file_id>/).
-            let timeout = Duration::from_secs(300);
+            // The previous 5-minute timeout outlasted every browser's
+            // own network timeout — Safari and Android Chrome bail
+            // around 30-60s of inactivity, and the user sees a
+            // network-error toast while the server is happily still
+            // extracting. Pin the wait to 60s: it still covers the
+            // common case (a few-GB MKV gets its subs scanned in
+            // <30s) but matches mobile network reality. Pathologically
+            // slow sources (full Bluray remux end-to-end scan) will
+            // serve a 404 here; the player drops captions and the
+            // background task continues populating the cache for the
+            // next request to pick up.
+            let timeout = Duration::from_secs(60);
             let mut rx = (*sidecar.progress).clone();
             let wait = async {
                 loop {
@@ -1237,7 +1244,7 @@ pub async fn variant_file(
                 Err(_) => {
                     warn!(
                         session_id = %id,
-                        "subtitle extraction still running after 5 min timeout; serving 404"
+                        "subtitle extraction still running after 60s timeout; serving 404"
                     );
                     return Err(ApiError::NotFound);
                 }
@@ -1253,8 +1260,17 @@ pub async fn variant_file(
     // still streaming heredoc / initial bytes). Segments use atomic
     // rename via `temp_file`, so they don't need the same grace; the
     // player retries 404s naturally.
+    //
+    // 30s (was 15s): heavily-loaded boxes and ffmpeg HEVC startup
+    // (filter-graph compilation + GPU init) can take >10s, and the
+    // previous 15s budget was racing with the idle reaper's 15s
+    // interval — first-manifest fetches on slow mobile networks
+    // would lose that race and 404 even though the encoder was
+    // bootstrapping fine. The client's HLS.js
+    // `manifestLoadingTimeOut` was bumped to 35s in lockstep so it
+    // doesn't give up before this returns.
     if is_manifest {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(meta) = tokio::fs::metadata(&path).await {
                 if meta.len() > 0 {

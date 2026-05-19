@@ -21,7 +21,10 @@ function csp(): string {
     "frame-src https://www.youtube-nocookie.com https://www.youtube.com",
     "frame-ancestors 'none'",
     // Inline styles + scripts: Next App Router emits inline bootstrap.
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+    // `unsafe-eval` was removed in round-3 (2026-05-19) — production
+    // builds don't use eval/new Function; HMR (which does) only runs
+    // in `next dev` and the dev server bypasses these headers.
+    "script-src 'self' 'unsafe-inline'",
     "style-src 'self' 'unsafe-inline'",
     // Posters / backdrops served from same origin; trailer thumbnails
     // come from i.ytimg.com.

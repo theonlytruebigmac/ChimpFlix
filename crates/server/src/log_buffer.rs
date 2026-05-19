@@ -39,11 +39,25 @@ impl LogBuffer {
 
     /// Push a line into the buffer, evicting the oldest when full.
     pub fn push(&self, line: LogLine) {
-        if let Ok(mut buf) = self.inner.write() {
-            if buf.len() == CAPACITY {
-                buf.pop_front();
+        match self.inner.write() {
+            Ok(mut buf) => {
+                if buf.len() == CAPACITY {
+                    buf.pop_front();
+                }
+                buf.push_back(line);
             }
-            buf.push_back(line);
+            Err(e) => {
+                // Poisoned lock — a previous panic-during-write
+                // corrupted the buffer state. We can't call `tracing`
+                // here because we ARE inside the tracing subscriber
+                // layer and would recurse. Drop to bare `eprintln!`
+                // so the operator at least sees the failure on
+                // stderr instead of silently losing every subsequent
+                // line.
+                eprintln!(
+                    "log_buffer: write lock poisoned ({e}); dropping log line. Restart required to recover the admin Logs page."
+                );
+            }
         }
     }
 

@@ -28,6 +28,9 @@ export function AdminPrerollClient({
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
+  // Set false on unmount so the debounced volume PATCH below doesn't
+  // call setState against a torn-down component.
+  const aliveRef = useRef(true);
 
   async function upload(file: File) {
     setBusy("upload");
@@ -87,6 +90,15 @@ export function AdminPrerollClient({
   }, [volume]);
 
   const saveVolumeRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      aliveRef.current = false;
+      if (saveVolumeRef.current) {
+        window.clearTimeout(saveVolumeRef.current);
+        saveVolumeRef.current = null;
+      }
+    };
+  }, []);
   function setVolumeAndPersist(next: number) {
     setVolume(next);
     if (saveVolumeRef.current) window.clearTimeout(saveVolumeRef.current);
@@ -94,9 +106,11 @@ export function AdminPrerollClient({
       saveVolumeRef.current = null;
       try {
         await adminApi.settings.patch({ preroll_volume: next });
-        setSavedAt(Date.now());
+        if (aliveRef.current) setSavedAt(Date.now());
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if (aliveRef.current) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
       }
     }, 350);
   }

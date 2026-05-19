@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { brandNameUpper } from "@/lib/env";
-import { auth, ChimpFlixApiError } from "@/lib/chimpflix-api";
+import { auth, ChimpFlixApiError, safeLocalPath } from "@/lib/chimpflix-api";
 
 type Mode = "login" | "setup" | "register" | "forgot" | "two_factor";
 
@@ -18,7 +18,13 @@ export default function LoginPage() {
 function LoginContent() {
   const router = useRouter();
   const search = useSearchParams();
-  const next = search.get("next") || "/";
+  // The `?next=` parameter is user-controlled: an attacker can craft
+  // `/login?next=https://attacker.com` and Next's router will happily
+  // navigate off-origin after a successful login. `safeLocalPath`
+  // enforces "must start with a single `/`, not protocol-relative,
+  // no control chars, no backslash-trick" so we only redirect to
+  // known-local routes.
+  const next = safeLocalPath(search.get("next"), "/");
   const invite = search.get("invite")?.trim() ?? "";
 
   // If we landed with an invite code in the URL we know the user wants

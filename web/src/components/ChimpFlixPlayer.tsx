@@ -17,6 +17,7 @@ import {
   stream as streamApi,
   playState as playStateApi,
   seasons as seasonsApi,
+  readCsrfToken,
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
 import { ChaptersControl } from "@/components/ChaptersControl";
@@ -369,6 +370,25 @@ export function ChimpFlixPlayer({
   // session useEffect lists it as a dep so the bump tears the session
   // down and creates a new one rooted at `liveTimeMsRef.current`.
   const [resumeEpoch, setResumeEpoch] = useState(0);
+  // Debounce handle for `triggerSessionRestart`. A user spamming the
+  // scrubber can fire 5-10 restart-eligible seekTo calls in under a
+  // second; each one used to spawn a DELETE + POST pair against the
+  // backend, and the old session's in-flight segment fetches would
+  // race the new session's manifest. With this timer we coalesce
+  // adjacent restarts so only the final target survives — the user
+  // still lands where they expect, but ffmpeg only spins up once.
+  const restartDebounceRef = useRef<number | null>(null);
+  // The user's pending seek target (source-time, ms) while a session
+  // restart is being debounced or in-flight. SEPARATE from
+  // `liveTimeMsRef` because that ref is overwritten by every
+  // onTimeUpdate while the existing session is still playing — if
+  // we used liveTimeMsRef as the restart target, a fast user seeking
+  // backward would have their target clobbered by the playhead's
+  // forward progress during the debounce window. The useEffect that
+  // mints new sessions reads this ref FIRST and clears it after
+  // consumption; if null, falls back to liveTimeMsRef (mount-time
+  // resume path).
+  const pendingRestartTargetMsRef = useRef<number | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -662,6 +682,15 @@ export function ChimpFlixPlayer({
     // (HLS.js's case). Both `background` shorthand and
     // `background-color` are emitted because Chrome historically
     // only honored the shorthand on ::cue.
+    //
+    // We *intentionally* don't emit the functional `::cue(c)`,
+    // `::cue(v)`, `::cue(i)`, `::cue(b)` variants: Firefox's CSS
+    // parser flags them as "Unknown pseudo-class or pseudo-element
+    // 'cue'" and drops the entire ruleset, while every other
+    // browser accepts them. Inheritance from the bare `::cue`
+    // already cascades into the child elements (<c>, <v>, <i>,
+    // <b>) so dropping them costs nothing and silences four
+    // console warnings per page load in Firefox.
     const font = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
     const cssBlock = `
       background: ${subtitleAppearance.backgroundColor} !important;
@@ -675,10 +704,6 @@ export function ChimpFlixPlayer({
     el.textContent = `
       ::cue { ${cssBlock} }
       video::cue { ${cssBlock} }
-      ::cue(c) { ${cssBlock} }
-      ::cue(v) { ${cssBlock} }
-      ::cue(i) { ${cssBlock} }
-      ::cue(b) { ${cssBlock} }
     `;
     return () => {
       // Don't remove on unmount — other player instances or tab
@@ -827,8 +852,28 @@ export function ChimpFlixPlayer({
     let cleanup: () => void = () => {};
     let keepaliveTimer: number | null = null;
 
+    // Prefer the seek target set by triggerSessionRestart — that's the
+    // user's actual intent for THIS re-run. If absent (mount-time
+    // resume, or a re-run triggered by an audio/subtitle change rather
+    // than a seek), fall back to liveTimeMsRef (current playback
+    // position) or the saved startPositionMs. Consume the target
+    // immediately so the next re-run that's NOT a seek doesn't accidentally
+    // re-use a stale value.
+    const pendingTarget = pendingRestartTargetMsRef.current;
+    pendingRestartTargetMsRef.current = null;
     const resumeMs =
-      liveTimeMsRef.current > 1000 ? liveTimeMsRef.current : startPositionMs;
+      pendingTarget !== null
+        ? pendingTarget
+        : liveTimeMsRef.current > 1000
+          ? liveTimeMsRef.current
+          : startPositionMs;
+    // Keep liveTimeMsRef in sync so a subsequent restart without a
+    // seek (e.g. audio track change) doesn't lose the user's current
+    // position. Without this, a track switch immediately after a
+    // backward seek would skip back to the OLD playback position
+    // because pendingTarget would be null and liveTimeMs would still
+    // hold the pre-seek value.
+    liveTimeMsRef.current = resumeMs;
 
     async function start() {
       const video = videoRef.current;
@@ -961,9 +1006,17 @@ export function ChimpFlixPlayer({
         audioTreatment: resp.session.audio_treatment ?? null,
       });
 
-      // Transcode sessions have ffmpeg fast-seek to resumeMs and HLS.js
-      // renders that as media-time 0. Record the offset so source-time
-      // reads can add it back. Direct play has no shift.
+      // Transcode sessions have ffmpeg fast-seek to its
+      // start_position_ms and HLS.js renders that as media-time 0.
+      // Record the offset so source-time reads can add it back.
+      // Direct play has no shift.
+      //
+      // Critical: use the *response's* start_position_ms, not the
+      // request's `resumeMs`. When the server adopts an existing
+      // compatible session (find_compatible), its start_position_ms
+      // is where the encoder originally began — NOT where the user
+      // asked to resume. Using `resumeMs` here would misalign HLS-time
+      // and source-time, causing every seek to land at the wrong place.
       //
       // …with one important caveat: some HLS configurations (Safari's
       // native player, or HLS.js when the encoder writes a non-zero
@@ -975,7 +1028,9 @@ export function ChimpFlixPlayer({
       // source-time mode — this single check protects both reads
       // (`onTimeUpdate`, `report()`) and writes (`seekBy`/`seekTo`).
       sessionStartMsRef.current =
-        resp.session.mode === "transcode" ? resumeMs : 0;
+        resp.session.mode === "transcode"
+          ? resp.session.start_position_ms
+          : 0;
 
       function applyResume() {
         if (!video) return;
@@ -1030,6 +1085,14 @@ export function ChimpFlixPlayer({
             video.removeEventListener("loadedmetadata", onLoaded);
           return;
         }
+        // Tracked in the outer scope so the session-cleanup function
+        // can clear it. Without that, a session teardown that lands
+        // BEFORE `start()` (the inner warmup-finish handler) fires
+        // leaves a 4-second timeout in flight referencing a destroyed
+        // hls instance; the timer eventually wakes up and tries to
+        // call attemptPlay() on a stale closure — visible in profilers
+        // as a slow accumulation of detached HTMLVideoElement references.
+        let warmupSafetyTimer: number | null = null;
         try {
           const HlsModule = (await import("hls.js")).default;
           if (cancelled) return;
@@ -1076,24 +1139,36 @@ export function ChimpFlixPlayer({
               maxBufferLength: isMobile ? 30 : 60,
               maxMaxBufferLength: isMobile ? 60 : 120,
               // Hard cap on buffer size in MB. 1080p ~5 Mbps × 60 s ≈
-              // 38 MB; desktop gets 200 MB of headroom, mobile capped
-              // at 60 MB which is well under iOS Safari's per-tab MSE
-              // budget (~150 MB before the OS kills the page).
-              maxBufferSize: isMobile ? 60 * 1000 * 1000 : 200 * 1000 * 1000,
-              // First-manifest timeouts have to cover the server's 15s
-              // wait for ffmpeg to write `index.m3u8`. Under-budgeting
-              // here was the cause of the "Auto quality won't start"
-              // symptom — HLS.js gave up before the encoder finished
-              // bootstrapping. Variant + fragment loads stay tight so
-              // mid-playback hiccups still surface quickly.
-              manifestLoadingTimeOut: 20000,
+              // 38 MB; desktop gets 200 MB of headroom, mobile gets
+              // 120 MB which is still under iOS Safari's per-tab MSE
+              // budget (~150 MB before the OS kills the page). 60 MB
+              // was the previous value but tripped the ceiling on
+              // higher-bitrate streams (8-10 Mbps × 30 s ≈ 30-40 MB
+              // with two segments in flight), forcing HLS.js to pause
+              // appending and starving playback even though the network
+              // had bandwidth available.
+              maxBufferSize: isMobile ? 120 * 1000 * 1000 : 200 * 1000 * 1000,
+              // First-manifest timeouts have to cover the server's
+              // wait for ffmpeg to write `index.m3u8` (now 30s after
+              // the bump to handle slow boxes). Variant + fragment
+              // loads stay tighter so mid-playback hiccups surface
+              // quickly.
+              manifestLoadingTimeOut: 35000,
               manifestLoadingMaxRetry: 4,
               manifestLoadingRetryDelay: 500,
               levelLoadingTimeOut: 15000,
               levelLoadingMaxRetry: 4,
               fragLoadingTimeOut: 20000,
               fragLoadingMaxRetry: 6,
-              abrEwmaDefaultEstimate: 5_000_000,
+              // Initial bandwidth estimate before HLS.js observes real
+              // throughput. 5 Mbps was too optimistic on mobile —
+              // jittery 4G/5G picks a high quality, segments arrive
+              // late, the stall watchdog kicks in and the user sees
+              // a jitter or skip on the first few seconds. 2.5 Mbps
+              // is conservative; the ABR model converges within ~3
+              // segments so the only cost is a brief lower-quality
+              // start. Desktop keeps the higher estimate.
+              abrEwmaDefaultEstimate: isMobile ? 2_500_000 : 5_000_000,
             });
             hlsRef.current = hls;
             hls.loadSource(url);
@@ -1126,7 +1201,10 @@ export function ChimpFlixPlayer({
                 if (started) return;
                 started = true;
                 hls.off(HlsModule.Events.FRAG_BUFFERED, onFrag);
-                window.clearTimeout(safety);
+                if (warmupSafetyTimer !== null) {
+                  window.clearTimeout(warmupSafetyTimer);
+                  warmupSafetyTimer = null;
+                }
                 attemptPlay();
               };
               const onFrag = () => {
@@ -1135,7 +1213,7 @@ export function ChimpFlixPlayer({
                 if (ahead >= WARMUP_TARGET_SEC) start();
               };
               hls.on(HlsModule.Events.FRAG_BUFFERED, onFrag);
-              const safety = window.setTimeout(start, WARMUP_TIMEOUT_MS);
+              warmupSafetyTimer = window.setTimeout(start, WARMUP_TIMEOUT_MS);
             });
             // Fatal-error recovery: HLS.js docs recommend trying
             // `recoverMediaError()` for media errors and `startLoad()`
@@ -1186,7 +1264,42 @@ export function ChimpFlixPlayer({
             });
             cleanup = () => {
               hlsRef.current = null;
+              if (warmupSafetyTimer !== null) {
+                window.clearTimeout(warmupSafetyTimer);
+                warmupSafetyTimer = null;
+              }
               hls.destroy();
+              // Firefox holds onto the MediaSource and SourceBuffers
+              // after hls.destroy() unless we also clear the video
+              // element's src and force a reload — without this,
+              // every session restart leaks one MediaSource (with its
+              // buffered segments) into memory. Symptoms: gradual
+              // memory growth + Firefox-specific playback slowdown
+              // after a dozen+ seeks/track-changes in a single page
+              // session. Chrome/Safari release the MediaSource on
+              // destroy() alone, but the extra pair of calls is
+              // harmless there.
+              try {
+                video.removeAttribute("src");
+                video.load();
+              } catch (e) {
+                // The expected error is `InvalidStateError` on an
+                // element whose MediaSource was already detached;
+                // that's the no-op case we deliberately allow.
+                // Anything else (OOM, unusual DOMException) is worth
+                // surfacing — bare `catch {}` masked real bugs during
+                // development, so we now warn loudly and only swallow
+                // the specific expected case.
+                if (
+                  !(e instanceof DOMException) ||
+                  e.name !== "InvalidStateError"
+                ) {
+                  console.warn(
+                    "ChimpFlixPlayer: unexpected error during MSE cleanup",
+                    e,
+                  );
+                }
+              }
             };
             return;
           }
@@ -1201,32 +1314,48 @@ export function ChimpFlixPlayer({
       setError("Server returned an unplayable session");
     }
 
-    // Tear down the transcode session. Tries sendBeacon first (most
-    // reliable for unload-time requests, especially in PWA standalone
-    // mode where fetch+keepalive has been seen to drop on force-close),
-    // then falls back to fetch+keepalive for in-SPA navigation cases.
-    function teardownSession() {
+    // Tear down the transcode session. Two paths:
+    //
+    //   * In-SPA cleanup (resumeEpoch++ for a session restart, audio
+    //     track change, etc.): use fetch+keepalive with an explicit
+    //     X-CSRF-Token header. Without the token the server's CSRF
+    //     middleware rejects with 403 and the session lingers — which
+    //     was the cause of the "unable to jump back" bug, because
+    //     find_compatible would then adopt the still-alive session on
+    //     the next POST /sessions.
+    //   * True page unload (pagehide non-persisted): sendBeacon is the
+    //     only reliable transport, and the `/close` endpoint is
+    //     explicitly exempted from the double-submit token check on
+    //     the server side (Origin + session-cookie + per-handler
+    //     ownership check still apply).
+    function teardownSession(opts?: { unload?: boolean }) {
       if (!sessionId) return;
       const closeUrl = `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/close`;
       const deleteUrl = `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}`;
       try {
         if (
+          opts?.unload &&
           typeof navigator !== "undefined" &&
           typeof navigator.sendBeacon === "function"
         ) {
           // sendBeacon is fire-and-forget POST; the browser guarantees
           // delivery even if the page is unloading. Empty body — the
-          // session id is encoded in the URL.
+          // session id is encoded in the URL. Server-side exemption
+          // covers the missing CSRF token.
           const beaconOk = navigator.sendBeacon(closeUrl, new Blob());
           if (beaconOk) return;
         }
-        // Fallback: in-SPA cleanup where the page isn't going away,
-        // or browsers without sendBeacon (very old). DELETE keeps the
-        // existing semantics for hand-rolled testing.
+        // In-SPA path: keepalive fetch with the CSRF token. DELETE keeps
+        // the existing semantics; the server's middleware accepts the
+        // token via X-CSRF-Token mirroring the cf_csrf cookie value.
+        const csrf = readCsrfToken();
+        const headers: Record<string, string> = {};
+        if (csrf) headers["X-CSRF-Token"] = csrf;
         fetch(deleteUrl, {
           method: "DELETE",
           keepalive: true,
           credentials: "include",
+          headers,
         }).catch(() => {});
       } catch {
         // Fetch / sendBeacon can throw synchronously during unload on
@@ -1245,7 +1374,7 @@ export function ChimpFlixPlayer({
     // (sudden process kill, network blip during keepalive).
     const onPageHide = (e: PageTransitionEvent) => {
       if (e.persisted) return;
-      teardownSession();
+      teardownSession({ unload: true });
     };
     window.addEventListener("pagehide", onPageHide);
 
@@ -1268,12 +1397,34 @@ export function ChimpFlixPlayer({
     };
     document.addEventListener("resume", onResume);
 
+    // iOS Safari (incl. PWA on iOS) doesn't fire the Page Lifecycle
+    // `resume` event. Instead, returning from the bfcache fires
+    // `pageshow` with `persisted: true`. Same recovery as the Chrome
+    // path — one immediate keepalive to repair `last_seen` before the
+    // 60s interval ticks. Without this, an iPhone user who backgrounds
+    // the PWA for >5 minutes comes back to a 404 manifest because the
+    // server reaper has already culled the session.
+    //
+    // We also fire on the *non*-persisted pageshow (fresh load) so the
+    // path is one-and-the-same; the cost is a single extra HTTP roundtrip
+    // at page load that would have been redundant with `start()` anyway.
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!e.persisted) return;
+      if (!sessionId) return;
+      fetch(
+        `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/master.m3u8`,
+        { credentials: "include" },
+      ).catch(() => {});
+    };
+    window.addEventListener("pageshow", onPageShow);
+
     start();
 
     return () => {
       cancelled = true;
       cleanup();
       window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
       document.removeEventListener("resume", onResume);
       if (keepaliveTimer !== null) {
         window.clearInterval(keepaliveTimer);
@@ -1857,6 +2008,42 @@ export function ChimpFlixPlayer({
     else v.pause();
   }, []);
 
+  // Schedule a session restart at the given source-time. 250ms debounce
+  // coalesces a burst of scrubs into one DELETE + POST cycle; without
+  // it, fast-scrubbing the bar would queue several teardown/start pairs
+  // back-to-back and the old session's in-flight segment fetches would
+  // race the new manifest. The latest target wins (each call clobbers
+  // the previous pending one). Cleared on unmount.
+  //
+  // Critical: writes to `pendingRestartTargetMsRef`, NOT `liveTimeMsRef`.
+  // The latter is updated on every onTimeUpdate while the still-playing
+  // session continues forward; if we wrote the target there, the
+  // playhead's forward progress would overwrite our backward target
+  // during the 250ms debounce window — the symptom users reported as
+  // "unable to jump back on the timeline". The new session's
+  // start_position is read from `pendingRestartTargetMsRef` first.
+  const triggerSessionRestart = useCallback((sourceTimeSec: number) => {
+    pendingRestartTargetMsRef.current = Math.max(
+      0,
+      Math.floor(sourceTimeSec * 1000),
+    );
+    if (restartDebounceRef.current !== null) {
+      window.clearTimeout(restartDebounceRef.current);
+    }
+    restartDebounceRef.current = window.setTimeout(() => {
+      restartDebounceRef.current = null;
+      setResumeEpoch((e) => e + 1);
+    }, 250);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (restartDebounceRef.current !== null) {
+        window.clearTimeout(restartDebounceRef.current);
+        restartDebounceRef.current = null;
+      }
+    };
+  }, []);
+
   // All seek/seekBy/seekTo arguments are in SOURCE-time (file timeline).
   // Convert to HLS media-time by subtracting the session start; if the
   // target lands before the session start we roll the session at the
@@ -1877,8 +2064,7 @@ export function ChimpFlixPlayer({
       // down + restart at the new position. ffmpeg fast-seeks (`-ss
       // BEFORE -i`) so this is near-instant — the player shows the
       // loading spinner for ~1 s while the new session warms up.
-      liveTimeMsRef.current = Math.max(0, Math.floor(time * 1000));
-      setResumeEpoch((e) => e + 1);
+      triggerSessionRestart(time);
       return;
     }
 
@@ -1901,8 +2087,7 @@ export function ChimpFlixPlayer({
       bufferedEndSec = Math.max(bufferedEndSec, v.buffered.end(i));
     }
     if (offsetSec - bufferedEndSec > 10) {
-      liveTimeMsRef.current = Math.max(0, Math.floor(time * 1000));
-      setResumeEpoch((e) => e + 1);
+      triggerSessionRestart(time);
       return;
     }
 
@@ -1915,7 +2100,7 @@ export function ChimpFlixPlayer({
       ? v.duration
       : Number.POSITIVE_INFINITY;
     v.currentTime = Math.max(0, Math.min(hlsMax, offsetSec));
-  }, []);
+  }, [triggerSessionRestart]);
 
   const seekBy = useCallback(
     (delta: number) => {
@@ -1944,6 +2129,21 @@ export function ChimpFlixPlayer({
   const lastTapRef = useRef<{ at: number; x: number; w: number } | null>(null);
   const seekFlashIdRef = useRef(0);
   const suppressNextClickRef = useRef(false);
+  // Holds the 150ms timer that auto-clears `suppressNextClickRef`. We
+  // track it so a player unmount within the suppression window can
+  // cancel the pending clear — otherwise the closure outlives the
+  // component and runs against a stale ref. Tiny leak in practice
+  // (150ms × small closure), but inconsistent with how the other
+  // player timers are managed.
+  const suppressClearTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (suppressClearTimerRef.current !== null) {
+        window.clearTimeout(suppressClearTimerRef.current);
+        suppressClearTimerRef.current = null;
+      }
+    };
+  }, []);
   // Double-tap seek is wired to the *container* (not the video element).
   // When the controls are shown, the top + bottom gradient bars cover
   // the corners where edge taps land, and a video-only listener would
@@ -1985,14 +2185,20 @@ export function ChimpFlixPlayer({
         // `stopPropagation` doesn't suppress the click; the synthetic
         // click fires from the touch sequence regardless. So we set a
         // ref that the video's onClick checks and ignores once. The
-        // timeout guards against the case where the synthetic click
-        // never fires (touch cancelled, finger dragged off target):
-        // without it, the suppression would leak and silently swallow
-        // an unrelated subsequent tap.
+        // timeout is the fallback if the synthetic click never fires
+        // (touch cancelled, finger dragged off target). 150ms is long
+        // enough to cover the synthetic-click delay (~50ms typically)
+        // but short enough that the next deliberate user tap isn't
+        // accidentally swallowed — 500ms used to be the value and
+        // overlapped real follow-up taps, making touch feel dead.
         suppressNextClickRef.current = true;
-        window.setTimeout(() => {
+        if (suppressClearTimerRef.current !== null) {
+          window.clearTimeout(suppressClearTimerRef.current);
+        }
+        suppressClearTimerRef.current = window.setTimeout(() => {
+          suppressClearTimerRef.current = null;
           suppressNextClickRef.current = false;
-        }, 500);
+        }, 150);
         const delta = x < w / 2 ? -10 : 10;
         seekBy(delta);
         seekFlashIdRef.current += 1;
@@ -2487,15 +2693,19 @@ export function ChimpFlixPlayer({
         )}
 
       <div
-        // `inert` (React 19) is the only reliable way to stop child
-        // buttons from receiving taps when the controls are hidden.
-        // CSS `pointer-events: none` on this wrapper alone does NOT
-        // propagate to children with default `auto`, so the previous
-        // setup let invisible buttons capture taps on the player
-        // surface — the source of the random ±10s jumps users reported.
-        inert={!showControls}
+        // When the controls are hidden, the wrapper covers the entire
+        // video surface (absolute inset-0). `inert` masks the subtree
+        // but in some browsers (notably Android Chrome PWA) it also
+        // swallows the tap that would otherwise bubble to the container's
+        // onPointerDown→resetHide, so the user can't reveal controls
+        // again — touch appears dead. `pointer-events-none` on the
+        // wrapper instead lets the tap fall through to the container,
+        // and since no descendant inside this wrapper sets an explicit
+        // `pointer-events: auto`, the `none` correctly propagates and
+        // hidden buttons can't capture taps.
+        aria-hidden={!showControls}
         className={`absolute inset-0 transition-opacity duration-200 ${
-          showControls ? "opacity-100" : "opacity-0"
+          showControls ? "opacity-100" : "pointer-events-none opacity-0"
         }`}
       >
         {/* Top bar — back link + title (title hides on desktop because

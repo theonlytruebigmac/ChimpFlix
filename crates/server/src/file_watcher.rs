@@ -45,14 +45,22 @@ pub fn spawn(state: AppState) {
 async fn run(state: AppState) -> Result<()> {
     // Bounded so a sudden burst of filesystem events (mass rename, full
     // library restore, rsync sweep) can't grow the channel without limit
-    // and OOM the server. 4096 events is plenty for normal use — typical
-    // scan storms produce 100s of events, never 1000s. When full, the
-    // notify callback drops the overflowing event; we recover via the
-    // 30s periodic re-sync that re-scans library roots regardless.
+    // and OOM the server. 16384 events covers a season pack rsync
+    // (typical: 1k-5k events) plus headroom. When the channel IS full,
+    // the notify callback flips `overflow_flag` so the main loop knows
+    // events were dropped and force-rescans every library to catch the
+    // missed files, rather than waiting on the 30s periodic re-sync
+    // which only re-checks library paths (not their contents).
+    let overflow_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overflow_flag_cb = overflow_flag.clone();
     let (tx, mut rx) =
-        mpsc::channel::<notify::Result<notify::Event>>(4096);
+        mpsc::channel::<notify::Result<notify::Event>>(16384);
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
-        let _ = tx.try_send(res);
+        if tx.try_send(res).is_err() {
+            // Channel full — record the drop so the main loop can
+            // trigger a full library rescan when it next wakes.
+            overflow_flag_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     })?;
 
     // Track currently-watched paths so the periodic re-poll only arms
@@ -91,6 +99,20 @@ async fn run(state: AppState) -> Result<()> {
             }
             _ = sleep(Duration::from_secs(1)) => {
                 let now = Instant::now();
+                // Channel-overflow recovery: notify dropped at least
+                // one event since we last looked, so the incremental
+                // pending-buckets set is incomplete. Force-queue a
+                // scan for every currently-watched library so missed
+                // additions get picked up.
+                if overflow_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        watched_count = watched.len(),
+                        "file watcher: event channel overflowed — forcing a rescan of every library"
+                    );
+                    for lib_id in watched.values() {
+                        pending.insert(*lib_id, now);
+                    }
+                }
                 let due: Vec<i64> = pending
                     .iter()
                     .filter(|(_, t)| now.duration_since(**t) >= DEBOUNCE)
@@ -182,17 +204,38 @@ async fn library_paths(state: &AppState) -> Result<Vec<(PathBuf, i64)>> {
     )
     .fetch_all(&state.pool)
     .await?;
-    Ok(rows
+    let mut out: Vec<(PathBuf, i64)> = rows
         .iter()
         .filter_map(|row| {
             let id: i64 = row.try_get("library_id").ok()?;
             let path: String = row.try_get("path").ok()?;
             Some((PathBuf::from(path), id))
         })
-        .collect())
+        .collect();
+    // Sort by descending component count so the deepest matching root
+    // wins in `match_library`'s `starts_with` scan. Without this, an
+    // operator with nested roots like `/media` + `/media/movies` would
+    // see file events under `/media/movies/...` ascribed to whichever
+    // root happened to come first out of the DB — typically the
+    // shorter one, which scans the wrong library.
+    out.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+    Ok(out)
 }
 
 async fn spawn_scan(state: AppState, library_id: i64) {
+    // Coordinate with the scheduled scan + admin-triggered scan via
+    // the shared per-library lock. A burst of file events during a
+    // scheduled scan otherwise piles up parallel scanner runs that
+    // hammer the same disk live transcodes are reading from. Bail
+    // when the lock is held — whatever scan is already running will
+    // sweep up the newly-landed file when it iterates the library.
+    if !state.try_acquire_library_scan(library_id).await {
+        info!(
+            library_id,
+            "file watcher: skipping (another scan for this library is in progress)"
+        );
+        return;
+    }
     // Reuse the same orchestration as the manual /libraries/{id}/scan
     // route — create a scan_job row, then spawn the scanner with the
     // current TMDB/TVDB/AniList snapshots. Failure here logs and moves
@@ -201,6 +244,7 @@ async fn spawn_scan(state: AppState, library_id: i64) {
         Ok(j) => j,
         Err(e) => {
             warn!(library_id, error = %format!("{e:#}"), "file watcher: create_scan_job failed");
+            state.release_library_scan(library_id).await;
             return;
         }
     };
@@ -215,11 +259,12 @@ async fn spawn_scan(state: AppState, library_id: i64) {
     let hub = state.hub.clone();
     let cache_root = state.transcoder.cache_root().to_path_buf();
     let state_for_markers = state.clone();
+    let state_for_release = state.clone();
     tokio::spawn(async move {
         let emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
             hub.publish(crate::events::Event::Scan(evt));
         });
-        let result = chimpflix_library::run_scan(
+        let scan_ok = match chimpflix_library::run_scan(
             pool.clone(),
             ffmpeg,
             tmdb,
@@ -231,36 +276,47 @@ async fn spawn_scan(state: AppState, library_id: i64) {
             Some(cache_root),
             emitter,
         )
-        .await;
-        if let Err(e) = result {
-            warn!(library_id, job_id = job.id, error = %format!("{e:#}"), "file watcher scan failed");
-            return;
-        }
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(library_id, job_id = job.id, error = %format!("{e:#}"), "file watcher scan failed");
+                false
+            }
+        };
         // Optional post-scan trigger: detect markers for any file the
         // scan introduced that doesn't have auto markers yet. Off by
         // default — gated on `detect_markers_on_add` because the
         // blackdetect pass costs ~30s/45min-episode and not every
         // operator wants that overhead on every drop.
-        let on_add = state_for_markers.settings.read().await.detect_markers_on_add;
-        if !on_add {
-            return;
-        }
-        // 256 caps a single scan from queueing thousands of jobs at
-        // once — typical drops are 1–20 files; an rsync of a season
-        // pack still fits comfortably. Excess gets picked up by the
-        // next scan or the scheduled `detect_markers` task.
-        let files =
-            match queries::list_media_files_needing_markers(&pool, library_id, 256).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(library_id, error = %format!("{e:#}"), "file watcher: marker query failed");
-                    return;
+        if scan_ok {
+            let on_add = state_for_markers.settings.read().await.detect_markers_on_add;
+            if on_add {
+                // 256 caps a single scan from queueing thousands of jobs at
+                // once — typical drops are 1–20 files; an rsync of a season
+                // pack still fits comfortably. Excess gets picked up by the
+                // next scan or the scheduled `detect_markers` task.
+                match queries::list_media_files_needing_markers(&pool, library_id, 256).await {
+                    Ok(files) if !files.is_empty() => {
+                        info!(
+                            library_id,
+                            count = files.len(),
+                            "file watcher: queueing markers for new files"
+                        );
+                        crate::api::markers::spawn_detection(&state_for_markers, files);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(library_id, error = %format!("{e:#}"), "file watcher: marker query failed");
+                    }
                 }
-            };
-        if files.is_empty() {
-            return;
+            }
         }
-        info!(library_id, count = files.len(), "file watcher: queueing markers for new files");
-        crate::api::markers::spawn_detection(&state_for_markers, files);
+        // Release the lock as the final act so a concurrent scheduled
+        // scan or manual trigger can proceed cleanly. The marker
+        // detection above is fire-and-forget (`spawn_detection` spawns
+        // its own task), so we don't need to keep the lock for its
+        // duration — only the scan itself contended for disk.
+        state_for_release.release_library_scan(library_id).await;
     });
 }

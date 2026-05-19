@@ -44,9 +44,13 @@ export function TrailerPlayer({
   }, []);
 
   const postCommand = useCallback((func: "mute" | "unMute") => {
+    // Pin the target origin to YouTube's nocookie domain so the IFrame
+    // API command can't be intercepted by any other document that
+    // might be loaded in the iframe between render and command. The
+    // wildcard form was defense-in-depth weakening with no upside.
     iframeRef.current?.contentWindow?.postMessage(
       JSON.stringify({ event: "command", func, args: [] }),
-      "*",
+      "https://www.youtube-nocookie.com",
     );
   }, []);
 

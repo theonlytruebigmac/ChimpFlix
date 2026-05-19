@@ -1095,14 +1095,20 @@ async fn upload_image_impl(
             let _ = tokio::fs::remove_file(&prev).await;
         }
     }
+    // Write to a `.tmp` sibling first so a DB failure below doesn't
+    // leave a half-orphaned image file under data_dir. The sibling-
+    // cleanup loop above already dropped the previous file; we only
+    // promote the new bytes once the DB row update succeeds.
     let path = dir.join(format!("{id}.{ext}"));
-    let mut f = tokio::fs::File::create(&path)
+    let tmp_path = dir.join(format!("{id}.{ext}.tmp"));
+    let mut f = tokio::fs::File::create(&tmp_path)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     f.write_all(&bytes)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     f.flush().await.ok();
+    drop(f);
 
     // Stamp a version onto the stored URL so callers see a fresh string
     // every time the file changes. The blob handler ignores the query, so
@@ -1114,9 +1120,15 @@ async fn upload_image_impl(
         kind.url_suffix(),
         chimpflix_common::now_ms()
     );
-    queries::replace_primary_image(&state.pool, id, kind.db_kind(), "local", &url)
+    if let Err(e) = queries::replace_primary_image(&state.pool, id, kind.db_kind(), "local", &url)
         .await
-        .map_err(ApiError::Internal)?;
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(ApiError::Internal(e));
+    }
+    tokio::fs::rename(&tmp_path, &path)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
 
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?

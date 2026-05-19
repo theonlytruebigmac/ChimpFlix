@@ -72,7 +72,14 @@ pub async fn patch(
     Ok(Json(SettingsResponse { settings: updated }))
 }
 
-fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
+/// Validate every field on a `ServerSettingsUpdate` that has a
+/// validation rule attached. Exported so any PATCH endpoint touching
+/// `server_settings` (currently the catch-all settings handler, plus
+/// the network-specific one, and any future fragment handlers) can
+/// route through the same checks instead of duplicating inline.
+/// Adding a new field with constraints? Add the check here and every
+/// caller picks it up automatically.
+pub fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
     // SECURITY: `preroll_path` is read by `/preroll/blob` to serve raw
     // bytes from `data/preroll/<path>`. Without sanitisation an admin
     // (or a session-hijacked admin) could PATCH `preroll_path` to
@@ -319,6 +326,34 @@ fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
                 "database_cache_size_mb must be between 0 (SQLite default) and 4096",
             ));
         }
+    }
+    // Network-fragment fields. Previously validated inline in
+    // network.rs; folded in here so every PATCH handler that touches
+    // server_settings runs the same checks.
+    if let Some(n) = patch.transcoder_reaper_idle_threshold_ms {
+        // 5s floor — anything lower and the 60s client keepalive plus
+        // 15s reaper interval would race-kill healthy sessions. 1h
+        // ceiling so a typo can't strand sessions for a day.
+        if !(5_000..=3_600_000).contains(&n) {
+            return Err(ApiError::validation(
+                "transcoder_reaper_idle_threshold_ms must be between 5000 and 3600000",
+            ));
+        }
+    }
+    if let Some(n) = patch.max_remote_streams_per_user {
+        if !(0..=64).contains(&n) {
+            return Err(ApiError::validation(
+                "max_remote_streams_per_user must be between 0 (unlimited) and 64",
+            ));
+        }
+    }
+    if let Some(ref raw) = patch.lan_networks {
+        crate::net::validate_cidr_list(raw)
+            .map_err(|e| ApiError::validation(format!("lan_networks: {e}")))?;
+    }
+    if let Some(ref raw) = patch.auth_bypass_cidrs {
+        crate::net::validate_cidr_list(raw)
+            .map_err(|e| ApiError::validation(format!("auth_bypass_cidrs: {e}")))?;
     }
     // Silence the unused `json!` import when downstream features go away.
     let _ = json!({});

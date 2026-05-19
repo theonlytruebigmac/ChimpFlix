@@ -22,63 +22,83 @@ interface Props {
 /// (scan watcher, DB cache size); those flag a "Restart pending"
 /// badge next to the input so the operator knows.
 export function AdminLibrarySettingsClient({ settings }: Props) {
-  const [scanAuto, setScanAuto] = useState(settings.scan_automatically);
+  // See AdminGeneralForm for rationale — keep a baseline in state so
+  // dirty-checks compare against a value we control, not the parent's
+  // prop reference. The old `Object.assign(settings, patch)` mutated
+  // the prop in place, which silently shared state with any sibling
+  // also holding that reference.
+  const [baseline, setBaseline] = useState({
+    scan_automatically: settings.scan_automatically,
+    detect_markers_on_add: settings.detect_markers_on_add,
+    audio_normalize_enabled: settings.audio_normalize_enabled,
+    scanner_nice_level: settings.scanner_nice_level,
+    video_played_threshold_pct: settings.video_played_threshold_pct,
+    video_completion_behaviour: settings.video_completion_behaviour,
+    continue_watching_max_items: settings.continue_watching_max_items,
+    continue_watching_max_age_weeks: settings.continue_watching_max_age_weeks,
+    continue_watching_include_premieres:
+      settings.continue_watching_include_premieres,
+    database_cache_size_mb: settings.database_cache_size_mb,
+    metadata_language: settings.metadata_language,
+    recently_added_days: settings.recently_added_days,
+  });
+  const [scanAuto, setScanAuto] = useState(baseline.scan_automatically);
   const [detectMarkersOnAdd, setDetectMarkersOnAdd] = useState(
-    settings.detect_markers_on_add,
+    baseline.detect_markers_on_add,
   );
   const [audioNormalize, setAudioNormalize] = useState(
-    settings.audio_normalize_enabled,
+    baseline.audio_normalize_enabled,
   );
-  const [scannerNice, setScannerNice] = useState(settings.scanner_nice_level);
+  const [scannerNice, setScannerNice] = useState(baseline.scanner_nice_level);
   const [playedThreshold, setPlayedThreshold] = useState(
-    settings.video_played_threshold_pct,
+    baseline.video_played_threshold_pct,
   );
   const [completionBehaviour, setCompletionBehaviour] = useState(
-    settings.video_completion_behaviour,
+    baseline.video_completion_behaviour,
   );
   const [cwMaxItems, setCwMaxItems] = useState(
-    settings.continue_watching_max_items,
+    baseline.continue_watching_max_items,
   );
   const [cwMaxAgeWeeks, setCwMaxAgeWeeks] = useState(
-    settings.continue_watching_max_age_weeks,
+    baseline.continue_watching_max_age_weeks,
   );
   const [cwIncludePremieres, setCwIncludePremieres] = useState(
-    settings.continue_watching_include_premieres,
+    baseline.continue_watching_include_premieres,
   );
-  const [dbCacheMb, setDbCacheMb] = useState(settings.database_cache_size_mb);
+  const [dbCacheMb, setDbCacheMb] = useState(baseline.database_cache_size_mb);
   const [metadataLanguage, setMetadataLanguage] = useState(
-    settings.metadata_language,
+    baseline.metadata_language,
   );
   const [recentlyAddedDays, setRecentlyAddedDays] = useState(
-    settings.recently_added_days,
+    baseline.recently_added_days,
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
 
   const dirty =
-    scanAuto !== settings.scan_automatically ||
-    detectMarkersOnAdd !== settings.detect_markers_on_add ||
-    audioNormalize !== settings.audio_normalize_enabled ||
-    scannerNice !== settings.scanner_nice_level ||
-    playedThreshold !== settings.video_played_threshold_pct ||
-    completionBehaviour !== settings.video_completion_behaviour ||
-    cwMaxItems !== settings.continue_watching_max_items ||
-    cwMaxAgeWeeks !== settings.continue_watching_max_age_weeks ||
-    cwIncludePremieres !== settings.continue_watching_include_premieres ||
-    dbCacheMb !== settings.database_cache_size_mb ||
-    metadataLanguage !== settings.metadata_language ||
-    recentlyAddedDays !== settings.recently_added_days;
+    scanAuto !== baseline.scan_automatically ||
+    detectMarkersOnAdd !== baseline.detect_markers_on_add ||
+    audioNormalize !== baseline.audio_normalize_enabled ||
+    scannerNice !== baseline.scanner_nice_level ||
+    playedThreshold !== baseline.video_played_threshold_pct ||
+    completionBehaviour !== baseline.video_completion_behaviour ||
+    cwMaxItems !== baseline.continue_watching_max_items ||
+    cwMaxAgeWeeks !== baseline.continue_watching_max_age_weeks ||
+    cwIncludePremieres !== baseline.continue_watching_include_premieres ||
+    dbCacheMb !== baseline.database_cache_size_mb ||
+    metadataLanguage !== baseline.metadata_language ||
+    recentlyAddedDays !== baseline.recently_added_days;
 
   // Restart-required hints. These are read once at server startup
   // (file_watcher::spawn, SqliteConnectOptions, TmdbClient::with_language);
   // we surface a badge so the operator isn't surprised when saving
   // doesn't immediately change behavior.
-  const scanAutoChanged = scanAuto !== settings.scan_automatically;
-  const dbCacheChanged = dbCacheMb !== settings.database_cache_size_mb;
-  const niceChanged = scannerNice !== settings.scanner_nice_level;
+  const scanAutoChanged = scanAuto !== baseline.scan_automatically;
+  const dbCacheChanged = dbCacheMb !== baseline.database_cache_size_mb;
+  const niceChanged = scannerNice !== baseline.scanner_nice_level;
   const metadataLanguageChanged =
-    metadataLanguage !== settings.metadata_language;
+    metadataLanguage !== baseline.metadata_language;
 
   async function save() {
     setSaving(true);
@@ -99,7 +119,20 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
         recently_added_days: recentlyAddedDays,
       };
       await adminApi.settings.patch(patch);
-      Object.assign(settings, patch);
+      setBaseline({
+        scan_automatically: scanAuto,
+        detect_markers_on_add: detectMarkersOnAdd,
+        audio_normalize_enabled: audioNormalize,
+        scanner_nice_level: scannerNice,
+        video_played_threshold_pct: playedThreshold,
+        video_completion_behaviour: completionBehaviour,
+        continue_watching_max_items: cwMaxItems,
+        continue_watching_max_age_weeks: cwMaxAgeWeeks,
+        continue_watching_include_premieres: cwIncludePremieres,
+        database_cache_size_mb: dbCacheMb,
+        metadata_language: metadataLanguage,
+        recently_added_days: recentlyAddedDays,
+      });
       setSavedAt(Date.now());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

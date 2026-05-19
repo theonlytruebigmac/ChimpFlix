@@ -1,7 +1,9 @@
 //! Request extractors that resolve a session cookie into the current
 //! user (or 401 the request).
 
+use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::LazyLock;
 
 use axum::extract::FromRequestParts;
 use axum::http::header::COOKIE;
@@ -9,12 +11,21 @@ use axum::http::request::Parts;
 use chimpflix_common::now_ms;
 use chimpflix_library::UserRole;
 use chimpflix_library::queries;
+use tokio::sync::RwLock;
 
 use crate::api::error::ApiError;
 use crate::auth::{cookie, cookie_name};
 use crate::client_ip::EffectiveClientIp;
 use crate::net;
 use crate::state::AppState;
+
+/// Process-local set of client IPs that have already triggered an
+/// info-level "network bypass granted" audit log. Keeps logging
+/// quiet for chatty LAN clients while still surfacing the first
+/// grant from each new source — usually enough for an operator to
+/// notice if their bypass CIDR is wider than they intended.
+static NETWORK_BYPASS_LOGGED: LazyLock<RwLock<HashSet<IpAddr>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Sentinel session id used by the network-bypass path. The bypass
 /// fakes an AuthUser without a real DB-backed session row; this
@@ -69,6 +80,20 @@ impl FromRequestParts<AppState> for AuthUser {
                         .await
                         .map_err(ApiError::Internal)?
                     {
+                        // Audit-log the first bypass per (process, IP).
+                        // Operators sometimes forget the CIDR is even
+                        // configured; logging the grant once per IP
+                        // makes "wait, why does that request have
+                        // Owner with no cookie" debuggable. Subsequent
+                        // bypasses from the same IP stay quiet so
+                        // chatty LAN clients don't spam the log.
+                        if NETWORK_BYPASS_LOGGED.write().await.insert(ip) {
+                            tracing::info!(
+                                client_ip = %ip,
+                                owner_id = owner.id,
+                                "auth: network-bypass CIDR matched — granting Owner without session cookie"
+                            );
+                        }
                         return Ok(AuthUser {
                             id: owner.id,
                             username: owner.username,

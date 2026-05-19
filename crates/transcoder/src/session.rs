@@ -360,6 +360,16 @@ pub struct Session {
     /// in the snapshot so the admin dashboard can show "▌▌ paused"
     /// next to those sessions.
     paused: AtomicBool,
+    /// Epoch-ms when the current pause started, or 0 if not paused.
+    /// Together with `total_paused_ms` we can compute "how much wall
+    /// time has been spent paused" — needed by `find_compatible`'s
+    /// encoded-extent guard, which would otherwise treat a long-
+    /// paused session as if its encoder had been making progress all
+    /// along.
+    pause_started_at: AtomicI64,
+    /// Accumulated time the encoder has been paused over the lifetime
+    /// of the session. Incremented on each pause→resume transition.
+    total_paused_ms: AtomicI64,
     _child: Mutex<Child>,
 }
 
@@ -418,6 +428,20 @@ impl Session {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Total wall-clock time the encoder has been paused, including
+    /// the currently-in-progress pause if any. Used by
+    /// `find_compatible` to discount paused time from the
+    /// "max encoded ahead" calculation.
+    pub fn paused_ms_so_far(&self) -> i64 {
+        let total = self.total_paused_ms.load(Ordering::Relaxed);
+        let started = self.pause_started_at.load(Ordering::Relaxed);
+        if started > 0 {
+            total + (now_ms() - started).max(0)
+        } else {
+            total
+        }
+    }
+
     /// Suspend the ffmpeg child via SIGSTOP. Stops the encoder from
     /// burning CPU/GPU and writing new segments while the player is
     /// paused. Idempotent — re-pausing a paused session is a no-op.
@@ -428,6 +452,7 @@ impl Session {
         if self.paused.swap(true, Ordering::AcqRel) {
             return true;
         }
+        self.pause_started_at.store(now_ms(), Ordering::Relaxed);
         self.signal_child(signal::Pause)
     }
 
@@ -438,6 +463,15 @@ impl Session {
     pub fn resume(&self) -> bool {
         if !self.paused.swap(false, Ordering::AcqRel) {
             return true;
+        }
+        // Bank the time we were paused so paused_ms_so_far() stays
+        // monotonic across pause/resume cycles.
+        let started = self
+            .pause_started_at
+            .swap(0, Ordering::Relaxed);
+        if started > 0 {
+            let delta = (now_ms() - started).max(0);
+            self.total_paused_ms.fetch_add(delta, Ordering::Relaxed);
         }
         self.touch();
         self.signal_child(signal::Continue)
@@ -926,6 +960,8 @@ impl TranscodeManager {
             last_seen: AtomicI64::new(now),
             bytes_served: AtomicI64::new(0),
             paused: AtomicBool::new(false),
+            pause_started_at: AtomicI64::new(0),
+            total_paused_ms: AtomicI64::new(0),
             _child: Mutex::new(child),
         });
 
@@ -990,10 +1026,32 @@ impl TranscodeManager {
     ) -> Option<Arc<Session>> {
         const BACK_TOLERANCE_MS: i64 = 5_000;
         const MAX_AHEAD_MS: i64 = 30 * 60 * 1000;
+        // Encoded-extent guard. The position-delta check alone allows
+        // adopting a session whose encoder hasn't yet reached the
+        // requested position — the player then sits in `waiting`
+        // state while ffmpeg catches up, which from the user's POV
+        // is a stall. Cap the delta by an upper bound on encoded
+        // extent computed from wall-clock elapsed. NVENC can run
+        // ~5× realtime on H.264, so allow 5× elapsed plus a small
+        // grace window to absorb startup latency.
+        const ENCODER_SPEEDUP_FACTOR: i64 = 5;
+        const ENCODE_HEADROOM_MS: i64 = 5_000;
+        let now = now_ms();
         let map = self.inner.sessions.read().expect("sessions lock");
         map.values()
             .find(|s| {
                 let pos_delta = start_position_ms - s.start_position_ms;
+                // Subtract paused time from wall-clock elapsed. A
+                // session that's been paused for most of its lifetime
+                // hasn't been encoding during the pause; using raw
+                // elapsed would over-estimate the encoded extent and
+                // we'd adopt a session whose ffmpeg is well behind
+                // the requested position. The player then sits in
+                // `waiting` state forever.
+                let elapsed = (now - s.created_at).max(0);
+                let encoder_active_ms = (elapsed - s.paused_ms_so_far()).max(0);
+                let max_encoded_ahead =
+                    encoder_active_ms * ENCODER_SPEEDUP_FACTOR + ENCODE_HEADROOM_MS;
                 s.user_id == user_id
                     && s.media_file_id == media_file_id
                     && s.audio_index == audio_index
@@ -1008,6 +1066,7 @@ impl TranscodeManager {
                     && s.fallback_variant == fallback_variant
                     && pos_delta >= -BACK_TOLERANCE_MS
                     && pos_delta <= MAX_AHEAD_MS
+                    && pos_delta <= max_encoded_ahead
             })
             .cloned()
     }
@@ -1217,7 +1276,33 @@ impl TranscodeManager {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Push encoder args that align video keyframes with HLS segment
+/// boundaries. Without this, ffmpeg emits keyframes at scene cuts
+/// or every ~250 frames (its default GOP), and an HLS segment can
+/// start with a P-frame that references frames in the previous
+/// segment — the player either stalls waiting for the next natural
+/// keyframe or visibly skips back when the decoder syncs. On mobile
+/// where bandwidth adaptation requests segments more aggressively,
+/// this manifests as the "plays smoothly on desktop, skips on
+/// mobile" pattern.
+///
+/// The `expr:gte(t,n_forced*N)` form is FPS-agnostic — ffmpeg picks
+/// keyframes at the nearest possible frame to each Nx multiple. The
+/// HLS muxer then cuts segments at those boundaries.
+fn apply_hls_keyframe_args(cmd: &mut Command, hwaccel: HwAccel) {
+    let expr = format!("expr:gte(t,n_forced*{})", HLS_SEGMENT_DURATION_S);
+    cmd.args(["-force_key_frames", &expr]);
+    // NVENC defaults `-forced-idr 0`, which emits a non-IDR I-frame
+    // for forced keyframes. Some HLS clients (notably older Safari +
+    // HLS.js on certain Android builds) can't decode a segment that
+    // opens with a non-IDR I-frame because the GOP closure isn't
+    // guaranteed. Flipping forced-idr on emits a true IDR at every
+    // forced keyframe — segments become fully self-contained.
+    if matches!(hwaccel, HwAccel::Nvenc) {
+        cmd.args(["-forced-idr", "1"]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_ffmpeg(
     cfg: &FfmpegConfig,
@@ -1293,16 +1378,30 @@ async fn spawn_ffmpeg(
     // the harmless init warnings. Same flag is already present on the
     // webvtt-extract and gop-probe ffmpeg calls (search the file).
     cmd.args(["-y", "-nostdin", "-loglevel", "warning"]);
-    // Bigger probe window applied to every session. The default
-    // 5 MB / 5 s probe routinely fails on Bluray rips with multiple
-    // subtitle / audio / attachment streams — ffmpeg gives up with
-    // "Could not find codec parameters for stream N" warnings that
-    // are non-fatal on a video-only pipeline but block PGS overlay
-    // entirely (overlay can't synth sub2video frames without
-    // dimensions). 100 MB / 100 s is the conservative number the
-    // PGS-overlay community settled on; on local-file I/O the
-    // additional probe time is sub-100ms even on slow disks.
-    cmd.args(["-analyzeduration", "100M", "-probesize", "100M"]);
+    // Probe window. Two tiers:
+    //   * Picture-based subtitle burn-in (PGS / DVD / VobSub / dvb)
+    //     needs 100 MB / 100 s. The overlay filter can't synth
+    //     sub2video frames without the subtitle stream's
+    //     dimensions, and ffmpeg's default 5 MB / 5 s probe
+    //     routinely fails to pull them out of a Bluray remux
+    //     where the first PGS event lands minutes into the file.
+    //   * Everything else (the common case) gets 10 MB / 10 s.
+    //     The main video + audio streams are reliably identified
+    //     within that window even on multi-stream MKVs, and we
+    //     cut ~6-10 seconds off the cold-start wall-clock — the
+    //     symptom users see as a slow first manifest. The
+    //     `is_benign_ffmpeg_line` filter still catches the
+    //     "Could not find codec parameters" noise for attachment
+    //     / unknown-codec streams that we don't map.
+    let picture_sub_burn = matches!(
+        subtitle_codec,
+        Some("hdmv_pgs_subtitle" | "pgssub" | "dvd_subtitle" | "dvb_subtitle" | "vobsub")
+    ) && subtitle_index.is_some();
+    if picture_sub_burn {
+        cmd.args(["-analyzeduration", "100M", "-probesize", "100M"]);
+    } else {
+        cmd.args(["-analyzeduration", "10M", "-probesize", "10M"]);
+    }
     // Pre-input device init for encoders that need one (currently
     // only VAAPI's `-vaapi_device /dev/dri/renderD128`). Must come
     // before `-i` because ffmpeg ties hardware contexts to the input
@@ -1454,6 +1553,17 @@ async fn spawn_ffmpeg(
                     }
                     cmd.args(["-c:a", "aac"])
                         .args(["-b:a", &format!("{audio_bitrate_bps}")])
+                        // Pin sample rate + channels across every
+                        // variant. Without `-ar`, ffmpeg may pick
+                        // different sample rates per output (e.g.
+                        // 48 kHz on v1 from a 48 kHz source, 44.1 kHz
+                        // on v2 after a filter-graph resample), which
+                        // makes the audio decoder hiccup at the
+                        // segment boundary when HLS.js switches
+                        // variants. 48 kHz is the most common
+                        // broadcast/streaming target and what every
+                        // HLS-capable client expects to negotiate.
+                        .args(["-ar", "48000"])
                         .args(["-ac", "2"]);
                 }
             }
@@ -1561,6 +1671,7 @@ async fn spawn_ffmpeg(
                 // Variant 1 (primary).
                 cmd.args(["-map", "[v1]"]);
                 hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
+                apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
 
                 // Variant 2 (fallback).
@@ -1569,6 +1680,7 @@ async fn spawn_ffmpeg(
                     .expect("fallback_paths set when fallback_variant set");
                 cmd.args(["-map", "[v2]"]);
                 hwaccel.apply_encoder_for(&mut cmd, target_video_codec, fb_bitrate, encoder_preset);
+                apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, fb_manifest, fb_segments, audio_index);
             }
             (_, true) => {
@@ -1608,6 +1720,7 @@ async fn spawn_ffmpeg(
                 );
                 cmd.args(["-filter_complex", &fc]).args(["-map", "[v]"]);
                 hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
+                apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
             }
             (None, false) => {
@@ -1679,6 +1792,7 @@ async fn spawn_ffmpeg(
                 }
                 cmd.args(["-vf", &vf]).args(["-map", "0:v:0"]);
                 hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
+                apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
             }
         }
@@ -1693,9 +1807,31 @@ async fn spawn_ffmpeg(
         // muxer don't always agree on how to reconcile that with
         // manifest media-time (which always starts at 0), and some
         // configurations end up never producing a playable segment.
-        // ffmpeg's default — reset PTS to 0 after the input seek —
-        // matches what the re-encode path does and works reliably.
-        cmd.args(["-map", "0:v:0"]).args(["-c:v", "copy"]);
+        //
+        // Instead we rely on ffmpeg's default PTS reset after the
+        // input seek and pin it down with two explicit flags so we
+        // don't drift on edge cases:
+        //   * `-start_at_zero` — anchors the output PTS at 0 even on
+        //     ffmpeg builds that interpret `-ss` before `-i` as a
+        //     keyframe-only fast seek and would otherwise leak a
+        //     small positive PTS offset to the first segment.
+        //   * `-avoid_negative_ts make_zero` — covers the inverse
+        //     case where a B-frame's DTS lands slightly negative
+        //     relative to its anchor, which would push the segment's
+        //     EXTINF start time negative and trip HLS.js's manifest
+        //     parser. `make_zero` shifts the timestamp basis up so
+        //     every segment opens at PTS=0 cleanly.
+        //
+        // Without these explicit flags, some sources (notably MKV
+        // remuxes with negative initial DTS, or files with B-frame
+        // GOPs near the seek point) produce PTS-misaligned segments
+        // that show up as intermittent skips on the client after a
+        // seek-induced restart — exactly the "random skip" pattern
+        // mobile users were reporting.
+        cmd.args(["-map", "0:v:0"])
+            .args(["-c:v", "copy"])
+            .args(["-start_at_zero"])
+            .args(["-avoid_negative_ts", "make_zero"]);
         emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
     }
 
@@ -1775,6 +1911,11 @@ async fn spawn_ffmpeg(
                 tick.tick().await;
                 // kill(pid, 0) returns 0 if process exists, -1 + ESRCH
                 // if not. Doesn't actually signal anything.
+                // SAFETY: `libc::kill` with signal 0 is a no-op probe
+                // that only reads kernel process-table state. We pass
+                // a valid `pid_t` (we obtained it from the child we
+                // spawned) and the signal value 0 is documented as
+                // safe to use with any pid. No memory is touched.
                 let alive = unsafe { libc::kill(pid_u32 as libc::pid_t, 0) == 0 };
                 if !alive {
                     info!(
@@ -1876,6 +2017,12 @@ async fn spawn_ffmpeg(
             // ffmpeg.
             let exit_detail = if let Some(pid_u32) = pid {
                 let mut status: libc::c_int = 0;
+                // SAFETY: `libc::waitpid` is safe to call with a valid
+                // `pid_t` (obtained from a child we spawned), a writable
+                // `&mut c_int` for the status out-parameter, and the
+                // `WNOHANG` flag which makes it non-blocking. The
+                // status variable lives on the stack for the duration
+                // of the call. No raw pointers escape this scope.
                 let r = unsafe {
                     libc::waitpid(
                         pid_u32 as libc::pid_t,
@@ -2065,6 +2212,18 @@ fn is_benign_ffmpeg_line(line: &str) -> bool {
             || line.contains("dvd_subtitle")
             || line.contains("dvb_subtitle")
             || line.contains("vobsub"))
+    {
+        return true;
+    }
+    // MKV attachment streams (fonts, cover art, NFO files embedded as
+    // streams). Common in anime releases that ship subtitle fonts
+    // inline. ffmpeg's demuxer probes every stream regardless of
+    // whether we map it, so each non-mapped attachment emits a
+    // "Could not find codec parameters … (Attachment: none): unknown
+    // codec" line. We don't output attachments, so these are pure
+    // noise on every session start.
+    if line.contains("Could not find codec parameters")
+        && line.contains("Attachment:")
     {
         return true;
     }

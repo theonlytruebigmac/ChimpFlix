@@ -8,7 +8,7 @@
 //! triggers an immediate history + playback pull.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -17,6 +17,7 @@ use chimpflix_common::now_ms;
 use chimpflix_library::queries;
 use chimpflix_metadata::{DeviceCodeResponse, DevicePollResult};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::api::access;
 use crate::api::error::ApiError;
@@ -29,6 +30,12 @@ use crate::trakt_sync;
 /// (the UI never sees it); the user_code shown to the user is bound
 /// to it server-side. Entries expire whenever Trakt expires them; we
 /// also evict on success/expiry so the map stays small.
+///
+/// Uses `tokio::sync::Mutex` so a future widening of the critical
+/// section (e.g. lookup-then-await for HTTP) doesn't accidentally
+/// block a Tokio worker. Today's critical sections are HashMap-only
+/// (microseconds) but a blocking mutex on an async worker is a
+/// latent foot-gun we don't want to leave behind.
 type DeviceCache = Arc<Mutex<HashMap<i64, CachedDevice>>>;
 
 struct CachedDevice {
@@ -40,6 +47,16 @@ fn device_cache() -> &'static DeviceCache {
     use std::sync::OnceLock;
     static CACHE: OnceLock<DeviceCache> = OnceLock::new();
     CACHE.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+/// Drop entries whose `expires_at` is in the past. Called at every
+/// `link_start` / `link_poll` access so a user who abandons the link
+/// flow doesn't pin a `CachedDevice` in memory until process restart.
+/// The map is small (≤ concurrent linking users) so a full sweep is
+/// cheaper than threading a timer in.
+fn sweep_expired(map: &mut HashMap<i64, CachedDevice>) {
+    let now = Instant::now();
+    map.retain(|_, entry| entry.expires_at > now);
 }
 
 #[derive(Debug, Serialize)]
@@ -64,13 +81,17 @@ pub async fn link_start(
         .await
         .map_err(ApiError::Internal)?;
     let expires_at = Instant::now() + Duration::from_secs(resp.expires_in.max(0) as u64);
-    device_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
-        user.id,
-        CachedDevice {
-            device_code: resp.device_code.clone(),
-            expires_at,
-        },
-    );
+    {
+        let mut guard = device_cache().lock().await;
+        sweep_expired(&mut guard);
+        guard.insert(
+            user.id,
+            CachedDevice {
+                device_code: resp.device_code.clone(),
+                expires_at,
+            },
+        );
+    }
     Ok(Json(LinkStartResponse {
         user_code: resp.user_code,
         verification_url: resp.verification_url,
@@ -96,7 +117,11 @@ pub async fn link_poll(
     let Some(client) = state.trakt_snapshot().await else {
         return Err(ApiError::validation("Trakt is not configured"));
     };
-    let entry = device_cache().lock().unwrap_or_else(|e| e.into_inner()).remove(&user.id);
+    let entry = {
+        let mut guard = device_cache().lock().await;
+        sweep_expired(&mut guard);
+        guard.remove(&user.id)
+    };
     let Some(entry) = entry else {
         return Err(ApiError::validation(
             "no pending link — call /trakt/link/start first",
@@ -127,7 +152,7 @@ pub async fn link_poll(
         }
         DevicePollResult::Pending | DevicePollResult::SlowDown => {
             // Put it back so the next poll uses the same code.
-            device_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(user.id, entry);
+            device_cache().lock().await.insert(user.id, entry);
             Ok(Json(if matches!(result, DevicePollResult::SlowDown) {
                 LinkPollResponse::SlowDown
             } else {

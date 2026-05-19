@@ -20,6 +20,14 @@ use crate::state::AppState;
 
 const HSTS_VALUE: &str = "max-age=31536000; includeSubDomains";
 const REFERRER_POLICY: &str = "strict-origin-when-cross-origin";
+/// Default Cache-Control for API responses. Every API reply is
+/// per-user / per-session — admin stats, my-list, play-state,
+/// notifications, /auth/me — so the safe default is "no proxy or
+/// browser may cache this". Handlers that need different semantics
+/// (HLS manifests using `no-cache` for revalidation, static-poster
+/// blobs, etc.) set their own `Cache-Control` and `set_if_absent`
+/// leaves their value alone.
+const API_CACHE_CONTROL: &str = "private, no-store";
 const PERMISSIONS_POLICY: &str = "accelerometer=(), browsing-topics=(), camera=(), \
                                   display-capture=(), geolocation=(), gyroscope=(), \
                                   interest-cohort=(), magnetometer=(), microphone=(), \
@@ -95,6 +103,18 @@ pub async fn layer(
     headers.insert(
         HeaderName::from_static("x-xss-protection"),
         HeaderValue::from_static(X_XSS_PROTECTION),
+    );
+
+    // Cache-Control: default to `private, no-store` for all responses
+    // unless a handler already set its own value. API replies are
+    // per-user almost without exception; without this, a misconfigured
+    // upstream proxy / CDN could cache one user's `/auth/me` response
+    // and serve it to another. `set_if_absent` preserves the per-
+    // handler overrides used by HLS manifests and static-poster blobs.
+    set_if_absent(
+        headers,
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(API_CACHE_CONTROL),
     );
 
     // HSTS only when we're sure the deployment is HTTPS — see auth/mod.rs

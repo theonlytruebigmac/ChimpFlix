@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { formatRuntime, type MediaItem } from "@/lib/chimpflix-types";
 import { plexImage } from "@/lib/image";
 
@@ -17,9 +17,23 @@ export function SeasonEpisodes({
   const [selectedKey, setSelectedKey] = useState(initialSeasonKey);
   const [episodes, setEpisodes] = useState(initialEpisodes);
   const [loading, setLoading] = useState(false);
+  // Monotonic request id + alive flag. Used to drop stale responses
+  // — a rapid user double-click on different seasons used to race
+  // the two fetches and whichever resolved last won, even if it was
+  // the earlier click. Now only the most-recent request's response
+  // is applied. The alive flag also prevents setState after unmount.
+  const requestIdRef = useRef(0);
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
 
   async function changeSeason(seasonKey: string) {
     if (seasonKey === selectedKey) return;
+    const myRequestId = ++requestIdRef.current;
     setSelectedKey(seasonKey);
     setLoading(true);
     try {
@@ -27,6 +41,7 @@ export function SeasonEpisodes({
       // hit /api/v1/seasons/<id>.
       const numericId = seasonKey.startsWith("s") ? seasonKey.slice(1) : seasonKey;
       const res = await fetch(`/api/v1/seasons/${numericId}`);
+      if (!aliveRef.current || requestIdRef.current !== myRequestId) return;
       if (!res.ok) {
         setEpisodes([]);
         return;
@@ -43,6 +58,7 @@ export function SeasonEpisodes({
           play_state: { position_ms: number } | null;
         }[];
       };
+      if (!aliveRef.current || requestIdRef.current !== myRequestId) return;
       setEpisodes(
         data.episodes.map((e) => ({
           ratingKey: `e${e.id}`,
@@ -57,7 +73,9 @@ export function SeasonEpisodes({
         })),
       );
     } finally {
-      setLoading(false);
+      if (aliveRef.current && requestIdRef.current === myRequestId) {
+        setLoading(false);
+      }
     }
   }
 

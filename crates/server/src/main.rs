@@ -290,7 +290,15 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    let hub = Hub::new(256);
+    // Broadcast capacity for the in-process event hub. Sized for the
+    // worst-case burst: a freshly-dropped season pack (typically up to
+    // ~50 files) triggers a scan that emits per-file Added / Updated
+    // events plus the eventual Completed. With 4096 slots a slow
+    // subscriber (e.g. a paused WebSocket client) has plenty of room
+    // before tokio::broadcast starts dropping for laggards. The old
+    // 256-slot ceiling was tight enough that webhook deliveries and
+    // scan-progress events would silently disappear under burst.
+    let hub = Hub::new(4096);
 
     let settings = std::sync::Arc::new(tokio::sync::RwLock::new(initial_settings));
 
@@ -342,6 +350,12 @@ async fn main() -> anyhow::Result<()> {
         reset_email_limiter: crate::api::rate_limit::reset_email_limiter(),
         report_issue_limiter: crate::api::rate_limit::report_issue_limiter(),
         trusted_proxies,
+        library_scans_in_progress: Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashSet::new(),
+        )),
+        trakt_refresh_locks: Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
     };
 
     // Scheduled tasks: flip orphaned `running` rows, seed defaults, spawn

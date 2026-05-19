@@ -123,18 +123,52 @@ impl AniListClient {
         query: &str,
         variables: &serde_json::Value,
     ) -> Result<GraphQlResponse<T>> {
-        let mut req = self
-            .http
-            .post(&self.url)
-            .json(&json!({ "query": query, "variables": variables }));
-        if let Some(token) = self.token.as_ref() {
-            req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+        // AniList allows 30 req/min unauthenticated, 90/min with a
+        // token. On a large anime library scan the worker chews
+        // through that bucket fast and a 429 used to just bubble up
+        // as a hard failure — half the library would silently miss
+        // enrichment. Handle 429 by reading `Retry-After` and waiting
+        // it out once before giving up. The retry budget is one
+        // attempt: if AniList tells us 60s+, we honor it and try
+        // again; if it lies or the second attempt also 429s, the
+        // caller will log a warn and move on.
+        for attempt in 0..2 {
+            let mut req = self
+                .http
+                .post(&self.url)
+                .json(&json!({ "query": query, "variables": variables }));
+            if let Some(token) = self.token.as_ref() {
+                req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("POST {}", self.url))?;
+            let status = resp.status();
+            if status.as_u16() == 429 && attempt == 0 {
+                let wait_s = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(60)
+                    .min(120);
+                warn!(
+                    wait_s,
+                    "AniList rate-limited (429); sleeping then retrying once"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait_s)).await;
+                continue;
+            }
+            return Self::parse_anilist_response(resp, status).await;
         }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("POST {}", self.url))?;
-        let status = resp.status();
+        anyhow::bail!("AniList POST kept 429-ing after rate-limit wait")
+    }
+
+    async fn parse_anilist_response<T: for<'de> Deserialize<'de>>(
+        resp: reqwest::Response,
+        status: reqwest::StatusCode,
+    ) -> Result<GraphQlResponse<T>> {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(

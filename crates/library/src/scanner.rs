@@ -10,12 +10,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use chimpflix_metadata::{AniListClient, TmdbClient, TvMazeClient, TvdbClient};
 use chimpflix_transcoder::FfmpegConfig;
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -23,6 +25,16 @@ use crate::events::{ScanEmitter, ScanEvent};
 use crate::models::{ItemKind, LibraryKind};
 use crate::parser::{self, Classification};
 use crate::queries;
+
+/// Process-wide semaphore that bounds how many WebVTT pre-warm
+/// ffmpegs can run at once. Before this cap was added, a fresh scan
+/// over a 1000-file library spawned one tokio task per text-sub
+/// stream and each task launched ffmpeg — easily 50+ concurrent
+/// ffmpeg processes contending for the CPU and stealing cycles from
+/// any active live transcode. 4 is a conservative ceiling that still
+/// makes meaningful progress while leaving the encoder reachable.
+static SUBTITLE_PREWARM_LIMIT: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
 const PROGRESS_INTERVAL: i64 = 25;
 
@@ -245,7 +257,27 @@ async fn collect_candidates(roots: &[String]) -> Result<Vec<(PathBuf, PathBuf)>>
                 warn!(root = %root.display(), "library root does not exist");
                 continue;
             }
-            for entry in WalkDir::new(root).follow_links(false) {
+            // `follow_links(false)` keeps us from descending through
+            // symlinks, which handles the common cycle case (Library
+            // -> Show -> ../). The `max_depth` cap is a belt: a
+            // pathological bind-mount loop (mount --bind A B where
+            // B is under A) presents to walkdir as real directories
+            // and would otherwise iterate forever. 32 levels is well
+            // beyond any legitimate library tree
+            // (Library/Show/Season/Episode-folder/Extras is 4-5).
+            // We also skip "hidden" dotfiles to avoid descending into
+            // .git or .DS_Store metadata trees from synced shares.
+            for entry in WalkDir::new(root)
+                .follow_links(false)
+                .max_depth(32)
+                .into_iter()
+                .filter_entry(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|s| !s.starts_with('.') || s == ".")
+                        .unwrap_or(true)
+                })
+            {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
@@ -286,10 +318,24 @@ async fn process_file(
     path: &Path,
     cache_root: Option<&Path>,
 ) -> Result<queries::FileOutcome> {
+    // Non-UTF8 paths used to fail silently up the error chain with
+    // only the generic "non-UTF8 path" message in the scan job log.
+    // Operators reported files disappearing from the library without
+    // an obvious cause; the lossy display string here lets them see
+    // *which* file got rejected (typically a Latin-1 filename that
+    // the filesystem driver didn't normalize) so they can rename it.
     let path_str = path
         .to_str()
-        .with_context(|| format!("non-UTF8 path: {}", path.display()))?
-        .to_string();
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            let lossy = path.to_string_lossy();
+            warn!(
+                path_lossy = %lossy,
+                root = %root.display(),
+                "scanner: skipping file with non-UTF8 path; rename via shell to recover"
+            );
+            anyhow::anyhow!("non-UTF8 path: {lossy}")
+        })?;
 
     let meta = tokio::fs::metadata(path)
         .await
@@ -313,7 +359,17 @@ async fn process_file(
     let classification = match parser::classify(path, root, library_kind) {
         Some(c) => c,
         None => {
-            debug!(?path, "classifier could not extract info");
+            // Bumped from `debug` to `info` and added the stem so
+            // operators can see which filenames the parser couldn't
+            // parse. Skipped files used to vanish silently — common
+            // cause is unusual release-name formatting that doesn't
+            // match the season/episode regexes.
+            info!(
+                stem = %path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
+                path = %path.display(),
+                library_kind = ?library_kind,
+                "scanner: skipping file — classifier couldn't extract season/episode/title; rename to match an SxxExx pattern or move into a typed folder"
+            );
             return Ok(queries::FileOutcome::Unchanged);
         }
     };
@@ -423,7 +479,18 @@ async fn process_file(
             let ffmpeg_cfg = ffmpeg.clone();
             let cache_root_owned = cache_root.to_path_buf();
             let input_owned = path.to_path_buf();
+            // Capture the semaphore Arc; acquire happens inside the
+            // spawned task so the scanner doesn't block its own
+            // sequential file loop on a saturated pre-warm queue.
+            let limiter = SUBTITLE_PREWARM_LIMIT.clone();
             tokio::spawn(async move {
+                let _permit = match limiter.acquire_owned().await {
+                    Ok(p) => p,
+                    // Semaphore closed: process shutdown. Drop the
+                    // task quietly rather than running pre-warm
+                    // against an outgoing FfmpegConfig.
+                    Err(_) => return,
+                };
                 if let Err(e) = chimpflix_transcoder::scan_prewarm_text_subs(
                     &ffmpeg_cfg,
                     &cache_root_owned,

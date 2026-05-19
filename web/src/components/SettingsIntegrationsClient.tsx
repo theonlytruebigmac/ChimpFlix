@@ -20,10 +20,18 @@ export function SettingsIntegrationsClient() {
   const [error, setError] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<TraktSyncNowResult | null>(null);
   const pollTimer = useRef<number | null>(null);
+  // True while this component is mounted. The poll() callback runs on
+  // a Trakt-suggested interval (~5s) and lives across many awaits; if
+  // the user navigates away mid-poll, the late-arriving response
+  // would otherwise call setState on an unmounted component and trip
+  // React warnings.
+  const aliveRef = useRef(true);
 
   useEffect(() => {
+    aliveRef.current = true;
     refresh();
     return () => {
+      aliveRef.current = false;
       if (pollTimer.current) window.clearInterval(pollTimer.current);
     };
   }, []);
@@ -61,6 +69,7 @@ export function SettingsIntegrationsClient() {
     setBusy("poll");
     try {
       const result = await traktApi.linkPoll();
+      if (!aliveRef.current) return;
       switch (result.status) {
         case "ready":
           stopPolling();
@@ -83,11 +92,12 @@ export function SettingsIntegrationsClient() {
           break;
       }
     } catch (e) {
+      if (!aliveRef.current) return;
       stopPolling();
       setPending(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(null);
+      if (aliveRef.current) setBusy(null);
     }
   }
 

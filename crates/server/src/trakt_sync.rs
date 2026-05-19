@@ -47,23 +47,44 @@ where
         return Ok(None);
     };
     if tokens.expires_at - now_ms() < REFRESH_LEAD_MS {
-        match client.refresh_token(&tokens.refresh_token).await {
-            Ok(pair) => {
-                let expires_at = now_ms() + pair.expires_in * 1000;
-                queries::upsert_trakt_tokens(
-                    &state.pool,
-                    &state.vault,
-                    user_id,
-                    &pair.access_token,
-                    &pair.refresh_token,
-                    pair.scope.as_deref(),
-                    expires_at,
-                )
-                .await?;
-                tokens.access_token = pair.access_token;
-            }
-            Err(e) => {
-                warn!(user_id, error = %format!("{e:#}"), "Trakt refresh failed; using stale token");
+        // Serialize concurrent refreshes for the same user. Without
+        // the per-user mutex, the play_state hook, the scheduled
+        // trakt_pull task, and a manual UI ping can all observe an
+        // about-to-expire token at the same time and each fire
+        // `POST /oauth/token`. Trakt mints fresh pairs for each
+        // call; last-writer-wins on our `upsert` can stash an older
+        // refresh_token and break subsequent refreshes. Hold the
+        // mutex across read-current-tokens → refresh → upsert so
+        // only one of the racing callers actually hits Trakt; the
+        // rest re-read the freshly-upserted token and skip the
+        // network round-trip entirely.
+        let lock = state.trakt_refresh_lock(user_id).await;
+        let _guard = lock.lock().await;
+        // Re-read tokens under the lock. A concurrent caller that
+        // got here first will have already refreshed; we'd be
+        // wasting a round-trip otherwise.
+        if let Some(fresh) = queries::get_trakt_tokens(&state.pool, &state.vault, user_id).await? {
+            tokens = fresh;
+        }
+        if tokens.expires_at - now_ms() < REFRESH_LEAD_MS {
+            match client.refresh_token(&tokens.refresh_token).await {
+                Ok(pair) => {
+                    let expires_at = now_ms() + pair.expires_in * 1000;
+                    queries::upsert_trakt_tokens(
+                        &state.pool,
+                        &state.vault,
+                        user_id,
+                        &pair.access_token,
+                        &pair.refresh_token,
+                        pair.scope.as_deref(),
+                        expires_at,
+                    )
+                    .await?;
+                    tokens.access_token = pair.access_token;
+                }
+                Err(e) => {
+                    warn!(user_id, error = %format!("{e:#}"), "Trakt refresh failed; using stale token");
+                }
             }
         }
     }

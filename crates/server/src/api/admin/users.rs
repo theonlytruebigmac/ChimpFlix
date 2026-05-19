@@ -19,7 +19,7 @@ use sha2::Digest as _;
 
 use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
-use crate::auth::{AdminAuth, can_act_on};
+use crate::auth::{AdminAuth, OwnerAuth, can_act_on};
 use crate::mail_template;
 use crate::mailer::{Mailer, OutgoingMessage};
 use crate::state::AppState;
@@ -439,7 +439,7 @@ pub struct LibraryAccessAssignment {
 
 pub async fn put_access_matrix(
     State(state): State<AppState>,
-    AdminAuth(actor): AdminAuth,
+    OwnerAuth(actor): OwnerAuth,
     headers: HeaderMap,
     Json(input): Json<AccessUpdate>,
 ) -> Result<Json<AccessMatrixResponse>, ApiError> {

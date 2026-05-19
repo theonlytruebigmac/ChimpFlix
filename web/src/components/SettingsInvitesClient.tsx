@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   admin as adminApi,
   auth as authApi,
@@ -42,6 +42,27 @@ export function SettingsInvitesClient() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [issued, setIssued] = useState<CreatedInvite | null>(null);
+
+  // Tracks the "Copied to clipboard" toast timer so an unmount mid-
+  // toast doesn't fire `setMessage` against a torn-down component.
+  const messageTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (messageTimerRef.current !== null) {
+        window.clearTimeout(messageTimerRef.current);
+        messageTimerRef.current = null;
+      }
+    };
+  }, []);
+  function scheduleMessageClear() {
+    if (messageTimerRef.current !== null) {
+      window.clearTimeout(messageTimerRef.current);
+    }
+    messageTimerRef.current = window.setTimeout(() => {
+      messageTimerRef.current = null;
+      setMessage(null);
+    }, 2500);
+  }
 
   useEffect(() => {
     refresh();
@@ -110,13 +131,13 @@ export function SettingsInvitesClient() {
     if (!issued?.accept_url) return;
     void navigator.clipboard.writeText(issued.accept_url).catch(() => {});
     setMessage("Accept link copied to clipboard.");
-    window.setTimeout(() => setMessage(null), 2500);
+    scheduleMessageClear();
   }
   function copyCode() {
     if (!issued?.code) return;
     void navigator.clipboard.writeText(issued.code).catch(() => {});
     setMessage("Code copied to clipboard.");
-    window.setTimeout(() => setMessage(null), 2500);
+    scheduleMessageClear();
   }
 
   function toggleLib(id: number) {

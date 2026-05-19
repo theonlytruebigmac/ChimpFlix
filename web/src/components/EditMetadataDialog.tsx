@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   items as itemsApi,
+  readCsrfToken,
   type Credit,
   type CreditEditInput,
   type ItemDetail,
@@ -151,10 +152,20 @@ export function EditMetadataDialog({
     try {
       const fd = new FormData();
       fd.append("file", file);
+      // Multipart uploads can't go through apiFetch (it always
+      // JSON-stringifies the body) so we use raw fetch — but we still
+      // need to attach the CSRF token, otherwise the server's csrf
+      // middleware rejects the mutating request with 403. The cookie
+      // gets sent automatically via credentials:"include"; the header
+      // is the double-submit half.
+      const csrf = readCsrfToken();
+      const headers: Record<string, string> = {};
+      if (csrf) headers["X-CSRF-Token"] = csrf;
       const res = await fetch(`/api/v1/items/${detail.id}/poster`, {
         method: "POST",
         body: fd,
         credentials: "include",
+        headers,
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");

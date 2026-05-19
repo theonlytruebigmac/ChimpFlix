@@ -17,41 +17,52 @@ interface Props {
 // once those phases land; this form intentionally only exposes the values
 // that are useful to set in isolation today.
 export function AdminGeneralForm({ initial }: Props) {
-  const [serverName, setServerName] = useState(initial.server_name);
-  const [publicUrl, setPublicUrl] = useState(initial.public_url ?? "");
-  const [telemetry, setTelemetry] = useState(initial.telemetry_opt_in);
+  // Baseline state — initialized from the `initial` prop and updated
+  // on save success. Mutating `initial` directly (the previous
+  // `Object.assign(initial, …)` pattern) is a React anti-pattern:
+  // a parent re-render between save and the next user edit can
+  // resurrect stale values, and other children holding the same
+  // reference observe a silently-changed object.
+  const [baseline, setBaseline] = useState({
+    server_name: initial.server_name,
+    public_url: initial.public_url ?? null,
+    telemetry_opt_in: initial.telemetry_opt_in,
+    totp_enforcement: initial.totp_enforcement,
+  });
+  const [serverName, setServerName] = useState(baseline.server_name);
+  const [publicUrl, setPublicUrl] = useState(baseline.public_url ?? "");
+  const [telemetry, setTelemetry] = useState(baseline.telemetry_opt_in);
   const [totpEnforcement, setTotpEnforcement] = useState<TotpEnforcement>(
-    initial.totp_enforcement,
+    baseline.totp_enforcement,
   );
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const dirty =
-    serverName !== initial.server_name ||
-    (publicUrl || null) !== (initial.public_url ?? null) ||
-    telemetry !== initial.telemetry_opt_in ||
-    totpEnforcement !== initial.totp_enforcement;
+    serverName !== baseline.server_name ||
+    (publicUrl || null) !== baseline.public_url ||
+    telemetry !== baseline.telemetry_opt_in ||
+    totpEnforcement !== baseline.totp_enforcement;
 
   async function save() {
     setSaving(true);
     setError(null);
     try {
       const patch: ServerSettingsUpdate = {};
-      if (serverName !== initial.server_name) patch.server_name = serverName.trim();
-      if ((publicUrl || null) !== (initial.public_url ?? null)) {
+      if (serverName !== baseline.server_name) patch.server_name = serverName.trim();
+      if ((publicUrl || null) !== baseline.public_url) {
         patch.public_url = publicUrl.trim() || null;
       }
-      if (telemetry !== initial.telemetry_opt_in) {
+      if (telemetry !== baseline.telemetry_opt_in) {
         patch.telemetry_opt_in = telemetry;
       }
-      if (totpEnforcement !== initial.totp_enforcement) {
+      if (totpEnforcement !== baseline.totp_enforcement) {
         patch.totp_enforcement = totpEnforcement;
       }
       await adminApi.settings.patch(patch);
       setSavedAt(Date.now());
-      // Reflect the new "saved" baseline so dirty-checks reset.
-      Object.assign(initial, {
+      setBaseline({
         server_name: serverName,
         public_url: publicUrl.trim() || null,
         telemetry_opt_in: telemetry,

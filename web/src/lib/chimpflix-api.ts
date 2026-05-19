@@ -1723,10 +1723,43 @@ function csrfFromCookieString(raw: string): string | null {
 
 /// Client-side CSRF read from `document.cookie`. Returns null on the
 /// server (the SSR path uses csrfFromCookieString directly against the
-/// Next-supplied cookie header).
-function readCsrfToken(): string | null {
+/// Next-supplied cookie header). Exported so callers that bypass
+/// `apiFetch` (e.g. the player's teardown path, which uses raw fetch
+/// + keepalive for reliability during unload) can still attach the
+/// token; without it the server's CSRF middleware rejects with 403.
+export function readCsrfToken(): string | null {
   if (typeof document === "undefined") return null;
   return csrfFromCookieString(document.cookie);
+}
+
+/// Normalize a user-supplied "next" / return-to path to one that we
+/// know is safe to `router.push(...)`. Returns the path verbatim only
+/// when it is unambiguously local: starts with a single `/`, is not
+/// protocol-relative (`//host/...`), is not a backslash-trick
+/// (`/\evil.com`), and doesn't carry a colon in the first segment
+/// that could be parsed as a scheme (`/x:/y` is fine but `:javascript`
+/// is not — we reject anything before the first `/` containing `:`).
+/// Anything else returns the fallback.
+///
+/// Used by post-login redirects and any other code path that takes a
+/// "where should we send the user next" query parameter. Without
+/// validation, `?next=https://attacker.com` flows into `router.push`
+/// and Next.js happily navigates off-origin.
+export function safeLocalPath(
+  candidate: string | null | undefined,
+  fallback = "/",
+): string {
+  if (!candidate) return fallback;
+  // Must start with exactly one '/' followed by something that isn't
+  // another '/' (which would make it protocol-relative).
+  if (!candidate.startsWith("/")) return fallback;
+  if (candidate.startsWith("//")) return fallback;
+  // Backslash trick: some browsers normalize `\` to `/`, so
+  // `/\evil.com` becomes `//evil.com`.
+  if (candidate.startsWith("/\\")) return fallback;
+  // Reject control characters that could break the URL boundary.
+  if (/[\x00-\x1f]/.test(candidate)) return fallback;
+  return candidate;
 }
 
 async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {

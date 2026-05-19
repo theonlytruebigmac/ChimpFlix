@@ -13,6 +13,7 @@ use std::time::Duration;
 use chimpflix_common::now_ms;
 use chimpflix_library::{Webhook, queries};
 use hmac::{Hmac, Mac};
+use rand_core::RngCore;
 use sha2::Sha256;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
@@ -22,6 +23,98 @@ use crate::state::AppState;
 
 const MAX_ATTEMPTS: i64 = 3;
 const BACKOFF_MS: [i64; 3] = [60_000, 300_000, 1_800_000];
+
+/// Apply a ±10% multiplicative jitter to a retry backoff. Without
+/// jitter, every webhook that fails its first attempt at the same
+/// time retries at the same instant — a thundering herd against the
+/// receiver. The OS RNG is plenty for non-cryptographic spread.
+fn jittered_backoff_ms(base_ms: i64) -> i64 {
+    // basis-point offset in [-1000, 1000) → ±10% of base.
+    let r = rand_core::OsRng.next_u32() % 2000;
+    let bps_offset = r as i64 - 1000;
+    let scaled = base_ms.saturating_mul(10_000_i64.saturating_add(bps_offset)) / 10_000;
+    scaled.max(1)
+}
+
+/// Walk a JSON value and replace any field whose key looks
+/// secret-shaped with the literal string `"***"`. Defense in depth
+/// for the stored-payload column in `webhook_deliveries` — the events
+/// we emit today don't include credentials, but a future event might
+/// and we'd rather the DB column be safe-by-default than hope every
+/// future contributor remembers. Matches case-insensitively against
+/// common substrings used across our codebase + Trakt + TMDB + OAuth.
+fn mask_sensitive_json_in_place(v: &mut serde_json::Value) {
+    const SENSITIVE_KEY_SUBSTRINGS: &[&str] = &[
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "refresh_token",
+        "access_token",
+        "session_id",
+        "csrf",
+    ];
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                let lk = k.to_ascii_lowercase();
+                if SENSITIVE_KEY_SUBSTRINGS.iter().any(|p| lk.contains(p)) {
+                    *val = serde_json::Value::String("***".to_string());
+                } else {
+                    mask_sensitive_json_in_place(val);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                mask_sensitive_json_in_place(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_sensitive_json_in_place;
+    use serde_json::json;
+
+    #[test]
+    fn masks_top_level_token() {
+        let mut v = json!({"id": 7, "token": "abc"});
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["token"], "***");
+    }
+
+    #[test]
+    fn masks_nested_secrets() {
+        let mut v = json!({
+            "data": { "user": { "api_key": "k", "name": "alice" } }
+        });
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["data"]["user"]["api_key"], "***");
+        assert_eq!(v["data"]["user"]["name"], "alice");
+    }
+
+    #[test]
+    fn masks_inside_arrays() {
+        let mut v = json!({ "creds": [ {"refresh_token": "x"}, {"keep": 1} ] });
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["creds"][0]["refresh_token"], "***");
+        assert_eq!(v["creds"][1]["keep"], 1);
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        let mut v = json!({ "API_KEY": "x", "AccessToken": "y" });
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["API_KEY"], "***");
+        assert_eq!(v["AccessToken"], "***");
+    }
+}
 
 pub fn spawn(state: AppState) {
     // Bus subscriber: fan out to matching webhooks.
@@ -76,13 +169,22 @@ async fn fan_out(state: &AppState, evt: WebhookEvent) {
 }
 
 async fn deliver_async(state: AppState, hook: Webhook, evt: WebhookEvent) {
-    let payload = serde_json::json!({ "event": evt.name, "data": evt.payload });
+    let mut payload = serde_json::json!({ "event": evt.name, "data": evt.payload });
     let payload_str = payload.to_string();
+    // Mask any sensitive fields in the stored copy before it lands in
+    // the admin-visible `webhook_deliveries` table. We don't mask the
+    // bytes we actually POST to the receiver — those are payload_str
+    // above — so signatures remain verifiable. The masked variant
+    // exists solely for the operator-facing log so a misbehaving
+    // event payload (or a future event we add) can't leak a secret
+    // into a DB column.
+    mask_sensitive_json_in_place(&mut payload);
+    let stored_payload = payload.to_string();
     let delivery_id = match queries::create_webhook_delivery(
         &state.pool,
         hook.id,
         &evt.name,
-        &payload_str,
+        &stored_payload,
     )
     .await
     {
@@ -133,8 +235,9 @@ async fn deliver_with_retries(
                     );
                     return;
                 }
-                let backoff =
+                let base_backoff =
                     BACKOFF_MS.get(attempt_idx).copied().unwrap_or(1_800_000);
+                let backoff = jittered_backoff_ms(base_backoff);
                 let next_at = now_ms() + backoff;
                 let _ = queries::record_webhook_attempt(
                     &state.pool,
@@ -230,11 +333,17 @@ async fn attempt_once(
         Ok(resp) => {
             let status = resp.status();
             let code = status.as_u16() as i64;
+            // Cap the response body we persist. The receiver might
+            // echo our payload back (especially on validation errors)
+            // and we don't want to forever-store secrets we just
+            // masked above. 1024 chars is plenty to diagnose a
+            // misbehaving endpoint without copy-pasting half its
+            // request log into our DB.
             let body = resp
                 .text()
                 .await
                 .ok()
-                .map(|s| s.chars().take(4096).collect::<String>());
+                .map(|s| s.chars().take(1024).collect::<String>());
             if status.is_success() {
                 let _ = queries::record_webhook_attempt(
                     &state.pool,

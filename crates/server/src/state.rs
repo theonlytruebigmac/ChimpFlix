@@ -1,5 +1,6 @@
 //! Application state shared across handlers.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chimpflix_common::Vault;
@@ -107,6 +108,26 @@ pub struct AppState {
     /// ignore proxy headers entirely. Sourced from the
     /// `TRUSTED_PROXIES` env var at startup.
     pub trusted_proxies: Arc<Vec<IpNet>>,
+    /// Per-library scan mutex. Tracks which `library_id`s are currently
+    /// being scanned (by the scheduled `scan_library` task, a manual
+    /// admin trigger, or the filesystem watcher). Each pathway acquires
+    /// the lock via `try_acquire_library_scan` before spawning ffmpeg
+    /// / IO-heavy work and releases it via `release_library_scan` when
+    /// done. Without this, the three pathways can run concurrently on
+    /// the same library and saturate the disk that's also serving live
+    /// transcode segments — the dominant cause of "smooth at 7pm, skips
+    /// during the 2am maintenance window" reports.
+    pub library_scans_in_progress: Arc<RwLock<HashSet<i64>>>,
+    /// Per-user Trakt token-refresh serialization. Each entry is a
+    /// dedicated `Mutex<()>` held for the lifetime of one user's
+    /// refresh-and-upsert sequence so concurrent server tasks
+    /// (push_history hook + scheduled trakt_pull + manual UI ping)
+    /// don't all hit `/oauth/token` simultaneously when the access
+    /// token is about to expire — that produces duplicate refreshes,
+    /// each minting a new token pair, and a last-writer-wins upsert
+    /// that can lose a valid refresh_token.
+    pub trakt_refresh_locks:
+        Arc<RwLock<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AppState {
@@ -152,5 +173,49 @@ impl AppState {
 
     pub async fn set_trakt(&self, client: Option<TraktClient>) {
         *self.trakt.write().await = client;
+    }
+
+    /// Try to acquire the scan lock for `library_id`. Returns true if
+    /// the caller now holds the lock and should proceed; false if a
+    /// scan is already in progress and the caller should bail out
+    /// cleanly. Pair with [`release_library_scan`] in the same task.
+    /// Spawn-and-forget call sites should install a local RAII guard
+    /// that re-spawns the release on `Drop` so a panic inside the
+    /// scanner doesn't leak the entry (see `scheduler::run_task`).
+    pub async fn try_acquire_library_scan(&self, library_id: i64) -> bool {
+        let mut guard = self.library_scans_in_progress.write().await;
+        guard.insert(library_id)
+    }
+
+    /// Release the scan lock previously taken by
+    /// [`try_acquire_library_scan`]. Idempotent: a release without a
+    /// matching acquire is a no-op.
+    pub async fn release_library_scan(&self, library_id: i64) {
+        self.library_scans_in_progress
+            .write()
+            .await
+            .remove(&library_id);
+    }
+
+    /// Get-or-insert the per-user Trakt-refresh mutex. Callers hold
+    /// the returned mutex across their refresh+upsert sequence; see
+    /// [`trakt_refresh_locks`][AppState::trakt_refresh_locks] for the
+    /// race that motivates this.
+    pub async fn trakt_refresh_lock(&self, user_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        // Fast path under the read lock for the common case (lock
+        // already exists).
+        {
+            let guard = self.trakt_refresh_locks.read().await;
+            if let Some(m) = guard.get(&user_id) {
+                return m.clone();
+            }
+        }
+        // Cold path: take the write lock and re-check (another
+        // caller may have inserted between our read and write).
+        let mut guard = self.trakt_refresh_locks.write().await;
+        guard
+            .entry(user_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }

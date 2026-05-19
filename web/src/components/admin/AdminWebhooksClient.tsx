@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   admin as adminApi,
   type Webhook,
@@ -99,6 +99,17 @@ function WebhookRow({
   const [mask, setMask] = useState<string[]>(initialMask);
   const [busy, setBusy] = useState(false);
   const [deliveries, setDeliveries] = useState<WebhookDelivery[] | null>(null);
+  // Handle for the 600ms post-test deliveries refresh. Tracked so an
+  // unmount mid-wait cancels the pending fetch + setState pair.
+  const testRefreshTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (testRefreshTimerRef.current !== null) {
+        window.clearTimeout(testRefreshTimerRef.current);
+        testRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const dirty =
     name !== webhook.name ||
@@ -143,7 +154,11 @@ function WebhookRow({
     onError(null);
     try {
       await adminApi.webhooks.test(webhook.id);
-      setTimeout(async () => {
+      if (testRefreshTimerRef.current !== null) {
+        window.clearTimeout(testRefreshTimerRef.current);
+      }
+      testRefreshTimerRef.current = window.setTimeout(async () => {
+        testRefreshTimerRef.current = null;
         if (expanded) {
           const r = await adminApi.webhooks.listDeliveries(webhook.id, 20);
           setDeliveries(r.deliveries);

@@ -378,12 +378,19 @@ async fn run_once(state: &AppState) -> Result<()> {
 }
 
 /// Public for the `POST /admin/tasks/{id}/run` route — fires the handler
-/// out-of-band of the schedule. Concurrency control matches the normal
-/// path: the task row is marked `running` before dispatch.
+/// out-of-band of the schedule. Rejects the call if the task is already
+/// running so a double-click in the admin UI (or two operators hitting
+/// the button at the same time) can't spawn duplicate executions —
+/// previously `mark_task_running` would succeed for both, scan/marker
+/// jobs would race on the same files, and the second `mark_task_finished`
+/// would overwrite the first's status/next-run bookkeeping.
 pub async fn run_now(state: AppState, task_id: i64) -> Result<()> {
     let Some(task) = queries::get_scheduled_task(&state.pool, task_id).await? else {
         bail!("task {task_id} not found");
     };
+    if task.last_status.as_deref() == Some("running") {
+        bail!("task {} is already running", task.name);
+    }
     tokio::spawn(async move { execute(state, task).await });
     Ok(())
 }
@@ -421,6 +428,41 @@ async fn execute(state: AppState, task: ScheduledTask) {
             warn!(task_id = task.id, error = %format!("{e:#}"), "next firing computation failed; deferring 1h");
             finished_at + 3_600_000
         }
+    };
+
+    // Exponential backoff on consecutive failures. A failing task
+    // (e.g. refresh_metadata while TMDB is down) at hourly cadence
+    // would otherwise retry every hour and spam the logs. With
+    // backoff: 1st failure → +5 min, 2nd → +10 min, 3rd → +20 min,
+    // capped at 6 hours. The backoff is layered on top of the normal
+    // schedule via `max`, so a normally-daily task whose backoff is
+    // only 20 minutes still waits the full day.
+    //
+    // We count *including this run* — the query reads task_runs after
+    // mark_task_finished below, so we read before-the-finish and
+    // include this run's outcome by checking `status` locally. This
+    // avoids a second round-trip after the UPDATE.
+    let next = if status == "failed" {
+        let prior_failures = queries::count_consecutive_task_failures(&state.pool, task.id)
+            .await
+            .unwrap_or(0);
+        // +1 for this run itself (which mark_task_finished is about to record).
+        let n = (prior_failures + 1).clamp(1, 16) as u32;
+        let base_ms: i64 = 5 * 60 * 1000;
+        let cap_ms: i64 = 6 * 60 * 60 * 1000;
+        let backoff = base_ms
+            .saturating_mul(1_i64.checked_shl(n.saturating_sub(1)).unwrap_or(i64::MAX))
+            .min(cap_ms);
+        let backoff_until = finished_at.saturating_add(backoff);
+        debug!(
+            task_id = task.id,
+            consecutive_failures = n,
+            backoff_ms = backoff,
+            "applying failure backoff"
+        );
+        next.max(backoff_until)
+    } else {
+        next
     };
 
     if let Err(e) = queries::mark_task_finished(
@@ -520,6 +562,24 @@ async fn dispatch(
                 .get("library_id")
                 .and_then(|v| v.as_i64())
                 .context("scan_library requires params.library_id")?;
+            // Per-library scan lock: prevents the scheduled scan, an
+            // operator-triggered manual scan, and the filesystem
+            // watcher from running concurrent ffmpeg/IO work on the
+            // same library. The dominant symptom of overlap was live
+            // playback stalling during maintenance windows because all
+            // three pathways were hammering the same disk holding the
+            // transcoder cache. Bail out cleanly when the lock is
+            // already held — the in-flight scan will pick up whatever
+            // this task would have noticed.
+            if !state.try_acquire_library_scan(library_id).await {
+                append_log(
+                    log,
+                    format!(
+                        "skipped: a scan for library {library_id} is already in progress"
+                    ),
+                );
+                return Ok(());
+            }
             // Reuse the existing trigger-scan flow: create a scan_job row
             // and spawn the scanner. The handler returns immediately —
             // long-running scan progress is tracked in scan_jobs, not
@@ -534,7 +594,29 @@ async fn dispatch(
             let job_id = job.id;
             let hub = state.hub.clone();
             let cache_root = state.transcoder.cache_root().to_path_buf();
+            let release_state = state.clone();
             tokio::spawn(async move {
+                // RAII guard: release the scan lock on every exit path
+                // including a panic inside `run_scan`. Without it, a
+                // panic between the acquire above and the release below
+                // would leak the entry and the library would be stuck
+                // until a process restart. Spawned in its own thread so
+                // the destructor runs in `tokio::spawn`'s catch_unwind
+                // boundary even when the future panics.
+                struct ScanLockGuard {
+                    state: AppState,
+                    library_id: i64,
+                }
+                impl Drop for ScanLockGuard {
+                    fn drop(&mut self) {
+                        let st = self.state.clone();
+                        let lib = self.library_id;
+                        tokio::spawn(async move {
+                            st.release_library_scan(lib).await;
+                        });
+                    }
+                }
+                let _guard = ScanLockGuard { state: release_state, library_id };
                 let emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
                     hub.publish(crate::events::Event::Scan(evt));
                 });
@@ -623,10 +705,25 @@ async fn dispatch(
             let params: serde_json::Value =
                 serde_json::from_str(&task.params_json).unwrap_or_default();
             let scoped_library_id = params.get("library_id").and_then(|v| v.as_i64());
-            let batch = params
+            let param_batch = params
                 .get("batch_size")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(32);
+            // Cap per-tick batch by the operator's background-concurrency
+            // setting (same pattern as optimize_versions / analyze_loudness).
+            // detect_markers runs ffmpeg serially per file, but a tick that
+            // chews through 32 × N files still occupies the encoder for
+            // 15-30 minutes; with the cap an operator who set
+            // `transcoder_max_background_concurrent = 1` actually gets the
+            // "background work yields to live playback" guarantee they
+            // configured. Bigger batches still possible via the setting.
+            let settings_cap = state
+                .settings
+                .read()
+                .await
+                .transcoder_max_background_concurrent
+                .max(1);
+            let batch = param_batch.min(settings_cap);
 
             let library_ids: Vec<i64> = match scoped_library_id {
                 Some(lid) => vec![lid],
@@ -1102,11 +1199,22 @@ async fn generate_previews_task(
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let batch = params
+    let param_batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
         .unwrap_or(4)
         .max(1);
+    // Honor the background-concurrency setting; same rationale as
+    // detect_markers / analyze_loudness — sprite generation runs an
+    // ffmpeg per file and an unrestrained batch will compete with
+    // live transcodes for CPU/GPU.
+    let settings_cap = state
+        .settings
+        .read()
+        .await
+        .transcoder_max_background_concurrent
+        .max(1);
+    let batch = param_batch.min(settings_cap);
     let interval_s = params
         .get("interval_s")
         .and_then(|v| v.as_i64())
@@ -1177,11 +1285,20 @@ async fn generate_chapter_thumbs_task(
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let batch = params
+    let param_batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
         .unwrap_or(8)
         .max(1);
+    // Honor the background-concurrency setting; same rationale as
+    // detect_markers / generate_previews / analyze_loudness.
+    let settings_cap = state
+        .settings
+        .read()
+        .await
+        .transcoder_max_background_concurrent
+        .max(1);
+    let batch = param_batch.min(settings_cap);
 
     let candidates = queries::list_media_files_needing_chapter_thumbs(
         &state.pool,
@@ -1279,11 +1396,25 @@ async fn analyze_loudness_task(
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let batch = params
+    let param_batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
         .unwrap_or(4)
         .max(1);
+    // Honor the operator's `transcoder_max_background_concurrent`
+    // ceiling — same pattern `optimize_versions` uses. Loudness
+    // analysis spawns an ffmpeg per file; without the cap, a default
+    // batch_size of 4 plus two live streams can put 6 ffmpeg
+    // processes on a 4-core box and make playback stutter. Take the
+    // tighter of the two settings: the explicit param wins when set
+    // smaller, but the operator's global cap is the upper bound.
+    let settings_cap = state
+        .settings
+        .read()
+        .await
+        .transcoder_max_background_concurrent
+        .max(1);
+    let batch = param_batch.min(settings_cap);
 
     let candidates = queries::list_media_files_needing_loudness(
         &state.pool,

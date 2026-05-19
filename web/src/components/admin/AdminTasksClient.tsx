@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   admin as adminApi,
   type ScheduledTask,
@@ -321,6 +321,17 @@ function SimpleTaskRow({
   onError: (msg: string | null) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // Handle for the post-runNow refresh delay. Tracked so an unmount
+  // mid-wait cancels the pending setState.
+  const runNowTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (runNowTimerRef.current !== null) {
+        window.clearTimeout(runNowTimerRef.current);
+        runNowTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const enabled = existing?.enabled ?? false;
   const frequency = (existing?.frequency ?? kind.default_frequency) as TaskFrequency;
@@ -374,7 +385,11 @@ function SimpleTaskRow({
     try {
       await adminApi.tasks.runNow(existing.id);
       // Give the runner a beat to start writing history, then refresh.
-      window.setTimeout(() => {
+      if (runNowTimerRef.current !== null) {
+        window.clearTimeout(runNowTimerRef.current);
+      }
+      runNowTimerRef.current = window.setTimeout(() => {
+        runNowTimerRef.current = null;
         void onChanged();
         setBusy(false);
       }, 700);
@@ -462,6 +477,16 @@ function TaskRow({
   const [params, setParams] = useState(task.params_json);
   const [busy, setBusy] = useState(false);
   const [runs, setRuns] = useState<TaskRun[] | null>(null);
+  // Tracked so unmount mid-wait cancels the pending refresh.
+  const taskCardRunNowTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (taskCardRunNowTimerRef.current !== null) {
+        window.clearTimeout(taskCardRunNowTimerRef.current);
+        taskCardRunNowTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const kindInfo = kinds.find((k) => k.kind === task.kind);
   const dirty =
@@ -512,7 +537,11 @@ function TaskRow({
     try {
       await adminApi.tasks.runNow(task.id);
       // Give the runner a beat to start and write history.
-      setTimeout(async () => {
+      if (taskCardRunNowTimerRef.current !== null) {
+        window.clearTimeout(taskCardRunNowTimerRef.current);
+      }
+      taskCardRunNowTimerRef.current = window.setTimeout(async () => {
+        taskCardRunNowTimerRef.current = null;
         await onChanged();
         if (expanded) {
           const r = await adminApi.tasks.listRuns(task.id, 20);
@@ -646,7 +675,7 @@ function TaskRow({
             {frequency === "custom" && (
               <Field
                 label="Custom cron"
-                hint="Six fields: sec min hour dom mon dow (UTC). Advanced — most operators should pick a frequency above instead."
+                hint="Six fields: sec min hour dom mon dow (UTC). Note: the maintenance-window times above are server-LOCAL; if your server's timezone isn't UTC, a cron time and a window time that look the same on paper won't actually overlap. Pick a frequency above unless you need cron's flexibility."
               >
                 <input
                   type="text"
@@ -849,7 +878,10 @@ function NewTaskForm({
           </label>
         </Field>
         {frequency === "custom" && (
-          <Field label="Custom cron" hint="Six fields: sec min hour dom mon dow (UTC).">
+          <Field
+            label="Custom cron"
+            hint="Six fields: sec min hour dom mon dow (UTC). The maintenance-window times above are server-LOCAL — on a non-UTC server, a cron time and a window time that look the same on paper won't actually overlap."
+          >
             <input
               type="text"
               value={cron}

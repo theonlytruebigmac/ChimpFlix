@@ -318,9 +318,19 @@ pub async fn stage_restore(
     // 16-byte-headered SQLite file in the auto-backup dir would be
     // staged and applied on next boot — giving anyone with write
     // access to that directory persistent control over server state.
-    let header_bytes = fs::read(&src)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
+    let header_bytes = fs::read(&src).await.map_err(|e| {
+        // TOCTOU: the source file may have been deleted between the
+        // `exists()` check above and this `fs::read`. Map the IO
+        // `NotFound` to a useful validation message so the operator
+        // gets a clear "file disappeared" instead of an opaque 500.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::validation(format!(
+                "`{filename}` was removed before the stage could complete; re-list backups and try again"
+            ))
+        } else {
+            ApiError::Internal(e.into())
+        }
+    })?;
     if header_bytes.len() < 16 || !header_bytes.starts_with(b"SQLite format 3\0") {
         return Err(ApiError::validation(format!(
             "`{filename}` does not look like a SQLite database file"
@@ -363,14 +373,31 @@ pub async fn stage_restore(
     }
 
     let staged = state.data_dir.join(STAGED_RESTORE_FILENAME);
-    // Remove any previous staging so the operator can change their
-    // mind without an explicit cancel call.
-    if staged.exists() {
-        let _ = fs::remove_file(&staged).await;
+    // Drop any previous staging unconditionally. `remove_file`
+    // returning `NotFound` is the desired state, so we collapse it to
+    // a no-op — `if exists then remove` was non-atomic and could
+    // race with another concurrent stage call.
+    if let Err(e) = fs::remove_file(&staged).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                error = %e,
+                path = %staged.display(),
+                "stage_restore: could not remove previous staged file; proceeding to copy",
+            );
+        }
     }
-    fs::copy(&src, &staged)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
+    fs::copy(&src, &staged).await.map_err(|e| {
+        // Same TOCTOU window: source could have been deleted between
+        // the schema probe above and this copy. Surface a useful
+        // message instead of 500.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::validation(format!(
+                "`{filename}` was removed before the stage could complete; re-list backups and try again"
+            ))
+        } else {
+            ApiError::Internal(e.into())
+        }
+    })?;
 
     let user_agent = headers
         .get(USER_AGENT)

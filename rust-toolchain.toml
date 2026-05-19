@@ -1,4 +1,9 @@
 [toolchain]
-channel = "stable"
+# Pinned to a specific stable so rebuilds don't silently shift toolchains.
+# Workspace `rust-version = "1.85"` is the *language floor* (no new
+# nightly features used); the actual build needs ≥1.88 because of
+# transitive deps (image 0.25.10, icu 2.2). Bump this pin and the
+# workspace floor together when adopting a newer Rust feature.
+channel = "1.88"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

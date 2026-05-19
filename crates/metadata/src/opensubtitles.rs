@@ -201,27 +201,55 @@ impl OpenSubtitlesClient {
             );
         }
         let link: DownloadResponse = resp.json().await.context("parse download response")?;
-        let bytes = self
+        let dl = self
             .http
             .get(&link.link)
             .send()
             .await
-            .with_context(|| format!("GET {}", link.link))?
-            .bytes()
-            .await
-            .context("read subtitle body")?;
+            .with_context(|| format!("GET {}", link.link))?;
+        // Validate Content-Length up front when the server advertises
+        // one — the OpenSubtitles download link is a one-time URL
+        // signed by them, but a DNS hijack or compromised mirror
+        // could return arbitrary payload. Cap at 10 MB; a real
+        // subtitle (even verbose ASS for a full film) is well under
+        // 2 MB. Anything bigger is suspicious and we'd otherwise
+        // buffer the whole thing into Vec<u8> before noticing.
+        const MAX_SUBTITLE_BYTES: u64 = 10 * 1024 * 1024;
+        if let Some(len) = dl.content_length() {
+            if len > MAX_SUBTITLE_BYTES {
+                bail!(
+                    "OpenSubtitles download oversized: {len} bytes > {MAX_SUBTITLE_BYTES} max"
+                );
+            }
+        }
+        let bytes = dl.bytes().await.context("read subtitle body")?;
+        if bytes.len() as u64 > MAX_SUBTITLE_BYTES {
+            bail!(
+                "OpenSubtitles download oversized after read: {} bytes",
+                bytes.len()
+            );
+        }
+        // Sniff the first few bytes against the formats we accept.
+        // Picture-based / unknown payloads are rejected here rather
+        // than getting stored and then surprising the player.
+        if !looks_like_text_subtitle(&bytes) {
+            bail!("OpenSubtitles download doesn't look like a text subtitle (SRT/ASS/SSA/VTT)");
+        }
         Ok(bytes.to_vec())
     }
 
     async fn token(&self) -> Result<String> {
-        {
-            let guard = self.token.lock().await;
-            if let Some(t) = guard.as_ref() {
-                return Ok(t.clone());
-            }
+        // Hold the mutex across `login()` so concurrent callers queue
+        // up behind us instead of each racing to POST `/login`. Same
+        // hazard and fix as `TvdbClient::token` — the previous
+        // "check, drop, login, re-take" pattern let two parallel
+        // scans each trigger a fresh login on cold start, wasting
+        // credentials and risking a 429 from OpenSubtitles.
+        let mut guard = self.token.lock().await;
+        if let Some(t) = guard.as_ref() {
+            return Ok(t.clone());
         }
         let token = self.login().await?;
-        let mut guard = self.token.lock().await;
         *guard = Some(token.clone());
         Ok(token)
     }
@@ -249,6 +277,89 @@ impl OpenSubtitlesClient {
         }
         let parsed: LoginResponse = resp.json().await.context("parse login response")?;
         parsed.token.ok_or_else(|| anyhow!("OpenSubtitles login returned no token"))
+    }
+}
+
+/// Best-effort heuristic that the payload is a text subtitle in one
+/// of the formats we accept (SRT, ASS/SSA, WebVTT). We don't fully
+/// parse — just check the first ~256 bytes for a recognizable opener.
+/// The defence here is against a download link being hijacked to
+/// return arbitrary binary (executable, exploit payload, multi-MB
+/// junk), not against malformed-but-real subtitles.
+fn looks_like_text_subtitle(bytes: &[u8]) -> bool {
+    // Trim BOM + leading whitespace before sniffing.
+    let mut head = bytes;
+    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        head = &head[3..];
+    }
+    while head.first().is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')) {
+        head = &head[1..];
+    }
+    let head = &head[..head.len().min(256)];
+    let as_str = match std::str::from_utf8(head) {
+        Ok(s) => s,
+        // Not valid UTF-8 — could still be Latin-1 SRT. Accept ONLY
+        // if every byte looks textual: ASCII printable / common
+        // whitespace, or the Latin-1 supplement range (0xa0-0xff).
+        // The C1 control range (0x80-0x9f) and NUL/DEL are rejected
+        // — they're what binary headers (PNG \x89, etc.) hit.
+        Err(_) => {
+            return head.iter().all(|&b| {
+                matches!(b, 0x20..=0x7e | b'\t' | b'\n' | b'\r' | 0xa0..=0xff)
+            });
+        }
+    };
+    // WebVTT: must start with the magic header.
+    if as_str.starts_with("WEBVTT") {
+        return true;
+    }
+    // ASS / SSA: section headers.
+    if as_str.starts_with("[Script Info]") || as_str.starts_with("[V4 Styles]")
+        || as_str.starts_with("[V4+ Styles]") || as_str.starts_with("[Events]")
+    {
+        return true;
+    }
+    // SRT: first event index, e.g. "1\n00:00:01,000 --> ...".
+    // Accept any leading digit followed within ~30 chars by an arrow.
+    if as_str.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        && as_str.contains("-->")
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod sniff_tests {
+    use super::looks_like_text_subtitle;
+
+    #[test]
+    fn accepts_webvtt() {
+        assert!(looks_like_text_subtitle(b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi"));
+    }
+    #[test]
+    fn accepts_ass() {
+        assert!(looks_like_text_subtitle(b"[Script Info]\nTitle: x\n"));
+    }
+    #[test]
+    fn accepts_srt() {
+        assert!(looks_like_text_subtitle(
+            b"1\n00:00:01,000 --> 00:00:02,000\nHi\n"
+        ));
+    }
+    #[test]
+    fn accepts_srt_with_bom() {
+        assert!(looks_like_text_subtitle(
+            b"\xef\xbb\xbf1\n00:00:01,000 --> 00:00:02,000\nHi\n"
+        ));
+    }
+    #[test]
+    fn rejects_png() {
+        assert!(!looks_like_text_subtitle(b"\x89PNG\r\n\x1a\n"));
+    }
+    #[test]
+    fn rejects_zip() {
+        assert!(!looks_like_text_subtitle(b"PK\x03\x04"));
     }
 }
 

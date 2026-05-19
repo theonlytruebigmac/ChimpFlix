@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   auth as authApi,
   ChimpFlixApiError,
@@ -39,6 +39,18 @@ export function SettingsProfileClient({ initial }: Props) {
   const [notifyEmail, setNotifyEmail] = useState(initial.notify_via_email);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  // Holds the auto-clear timer so we can cancel it on unmount and
+  // avoid setState-on-unmounted warnings (and a small leak) if the
+  // user navigates away inside the 2.5s window.
+  const messageTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (messageTimerRef.current !== null) {
+        window.clearTimeout(messageTimerRef.current);
+        messageTimerRef.current = null;
+      }
+    };
+  }, []);
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
@@ -54,7 +66,13 @@ export function SettingsProfileClient({ initial }: Props) {
       });
       setUser(updated);
       setMessage("Saved.");
-      window.setTimeout(() => setMessage(null), 2500);
+      if (messageTimerRef.current !== null) {
+        window.clearTimeout(messageTimerRef.current);
+      }
+      messageTimerRef.current = window.setTimeout(() => {
+        messageTimerRef.current = null;
+        setMessage(null);
+      }, 2500);
     } catch (e) {
       if (e instanceof ChimpFlixApiError) {
         // Surface the server's validation message (e.g. "email is

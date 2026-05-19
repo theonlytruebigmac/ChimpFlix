@@ -95,6 +95,20 @@ pub async fn trigger_scan(
         .await?
         .ok_or(ApiError::NotFound)?;
 
+    // Coordinate with the scheduled scan and file watcher via the
+    // shared per-library lock. Operator hitting the scan button twice
+    // (or hitting it while a scheduled scan is running) used to
+    // spawn parallel scanner processes — same library, same disk,
+    // same DB rows — which not only wasted IO but stalled live
+    // transcodes sharing the cache disk. Reject the second trigger
+    // with a 409 so the UI can show "already scanning" rather than
+    // silently piling on.
+    if !state.try_acquire_library_scan(library_id).await {
+        return Err(ApiError::Conflict(
+            "a scan is already in progress for this library".to_string(),
+        ));
+    }
+
     let job = queries::create_scan_job(&state.pool, library_id).await?;
     let job_id = job.id;
 
@@ -135,6 +149,7 @@ pub async fn trigger_scan(
     });
 
     let cache_root = state.transcoder.cache_root().to_path_buf();
+    let state_for_release = state.clone();
     tokio::spawn(async move {
         if let Err(e) = chimpflix_library::run_scan(
             pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job_id,
@@ -145,6 +160,7 @@ pub async fn trigger_scan(
         {
             warn!(error = %format!("{e:#}"), library_id, job_id, "scan task ended with error");
         }
+        state_for_release.release_library_scan(library_id).await;
     });
 
     Ok((StatusCode::ACCEPTED, Json(job)))

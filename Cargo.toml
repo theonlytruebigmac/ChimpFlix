@@ -54,7 +54,22 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+# Hand-picked tokio feature set. `full` historically pulled the
+# kitchen sink (which inflated build time + binary size); we use only
+# what's actually referenced by the workspace today. Add a feature
+# here when you hit a "this fn is gated by feature X" compile error
+# rather than going back to `full`.
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 # Pure-Rust QR encoder. Used by the 2FA enrollment endpoint to render
 # the otpauth:// URI as an SVG the frontend can drop into an <img> tag.
 # Server-side rendering keeps the web bundle dep-free.
