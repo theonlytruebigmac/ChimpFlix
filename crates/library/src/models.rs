@@ -1664,6 +1664,10 @@ pub struct ServerSettings {
     /// is set, the player runs the pre-roll first; user prefs can
     /// override per-user.
     pub preroll_enabled: bool,
+    /// Output level for the pre-roll, 0..=100 (percent of the source's
+    /// authored level). Stings often ship mastered at theatre levels;
+    /// this lets operators tame that without re-encoding the upload.
+    pub preroll_volume: i64,
     /// HEVC output mode for transcode sessions:
     /// `off` | `when_client_supports` | `always`. See migration phase 43.
     pub transcoder_hevc_encoding_mode: String,
@@ -1856,6 +1860,12 @@ impl ServerSettings {
                 .flatten()
                 .unwrap_or(0)
                 != 0,
+            preroll_volume: row
+                .try_get::<Option<i64>, _>("preroll_volume")
+                .ok()
+                .flatten()
+                .unwrap_or(100)
+                .clamp(0, 100),
             transcoder_hevc_encoding_mode: row
                 .try_get::<Option<String>, _>("transcoder_hevc_encoding_mode")
                 .ok()
@@ -2024,6 +2034,8 @@ pub struct ServerSettingsUpdate {
     pub preroll_path: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preroll_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preroll_volume: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hevc_encoding_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

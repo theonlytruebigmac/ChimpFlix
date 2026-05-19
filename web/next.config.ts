@@ -27,7 +27,9 @@ function csp(): string {
     // come from i.ytimg.com.
     "img-src 'self' data: blob: https://i.ytimg.com https://image.tmdb.org",
     "font-src 'self' data:",
-    "media-src 'self' blob:",
+    // Plex's CDN for show theme songs played on the title modal.
+    // Same source the official Plex web app uses; first-party MP3.
+    "media-src 'self' blob: https://tvthemes.plexapp.com",
     "connect-src 'self'",
     "object-src 'none'",
     "worker-src 'self' blob:",

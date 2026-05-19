@@ -22,6 +22,7 @@ import {
   type MediaFileSummary,
   type MediaStreamSummary,
   type PreviewManifest,
+  type SeasonSummary,
   type User,
 } from "@/lib/chimpflix-api";
 import { PrerollGate } from "@/components/PrerollGate";
@@ -54,6 +55,22 @@ interface Resolved {
   subtitleTracks: StreamChoice[];
   markers: PlayerMarker[];
   seasonEpisodes?: EpisodeSibling[];
+  // ── Episode popup / season switcher ──
+  /// Rating-key of the currently-playing episode. The popup uses this
+  /// to render the active row in the Netflix-style expanded layout and
+  /// to put a checkmark next to the right season in the picker pane.
+  currentRatingKey?: string;
+  /// DB id of the current season. Used by the picker to show which
+  /// season is "checked".
+  currentSeasonId?: number;
+  /// Show id. Required so the popup can lazy-load episodes for a
+  /// different season when the user uses the season picker.
+  showId?: number;
+  /// Show's display title — header in the season picker pane.
+  showTitle?: string;
+  /// All seasons in the show, ordered as the API returns them. Source
+  /// of truth for the picker list (with a checkmark on the current one).
+  seasons?: { id: number; season_number: number; title: string | null }[];
   previewManifest?: PreviewManifest;
   versions?: VersionChoice[];
 }
@@ -272,7 +289,7 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
 
 async function resolveEpisode(
   episode: EpisodeDetail,
-  showTitle: string,
+  show: { title: string; seasons?: SeasonSummary[] },
 ): Promise<Resolved | null> {
   const file = episode.files[0];
   if (!file) return null;
@@ -306,7 +323,7 @@ async function resolveEpisode(
     .catch(() => [] as ExternalSubtitle[]);
   return {
     mediaFileId: file.id,
-    title: showTitle,
+    title: show.title,
     subtitle: `S${episode.season_number} · E${episode.episode_number} · ${episode.title}`,
     episodeId: episode.id,
     startPositionMs: episode.play_state?.position_ms ?? 0,
@@ -319,6 +336,15 @@ async function resolveEpisode(
     subtitleTracks: mergeExternalSubtitles(tracks.subtitle, external),
     markers: file.markers ?? [],
     seasonEpisodes,
+    currentRatingKey: `e${episode.id}`,
+    currentSeasonId: episode.season_id,
+    showId: episode.show_id,
+    showTitle: show.title,
+    seasons: show.seasons?.map((s) => ({
+      id: s.id,
+      season_number: s.season_number,
+      title: s.title,
+    })),
     previewManifest: await maybePreviewManifest(file.id),
     versions: versionsFor(episode.files, external),
   };
@@ -372,7 +398,7 @@ async function resolveShowFirstEpisode(
   const firstEpisode = seasonDetail.episodes[0];
   if (!firstEpisode) return null;
   const episodeDetail = await episodesApi.get(firstEpisode.id);
-  return resolveEpisode(episodeDetail, detail.title);
+  return resolveEpisode(episodeDetail, detail);
 }
 
 function parseIndex(v: string | undefined): number | undefined {
@@ -462,7 +488,7 @@ export default async function WatchPage({
       if (!Number.isFinite(epId) || epId <= 0) notFound();
       const episode = await episodesApi.get(epId);
       const show = await itemsApi.get(episode.show_id);
-      resolved = await resolveEpisode(episode, show.title);
+      resolved = await resolveEpisode(episode, show);
     } else {
       const id = Number.parseInt(ratingKey, 10);
       if (!Number.isFinite(id) || id <= 0) notFound();
@@ -510,12 +536,25 @@ export default async function WatchPage({
   // Check whether a pre-roll is configured + enabled. Fetched here on
   // the server so the wrapper can decide synchronously whether to
   // gate the player. Failures fall through to no-preroll.
+  //
+  // Suppressed on resume: pre-roll is a session-start sting, not
+  // something to replay every time the viewer comes back to a paused
+  // show. Without this guard, hitting "skip" on the pre-roll lands the
+  // viewer at their saved position, which feels like the player just
+  // skipped forward by 10 minutes.
   let prerollUrl: string | null = null;
-  try {
-    const ps = await prerollApi.status();
-    if (ps.enabled && ps.url) prerollUrl = ps.url;
-  } catch {
-    // No-op.
+  let prerollVolume = 100;
+  const isResume = (resolved.startPositionMs ?? 0) > 30_000;
+  if (!isResume) {
+    try {
+      const ps = await prerollApi.status();
+      if (ps.enabled && ps.url) {
+        prerollUrl = ps.url;
+        prerollVolume = ps.volume ?? 100;
+      }
+    } catch {
+      // No-op.
+    }
   }
 
   const player = (
@@ -538,6 +577,11 @@ export default async function WatchPage({
       externalSubtitleUrl={externalSubtitleUrl}
       markers={resolved.markers}
       seasonEpisodes={resolved.seasonEpisodes}
+      currentRatingKey={resolved.currentRatingKey}
+      currentSeasonId={resolved.currentSeasonId}
+      showId={resolved.showId}
+      showTitle={resolved.showTitle}
+      seasons={resolved.seasons}
       previewManifest={resolved.previewManifest}
       versions={resolved.versions}
       playedThresholdPct={playedThresholdPct}
@@ -546,7 +590,11 @@ export default async function WatchPage({
   );
 
   if (prerollUrl) {
-    return <PrerollGate prerollUrl={prerollUrl}>{player}</PrerollGate>;
+    return (
+      <PrerollGate prerollUrl={prerollUrl} prerollVolume={prerollVolume}>
+        {player}
+      </PrerollGate>
+    );
   }
   return player;
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import {
   displayTitle,
   formatRuntime,
@@ -13,12 +14,16 @@ import { useMyListItem } from "@/lib/my-list";
 import { prefetchPlay } from "@/lib/play-prefetch";
 import { useRecentlyAddedDays } from "@/lib/server-config";
 
-function recencyBadge(item: MediaItem, windowDays: number): string | null {
+function recencyBadge(
+  item: MediaItem,
+  windowDays: number,
+  now: number,
+): string | null {
   // `windowDays = 0` is the explicit "no badge ever" setting.
   if (windowDays <= 0) return null;
   if (!item.addedAt) return null;
   const windowMs = windowDays * 24 * 60 * 60 * 1000;
-  if (Date.now() - item.addedAt > windowMs) return null;
+  if (now - item.addedAt > windowMs) return null;
   // For TV shows where we know a new season just landed, surface that
   // over generic "Recently Added". (Season-add tracking lives in
   // `latestSeasonAt` once we wire it; until then any recently-added show
@@ -37,7 +42,20 @@ export function Card({ item }: { item: MediaItem }) {
       ? Math.min(100, (item.viewOffset / item.duration) * 100)
       : null;
   const recentlyAddedDays = useRecentlyAddedDays();
-  const badge = recencyBadge(item, recentlyAddedDays);
+  // Compute the recency badge after hydration. The badge depends on
+  // `Date.now()` and the server's clock is N ms ahead of the browser's
+  // by render time, so doing it in render lets the server emit
+  // "Recently Added" while the client emits null (or vice versa) — a
+  // textual hydration mismatch that triggers React error #418 and, on
+  // mobile Chrome, an "Aw, snap" renderer crash. `now` starts undefined
+  // so initial SSR + first client render agree (no badge); the effect
+  // then fills it in.
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setNow(Date.now());
+  }, []);
+  const badge = now === null ? null : recencyBadge(item, recentlyAddedDays, now);
 
   const label = displayTitle(item);
   const modalKey =

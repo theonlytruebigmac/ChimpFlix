@@ -86,6 +86,19 @@ function useThemeMusic(tvdbId: number | null, enabled: boolean) {
   useEffect(() => {
     if (!tvdbId || !enabled) return;
     if (typeof Audio === "undefined") return;
+    // Skip on touch-primary devices. Stacking an autoplay <audio> on
+    // top of everything else the modal mounts (trailer iframe, preview
+    // video, and then the full HLS player when the viewer hits Play)
+    // overruns the mobile Chrome media stack and triggers an "Aw, snap"
+    // renderer crash. Battery + data are also nice things to save on
+    // phones. Desktop keeps the theme song — that's where it actually
+    // adds to the browse experience.
+    if (
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(hover: none) and (pointer: coarse)").matches
+    ) {
+      return;
+    }
     const audio = new Audio(`https://tvthemes.plexapp.com/${tvdbId}.mp3`);
     audio.loop = true;
     audio.volume = 0.35;

@@ -4,6 +4,10 @@ import { useEffect, useRef, useState } from "react";
 
 interface Props {
   prerollUrl: string;
+  /// Output level 0..=100. Applied to the video element before play()
+  /// so the operator's chosen level takes effect on the *first* frame,
+  /// not after a default-volume pop. Falls back to 100 if not provided.
+  prerollVolume?: number;
   children: React.ReactNode;
 }
 
@@ -21,7 +25,7 @@ interface Props {
 ///
 /// If the pre-roll fails to load (network blip, codec mismatch), we
 /// skip straight through — never blocking playback on a sting.
-export function PrerollGate({ prerollUrl, children }: Props) {
+export function PrerollGate({ prerollUrl, prerollVolume, children }: Props) {
   const [done, setDone] = useState(false);
   const [showSkip, setShowSkip] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -34,6 +38,12 @@ export function PrerollGate({ prerollUrl, children }: Props) {
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
+    // Apply the operator-set volume before kicking off playback so the
+    // first frame already plays at the correct level. Default 100 if
+    // the prop is missing (older callers that don't know about volume
+    // yet).
+    const clamped = Math.max(0, Math.min(100, prerollVolume ?? 100));
+    v.volume = clamped / 100;
     v.play().catch(() => {
       v.muted = true;
       v.play().catch(() => {
@@ -42,7 +52,7 @@ export function PrerollGate({ prerollUrl, children }: Props) {
         setDone(true);
       });
     });
-  }, []);
+  }, [prerollVolume]);
 
   if (done) return <>{children}</>;
 

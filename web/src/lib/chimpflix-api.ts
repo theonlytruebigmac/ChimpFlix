@@ -1091,6 +1091,8 @@ export interface ServerSettings {
   preroll_path: string | null;
   /** Master switch for pre-roll playback. */
   preroll_enabled: boolean;
+  /** Output level for the pre-roll, 0..=100. Defaults to 100. */
+  preroll_volume: number;
   // ── Playback / library (Phase 31) ──
   /** Hard cap on the Continue Watching rail. Default 40. */
   continue_watching_max_items: number;
@@ -1168,6 +1170,7 @@ export interface ServerSettingsUpdate {
   audio_normalize_enabled?: boolean;
   scanner_nice_level?: number;
   preroll_enabled?: boolean;
+  preroll_volume?: number;
   continue_watching_max_items?: number;
   continue_watching_max_age_weeks?: number;
   continue_watching_include_premieres?: boolean;
@@ -1327,6 +1330,9 @@ export interface PrerollStatus {
   configured: boolean;
   url: string | null;
   size_bytes: number | null;
+  /** Output level for the pre-roll, 0..=100. Applied as `video.volume`
+   *  in the gate so the player doesn't need a second settings fetch. */
+  volume: number;
 }
 
 // ─── Bulk item operations (Phase 43) ───────────────────────────────────────

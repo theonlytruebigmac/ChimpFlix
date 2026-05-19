@@ -21,7 +21,11 @@ export default async function AdminPrerollPage() {
           </>
         }
       />
-      <AdminPrerollClient initialStatus={status} initialEnabled={settings.preroll_enabled} />
+      <AdminPrerollClient
+        initialStatus={status}
+        initialEnabled={settings.preroll_enabled}
+        initialVolume={settings.preroll_volume ?? 100}
+      />
     </div>
   );
 }

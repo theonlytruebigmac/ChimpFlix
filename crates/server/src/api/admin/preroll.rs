@@ -27,6 +27,10 @@ pub struct PrerollStatus {
     pub url: Option<String>,
     /// Bytes on disk (best-effort stat); None when not configured.
     pub size_bytes: Option<u64>,
+    /// Output level 0..=100; the player applies this as `video.volume`
+    /// when it mounts the gate, so a single fetch covers both
+    /// playability and volume.
+    pub volume: i64,
 }
 
 pub async fn get_status(
@@ -49,6 +53,7 @@ pub async fn get_status(
             .as_ref()
             .map(|_| format!("/api/v1/preroll/blob?v={}", chimpflix_common::now_ms())),
         size_bytes,
+        volume: settings.preroll_volume,
     }))
 }
 
@@ -136,6 +141,7 @@ pub async fn upload(
         configured: true,
         url: Some(format!("/api/v1/preroll/blob?v={}", chimpflix_common::now_ms())),
         size_bytes: Some(bytes.len() as u64),
+        volume: updated.preroll_volume,
     }))
 }
 

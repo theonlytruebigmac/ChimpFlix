@@ -16,7 +16,9 @@ import {
   ChimpFlixApiError,
   stream as streamApi,
   playState as playStateApi,
+  seasons as seasonsApi,
 } from "@/lib/chimpflix-api";
+import { plexImage } from "@/lib/image";
 import { ChaptersControl } from "@/components/ChaptersControl";
 import { detectClientCapabilities } from "@/lib/client-caps";
 import {
@@ -182,6 +184,21 @@ interface Props {
   externalSubtitleUrl?: string;
   markers?: PlayerMarker[];
   seasonEpisodes?: EpisodeSibling[];
+  /// Rating-key of the currently-playing episode. Identifies which row
+  /// in the in-player popup gets the Netflix-style "expanded" treatment
+  /// (thumbnail + synopsis); every other row renders as a compact item.
+  currentRatingKey?: string;
+  /// DB id of the current season. The picker pane uses it to put a
+  /// checkmark next to the right entry.
+  currentSeasonId?: number;
+  /// Show id. The popup uses it to lazy-load episodes for a different
+  /// season when the viewer changes seasons mid-playback.
+  showId?: number;
+  /// Show title — shown as the heading in the season-picker pane.
+  showTitle?: string;
+  /// All seasons in the show, ordered as the API returns them. Powers
+  /// the season picker (back-arrow on the episodes pane).
+  seasons?: { id: number; season_number: number; title: string | null }[];
   previewManifest?: PreviewManifest;
   /// When the same title has multiple media files (4K + 1080p, etc.)
   /// the player exposes a Version picker. Initial `mediaFileId` is
@@ -284,6 +301,11 @@ export function ChimpFlixPlayer({
   externalSubtitleUrl,
   markers,
   seasonEpisodes,
+  currentRatingKey,
+  currentSeasonId,
+  showId,
+  showTitle,
+  seasons,
   previewManifest,
   versions,
   playedThresholdPct,
@@ -301,6 +323,24 @@ export function ChimpFlixPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const hideTimerRef = useRef<number | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  // Whether the device's primary input is a touch screen. Computed
+  // once via matchMedia because per-event `pointerType` is unreliable
+  // in the Android Chrome PWA wrapper — pointerup sometimes fires with
+  // pointerType="mouse" on a real touch tap, which made the click
+  // handler take the desktop branch (togglePlay = pause) instead of
+  // the touch branch (show controls). Device-based detection sidesteps
+  // that quirk entirely. `useState` (not useMemo) so SSR + hydration
+  // agree on `false` initially and the effect bumps it to true post-
+  // hydration if appropriate — keeps us out of hydration-mismatch land.
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const matches =
+      window.matchMedia?.("(hover: none) and (pointer: coarse)").matches ??
+      false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (matches) setIsTouchDevice(true);
+  }, []);
   // Late-bound ref to seekBy so callbacks declared before seekBy (Media
   // Session, etc.) can route through the source-time-aware seek path
   // without TDZ errors from a direct reference.
@@ -1359,9 +1399,15 @@ export function ChimpFlixPlayer({
     const POLL_STALL_MS = 6000;
     const KICK_WINDOW_MS = 60_000;
     const MAX_KICKS = 3;
+    // A "clean run" of this many uninterrupted seconds after a kick
+    // means the recovery worked — clear the kicks budget so a later,
+    // unrelated stall doesn't inherit those strikes and trip the
+    // give-up overlay prematurely.
+    const KICK_RESET_AFTER_CLEAN_SEC = 15;
     let lastAdvanceAt = Date.now();
     let lastTime = video.currentTime;
     let waitingTimer: number | null = null;
+    let cleanSinceKickAt: number | null = null;
     const kicks: number[] = [];
     const tryKick = (reason: "waiting" | "poll") => {
       if (video.paused || video.ended) return;
@@ -1375,6 +1421,7 @@ export function ChimpFlixPlayer({
         return;
       }
       kicks.push(now);
+      cleanSinceKickAt = now;
       lastAdvanceAt = now;
       lastTime = video.currentTime;
       const hls = hlsRef.current;
@@ -1431,8 +1478,21 @@ export function ChimpFlixPlayer({
         return;
       }
       if (video.currentTime > lastTime + 0.05) {
-        lastAdvanceAt = Date.now();
+        const now = Date.now();
+        lastAdvanceAt = now;
         lastTime = video.currentTime;
+        // Forgive past kicks once playback has been advancing
+        // smoothly for a while — otherwise three unrelated stalls
+        // spaced 20s apart all count against the 60s budget and
+        // surface the unrecoverable-error overlay even though each
+        // one recovered on its own.
+        if (
+          cleanSinceKickAt !== null &&
+          now - cleanSinceKickAt > KICK_RESET_AFTER_CLEAN_SEC * 1000
+        ) {
+          kicks.length = 0;
+          cleanSinceKickAt = null;
+        }
         return;
       }
       if (Date.now() - lastAdvanceAt < POLL_STALL_MS) return;
@@ -1469,11 +1529,29 @@ export function ChimpFlixPlayer({
   }, []);
 
   // PiP tracking.
+  //
+  // Browsers (Chrome on Android in particular) like to pause the video
+  // when the PiP window is dismissed. From the viewer's perspective
+  // that's wrong: they pressed "close PiP", not "pause". Capture the
+  // pre-enter playing state and restore it on leave so closing the PiP
+  // window is a no-op for playback.
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const onEnter = () => setPipActive(true);
-    const onLeave = () => setPipActive(false);
+    let wasPlayingBeforePip = false;
+    const onEnter = () => {
+      wasPlayingBeforePip = !v.paused;
+      setPipActive(true);
+    };
+    const onLeave = () => {
+      setPipActive(false);
+      if (wasPlayingBeforePip && v.paused) {
+        v.play().catch(() => {
+          // Autoplay policy can refuse — best-effort, user can hit
+          // play again. Don't surface this as a user-visible error.
+        });
+      }
+    };
     v.addEventListener("enterpictureinpicture", onEnter);
     v.addEventListener("leavepictureinpicture", onLeave);
     return () => {
@@ -1758,7 +1836,10 @@ export function ChimpFlixPlayer({
     return () => video.removeEventListener("ended", onEnded);
   }, [nextHref, router, autoNextCancelled, prefs.autoplayNext]);
 
-  // Idle-hide controls.
+  // Idle-hide controls. Always shows + (re-)arms the auto-hide timer.
+  // Idempotent: calling it multiple times in a row from cascading event
+  // handlers (pointerdown → click) just keeps the controls visible and
+  // pushes the auto-hide deadline out — no toggle race possible.
   const resetHide = useCallback(() => {
     setShowControls(true);
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
@@ -1863,19 +1944,32 @@ export function ChimpFlixPlayer({
   const lastTapRef = useRef<{ at: number; x: number; w: number } | null>(null);
   const seekFlashIdRef = useRef(0);
   const suppressNextClickRef = useRef(false);
-  const lastClickPointerTypeRef = useRef<"mouse" | "touch" | "pen">("mouse");
-  const onVideoPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLVideoElement>) => {
-      // Capture the pointer type so the subsequent synthetic `click`
-      // can branch on touch-vs-mouse semantics (touch → toggle controls,
-      // mouse → toggle play).
-      lastClickPointerTypeRef.current =
-        e.pointerType === "touch" || e.pointerType === "pen"
-          ? e.pointerType
-          : "mouse";
-      // Mouse + pen keep the original tap-to-play-or-pause flow. Only
-      // touch gets the seek gesture.
-      if (e.pointerType !== "touch") return;
+  // Double-tap seek is wired to the *container* (not the video element).
+  // When the controls are shown, the top + bottom gradient bars cover
+  // the corners where edge taps land, and a video-only listener would
+  // miss the second tap. Container-level capture catches both, and we
+  // filter on `target.closest("button, a")` so taps that hit a real
+  // control button still go straight to that button's handler instead
+  // of triggering a seek.
+  const onContainerPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      // Double-tap-to-seek is a touch gesture only. Mouse + pen skip
+      // straight to togglePlay via the click handler. `pointerType` on
+      // the React PointerEvent is usually accurate on Android Chrome
+      // PWA; if it isn't, the `isTouchDevice` fallback below treats the
+      // primary-input-is-touch case as touch too.
+      const isTouchEvent =
+        e.pointerType === "touch" ||
+        (isTouchDevice && e.pointerType !== "mouse");
+      if (!isTouchEvent) return;
+      // Skip if the tap landed on / inside an actual control —
+      // buttons, links, menu items. Those have their own handlers and
+      // shouldn't get hijacked by the seek gesture (e.g. a quick
+      // double-tap on the Play button would otherwise seek backwards).
+      const target = e.target as Element | null;
+      if (target?.closest("button, a, [role='menuitem'], [role='menuitemradio']")) {
+        return;
+      }
       const rect = e.currentTarget.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const w = rect.width;
@@ -1919,30 +2013,33 @@ export function ChimpFlixPlayer({
       }
       lastTapRef.current = { at: now, x, w };
     },
-    [seekBy],
+    [seekBy, isTouchDevice],
   );
   const onVideoClick = useCallback(() => {
     if (suppressNextClickRef.current) {
       suppressNextClickRef.current = false;
       return;
     }
-    // Mobile vs desktop tap semantics: on touch, a tap reveals/hides the
-    // controls overlay so the user can then pick a control (play, seek,
-    // tracks). Pause-on-tap is a desktop pattern that's actively wrong
-    // on phones — every tap pausing makes the menu buttons feel
-    // unresponsive because the user has to "wake" the controls without
-    // also pausing playback. On mouse, tap-to-toggle-play stays.
-    if (lastClickPointerTypeRef.current === "touch") {
-      setShowControls((v) => !v);
-      if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
-      hideTimerRef.current = window.setTimeout(() => {
-        const vid = videoRef.current;
-        if (vid && !vid.paused) setShowControls(false);
-      }, 3000);
+    // Mobile vs desktop tap semantics:
+    //  - Touch: a tap reliably reveals the controls (and re-arms the
+    //    auto-hide timer). Never toggle on tap — that races with the
+    //    container's pointerdown→resetHide which set show=true a moment
+    //    earlier, leaving the user staring at a black screen because
+    //    the toggle flipped it right back to false. Users hide controls
+    //    by waiting, not by tapping again.
+    //  - Mouse / desktop: a click toggles play/pause, the classic
+    //    desktop pattern that doesn't trip the "menu won't show" trap
+    //    because hover already keeps controls visible.
+    // Detection uses the matchMedia-derived `isTouchDevice`, not a
+    // per-event pointerType ref, because Android PWA Chrome will
+    // sometimes lose the pointer-type signal between pointerup and the
+    // synthetic click.
+    if (isTouchDevice) {
+      resetHide();
       return;
     }
     togglePlay();
-  }, [togglePlay]);
+  }, [isTouchDevice, resetHide, togglePlay]);
 
   // Scrub-time pre-warm. Called by ProgressBar after the user holds
   // a drag position for ~350 ms. Fires a `createSession` at the
@@ -2064,14 +2161,42 @@ export function ChimpFlixPlayer({
   const togglePip = useCallback(async () => {
     const v = videoRef.current;
     if (!v) return;
+    // PiP can be force-disabled per-element by extensions / a11y tools.
+    // Clearing this defensively before the request keeps the button
+    // working even if something else flipped the flag mid-session.
+    if (v.disablePictureInPicture) {
+      v.disablePictureInPicture = false;
+    }
     try {
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
-      } else if (typeof v.requestPictureInPicture === "function") {
-        await v.requestPictureInPicture();
+        return;
       }
-    } catch {
-      // PiP can be blocked or unsupported — best-effort.
+      if (!document.pictureInPictureEnabled) {
+        console.warn("[player] picture-in-picture not supported in this browser");
+        return;
+      }
+      if (typeof v.requestPictureInPicture !== "function") {
+        console.warn("[player] video element has no requestPictureInPicture");
+        return;
+      }
+      // Some browsers reject if `readyState < HAVE_METADATA`. Nudge the
+      // pipeline by awaiting metadata once if we're not there yet — the
+      // user clicked, so they expect *something* to happen.
+      if (v.readyState < 1) {
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            v.removeEventListener("loadedmetadata", done);
+            resolve();
+          };
+          v.addEventListener("loadedmetadata", done, { once: true });
+          // Safety timeout — don't hang forever.
+          setTimeout(done, 1500);
+        });
+      }
+      await v.requestPictureInPicture();
+    } catch (err) {
+      console.warn("[player] picture-in-picture toggle failed", err);
     }
   }, []);
 
@@ -2266,6 +2391,7 @@ export function ChimpFlixPlayer({
       ref={containerRef}
       onMouseMove={resetHide}
       onPointerDown={resetHide}
+      onPointerUp={onContainerPointerUp}
       className={`fixed inset-0 z-50 select-none bg-black ${
         showControls ? "" : "cursor-none"
       }`}
@@ -2275,7 +2401,6 @@ export function ChimpFlixPlayer({
         playsInline
         autoPlay
         onClick={onVideoClick}
-        onPointerUp={onVideoPointerUp}
         crossOrigin="anonymous"
         className={`h-full w-full bg-black ${cueClass}`}
       >
@@ -2362,13 +2487,20 @@ export function ChimpFlixPlayer({
         )}
 
       <div
-        className={`pointer-events-none absolute inset-0 transition-opacity duration-200 ${
+        // `inert` (React 19) is the only reliable way to stop child
+        // buttons from receiving taps when the controls are hidden.
+        // CSS `pointer-events: none` on this wrapper alone does NOT
+        // propagate to children with default `auto`, so the previous
+        // setup let invisible buttons capture taps on the player
+        // surface — the source of the random ±10s jumps users reported.
+        inert={!showControls}
+        className={`absolute inset-0 transition-opacity duration-200 ${
           showControls ? "opacity-100" : "opacity-0"
         }`}
       >
         {/* Top bar — back link + title (title hides on desktop because
             the bottom row already shows it there). */}
-        <div className="pointer-events-auto absolute inset-x-0 top-0 bg-linear-to-b from-black/80 to-transparent">
+        <div className="absolute inset-x-0 top-0 bg-linear-to-b from-black/80 to-transparent">
           <div className="flex items-center gap-3 pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] pt-[max(0.75rem,env(safe-area-inset-top))] pb-3 sm:gap-6 sm:pl-[max(2rem,env(safe-area-inset-left))] sm:pr-[max(2rem,env(safe-area-inset-right))] sm:pt-[max(1.25rem,env(safe-area-inset-top))] sm:pb-5">
             <Link
               href={backHref}
@@ -2398,7 +2530,7 @@ export function ChimpFlixPlayer({
             doesn't get crowded; mobile chrome already has thumb-reach
             margins via the bottom-bar gradient. Safe-area-inset offsets
             push controls clear of iOS home indicator + landscape notch. */}
-        <div className="pointer-events-auto absolute inset-x-0 bottom-0 bg-linear-to-t from-black/85 to-transparent pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-12 sm:pl-[max(2rem,env(safe-area-inset-left))] sm:pr-[max(2rem,env(safe-area-inset-right))] sm:pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:pt-16">
+        <div className="absolute inset-x-0 bottom-0 bg-linear-to-t from-black/85 to-transparent pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-12 sm:pl-[max(2rem,env(safe-area-inset-left))] sm:pr-[max(2rem,env(safe-area-inset-right))] sm:pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:pt-16">
           <div className="flex items-center gap-2 sm:gap-3">
             {/*
               Current position, left of the bar. Always visible so the
@@ -2493,6 +2625,11 @@ export function ChimpFlixPlayer({
                 <EpisodesControl
                   open={episodesOpen}
                   episodes={seasonEpisodes}
+                  currentRatingKey={currentRatingKey}
+                  currentSeasonId={currentSeasonId}
+                  showId={showId}
+                  showTitle={showTitle}
+                  seasons={seasons}
                   onToggle={() => setEpisodesOpen((o) => !o)}
                   onClose={() => setEpisodesOpen(false)}
                 />
@@ -2892,11 +3029,18 @@ function SubtitleSettingsControl({
       {open && (
         <div
           role="menu"
-          className="fixed inset-x-2 bottom-2 z-50 max-h-[75vh] overflow-y-auto rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:max-h-none sm:w-96 sm:overflow-hidden"
+          // Landscape phones are short — 75vh used to leave the menu
+          // taller than the viewport, anchored at the bottom, with the
+          // top (sync offset section) clipped off-screen. Anchor with
+          // top+bottom so the menu fills the available height and uses
+          // an inner scroll container; bumping max-h alone doesn't help
+          // in landscape where 85vh ≈ 300px.
+          className="fixed inset-x-2 top-2 bottom-2 z-50 flex flex-col overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:top-auto sm:right-0 sm:mb-3 sm:max-h-[80vh] sm:w-96"
         >
-          <div className="border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
+          <div className="shrink-0 border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
             Subtitle settings
           </div>
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
           <div className="px-4 py-3">
             <div className="mb-1 flex items-center justify-between text-[0.65rem] font-semibold uppercase tracking-wider text-white/55">
               <span>Sync offset</span>
@@ -2927,6 +3071,7 @@ function SubtitleSettingsControl({
               Appearance
             </div>
             <SubtitleAppearancePanel value={appearance} onChange={onAppearanceChange} />
+          </div>
           </div>
         </div>
       )}
@@ -3415,23 +3560,61 @@ function SpeedControl({
 function EpisodesControl({
   open,
   episodes,
+  currentRatingKey,
+  currentSeasonId,
+  showId,
+  showTitle,
+  seasons,
   onToggle,
   onClose,
 }: {
   open: boolean;
   episodes: EpisodeSibling[];
+  currentRatingKey?: string;
+  currentSeasonId?: number;
+  showId?: number;
+  showTitle?: string;
+  seasons?: { id: number; season_number: number; title: string | null }[];
   onToggle: () => void;
   onClose: () => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
+  // Local override for season-switching. `null` means "show the route's
+  // current season" — the popup re-opens to that state because the
+  // override is cleared whenever the popup is dismissed (see the close
+  // handler in the wrapper). Storing only an override avoids the
+  // cascading-render setState-in-effect that would otherwise be needed
+  // to reset state when `open` flips back to true.
+  const [override, setOverride] = useState<{
+    seasonId: number;
+    episodes: EpisodeSibling[];
+    label: string | undefined;
+  } | null>(null);
+  const [loadingSeason, setLoadingSeason] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  const viewSeasonId = override?.seasonId ?? currentSeasonId;
+  const viewEpisodes = override?.episodes ?? episodes;
+  const viewSeasonLabel = override?.label ?? episodes[0]?.parentTitle;
+
+  // Wrapper close handler: clear the override + collapse the picker so
+  // the popup is "fresh" on the next open. Keeps the effect-free reset.
+  const handleClose = useCallback(() => {
+    setOverride(null);
+    setPickerOpen(false);
+    onClose();
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) return;
     function onDocClick(e: MouseEvent) {
-      if (!wrapRef.current?.contains(e.target as Node)) onClose();
+      if (!wrapRef.current?.contains(e.target as Node)) handleClose();
     }
     function onEsc(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        if (pickerOpen) setPickerOpen(false);
+        else handleClose();
+      }
     }
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onEsc);
@@ -3439,9 +3622,37 @@ function EpisodesControl({
       document.removeEventListener("mousedown", onDocClick);
       document.removeEventListener("keydown", onEsc);
     };
-  }, [open, onClose]);
+  }, [open, handleClose, pickerOpen]);
 
-  const seasonLabel = episodes[0]?.parentTitle;
+  async function switchSeason(seasonId: number) {
+    setLoadingSeason(true);
+    try {
+      const season = await seasonsApi.get(seasonId);
+      const mapped: EpisodeSibling[] = season.episodes.map((e) => ({
+        ratingKey: `e${e.id}`,
+        title: e.title,
+        thumb: plexImage(e.thumb_path ?? undefined, 320, 180) ?? undefined,
+        summary: e.summary ?? undefined,
+        duration: e.duration_ms ?? undefined,
+        viewOffset: e.play_state?.position_ms,
+        index: e.episode_number,
+        parentTitle: `Season ${e.season_number}`,
+      }));
+      setOverride({
+        seasonId,
+        episodes: mapped,
+        label: mapped[0]?.parentTitle,
+      });
+      setPickerOpen(false);
+    } catch {
+      // Best-effort — leave the existing pane in place if the season
+      // fetch fails so the user isn't stuck in a half-loaded picker.
+    } finally {
+      setLoadingSeason(false);
+    }
+  }
+
+  const canShowPicker = !!(seasons && seasons.length > 1 && showId !== undefined);
 
   return (
     <div ref={wrapRef} className="relative">
@@ -3458,76 +3669,240 @@ function EpisodesControl({
           role="menu"
           className="fixed inset-x-2 bottom-2 z-50 max-h-[75vh] overflow-y-auto rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:max-h-none sm:w-md sm:overflow-hidden"
         >
-          {seasonLabel && (
-            <div className="border-b border-white/10 px-4 py-3 text-sm font-semibold">
-              {seasonLabel}
-            </div>
+          {pickerOpen ? (
+            <SeasonPickerPane
+              showTitle={showTitle ?? "Seasons"}
+              seasons={seasons ?? []}
+              currentSeasonId={viewSeasonId}
+              loading={loadingSeason}
+              onBack={() => setPickerOpen(false)}
+              onSelect={switchSeason}
+            />
+          ) : (
+            <>
+              <div className="flex items-center gap-2 border-b border-white/10 px-3 py-3">
+                {canShowPicker ? (
+                  <button
+                    type="button"
+                    onClick={() => setPickerOpen(true)}
+                    aria-label="Choose season"
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+                  >
+                    <svg
+                      width="18"
+                      height="18"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden
+                    >
+                      <line x1="19" y1="12" x2="5" y2="12" />
+                      <polyline points="12 19 5 12 12 5" />
+                    </svg>
+                  </button>
+                ) : null}
+                <div className="truncate text-sm font-semibold">
+                  {viewSeasonLabel ?? "Episodes"}
+                </div>
+              </div>
+              <ul className="max-h-112 overflow-y-auto">
+                {viewEpisodes.map((ep) => (
+                  <EpisodeRow
+                    key={ep.ratingKey}
+                    episode={ep}
+                    active={ep.ratingKey === currentRatingKey}
+                    onClose={handleClose}
+                  />
+                ))}
+              </ul>
+            </>
           )}
-          <ul className="max-h-112 overflow-y-auto">
-            {episodes.map((ep) => (
-              <EpisodeRow key={ep.ratingKey} episode={ep} onClose={onClose} />
-            ))}
-          </ul>
         </div>
       )}
     </div>
   );
 }
 
+function SeasonPickerPane({
+  showTitle,
+  seasons,
+  currentSeasonId,
+  loading,
+  onBack,
+  onSelect,
+}: {
+  showTitle: string;
+  seasons: { id: number; season_number: number; title: string | null }[];
+  currentSeasonId?: number;
+  loading: boolean;
+  onBack: () => void;
+  onSelect: (seasonId: number) => void;
+}) {
+  return (
+    <div>
+      <div className="flex items-center gap-2 border-b border-white/10 px-3 py-3">
+        <button
+          type="button"
+          onClick={onBack}
+          aria-label="Back to episodes"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+        >
+          <svg
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <line x1="19" y1="12" x2="5" y2="12" />
+            <polyline points="12 19 5 12 12 5" />
+          </svg>
+        </button>
+        <div className="truncate text-sm font-semibold">{showTitle}</div>
+      </div>
+      <ul className="max-h-112 overflow-y-auto">
+        {seasons.map((s) => {
+          const active = s.id === currentSeasonId;
+          const label = s.title?.trim() || `Season ${s.season_number}`;
+          return (
+            <li key={s.id}>
+              <button
+                type="button"
+                disabled={loading}
+                onClick={() => onSelect(s.id)}
+                className={`flex w-full items-center gap-3 border-b border-white/5 px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-white/5 disabled:opacity-50 ${
+                  active ? "bg-white/5" : ""
+                }`}
+              >
+                <span
+                  aria-hidden
+                  className={`flex h-4 w-4 shrink-0 items-center justify-center text-(--color-accent) ${
+                    active ? "opacity-100" : "opacity-0"
+                  }`}
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                </span>
+                <span className="text-sm font-medium">{label}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 function EpisodeRow({
   episode,
+  active,
   onClose,
 }: {
   episode: EpisodeSibling;
+  active: boolean;
   onClose: () => void;
 }) {
   const progress =
     episode.viewOffset && episode.duration
       ? Math.min(100, (episode.viewOffset / episode.duration) * 100)
       : null;
+
+  // Netflix's pattern: the row the viewer is *on* gets the rich
+  // thumbnail-plus-synopsis treatment; every other row is a compact
+  // number + title strip with a small progress underline. This keeps
+  // the popup short so it doesn't dominate the player chrome and
+  // makes the active episode pop without needing a separate accent
+  // colour.
+  if (active) {
+    return (
+      <li>
+        <Link
+          href={`/watch/${episode.ratingKey}`}
+          onClick={onClose}
+          aria-current="true"
+          className="flex gap-3 border-b border-white/5 border-l-2 border-l-(--color-accent) bg-white/5 px-4 py-3 transition-colors last:border-b-0 hover:bg-white/10"
+        >
+          <div className="relative aspect-video w-32 shrink-0 overflow-hidden rounded bg-black/50">
+            {episode.thumb && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={episode.thumb}
+                alt=""
+                loading="lazy"
+                className="h-full w-full object-cover"
+              />
+            )}
+            {progress !== null && (
+              <div className="absolute inset-x-0 bottom-0 h-0.5 bg-white/25">
+                <div
+                  className="h-full bg-(--color-accent)"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            )}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-baseline gap-2">
+              {episode.index !== undefined && (
+                <span className="text-sm font-semibold tabular-nums text-white/85">
+                  {episode.index}
+                </span>
+              )}
+              <span className="line-clamp-1 text-sm font-medium">
+                {episode.title}
+              </span>
+            </div>
+            {episode.summary && (
+              <p className="mt-1 line-clamp-2 text-xs text-white/65">
+                {episode.summary}
+              </p>
+            )}
+          </div>
+        </Link>
+      </li>
+    );
+  }
+
   return (
     <li>
       <Link
         href={`/watch/${episode.ratingKey}`}
         onClick={onClose}
-        className="flex gap-3 border-b border-white/5 px-4 py-3 transition-colors last:border-b-0 hover:bg-white/5"
+        className="flex items-center gap-3 border-b border-white/5 px-4 py-2.5 transition-colors last:border-b-0 hover:bg-white/5"
       >
-        <div className="relative aspect-video w-32 shrink-0 overflow-hidden rounded bg-black/50">
-          {episode.thumb && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={episode.thumb}
-              alt=""
-              loading="lazy"
-              className="h-full w-full object-cover"
+        {episode.index !== undefined && (
+          <span className="w-6 shrink-0 text-sm font-semibold tabular-nums text-white/70">
+            {episode.index}
+          </span>
+        )}
+        <span className="line-clamp-1 flex-1 text-sm text-white/90">
+          {episode.title}
+        </span>
+        {progress !== null && (
+          <span className="hidden h-0.5 w-12 shrink-0 overflow-hidden rounded bg-white/15 sm:block">
+            <span
+              className="block h-full bg-(--color-accent)"
+              style={{ width: `${progress}%` }}
             />
-          )}
-          {progress !== null && (
-            <div className="absolute inset-x-0 bottom-0 h-0.5 bg-white/25">
-              <div
-                className="h-full bg-(--color-accent)"
-                style={{ width: `${progress}%` }}
-              />
-            </div>
-          )}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-baseline gap-2">
-            {episode.index !== undefined && (
-              <span className="text-sm font-semibold tabular-nums text-white/85">
-                {episode.index}
-              </span>
-            )}
-            <span className="line-clamp-1 text-sm font-medium">
-              {episode.title}
-            </span>
-          </div>
-          {episode.summary && (
-            <p className="mt-1 line-clamp-2 text-xs text-white/65">
-              {episode.summary}
-            </p>
-          )}
-        </div>
+          </span>
+        )}
       </Link>
     </li>
   );

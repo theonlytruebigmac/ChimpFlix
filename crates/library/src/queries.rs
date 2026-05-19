@@ -6540,6 +6540,12 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.preroll_volume {
+        sqlx::query("UPDATE server_settings SET preroll_volume = ? WHERE id = 1")
+            .bind(v.clamp(0, 100))
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.transcoder_hevc_encoding_mode {
         if !matches!(v.as_str(), "off" | "when_client_supports" | "always") {
             anyhow::bail!(

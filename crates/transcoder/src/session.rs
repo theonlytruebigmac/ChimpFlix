@@ -1794,7 +1794,16 @@ async fn spawn_ffmpeg(
                                 if let Ok(mut inner) = tokio::fs::read_dir(e.path()).await {
                                     while let Ok(Some(f)) = inner.next_entry().await {
                                         if let Some(name) = f.file_name().to_str() {
-                                            if name.starts_with("seg-") && name.ends_with(".ts") {
+                                            // Both `.ts` (MPEG-TS) and
+                                            // `.m4s` (fmp4) sessions ship.
+                                            // The latter was previously
+                                            // invisible to this counter,
+                                            // so fmp4 sessions logged
+                                            // seg_count=0 forever.
+                                            if name.starts_with("seg-")
+                                                && (name.ends_with(".ts")
+                                                    || name.ends_with(".m4s"))
+                                            {
                                                 seg_count += 1;
                                             }
                                         }
@@ -1818,6 +1827,7 @@ async fn spawn_ffmpeg(
     if let Some(stderr) = child.stderr.take() {
         let session_id_str = session_id.to_string();
         let pid = child.id();
+        let session_dir_for_finalize = session_dir.to_path_buf();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             const RING_CAP: usize = 8;
@@ -1896,13 +1906,29 @@ async fn spawn_ffmpeg(
             } else {
                 "no pid captured".to_string()
             };
+            // Don't claim "session will produce no further segments" —
+            // that's only true if ffmpeg has actually exited. The
+            // stderr pipe can be drained early (kernel buffer closed,
+            // ffmpeg holding only stdout) while the encoder keeps
+            // writing segments to disk just fine. Heartbeat monitor
+            // above is authoritative on liveness via kill(pid, 0).
             warn!(
                 session_id = %session_id_str,
                 pid = ?pid,
                 exit = %exit_detail,
                 stderr_tail = %tail,
-                "ffmpeg child exited (stderr closed) — session will produce no further segments",
+                "ffmpeg stderr drained — liveness now tracked solely by the heartbeat monitor",
             );
+            // Make sure each variant playlist carries `#EXT-X-ENDLIST`.
+            // When ffmpeg exits cleanly it adds this itself; when it
+            // exits less-cleanly (zombie, kernel-buffer close, signal)
+            // it can leave an open-ended playlist behind. Without
+            // ENDLIST, the player keeps polling for segment N+1 and
+            // eventually surfaces "Playback stalled and could not
+            // recover" — even though the encoder is actually done.
+            // Idempotent: we only append if the marker isn't already
+            // present, so a clean-exit playlist stays unchanged.
+            finalize_playlists(&session_dir_for_finalize).await;
         });
     }
 
@@ -1975,6 +2001,58 @@ pub async fn evict_text_subs_cache(cache_root: &Path, input: &Path) -> Result<()
 /// (one per non-mapped PGS stream, on every session). They're
 /// harmless because we don't map those streams; they appear only
 /// because the demuxer probes every stream regardless.
+/// Append `#EXT-X-ENDLIST` to each variant playlist when the encoder
+/// is known to be done. ffmpeg writes this itself on a graceful exit
+/// (it's required for `-hls_playlist_type event` semantics), but a
+/// rough exit — zombie process, kernel-buffer close, signal — can
+/// leave the playlist open-ended. The player then keeps polling for
+/// segment N+1 forever and surfaces a "playback failed" overlay even
+/// though the stream actually ended.
+///
+/// Idempotent. Best-effort: any IO error is logged and ignored, the
+/// client's stall watchdog still catches the worst case.
+async fn finalize_playlists(session_dir: &Path) {
+    let mut entries = match tokio::fs::read_dir(session_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                dir = %session_dir.display(),
+                "finalize_playlists: read_dir failed",
+            );
+            return;
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let playlist = entry.path().join("index.m3u8");
+        let body = match tokio::fs::read_to_string(&playlist).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if body.contains("#EXT-X-ENDLIST") {
+            continue;
+        }
+        let mut updated = body;
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("#EXT-X-ENDLIST\n");
+        if let Err(e) = tokio::fs::write(&playlist, updated.as_bytes()).await {
+            tracing::debug!(
+                error = %e,
+                playlist = %playlist.display(),
+                "finalize_playlists: write failed",
+            );
+        }
+    }
+}
+
 fn is_benign_ffmpeg_line(line: &str) -> bool {
     // PGS / DVD / VobSub probe noise on Bluray remuxes. Match by
     // substring so we catch both the "Could not find codec

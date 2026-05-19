@@ -48,9 +48,21 @@ function writeCachedRole(value: UserRole | null): void {
 }
 
 function useCurrentUserRole(): UserRole | null {
-  const [role, setRole] = useState<UserRole | null>(() => readCachedRole());
+  // MUST start `null` for SSR + first client render to agree. Reading
+  // the sessionStorage cache in the `useState` initializer used to flip
+  // the role between server (`null`) and client (cached value) on
+  // hydration — a textual mismatch in the admin-only nav items that
+  // triggered React error #418 and crashed mobile Chrome's renderer
+  // with "Aw, snap". The cached value is populated in the effect below
+  // so the admin items still appear without a network round-trip; they
+  // just appear in the *second* client render instead of fighting
+  // hydration on the first.
+  const [role, setRole] = useState<UserRole | null>(null);
   useEffect(() => {
     let cancelled = false;
+    const cached = readCachedRole();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (cached) setRole(cached);
     authApi
       .me()
       .then(({ user }) => {
@@ -130,12 +142,17 @@ function libraryItem(lib: NavLibrary): NavItem {
 /// Shared hook — fetches the user's visible libraries once and caches
 /// in sessionStorage. Both the desktop bar and mobile drawer consume it.
 function useNavLibraries(): NavLibrary[] {
-  const [libraries, setLibraries] = useState<NavLibrary[]>(
-    () => readCached() ?? [],
-  );
+  // Empty array initial so SSR + first client render match. The cached
+  // value from sessionStorage gets applied in the effect below — same
+  // pattern as the role hook above, same reason (hydration mismatch
+  // crashed mobile Chrome's renderer).
+  const [libraries, setLibraries] = useState<NavLibrary[]>([]);
 
   useEffect(() => {
     let cancelled = false;
+    const cached = readCached();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (cached) setLibraries(cached);
     Promise.all([librariesApi.list(), prefsApi.hiddenLibraries()])
       .then(([{ libraries: all }, { library_ids: hiddenIds }]) => {
         if (cancelled) return;
