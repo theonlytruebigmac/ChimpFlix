@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Json, Response};
 use chimpflix_library::queries;
 use serde::Serialize;
 
+use crate::api::access;
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
@@ -40,9 +41,10 @@ pub struct ChaptersResponse {
 
 pub async fn list(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<ChaptersResponse>, ApiError> {
+    access::ensure_file_accessible(&state, &user, id).await?;
     let path = queries::get_media_file_path(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?
@@ -83,9 +85,10 @@ pub async fn list(
 
 pub async fn thumb(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path((id, index)): Path<(i64, u32)>,
 ) -> Result<Response, ApiError> {
+    access::ensure_file_accessible(&state, &user, id).await?;
     let root = state.data_dir.join("chapter_thumbs");
     let path =
         chimpflix_transcoder::chapter_thumbs::thumb_path(&root, id, index);

@@ -113,7 +113,9 @@ pub async fn probe_gop(
             "-read_intervals",
             &interval,
         ])
-        .arg(path)
+        // file: prefix prevents leading-`-` filenames from being parsed
+        // as ffprobe flags (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(path))
         .output()
         .await
         .with_context(|| format!("spawn ffprobe (gop) for {}", path.display()))?;
@@ -204,7 +206,9 @@ pub async fn probe(cfg: &FfmpegConfig, path: &Path) -> Result<ProbeResult> {
             "-show_streams",
             "-show_format",
         ])
-        .arg(path)
+        // file: prefix prevents leading-`-` filenames from being parsed
+        // as ffprobe flags (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(path))
         .output()
         .await
         .with_context(|| format!("spawn ffprobe for {}", path.display()))?;
@@ -287,7 +291,9 @@ pub async fn probe_chapters(cfg: &FfmpegConfig, path: &Path) -> Result<Vec<Chapt
             "json",
             "-show_chapters",
         ])
-        .arg(path)
+        // file: prefix prevents leading-`-` filenames from being parsed
+        // as ffprobe flags (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(path))
         .output()
         .await
         .with_context(|| format!("spawn ffprobe (chapters) for {}", path.display()))?;
@@ -374,7 +380,9 @@ pub async fn probe_subtitle_codec(
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
-        .arg(path)
+        // file: prefix prevents leading-`-` filenames from being parsed
+        // as ffprobe flags (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(path))
         .output()
         .await
         .with_context(|| format!("spawn ffprobe (subtitle codec) for {}", path.display()))?;

@@ -90,7 +90,9 @@ pub async fn detect_markers(
         .background_ffmpeg()
         .args(["-hide_banner", "-nostats", "-loglevel", "info"])
         .arg("-i")
-        .arg(path)
+        // file: prefix prevents a filename starting with `-` from being
+        // parsed as a flag (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(path))
         // d=1 → minimum 1s of black; pix_th low so fades are picked up.
         .args(["-vf", "blackdetect=d=1:pix_th=0.10"])
         .args(["-an", "-sn", "-f", "null"])

@@ -53,6 +53,22 @@ pub async fn open_with(
         .await
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
+    // SECURITY: lock the data dir down to owner-only. The DB carries
+    // hashed passwords, session-cookie HMAC, SMTP creds, TOTP secrets,
+    // and the credential vault. Inheriting umask (typically 022 → 0755
+    // / 0644) means any local UID could read it; a hostile sibling
+    // container or compromised neighbouring service would walk in.
+    // Best-effort: log on failure but don't abort the boot (FAT/SMB
+    // mounts and Windows containers don't honour Unix perms).
+    #[cfg(unix)]
+    if let Err(e) = lock_down_data_dir(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %format!("{e:#}"),
+            "could not chmod data dir to 0700; secrets may be readable by other users"
+        );
+    }
+
     let db_path = data_dir.join("chimpflix.db");
     let url = format!("sqlite://{}", db_path.display());
 
@@ -125,10 +141,42 @@ pub async fn open_with(
         .await
         .context("open library database")?;
 
+    // Tighten DB file perms after the pool has opened (and thus
+    // created `chimpflix.db` plus the WAL / SHM sidecar files).
+    #[cfg(unix)]
+    if let Err(e) = lock_down_db_files(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %format!("{e:#}"),
+            "could not chmod chimpflix.db to 0600"
+        );
+    }
+
     info!(
         ?db_path,
         cache_size_mb = ?cache_size_mb,
         "library database ready",
     );
     Ok(pool)
+}
+
+#[cfg(unix)]
+fn lock_down_data_dir(data_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(data_dir, perms)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_down_db_files(data_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    for name in ["chimpflix.db", "chimpflix.db-wal", "chimpflix.db-shm"] {
+        let p = data_dir.join(name);
+        if p.exists() {
+            std::fs::set_permissions(&p, perms.clone())?;
+        }
+    }
+    Ok(())
 }

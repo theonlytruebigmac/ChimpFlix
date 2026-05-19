@@ -49,20 +49,19 @@ pub async fn layer(
     };
 
     if is_preflight {
-        let req_headers = req.headers().clone();
         let mut resp = Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
             .expect("build preflight response");
         if let Some(o) = allowed_origin.as_deref() {
-            write_cors_headers(resp.headers_mut(), o, Some(&req_headers));
+            write_cors_headers(resp.headers_mut(), o, true);
         }
         return resp;
     }
 
     let mut resp = next.run(req).await;
     if let Some(o) = allowed_origin.as_deref() {
-        write_cors_headers(resp.headers_mut(), o, None);
+        write_cors_headers(resp.headers_mut(), o, false);
     }
     resp
 }
@@ -73,16 +72,24 @@ async fn origin_allowed(state: &AppState, origin: &str) -> bool {
     if allow_list.is_empty() {
         return false;
     }
+    // SECURITY: never honor `*` in the allow-list. With
+    // `Access-Control-Allow-Credentials: true` (which we always send),
+    // echoing an arbitrary origin produces the classic "credentialled
+    // wildcard" misconfig that lets any external site read auth'd
+    // responses from our API. Operators who genuinely need an open
+    // API would have to remove the credentialled-CORS coupling first,
+    // which is a deliberate design choice we don't want one stray
+    // settings entry to undo.
     allow_list.iter().any(|entry| {
         let e = entry.trim();
-        e == "*" || e.eq_ignore_ascii_case(origin)
+        !e.is_empty() && e != "*" && e.eq_ignore_ascii_case(origin)
     })
 }
 
 fn write_cors_headers(
     headers: &mut HeaderMap,
     origin: &str,
-    preflight_req_headers: Option<&HeaderMap>,
+    is_preflight: bool,
 ) {
     if let Ok(v) = HeaderValue::from_str(origin) {
         headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
@@ -93,21 +100,20 @@ fn write_cors_headers(
     );
     headers.insert(header::VARY, HeaderValue::from_static("Origin"));
 
-    if let Some(req_headers) = preflight_req_headers {
-        let methods_value = req_headers
-            .get(HeaderName::from_static("access-control-request-method"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_ALLOWED_METHODS);
-        if let Ok(v) = HeaderValue::from_str(methods_value) {
-            headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
-        }
-        let headers_value = req_headers
-            .get(HeaderName::from_static("access-control-request-headers"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_ALLOWED_HEADERS);
-        if let Ok(v) = HeaderValue::from_str(headers_value) {
-            headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
-        }
+    if is_preflight {
+        // Fixed allow-lists rather than echoing the preflight request.
+        // Echoing `Access-Control-Request-Headers` lets a forged
+        // preflight bypass any custom-header CSRF defence we might
+        // add later (`X-CSRF-Token` would trivially appear in any
+        // future `access-control-request-headers: x-csrf-token`).
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static(DEFAULT_ALLOWED_METHODS),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static(DEFAULT_ALLOWED_HEADERS),
+        );
         headers.insert(
             header::ACCESS_CONTROL_MAX_AGE,
             HeaderValue::from_static(PREFLIGHT_MAX_AGE_SECS),

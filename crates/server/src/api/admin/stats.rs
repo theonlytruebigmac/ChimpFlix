@@ -81,9 +81,26 @@ pub struct ActivityResponse {
 
 pub async fn activity(
     State(state): State<AppState>,
-    _admin: AdminAuth,
+    AdminAuth(actor): AdminAuth,
     Query(q): Query<ActivityQuery>,
 ) -> Result<Json<ActivityResponse>, ApiError> {
+    // Guard the per-user drill-in against Admin → Owner spying. The
+    // global feed (no user_id) stays accessible to all admins; targeted
+    // queries against an Owner's playback history require the caller
+    // to also be an Owner.
+    if let Some(target_id) = q.user_id {
+        if !matches!(actor.role, chimpflix_library::UserRole::Owner) {
+            if let Some(target) =
+                chimpflix_library::queries::find_user_by_id(&state.pool, target_id)
+                    .await
+                    .map_err(ApiError::Internal)?
+            {
+                if matches!(target.role, chimpflix_library::UserRole::Owner) {
+                    return Err(ApiError::Forbidden);
+                }
+            }
+        }
+    }
     let limit = q.limit.unwrap_or(50);
     let events =
         queries::list_playback_activity(&state.pool, limit, q.before, q.user_id)

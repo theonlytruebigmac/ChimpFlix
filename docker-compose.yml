@@ -42,8 +42,37 @@ services:
       - /mnt/archive/movies:/media/movies:ro
       - /mnt/archive/tv:/media/shows:ro
       - /mnt/archive/anime:/media/anime:ro
+    # IMPORTANT — choose the right bind for your topology:
+    #
+    #   * Same-host Traefik (shared docker network): remove the `ports:`
+    #     block entirely. Traefik reaches the container via the compose
+    #     network (`http://server:8080`); no host port needed.
+    #
+    #   * Same-host Traefik with a host-port shim: bind to loopback to
+    #     keep the port off the public interface:
+    #         ports: ["127.0.0.1:8080:8080"]
+    #
+    #   * Cross-host Traefik (CURRENT SETUP): keep the wide bind so the
+    #     Traefik machine can reach this host's LAN IP at :8080. **You
+    #     MUST restrict :8080 with a host firewall** (ufw / iptables /
+    #     nftables) to only accept connections from the Traefik host's
+    #     LAN IP — otherwise the origin is reachable from any device on
+    #     the LAN that knows this machine's address, bypassing
+    #     Cloudflare entirely. Example ufw rule:
+    #         sudo ufw allow from <traefik-host-ip> to any port 8080 proto tcp
+    #         sudo ufw deny  in to any port 8080 proto tcp
     ports:
       - "8080:8080"
+    # Container hardening. None of these break NVENC/VAAPI; ffmpeg only
+    # needs `cap_sys_nice` for `nice -n` (we use the `nice` binary
+    # already, which doesn't need elevated caps).
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # Disable kernel-mediated mount/CHROOT etc. Apparmor profile
+    # `docker-default` is implicit on Ubuntu/Debian hosts.
     # GPU passthrough. Pick one (or both — different runtime keys,
     # they coexist) depending on the host hardware:
     #
@@ -111,5 +140,19 @@ services:
       # Runtime endpoint for /api/v1/* rewrites in next.config.ts.
       CHIMPFLIX_API_URL: http://server:8080
       TZ: America/Kentucky/Louisville
+    # See the matching comment on the `server` service. For the
+    # cross-host setup (Traefik on another machine), keep the wide
+    # bind so Traefik can reach this host's LAN IP at :3000, and add
+    # a host firewall rule to restrict :3000 to the Traefik host IP.
+    # For same-host Traefik, switch to 127.0.0.1:3000:3000 (or remove
+    # the block entirely and let the compose network handle it).
     ports:
       - "3000:3000"
+    init: true            # docker-managed tini equivalent so Next.js
+                          # (PID 1) sees SIGTERM and reaps any child
+                          # processes the Next runtime spawns.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256

@@ -18,6 +18,7 @@ use chimpflix_library::queries;
 use chimpflix_metadata::{DeviceCodeResponse, DevicePollResult};
 use serde::{Deserialize, Serialize};
 
+use crate::api::access;
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
@@ -113,6 +114,7 @@ pub async fn link_poll(
             let expires_at = now_ms() + pair.expires_in * 1000;
             queries::upsert_trakt_tokens(
                 &state.pool,
+                &state.vault,
                 user.id,
                 &pair.access_token,
                 &pair.refresh_token,
@@ -153,7 +155,7 @@ pub async fn status(
     user: AuthUser,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let app_configured = state.trakt_snapshot().await.is_some();
-    let tokens = queries::get_trakt_tokens(&state.pool, user.id)
+    let tokens = queries::get_trakt_tokens(&state.pool, &state.vault, user.id)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(match tokens {
@@ -225,6 +227,7 @@ pub async fn get_item_rating(
     user: AuthUser,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<RatingResponse>, ApiError> {
+    access::ensure_item_accessible(&state, &user, id).await?;
     let rating = queries::get_user_rating_for_item(&state.pool, user.id, id)
         .await
         .map_err(ApiError::Internal)?;
@@ -237,6 +240,7 @@ pub async fn put_item_rating(
     axum::extract::Path(id): axum::extract::Path<i64>,
     Json(input): Json<RatingInput>,
 ) -> Result<Json<RatingResponse>, ApiError> {
+    access::ensure_item_accessible(&state, &user, id).await?;
     let row = queries::set_user_rating(&state.pool, user.id, Some(id), None, input.rating)
         .await
         .map_err(|e| ApiError::validation(format!("{e:#}")))?;
@@ -266,6 +270,7 @@ pub async fn delete_item_rating(
     user: AuthUser,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<RatingResponse>, ApiError> {
+    access::ensure_item_accessible(&state, &user, id).await?;
     let _ = queries::delete_user_rating(&state.pool, user.id, Some(id), None)
         .await
         .map_err(ApiError::Internal)?;
@@ -292,6 +297,7 @@ pub async fn get_episode_rating(
     user: AuthUser,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<RatingResponse>, ApiError> {
+    access::ensure_episode_accessible(&state, &user, id).await?;
     let rating = queries::get_user_rating_for_episode(&state.pool, user.id, id)
         .await
         .map_err(ApiError::Internal)?;
@@ -304,6 +310,7 @@ pub async fn put_episode_rating(
     axum::extract::Path(id): axum::extract::Path<i64>,
     Json(input): Json<RatingInput>,
 ) -> Result<Json<RatingResponse>, ApiError> {
+    access::ensure_episode_accessible(&state, &user, id).await?;
     let row = queries::set_user_rating(&state.pool, user.id, None, Some(id), input.rating)
         .await
         .map_err(|e| ApiError::validation(format!("{e:#}")))?;
@@ -336,6 +343,7 @@ pub async fn delete_episode_rating(
     user: AuthUser,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<RatingResponse>, ApiError> {
+    access::ensure_episode_accessible(&state, &user, id).await?;
     let _ = queries::delete_user_rating(&state.pool, user.id, None, Some(id))
         .await
         .map_err(ApiError::Internal)?;

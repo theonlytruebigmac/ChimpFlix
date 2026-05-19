@@ -312,9 +312,12 @@ pub async fn stage_restore(
         return Err(ApiError::NotFound);
     }
 
-    // Quick sanity check that the file is a SQLite DB by reading its
-    // 16-byte header. Cheap: avoids staging a half-downloaded or
-    // unrelated file as the next-boot DB.
+    // Sanity check: file is a SQLite DB by header bytes, AND it has
+    // the schema we expect (a `users` table — the first one every
+    // ChimpFlix migration creates). Without the schema probe, any
+    // 16-byte-headered SQLite file in the auto-backup dir would be
+    // staged and applied on next boot — giving anyone with write
+    // access to that directory persistent control over server state.
     let header_bytes = fs::read(&src)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
@@ -322,6 +325,41 @@ pub async fn stage_restore(
         return Err(ApiError::validation(format!(
             "`{filename}` does not look like a SQLite database file"
         )));
+    }
+    // Open read-only and confirm `users` exists. Cheap probe; doesn't
+    // run any migrations or change the file.
+    {
+        let url = format!(
+            "sqlite:{}?mode=ro&immutable=1",
+            src.to_string_lossy()
+        );
+        match sqlx::SqlitePool::connect(&url).await {
+            Ok(pool) => {
+                let probe: Result<(i64,), _> = sqlx::query_as(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'users'",
+                )
+                .fetch_one(&pool)
+                .await;
+                let _ = pool.close().await;
+                match probe {
+                    Ok((n,)) if n > 0 => {}
+                    _ => {
+                        return Err(ApiError::validation(format!(
+                            "`{filename}` is a SQLite file but doesn't look like \
+                             a ChimpFlix backup (no `users` table). Refusing to \
+                             stage it as the next-boot database."
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(ApiError::validation(format!(
+                    "`{filename}` failed to open as SQLite (corrupt? \
+                     wrong format?): {e}"
+                )));
+            }
+        }
     }
 
     let staged = state.data_dir.join(STAGED_RESTORE_FILENAME);

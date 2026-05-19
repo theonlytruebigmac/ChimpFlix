@@ -73,6 +73,28 @@ pub async fn patch(
 }
 
 fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
+    // SECURITY: `preroll_path` is read by `/preroll/blob` to serve raw
+    // bytes from `data/preroll/<path>`. Without sanitisation an admin
+    // (or a session-hijacked admin) could PATCH `preroll_path` to
+    // `../../etc/passwd` and the serve endpoint would happily stream
+    // it back. Restrict to a single filename component (no slashes,
+    // no `..`, no leading `.`, no NUL). The upload handler enforces
+    // its own narrower rule (preroll.{mp4|webm|mkv}); this is the
+    // generic-settings-PATCH belt-and-suspenders.
+    if let Some(Some(ref p)) = patch.preroll_path {
+        let bad = p.is_empty()
+            || p.contains('/')
+            || p.contains('\\')
+            || p.contains('\0')
+            || p.contains("..")
+            || p.starts_with('.');
+        if bad {
+            return Err(ApiError::validation(
+                "preroll_path must be a single filename without `..`, slashes, \
+                 a leading dot, or NUL bytes",
+            ));
+        }
+    }
     if let Some(ref s) = patch.secure_connections {
         if !matches!(s.as_str(), "required" | "preferred" | "disabled") {
             return Err(ApiError::validation(
@@ -156,7 +178,33 @@ fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
     if let Some(ref raw) = patch.cors_origins {
         let parsed: serde_json::Result<Vec<String>> = serde_json::from_str(raw);
         match parsed {
-            Ok(_) => {}
+            Ok(list) => {
+                // Reject the wildcard entry. The CORS middleware also
+                // refuses to honour `*` at request time (it would echo
+                // an arbitrary origin with `Access-Control-Allow-
+                // Credentials: true`, the classic credentialled-
+                // wildcard misconfig). Catching it at write time gives
+                // the operator an immediate error rather than a
+                // mysterious "CORS just doesn't work" later.
+                for entry in &list {
+                    let trimmed = entry.trim();
+                    if trimmed == "*" {
+                        return Err(ApiError::validation(
+                            "cors_origins cannot contain `*`. List explicit origins \
+                             (e.g. https://flix.example.com) or leave the list empty \
+                             to disable CORS entirely.",
+                        ));
+                    }
+                    if !trimmed.is_empty()
+                        && !trimmed.starts_with("http://")
+                        && !trimmed.starts_with("https://")
+                    {
+                        return Err(ApiError::validation(format!(
+                            "cors_origins entry `{trimmed}` must start with http:// or https://",
+                        )));
+                    }
+                }
+            }
             Err(_) => {
                 return Err(ApiError::validation(
                     "cors_origins must be a JSON array of strings",

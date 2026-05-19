@@ -7,9 +7,11 @@
 //! * `GET /api/v1/stream/sessions/{id}/{variant}/{name}` — variant
 //!   manifest and segments.
 
+use std::net::IpAddr;
 use std::path::Path as StdPath;
 use std::time::{Duration, Instant};
 
+use axum::Extension;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -23,51 +25,32 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::api::error::ApiError;
-use crate::api::rate_limit;
 use crate::auth::AuthUser;
+use crate::client_ip::EffectiveClientIp;
 use crate::net;
 use crate::state::AppState;
 
 /// Classify the request as "remote" (not on the operator-defined LAN)
-/// for the per-user remote-streams cap. When the LAN list is empty or
-/// the request headers don't carry a parseable client IP, we treat the
-/// request as remote — the cap-then-reject path is more conservative
-/// than the cap-bypass path for the cases we can't classify.
-fn is_remote_request(headers: &HeaderMap, lan_raw: &str) -> bool {
+/// for the per-user remote-streams cap. Empty LAN list = always remote
+/// (cap-then-reject is the conservative path).
+///
+/// `ip` MUST be the effective client IP — the trusted-proxy-resolved
+/// value from [`crate::client_ip::EffectiveClientIp`]. Reading raw
+/// `X-Forwarded-For` here would let a remote attacker spoof `LAN` and
+/// bypass the per-user cap.
+fn is_remote_request(ip: IpAddr, lan_raw: &str) -> bool {
     let trimmed = lan_raw.trim();
     if trimmed.is_empty() {
         return true;
     }
-    let Some(raw_ip) = rate_limit::header_client_ip(headers) else {
-        return true;
-    };
-    let Ok(ip) = raw_ip.parse::<std::net::IpAddr>() else {
-        return true;
-    };
     let nets = net::parse_cidr_list(trimmed);
     !net::ip_in_list(ip, &nets)
 }
 
-/// Reject the request if the user can't see the library this file belongs
-/// to. Returns 404 (not 403) so we don't leak that the file exists.
-async fn ensure_file_accessible(
-    state: &AppState,
-    user: &AuthUser,
-    file_id: i64,
-) -> Result<(), ApiError> {
-    let acc = queries::user_library_filter(&state.pool, user.id, user.role)
-        .await
-        .map_err(ApiError::Internal)?;
-    let Some(allowed) = acc else { return Ok(()) };
-    let lib_id = queries::media_file_library_id(&state.pool, file_id)
-        .await
-        .map_err(ApiError::Internal)?
-        .ok_or(ApiError::NotFound)?;
-    if !allowed.contains(&lib_id) {
-        return Err(ApiError::NotFound);
-    }
-    Ok(())
-}
+// Stream-side library access enforcement lives in [`crate::api::access`].
+// Re-export under the local name so existing callsites don't need to
+// chase a different module path.
+use crate::api::access::ensure_file_accessible;
 
 // ---------------------------------------------------------------------------
 // Direct play (HTTP Range)
@@ -327,16 +310,19 @@ pub struct SessionInfo {
 pub async fn create_session(
     State(state): State<AppState>,
     user: AuthUser,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    create_session_impl(&state, &user, &headers, req).await
+    create_session_impl(&state, &user, &headers, ip, req).await
 }
 
 /// Fire-and-forget recorder for the playback `start` event. Failures
 /// are logged but never surfaced — stats are observability and must
 /// not gate playback. Spawned so the user's POST returns immediately;
 /// the insert happens in the background.
+///
+/// `ip` is the trusted-proxy-resolved effective client IP.
 fn record_start_event(
     state: &AppState,
     user_id: i64,
@@ -345,10 +331,11 @@ fn record_start_event(
     container: Option<String>,
     duration_ms: Option<i64>,
     headers: &HeaderMap,
+    ip: Option<IpAddr>,
     session_token: Option<String>,
 ) {
     let pool = state.pool.clone();
-    let ip = rate_limit::header_client_ip(headers);
+    let ip = ip.map(|i| i.to_string());
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -385,6 +372,7 @@ async fn create_session_impl(
     state: &AppState,
     user: &AuthUser,
     headers: &HeaderMap,
+    ip: IpAddr,
     mut req: CreateSessionRequest,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     // Server-wide default for audio normalization. If the operator
@@ -589,6 +577,7 @@ async fn create_session_impl(
                 container.clone(),
                 duration_ms,
                 headers,
+                Some(ip),
                 None,
             );
             Ok((
@@ -639,7 +628,7 @@ async fn create_session_impl(
                 let s = state.settings.read().await;
                 (s.max_remote_streams_per_user, s.lan_networks.clone())
             };
-            if remote_cap > 0 && is_remote_request(headers, &lan_raw) {
+            if remote_cap > 0 && is_remote_request(ip, &lan_raw) {
                 let mine = state
                     .transcoder
                     .list_sessions()
@@ -1041,6 +1030,7 @@ async fn create_session_impl(
                 container.clone(),
                 duration_ms,
                 headers,
+                Some(ip),
                 Some(session.id.clone()),
             );
             let master_url = format!("/api/v1/stream/sessions/{}/master.m3u8", session.id);
@@ -1083,11 +1073,41 @@ async fn create_session_impl(
     }
 }
 
+/// Confirm the caller owns this session (or is admin/owner). Returns
+/// 404 (NOT 403) on mismatch so we don't leak whether the session id
+/// exists. Critical: without this, any authenticated user could
+/// terminate, pause, resume, or stream HLS segments from any other
+/// user's session by guessing the session id — the audit's #1 IDOR.
+fn ensure_session_accessible(
+    state: &AppState,
+    user: &AuthUser,
+    session_id: &str,
+) -> Result<std::sync::Arc<chimpflix_transcoder::Session>, ApiError> {
+    let session = state.transcoder.get(session_id).ok_or(ApiError::NotFound)?;
+    if session.user_id != user.id && !user.role.is_admin_or_owner() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(session)
+}
+
 pub async fn delete_session(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    // Verify ownership before destroying. Use the get-then-check
+    // pattern rather than delete_returning so we can refuse to
+    // operate on someone else's session.
+    if let Some(session) = state.transcoder.get(&id) {
+        if session.user_id != user.id && !user.role.is_admin_or_owner() {
+            // 404 instead of 403: don't reveal whether the id exists.
+            return Err(ApiError::NotFound);
+        }
+    } else {
+        // Idempotent on already-gone sessions.
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     // `delete_returning` snapshots the session before destroying it
     // so we can emit a stop event with the final bandwidth count.
     // Reaper-driven closes go through the same `emit_session_stop_event`
@@ -1098,23 +1118,21 @@ pub async fn delete_session(
             crate::emit_session_stop_event(&pool, &snap).await;
         });
     }
-    // Idempotent on already-gone sessions.
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Player calls this on the HTML5 `pause` event so the ffmpeg child
 /// stops burning CPU/GPU while the user isn't watching. The
 /// transcoder sends SIGSTOP; the next [`resume_session`] sends
-/// SIGCONT. Idempotent + safe to call on a non-existent session
-/// (returns 204 either way — the client should not block on it).
+/// SIGCONT. Returns 404 for missing OR non-owned sessions — the same
+/// shape masks the existence check.
 pub async fn pause_session(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(session) = state.transcoder.get(&id) {
-        let _ = session.pause();
-    }
+    let session = ensure_session_accessible(&state, &user, &id)?;
+    let _ = session.pause();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1124,21 +1142,20 @@ pub async fn pause_session(
 /// observe an explicit pause first).
 pub async fn resume_session(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(session) = state.transcoder.get(&id) {
-        let _ = session.resume();
-    }
+    let session = ensure_session_accessible(&state, &user, &id)?;
+    let _ = session.resume();
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn master_playlist(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let session = state.transcoder.get(&id).ok_or(ApiError::NotFound)?;
+    let session = ensure_session_accessible(&state, &user, &id)?;
     session.touch();
     let body = session.master_playlist();
     session.add_bytes_served(body.len() as u64);
@@ -1152,10 +1169,10 @@ pub async fn master_playlist(
 
 pub async fn variant_file(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path((id, variant, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = state.transcoder.get(&id).ok_or(ApiError::NotFound)?;
+    let session = ensure_session_accessible(&state, &user, &id)?;
     session.touch();
 
     // Whitelist allowed filenames. fMP4 sessions add `.m4s` segments
@@ -1878,6 +1895,7 @@ async fn resolve_rating_key(
 pub async fn prewarm_session(
     State(state): State<AppState>,
     user: AuthUser,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(req): Json<PrewarmRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
@@ -1896,7 +1914,7 @@ pub async fn prewarm_session(
         audio_normalize: req.audio_normalize,
         subtitle_offset_ms: 0,
     };
-    create_session_impl(&state, &user, &headers, inner).await
+    create_session_impl(&state, &user, &headers, ip, inner).await
 }
 
 /// Whether the client's declared capabilities include the given

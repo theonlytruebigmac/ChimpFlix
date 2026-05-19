@@ -15,6 +15,7 @@ use chimpflix_metadata::{
 };
 use chimpflix_transcoder::ProbeStream;
 use serde::Serialize;
+use sha2::Digest as _;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
@@ -712,6 +713,56 @@ pub async fn media_file_library_id(
          FROM media_files mf WHERE mf.id = ?",
     )
     .bind(file_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.try_get("library_id").ok()))
+}
+
+/// Owning library for an item — straight lookup, used by the access
+/// helper to enforce library_access on item-scoped endpoints.
+pub async fn item_library_id(pool: &SqlitePool, item_id: i64) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT library_id FROM items WHERE id = ?")
+        .bind(item_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get("library_id").ok()))
+}
+
+/// Owning library for an episode — walks episode → season → show → library.
+pub async fn episode_library_id(
+    pool: &SqlitePool,
+    episode_id: i64,
+) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        "SELECT i.library_id AS library_id
+           FROM episodes e
+           JOIN seasons s ON s.id = e.season_id
+           JOIN items i ON i.id = s.show_id
+           WHERE e.id = ?",
+    )
+    .bind(episode_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.try_get("library_id").ok()))
+}
+
+/// Owning library for an external subtitle row — derived from whichever
+/// of item_id / episode_id is set on the row.
+pub async fn external_subtitle_library_id(
+    pool: &SqlitePool,
+    sub_id: i64,
+) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        "SELECT COALESCE(
+             (SELECT library_id FROM items WHERE id = es.item_id),
+             (SELECT i.library_id FROM seasons s
+                JOIN items i ON i.id = s.show_id
+                JOIN episodes e ON e.season_id = s.id
+                WHERE e.id = es.episode_id)
+         ) AS library_id
+         FROM external_subtitles es WHERE es.id = ?",
+    )
+    .bind(sub_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|r| r.try_get("library_id").ok()))
@@ -1869,12 +1920,24 @@ pub async fn find_active_email_change_token(
 /// Apply the change: mark token consumed + write the new email to the
 /// user row. One transaction so a unique-index collision on email
 /// rolls back the token consumption too.
+/// Consume an email-change token. Returns the user's previous email
+/// (if any) so the caller can send a heads-up to that address — "your
+/// email was just changed to <new>, if this wasn't you, contact your
+/// admin." Without that notification an attacker who briefly had a
+/// session (via XSS or a stolen cookie) can silently re-bind the
+/// account email to one they control and then trigger a password
+/// reset, completing account takeover with the real owner none the
+/// wiser.
+///
+/// Also invalidates every OTHER pending email-change token for the
+/// same user — a single confirmed change supersedes any
+/// concurrently-issued requests.
 pub async fn consume_email_change(
     pool: &SqlitePool,
     token_id: i64,
     user_id: i64,
     new_email: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let now = now_ms();
     let mut tx = pool.begin().await?;
     let res = sqlx::query(
@@ -1889,14 +1952,33 @@ pub async fn consume_email_change(
     if res.rows_affected() == 0 {
         anyhow::bail!("email-change token already consumed");
     }
+    // Snapshot the previous email BEFORE the UPDATE so the caller can
+    // notify that address.
+    let prior: Option<String> = sqlx::query_scalar(
+        "SELECT email FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
     sqlx::query("UPDATE users SET email = ?, updated_at = ? WHERE id = ?")
         .bind(new_email)
         .bind(now)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    // Burn every other pending email-change token for this user.
+    sqlx::query(
+        "UPDATE email_change_tokens
+            SET consumed_at = ?
+          WHERE user_id = ? AND consumed_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(prior)
 }
 
 /// Replace the user's password hash. Caller is responsible for hashing
@@ -2021,6 +2103,10 @@ pub async fn create_session(
     ip: Option<&str>,
 ) -> Result<i64> {
     let now = now_ms();
+    // Store SHA-256 of the cookie nonce, NOT the raw nonce. The cookie
+    // still carries the raw 32 bytes; only the hash lives at rest. A
+    // stolen DB no longer hands the attacker a working session cookie.
+    let nonce_hash = sha2::Sha256::digest(&nonce[..]);
     let row = sqlx::query(
         "INSERT INTO sessions
             (user_id, nonce, user_agent, ip, last_seen_at, expires_at, created_at)
@@ -2028,7 +2114,7 @@ pub async fn create_session(
          RETURNING id",
     )
     .bind(user_id)
-    .bind(&nonce[..])
+    .bind(nonce_hash.as_slice())
     .bind(user_agent)
     .bind(ip)
     .bind(now)
@@ -2049,18 +2135,26 @@ pub async fn find_session(pool: &SqlitePool, id: i64) -> Result<Option<SessionRo
     };
     let nonce_blob: Vec<u8> = row.try_get("nonce")?;
     if nonce_blob.len() != 32 {
-        anyhow::bail!("corrupt session nonce length: {}", nonce_blob.len());
+        anyhow::bail!("corrupt session nonce-hash length: {}", nonce_blob.len());
     }
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&nonce_blob);
+    let mut nonce_hash = [0u8; 32];
+    nonce_hash.copy_from_slice(&nonce_blob);
     Ok(Some(SessionRow {
         id: row.try_get("id")?,
         user_id: row.try_get("user_id")?,
-        nonce,
+        nonce_hash,
         expires_at: row.try_get("expires_at")?,
         last_seen_at: row.try_get("last_seen_at")?,
         created_at: row.try_get("created_at")?,
     }))
+}
+
+/// Hash a cookie-supplied nonce the same way `create_session` does, so
+/// the extractor can verify `sha256(cookie_nonce) == session.nonce_hash`.
+pub fn hash_session_nonce(nonce: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(sha2::Sha256::digest(&nonce[..]).as_slice());
+    out
 }
 
 pub async fn touch_session(pool: &SqlitePool, id: i64) -> Result<()> {
@@ -2206,6 +2300,29 @@ pub async fn consume_password_reset(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    // Invalidate every OTHER pending password-reset token (a user
+    // resetting because they suspect compromise shouldn't leave a
+    // stolen sibling token live) and every pending email-change token
+    // (an attacker who captured an email-change token before the
+    // reset shouldn't be able to complete it after).
+    sqlx::query(
+        "UPDATE password_reset_tokens
+            SET consumed_at = ?
+          WHERE user_id = ? AND consumed_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE email_change_tokens
+            SET consumed_at = ?
+          WHERE user_id = ? AND consumed_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(sessions.rows_affected())
 }
@@ -2216,6 +2333,18 @@ pub async fn consume_password_reset(
 pub async fn cleanup_expired_password_reset_tokens(pool: &SqlitePool) -> Result<u64> {
     let now = now_ms();
     let res = sqlx::query("DELETE FROM password_reset_tokens WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Same shape as `cleanup_expired_password_reset_tokens` for the
+/// email-change flow. Both tables grow on every probe / abandoned
+/// request; the daily retention task sweeps them together.
+pub async fn cleanup_expired_email_change_tokens(pool: &SqlitePool) -> Result<u64> {
+    let now = now_ms();
+    let res = sqlx::query("DELETE FROM email_change_tokens WHERE expires_at < ?")
         .bind(now)
         .execute(pool)
         .await?;
@@ -2521,6 +2650,10 @@ pub struct SessionSummary {
     pub id: i64,
     pub user_id: i64,
     pub username: String,
+    /// Role of the user the session belongs to. Surfaced so admin
+    /// callers can filter out Owner-tier rows when the actor is only
+    /// a (non-Owner) Admin — see `list_all_sessions_for_actor`.
+    pub user_role: crate::models::UserRole,
     pub user_agent: Option<String>,
     pub ip: Option<String>,
     pub last_seen_at: i64,
@@ -2529,25 +2662,43 @@ pub struct SessionSummary {
 }
 
 pub async fn list_all_sessions(pool: &SqlitePool) -> Result<Vec<SessionSummary>> {
+    list_all_sessions_filtered(pool, false).await
+}
+
+/// List every live session. `exclude_owners=true` drops sessions
+/// belonging to Owner-role users — used when a non-Owner Admin
+/// requests `/admin/sessions`, so they can't see Owner IPs / UAs
+/// (a privilege boundary the audit flagged).
+pub async fn list_all_sessions_filtered(
+    pool: &SqlitePool,
+    exclude_owners: bool,
+) -> Result<Vec<SessionSummary>> {
     let now = now_ms();
-    let rows = sqlx::query(
-        "SELECT s.id, s.user_id, u.username,
+    let where_role = if exclude_owners {
+        "AND u.role != 'owner'"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT s.id, s.user_id, u.username, u.role AS user_role,
                 s.user_agent, s.ip,
                 s.last_seen_at, s.expires_at, s.created_at
          FROM sessions s
          JOIN users u ON u.id = s.user_id
-         WHERE s.expires_at >= ?
+         WHERE s.expires_at >= ? {where_role}
          ORDER BY s.last_seen_at DESC",
-    )
-    .bind(now)
-    .fetch_all(pool)
-    .await?;
+    );
+    let rows = sqlx::query(&sql).bind(now).fetch_all(pool).await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
+        let role_str: String = r.try_get("user_role")?;
+        let user_role = crate::models::UserRole::from_db(&role_str)
+            .unwrap_or(crate::models::UserRole::User);
         out.push(SessionSummary {
             id: r.try_get("id")?,
             user_id: r.try_get("user_id")?,
             username: r.try_get("username")?,
+            user_role,
             user_agent: r.try_get::<Option<String>, _>("user_agent").ok().flatten(),
             ip: r.try_get::<Option<String>, _>("ip").ok().flatten(),
             last_seen_at: r.try_get("last_seen_at")?,
@@ -2564,7 +2715,7 @@ pub async fn list_user_sessions(
 ) -> Result<Vec<SessionSummary>> {
     let now = now_ms();
     let rows = sqlx::query(
-        "SELECT s.id, s.user_id, u.username,
+        "SELECT s.id, s.user_id, u.username, u.role AS user_role,
                 s.user_agent, s.ip,
                 s.last_seen_at, s.expires_at, s.created_at
          FROM sessions s
@@ -2578,10 +2729,14 @@ pub async fn list_user_sessions(
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
+        let role_str: String = r.try_get("user_role")?;
+        let user_role = crate::models::UserRole::from_db(&role_str)
+            .unwrap_or(crate::models::UserRole::User);
         out.push(SessionSummary {
             id: r.try_get("id")?,
             user_id: r.try_get("user_id")?,
             username: r.try_get("username")?,
+            user_role,
             user_agent: r.try_get::<Option<String>, _>("user_agent").ok().flatten(),
             ip: r.try_get::<Option<String>, _>("ip").ok().flatten(),
             last_seen_at: r.try_get("last_seen_at")?,
@@ -7293,6 +7448,7 @@ pub struct TraktTokensRow {
 
 pub async fn upsert_trakt_tokens(
     pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
     user_id: i64,
     access_token: &str,
     refresh_token: &str,
@@ -7300,19 +7456,33 @@ pub async fn upsert_trakt_tokens(
     expires_at: i64,
 ) -> Result<()> {
     let now = now_ms();
+    // Encrypt before insert. The plaintext columns are explicitly set
+    // to NULL on upsert so a refresh-token rotation never leaves the
+    // old plaintext value behind.
+    let access_blob = vault.encrypt_str(access_token).context("encrypt trakt access_token")?;
+    let refresh_blob = vault.encrypt_str(refresh_token).context("encrypt trakt refresh_token")?;
     sqlx::query(
         "INSERT INTO user_trakt_tokens
-            (user_id, access_token, refresh_token, scope, expires_at, linked_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+            (user_id, access_token, refresh_token,
+             access_token_enc, access_token_nonce,
+             refresh_token_enc, refresh_token_nonce,
+             scope, expires_at, linked_at)
+         VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
-            access_token = excluded.access_token,
-            refresh_token = excluded.refresh_token,
+            access_token = NULL,
+            refresh_token = NULL,
+            access_token_enc = excluded.access_token_enc,
+            access_token_nonce = excluded.access_token_nonce,
+            refresh_token_enc = excluded.refresh_token_enc,
+            refresh_token_nonce = excluded.refresh_token_nonce,
             scope = excluded.scope,
             expires_at = excluded.expires_at",
     )
     .bind(user_id)
-    .bind(access_token)
-    .bind(refresh_token)
+    .bind(&access_blob.value)
+    .bind(&access_blob.nonce)
+    .bind(&refresh_blob.value)
+    .bind(&refresh_blob.nonce)
     .bind(scope)
     .bind(expires_at)
     .bind(now)
@@ -7323,6 +7493,7 @@ pub async fn upsert_trakt_tokens(
 
 pub async fn get_trakt_tokens(
     pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
     user_id: i64,
 ) -> Result<Option<TraktTokensRow>> {
     let row = sqlx::query(
@@ -7332,15 +7503,106 @@ pub async fn get_trakt_tokens(
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
+    // Prefer the encrypted column. Fall back to the legacy plaintext
+    // column for rows that haven't been migrated by the boot backfill
+    // yet — same pattern Webhook.from_row uses.
+    let access_token = decrypt_or_plaintext(
+        vault,
+        row.try_get::<Option<Vec<u8>>, _>("access_token_enc").ok().flatten(),
+        row.try_get::<Option<Vec<u8>>, _>("access_token_nonce").ok().flatten(),
+        row.try_get::<Option<String>, _>("access_token").ok().flatten(),
+    )
+    .context("decrypt trakt access_token")?
+    .ok_or_else(|| anyhow::anyhow!("trakt access_token row has neither plaintext nor ciphertext"))?;
+    let refresh_token = decrypt_or_plaintext(
+        vault,
+        row.try_get::<Option<Vec<u8>>, _>("refresh_token_enc").ok().flatten(),
+        row.try_get::<Option<Vec<u8>>, _>("refresh_token_nonce").ok().flatten(),
+        row.try_get::<Option<String>, _>("refresh_token").ok().flatten(),
+    )
+    .context("decrypt trakt refresh_token")?
+    .ok_or_else(|| anyhow::anyhow!("trakt refresh_token row has neither plaintext nor ciphertext"))?;
     Ok(Some(TraktTokensRow {
         user_id: row.try_get("user_id")?,
-        access_token: row.try_get("access_token")?,
-        refresh_token: row.try_get("refresh_token")?,
+        access_token,
+        refresh_token,
         scope: row.try_get::<Option<String>, _>("scope").ok().flatten(),
         expires_at: row.try_get("expires_at")?,
         linked_at: row.try_get("linked_at")?,
         last_synced_at: row.try_get::<Option<i64>, _>("last_synced_at").ok().flatten(),
     }))
+}
+
+/// One-shot backfill: encrypt every plaintext Trakt token row using
+/// the active vault, then NULL the legacy plaintext columns. Idempotent
+/// — re-runs are no-ops once every row is converted. Returns the
+/// number of rows migrated this call. Run from `main()` at boot.
+pub async fn backfill_trakt_tokens(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+) -> Result<usize> {
+    let rows = sqlx::query(
+        "SELECT user_id, access_token, refresh_token FROM user_trakt_tokens
+         WHERE (access_token IS NOT NULL OR refresh_token IS NOT NULL)
+           AND (access_token_enc IS NULL OR refresh_token_enc IS NULL)",
+    )
+    .fetch_all(pool)
+    .await
+    .context("scan user_trakt_tokens for plaintext rows")?;
+
+    let mut count = 0;
+    for row in rows {
+        let user_id: i64 = row.try_get("user_id")?;
+        let access_token: Option<String> =
+            row.try_get::<Option<String>, _>("access_token").ok().flatten();
+        let refresh_token: Option<String> =
+            row.try_get::<Option<String>, _>("refresh_token").ok().flatten();
+
+        let access_blob = match access_token.as_deref() {
+            Some(p) => Some(vault.encrypt_str(p).context("encrypt access_token backfill")?),
+            None => None,
+        };
+        let refresh_blob = match refresh_token.as_deref() {
+            Some(p) => Some(vault.encrypt_str(p).context("encrypt refresh_token backfill")?),
+            None => None,
+        };
+
+        sqlx::query(
+            "UPDATE user_trakt_tokens
+             SET access_token = NULL,
+                 refresh_token = NULL,
+                 access_token_enc = COALESCE(?, access_token_enc),
+                 access_token_nonce = COALESCE(?, access_token_nonce),
+                 refresh_token_enc = COALESCE(?, refresh_token_enc),
+                 refresh_token_nonce = COALESCE(?, refresh_token_nonce)
+             WHERE user_id = ?",
+        )
+        .bind(access_blob.as_ref().map(|b| b.value.clone()))
+        .bind(access_blob.as_ref().and_then(|b| b.nonce.clone()))
+        .bind(refresh_blob.as_ref().map(|b| b.value.clone()))
+        .bind(refresh_blob.as_ref().and_then(|b| b.nonce.clone()))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .with_context(|| format!("backfill trakt tokens user_id={user_id}"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Shared helper: prefer ciphertext if present, otherwise hand back the
+/// legacy plaintext. Returns `None` only when neither is set.
+fn decrypt_or_plaintext(
+    vault: &chimpflix_common::Vault,
+    enc_value: Option<Vec<u8>>,
+    enc_nonce: Option<Vec<u8>>,
+    plaintext: Option<String>,
+) -> Result<Option<String>> {
+    if let Some(value) = enc_value {
+        let blob = chimpflix_common::EncryptedBlob { value, nonce: enc_nonce };
+        return Ok(Some(vault.decrypt_str(&blob)?));
+    }
+    Ok(plaintext)
 }
 
 pub async fn delete_trakt_tokens(pool: &SqlitePool, user_id: i64) -> Result<bool> {

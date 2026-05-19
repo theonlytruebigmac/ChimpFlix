@@ -1,5 +1,8 @@
 //! /api/v1/auth handlers: setup, login, logout, me, register, invites.
 
+use std::net::IpAddr;
+
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::header::{SET_COOKIE, USER_AGENT};
@@ -17,6 +20,7 @@ use tracing::{info, warn};
 
 use crate::api::error::ApiError;
 use crate::auth::{AuthUser, OwnerAuth, SESSION_MAX_AGE_S, cookie, password};
+use crate::client_ip::EffectiveClientIp;
 use crate::mail_template;
 use crate::mailer::{Mailer, OutgoingMessage};
 use crate::state::AppState;
@@ -107,6 +111,7 @@ pub struct InvitesListResponse {
 
 pub async fn setup(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(input): Json<SetupInput>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -134,12 +139,12 @@ pub async fn setup(
     .await
     .map_err(ApiError::Internal)?;
 
-    let cookie_value = issue_session(&state, &user, &headers).await?;
+    let cookies = issue_session(&state, &user, &headers, Some(ip)).await?;
     info!(user_id = user.id, "setup complete");
     Ok(authed_response(
         StatusCode::CREATED,
         user,
-        cookie_value,
+        cookies,
         &state,
     ))
 }
@@ -150,6 +155,7 @@ pub async fn setup(
 
 pub async fn login(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(input): Json<LoginInput>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -205,12 +211,50 @@ pub async fn login(
                 serde_json::Value::String(input.username.trim().to_string())
             )),
             &headers,
+            Some(ip),
         )
         .await;
         return Err(invalid_credentials());
     }
     let user = user_opt.expect("ok=true requires a user");
     state.login_attempts.record_success(&attempt_key).await;
+
+    // Transparent rehash-on-login: if the stored hash uses weaker
+    // Argon2 parameters than today's target (e.g. an account created
+    // under the OWASP-floor default before Phase 52), recompute and
+    // persist the upgraded hash. Failures are logged but never block
+    // login — the user still has a working credential.
+    {
+        // Pull the secret-bearing record once more to get the hash.
+        // (`user` doesn't carry it; the secret view is gated behind a
+        // separate query to keep the User struct serializable.)
+        if let Ok(Some(rec)) =
+            queries::find_user_with_secret_by_username(&state.pool, &input.username).await
+        {
+            if password::needs_rehash(&rec.password_hash) {
+                match password::hash(&input.password) {
+                    Ok(new_hash) => {
+                        if let Err(e) =
+                            queries::update_user_password(&state.pool, user.id, &new_hash).await
+                        {
+                            warn!(
+                                error = %format!("{e:#}"),
+                                user_id = user.id,
+                                "argon2 rehash-on-login persist failed",
+                            );
+                        } else {
+                            info!(user_id = user.id, "upgraded password hash to stronger argon2 params");
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        user_id = user.id,
+                        "argon2 rehash-on-login compute failed",
+                    ),
+                }
+            }
+        }
+    }
 
     // 2FA check — if the user has a verified TOTP enrollment, don't
     // issue a session yet. Return a short-lived signed challenge that
@@ -220,7 +264,49 @@ pub async fn login(
     let totp_record = queries::get_user_totp(&state.pool, user.id)
         .await
         .map_err(ApiError::Internal)?;
-    if totp_record.as_ref().is_some_and(|r| r.verified_at.is_some()) {
+    let has_verified_totp = totp_record.as_ref().is_some_and(|r| r.verified_at.is_some());
+
+    // Enforce server-wide `totp_enforcement = "required"` at the
+    // login gate. Without this check the policy was a UI fiction
+    // for users who pre-dated it: enroll/disable handlers honoured
+    // the policy, but login itself happily let in any user without
+    // a TOTP secret. Now: if the policy says "required" and the
+    // user hasn't completed an enrollment, refuse the login outright.
+    //
+    // Recovery path when you've locked yourself out (no 2FA users
+    // CAN log in to enroll, because login is what enrolls them):
+    //   1) Temporarily relax the policy via SQL:
+    //        sqlite3 chimpflix.db \
+    //          "UPDATE server_settings SET totp_enforcement = 'optional';"
+    //   2) Log in, enroll TOTP under Settings → Two-Factor.
+    //   3) Re-tighten via admin UI under /admin/network or by reversing
+    //      the SQL.
+    //
+    // A bootstrap-enrollment flow (server hands back a one-time grant
+    // that authorises just the enroll/verify endpoints) is the better
+    // long-term UX — tracked as a follow-up.
+    if !has_verified_totp {
+        let policy = state.settings.read().await.totp_enforcement.clone();
+        if policy == "required" {
+            warn!(
+                user_id = user.id,
+                "login blocked: totp_enforcement=required but user has no verified 2FA"
+            );
+            audit_auth(
+                &state,
+                "auth.login.blocked_2fa_required",
+                Some(user.id),
+                Some(user.id),
+                None,
+                &headers,
+                Some(ip),
+            )
+            .await;
+            return Err(ApiError::Forbidden);
+        }
+    }
+
+    if has_verified_totp {
         let exp_ms = now_ms() + crate::totp::CHALLENGE_TTL_SECS * 1000;
         let challenge = crate::totp::build_challenge(user.id, exp_ms, &state.auth.session_secret);
         info!(user_id = user.id, "login pending 2FA");
@@ -231,6 +317,7 @@ pub async fn login(
             Some(user.id),
             None,
             &headers,
+            Some(ip),
         )
         .await;
         return Ok(Json(LoginResponse::TwoFactorRequired {
@@ -240,11 +327,11 @@ pub async fn login(
         .into_response());
     }
 
-    let ip = crate::api::rate_limit::header_client_ip(&headers);
-    if let Err(e) = queries::record_user_login(&state.pool, user.id, ip.as_deref()).await {
+    let ip_str = ip.to_string();
+    if let Err(e) = queries::record_user_login(&state.pool, user.id, Some(ip_str.as_str())).await {
         warn!(error = %format!("{e:#}"), user_id = user.id, "record_user_login");
     }
-    let cookie_value = issue_session(&state, &user, &headers).await?;
+    let cookies = issue_session(&state, &user, &headers, Some(ip)).await?;
     info!(user_id = user.id, "login");
     audit_auth(
         &state,
@@ -253,9 +340,10 @@ pub async fn login(
         Some(user.id),
         None,
         &headers,
+        Some(ip),
     )
     .await;
-    Ok(authed_login_response(user, cookie_value))
+    Ok(authed_login_response(user, cookies))
 }
 
 #[derive(Debug, Serialize)]
@@ -297,6 +385,7 @@ pub async fn list_my_sessions(
 
 pub async fn revoke_my_session(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Path(session_id): Path<i64>,
@@ -320,6 +409,7 @@ pub async fn revoke_my_session(
         Some(user.id),
         Some(format!(r#"{{"session_id":{session_id}}}"#)),
         &headers,
+        Some(ip),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -331,6 +421,7 @@ pub async fn revoke_my_session(
 /// multiple devices.
 pub async fn revoke_other_sessions(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
 ) -> Result<Json<RevokeOthersResponse>, ApiError> {
@@ -346,6 +437,7 @@ pub async fn revoke_other_sessions(
         Some(user.id),
         Some(format!(r#"{{"revoked":{revoked}}}"#)),
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(RevokeOthersResponse { revoked }))
@@ -353,6 +445,7 @@ pub async fn revoke_other_sessions(
 
 pub async fn logout(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -361,7 +454,7 @@ pub async fn logout(
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some(raw) = cookie::find_cookie(cookie_header, crate::auth::COOKIE_NAME) {
+    if let Some(raw) = cookie::find_cookie(cookie_header, crate::auth::cookie_name(state.auth.cookie_secure)) {
         if let Some((session_id, _)) = cookie::parse_value(raw, &state.auth.session_secret) {
             queries::delete_session(&state.pool, session_id)
                 .await
@@ -376,14 +469,19 @@ pub async fn logout(
         Some(user.id),
         None,
         &headers,
+        Some(ip),
     )
     .await;
-    let clear = cookie::clear_cookie_header(state.auth.cookie_secure);
+    let clear_session = cookie::clear_cookie_header(state.auth.cookie_secure);
+    let clear_csrf = cookie::clear_csrf_cookie_header(state.auth.cookie_secure);
     let mut response = StatusCode::NO_CONTENT.into_response();
-    if let Ok(hv) = HeaderValue::from_str(&clear) {
-        response.headers_mut().insert(SET_COOKIE, hv);
+    if let Ok(hv) = HeaderValue::from_str(&clear_session) {
+        response.headers_mut().append(SET_COOKIE, hv);
     } else {
         warn!("logout: failed to format clear-cookie header — client will keep cookie until expiry");
+    }
+    if let Ok(hv) = HeaderValue::from_str(&clear_csrf) {
+        response.headers_mut().append(SET_COOKIE, hv);
     }
     Ok(response)
 }
@@ -418,10 +516,21 @@ pub struct UpdateMeInput {
     pub notify_via_email: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
+}
+
+// Manual Debug — both fields are credentials; default derive would
+// leak them through any `tracing::debug!(?input, ...)`.
+impl std::fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePasswordRequest")
+            .field("current_password", &"<redacted>")
+            .field("new_password", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -439,6 +548,7 @@ pub struct ChangePasswordResponse {
 /// here.
 pub async fn change_password(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<ChangePasswordRequest>,
@@ -466,6 +576,7 @@ pub async fn change_password(
             Some(user.id),
             None,
             &headers,
+            Some(ip),
         )
         .await;
         return Err(ApiError::Unauthorized);
@@ -487,6 +598,7 @@ pub async fn change_password(
         Some(user.id),
         Some(format!(r#"{{"sessions_revoked":{revoked}}}"#)),
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(ChangePasswordResponse {
@@ -513,6 +625,15 @@ pub async fn update_me(
     if let Some(Some(ref addr)) = email_normalized {
         validate_email(addr)?;
     }
+    // Validate avatar_url. Rendered as `<img src>` in the nav and modal;
+    // a `javascript:` URL can't fire there (browsers refuse to execute
+    // JS via `<img src>`) but an arbitrary attacker-hosted URL turns
+    // every page render into a tracking-pixel exfil of the user's IP
+    // and User-Agent. Restrict to https:// only and cap length.
+    let avatar_normalized = normalize(input.avatar_url);
+    if let Some(Some(ref url)) = avatar_normalized {
+        validate_avatar_url(url)?;
+    }
     // Email change rules:
     //   * If the request sets `email` AND the user already has one,
     //     reject — they must use the verify flow at
@@ -536,7 +657,7 @@ pub async fn update_me(
     };
     let patch = queries::UserSelfUpdate {
         display_name: normalize(input.display_name),
-        avatar_url: normalize(input.avatar_url),
+        avatar_url: avatar_normalized,
         email: email_patch,
         default_audio_lang: normalize(input.default_audio_lang),
         default_subtitle_lang: normalize(input.default_subtitle_lang),
@@ -562,6 +683,7 @@ pub async fn update_me(
 
 pub async fn register(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(input): Json<RegisterInput>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -622,12 +744,12 @@ pub async fn register(
     // mirroring disabled.
     crate::notifier::notify_user_registered(&state, &user, invite_email).await;
 
-    let cookie_value = issue_session(&state, &user, &headers).await?;
+    let cookies = issue_session(&state, &user, &headers, Some(ip)).await?;
     info!(user_id = user.id, "register");
     Ok(authed_response(
         StatusCode::CREATED,
         user,
-        cookie_value,
+        cookies,
         &state,
     ))
 }
@@ -880,10 +1002,19 @@ fn invite_email_html(
 
 const EMAIL_CHANGE_TTL_S: i64 = 60 * 60;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct RequestEmailChangeRequest {
     pub new_email: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for RequestEmailChangeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestEmailChangeRequest")
+            .field("new_email", &self.new_email)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -899,6 +1030,7 @@ pub struct RequestEmailChangeResponse {
 
 pub async fn request_email_change(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<RequestEmailChangeRequest>,
@@ -981,6 +1113,7 @@ pub async fn request_email_change(
             email_sent
         )),
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(RequestEmailChangeResponse {
@@ -1002,6 +1135,7 @@ pub struct ConfirmEmailChangeResponse {
 
 pub async fn confirm_email_change(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<ConfirmEmailChangeRequest>,
@@ -1021,16 +1155,57 @@ pub async fn confirm_email_change(
     if token_user_id != user.id {
         return Err(ApiError::validation("token is invalid or expired"));
     }
-    queries::consume_email_change(&state.pool, token_id, user.id, &new_email)
+    let old_email = queries::consume_email_change(&state.pool, token_id, user.id, &new_email)
         .await
         .map_err(|e| {
             let msg = format!("{e:#}");
             if msg.contains("UNIQUE constraint failed") {
                 ApiError::Conflict("that email is already in use by another account".into())
             } else {
-                ApiError::validation(format!("{e}"))
+                warn!(error = %msg, user_id = user.id, "consume_email_change");
+                ApiError::validation("could not complete email change")
             }
         })?;
+
+    // Rotate every OTHER session for this user. A hijacked session
+    // that just succeeded in re-binding the email shouldn't survive
+    // the change — it cuts the attacker off before they can complete
+    // the password-reset takeover, while leaving the user's current
+    // browser logged in.
+    let _ = queries::delete_sessions_for_user_except(&state.pool, user.id, user.session_id).await;
+
+    // Notify the OLD address so an account-takeover attempt produces
+    // an out-of-band signal: even if the attacker controls the new
+    // address, the legitimate owner sees the breakup notification on
+    // their old inbox and can react. Best-effort: a missing SMTP
+    // config or send error doesn't block the change.
+    if let Some(prior) = old_email.as_deref() {
+        let settings = state.settings.read().await.clone();
+        if let Ok(Some(mailer)) =
+            Mailer::from_settings(&settings, &state.pool, &state.vault).await
+        {
+            let server_name = settings.server_name.clone();
+            let html = email_change_alert_html(&server_name, &new_email);
+            let text = email_change_alert_text(&server_name, &new_email);
+            let subject = format!("Your {server_name} account email was changed");
+            if let Err(e) = mailer
+                .send(OutgoingMessage {
+                    to_address: prior,
+                    to_name: None,
+                    subject: &subject,
+                    html: &html,
+                    text: &text,
+                })
+                .await
+            {
+                warn!(
+                    error = %format!("{e:#}"),
+                    user_id = user.id,
+                    "send email-change confirmation to old address",
+                );
+            }
+        }
+    }
     audit_auth(
         &state,
         "auth.email_change.confirm",
@@ -1041,6 +1216,7 @@ pub async fn confirm_email_change(
             serde_json::Value::String(new_email.clone())
         )),
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(ConfirmEmailChangeResponse { email: new_email }))
@@ -1094,6 +1270,48 @@ fn email_change_html(server_name: &str, verify_url: Option<&str>, token: &str) -
     })
 }
 
+/// Notification sent to the OLD email address after a successful
+/// email-change confirmation. Heads-up shape: "your account email
+/// just changed to <new>; if you didn't do this, contact your admin."
+fn email_change_alert_text(server_name: &str, new_email: &str) -> String {
+    let body = format!(
+        "Heads up — your {server_name} account email was just changed to:\n\n  \
+         {new_email}\n\nIf you did this, you can ignore this message. If you \
+         did NOT, your account may have been compromised. Contact your \
+         administrator immediately."
+    );
+    mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name,
+        headline: "Your account email was changed",
+        body: &body,
+        footer_note: "This is a security notification sent to the previous \
+                      email address on file.",
+    })
+}
+
+fn email_change_alert_html(server_name: &str, new_email: &str) -> String {
+    let mut body = String::new();
+    body.push_str(&mail_template::section_paragraph(&format!(
+        "Heads up — your <strong>{}</strong> account email was just changed to:",
+        mail_template::html_escape(server_name),
+    )));
+    body.push_str(&mail_template::section_code(new_email));
+    body.push_str(&mail_template::section_callout(
+        mail_template::CalloutKind::Warn,
+        "If you did NOT make this change, your account may have been \
+         compromised. Contact your administrator immediately to revert \
+         the email and rotate your password.",
+    ));
+    mail_template::render_email(mail_template::EmailOpts {
+        server_name,
+        eyebrow_html: "Security notice",
+        headline: "Your account email was changed",
+        body_html: &body,
+        footer_note: "This security notification was sent to the previous \
+                      email address on file.",
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Password reset (self-service)
 // ---------------------------------------------------------------------------
@@ -1114,6 +1332,7 @@ pub struct PasswordResetRequest {
 /// from probing addresses in bulk.
 pub async fn request_password_reset(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(input): Json<PasswordResetRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -1124,6 +1343,21 @@ pub async fn request_password_reset(
         return Ok(StatusCode::NO_CONTENT);
     }
 
+    // Per-email throttle: 3 requests / hour / address. The per-IP
+    // limiter on this route catches volume; this limiter catches the
+    // "rotate IPs to email-bomb one inbox" attack pattern. Lower-case
+    // the key so case-tampering can't sidestep the cap. We return the
+    // same 204 as the happy path so an attacker can't tell whether
+    // they tripped the throttle vs. typed a non-existent address.
+    let email_key = email.to_ascii_lowercase();
+    if state.reset_email_limiter.check_key(&email_key).is_err() {
+        warn!(
+            email = %obfuscate_email(email),
+            "password-reset throttled at per-email gate"
+        );
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     let user_opt = queries::find_user_by_email(&state.pool, email)
         .await
         .map_err(ApiError::Internal)?;
@@ -1131,6 +1365,12 @@ pub async fn request_password_reset(
     // Audit the REQUEST whether or not a user matched — same shape
     // either way so an attacker probing the audit log (if they could
     // see it) can't tell which addresses are real.
+    //
+    // Privacy: store only an obfuscated form of the address
+    // (`a***@example.com`) so the audit_log doesn't accumulate every
+    // typo'd / probed email forever. A leaked DB no longer hands the
+    // attacker a list of every address that ever appeared at this
+    // endpoint.
     audit_auth(
         &state,
         "auth.password_reset.request",
@@ -1138,9 +1378,10 @@ pub async fn request_password_reset(
         user_opt.as_ref().map(|u| u.id),
         Some(format!(
             r#"{{"email":{}}}"#,
-            serde_json::Value::String(email.to_string())
+            serde_json::Value::String(obfuscate_email(email))
         )),
         &headers,
+        Some(ip),
     )
     .await;
 
@@ -1151,18 +1392,18 @@ pub async fn request_password_reset(
         let token = hex::encode(buf);
         let token_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
         let expires_at = now_ms() + PASSWORD_RESET_TTL_S * 1000;
-        let ip = headers
-            .get(axum::http::HeaderName::from_static("x-forwarded-for"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(str::trim);
+        // Use the trusted-proxy-resolved IP (set by client_ip middleware)
+        // rather than reading X-Forwarded-For verbatim. Reading the raw
+        // header here meant an attacker could spoof the recorded IP on
+        // every password-reset request.
+        let ip_str = ip.to_string();
         let user_agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
         if let Err(e) = queries::create_password_reset_token(
             &state.pool,
             user.id,
             &token_hash,
             expires_at,
-            ip,
+            Some(ip_str.as_str()),
             user_agent,
         )
         .await
@@ -1221,10 +1462,21 @@ pub async fn request_password_reset(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct PasswordResetConfirm {
     pub token: String,
     pub new_password: String,
+}
+
+impl std::fmt::Debug for PasswordResetConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordResetConfirm")
+            // Token IS the credential — anyone with the token can
+            // complete the reset. Redact alongside the new password.
+            .field("token", &"<redacted>")
+            .field("new_password", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1237,6 +1489,7 @@ pub struct PasswordResetConfirmResponse {
 
 pub async fn confirm_password_reset(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(input): Json<PasswordResetConfirm>,
 ) -> Result<Json<PasswordResetConfirmResponse>, ApiError> {
@@ -1256,7 +1509,14 @@ pub async fn confirm_password_reset(
     let hash = password::hash(&input.new_password).map_err(ApiError::Internal)?;
     let revoked = queries::consume_password_reset(&state.pool, token_id, user_id, &hash)
         .await
-        .map_err(|e| ApiError::validation(format!("{e}")))?;
+        .map_err(|e| {
+            // Log the raw error server-side (operator sees schema/SQL
+            // details if they tail the log) but return a generic
+            // message to the client so leaked errors can't fingerprint
+            // the schema or hint at concurrent reset attempts.
+            warn!(error = %format!("{e:#}"), user_id, "consume_password_reset");
+            ApiError::validation("could not complete password reset; the token may have already been used")
+        })?;
 
     info!(user_id, sessions_revoked = revoked, "password reset");
     audit_auth(
@@ -1266,6 +1526,7 @@ pub async fn confirm_password_reset(
         Some(user_id),
         Some(format!(r#"{{"sessions_revoked":{revoked}}}"#)),
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(PasswordResetConfirmResponse {
@@ -1437,6 +1698,52 @@ fn validate_username(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Obfuscate an email so it can land in the audit log without storing
+/// the full address forever. Returns `a***@example.com` for
+/// `alice@example.com`; for short local parts (< 3 chars) collapses to
+/// `***@example.com`. The domain is preserved so an admin investigating
+/// abuse can still tell `example.com` from `attacker.tld`.
+fn obfuscate_email(email: &str) -> String {
+    let trimmed = email.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return "***".to_string();
+    };
+    let local = local.trim();
+    let prefix = if local.chars().count() >= 3 {
+        local.chars().next().unwrap_or('*').to_string()
+    } else {
+        String::new()
+    };
+    format!("{prefix}***@{domain}")
+}
+
+fn validate_avatar_url(url: &str) -> Result<(), ApiError> {
+    // Length cap first — saves work and prevents pathological scans.
+    if url.len() > 2048 {
+        return Err(ApiError::validation(
+            "avatar_url must be at most 2048 characters",
+        ));
+    }
+    // HTTPS only. `http://` would let a man-in-the-middle replace
+    // the image; `javascript:` doesn't execute in `<img src>` but
+    // `data:` / `file:` / arbitrary schemes are still hostile-shaped
+    // surface. https-only is conservative and matches every legit
+    // avatar source (Gravatar, S3, GitHub avatars, etc.).
+    if !url.starts_with("https://") {
+        return Err(ApiError::validation(
+            "avatar_url must start with https://",
+        ));
+    }
+    // Reject control chars + whitespace embedded in the URL — header
+    // injection / HTML smuggling territory.
+    if url.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(ApiError::validation(
+            "avatar_url contains illegal whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_password(password: &str) -> Result<(), ApiError> {
     if password.len() < MIN_PASSWORD_LEN {
         return Err(ApiError::validation(format!(
@@ -1534,45 +1841,62 @@ async fn issue_session(
     state: &AppState,
     user: &User,
     headers: &HeaderMap,
-) -> Result<String, ApiError> {
+    ip: Option<IpAddr>,
+) -> Result<(String, String), ApiError> {
     let mut nonce = [0u8; 32];
     password::fill_random(&mut nonce).map_err(ApiError::Internal)?;
     let expires_at = now_ms() + SESSION_MAX_AGE_S * 1000;
     let user_agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
-    // Pull the client IP from the same X-Forwarded-For / X-Real-IP /
-    // Forwarded headers the rate-limiter uses. Sessions previously
-    // stored `None` here, which is why the admin Sessions page showed
-    // every row as "unknown IP" even when behind a known proxy.
-    let ip = crate::api::rate_limit::header_client_ip(headers);
+    // Pull the effective client IP from the trusted-proxy middleware
+    // (see [`crate::client_ip`]). Caller passes it in via the
+    // `Extension<EffectiveClientIp>` extractor so we never silently
+    // trust an unverified `X-Forwarded-For`.
+    let ip_str = ip.map(|i| i.to_string());
     let session_id = queries::create_session(
         &state.pool,
         user.id,
         &nonce,
         expires_at,
         user_agent,
-        ip.as_deref(),
+        ip_str.as_deref(),
     )
     .await
     .map_err(ApiError::Internal)?;
 
     let value = cookie::build_value(session_id, &nonce, &state.auth.session_secret);
-    Ok(cookie::set_cookie_header(
+    let session_cookie = cookie::set_cookie_header(
         &value,
         SESSION_MAX_AGE_S,
         state.auth.cookie_secure,
-    ))
+    );
+    // Issue the double-submit CSRF companion cookie alongside. The
+    // token is deterministic (HMAC of session_id + nonce keyed by the
+    // server secret) so the middleware doesn't need to read any DB
+    // state to verify — just recompute and compare.
+    let csrf = cookie::csrf_token(session_id, &nonce, &state.auth.session_secret);
+    let csrf_cookie = cookie::set_csrf_cookie_header(
+        &csrf,
+        SESSION_MAX_AGE_S,
+        state.auth.cookie_secure,
+    );
+    Ok((session_cookie, csrf_cookie))
 }
 
 fn authed_response(
     status: StatusCode,
     user: User,
-    cookie_header: String,
+    cookies: (String, String),
     _state: &AppState,
 ) -> axum::response::Response {
     let mut response = (status, Json(AuthResponse { user })).into_response();
-    response.headers_mut().insert(
+    let (session_cookie, csrf_cookie) = cookies;
+    response.headers_mut().append(
         SET_COOKIE,
-        HeaderValue::from_str(&cookie_header).expect("ascii cookie"),
+        HeaderValue::from_str(&session_cookie).expect("ascii cookie"),
+    );
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&csrf_cookie).expect("ascii cookie"),
     );
     response
 }
@@ -1580,6 +1904,10 @@ fn authed_response(
 /// Push an audit-log entry for an authentication event. Centralized so
 /// every login/logout/password-reset/session-revoke logs the same
 /// shape (action + target user id + UA + IP, no schema drift).
+///
+/// `ip` must be the *effective* client IP — handlers extract it via
+/// [`Extension<EffectiveClientIp>`] and pass it explicitly so we never
+/// silently trust an unverified `X-Forwarded-For` header.
 pub(crate) async fn audit_auth(
     state: &AppState,
     action: &str,
@@ -1587,12 +1915,13 @@ pub(crate) async fn audit_auth(
     target_user_id: Option<i64>,
     payload_json: Option<String>,
     headers: &HeaderMap,
+    ip: Option<IpAddr>,
 ) {
     let user_agent = headers
         .get(USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let ip = crate::api::rate_limit::header_client_ip(headers);
+    let ip_str = ip.map(|i| i.to_string());
     crate::api::admin::audit_log(
         state,
         NewAuditEntry {
@@ -1601,7 +1930,7 @@ pub(crate) async fn audit_auth(
             target_kind: Some("auth".to_string()),
             target_id: target_user_id.map(|id| id.to_string()),
             payload_json,
-            ip,
+            ip: ip_str,
             user_agent,
         },
     )
@@ -1613,15 +1942,20 @@ pub(crate) async fn audit_auth(
 /// before destructuring `user` vs `challenge`. Setup + register still
 /// use `authed_response` because their happy path is always
 /// authenticated (no 2FA challenge applies — the user has no enrollment).
-fn authed_login_response(user: User, cookie_header: String) -> axum::response::Response {
+fn authed_login_response(user: User, cookies: (String, String)) -> axum::response::Response {
     let mut response = (
         StatusCode::OK,
         Json(LoginResponse::Authenticated { user }),
     )
         .into_response();
-    response.headers_mut().insert(
+    let (session_cookie, csrf_cookie) = cookies;
+    response.headers_mut().append(
         SET_COOKIE,
-        HeaderValue::from_str(&cookie_header).expect("ascii cookie"),
+        HeaderValue::from_str(&session_cookie).expect("ascii cookie"),
+    );
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&csrf_cookie).expect("ascii cookie"),
     );
     response
 }

@@ -9,6 +9,24 @@ pub mod previews;
 pub mod probe;
 pub mod session;
 
+/// Format a filesystem path for use as an `ffmpeg -i <input>` argument
+/// in a way that's safe against filenames beginning with `-`.
+///
+/// Without this, a media file named `-y output.mp4` (legitimate but
+/// hostile-looking) would be parsed by ffmpeg as the `-y` flag plus a
+/// later `output.mp4` — letting it overwrite an unrelated file, inject
+/// `-vf` filters, etc. With write access to a library mount (common in
+/// shared-NFS / SMB tenancy, or an attacker who landed code execution
+/// elsewhere), this becomes a privilege-escalation primitive.
+///
+/// ffmpeg's `file:` protocol prefix disambiguates from a flag for the
+/// canonical "this is a path on disk" case. Output paths we control
+/// (cache_root / temp files) don't need this — only paths sourced from
+/// scanner discovery do.
+pub fn safe_ffmpeg_input(path: &std::path::Path) -> String {
+    format!("file:{}", path.display())
+}
+
 pub use capabilities::{TranscoderCapabilities, detect_capabilities};
 pub use hwaccel::{EncoderPreset, HwAccel, VideoCodec};
 pub use markers::{DetectedMarker, MarkerKind, detect_markers};

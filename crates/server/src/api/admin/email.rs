@@ -76,10 +76,21 @@ pub async fn get_status(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SetPasswordRequest {
-    /// Plaintext password. Stored encrypted-at-rest in the vault.
+    /// Plaintext SMTP password. Stored encrypted-at-rest in the vault.
+    /// We intentionally do NOT derive Debug — any `tracing::debug!(?input, ...)`
+    /// would otherwise dump the credential to logs (audit finding,
+    /// 2026-05-18).
     pub password: String,
+}
+
+impl std::fmt::Debug for SetPasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetPasswordRequest")
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 pub async fn set_password(

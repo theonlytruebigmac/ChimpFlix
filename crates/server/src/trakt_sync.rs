@@ -43,7 +43,7 @@ where
     let Some(client) = state.trakt_snapshot().await else {
         return Ok(None);
     };
-    let Some(mut tokens) = queries::get_trakt_tokens(&state.pool, user_id).await? else {
+    let Some(mut tokens) = queries::get_trakt_tokens(&state.pool, &state.vault, user_id).await? else {
         return Ok(None);
     };
     if tokens.expires_at - now_ms() < REFRESH_LEAD_MS {
@@ -52,6 +52,7 @@ where
                 let expires_at = now_ms() + pair.expires_in * 1000;
                 queries::upsert_trakt_tokens(
                     &state.pool,
+                    &state.vault,
                     user_id,
                     &pair.access_token,
                     &pair.refresh_token,
@@ -114,8 +115,9 @@ pub async fn pull_user_history(
         user_id,
         |client, token| {
             let pool = state.pool.clone();
+            let vault = state.vault.clone();
             async move {
-                let tokens = queries::get_trakt_tokens(&pool, user_id).await?;
+                let tokens = queries::get_trakt_tokens(&pool, &vault, user_id).await?;
                 let since_iso = tokens
                     .as_ref()
                     .and_then(|t| t.last_synced_at)

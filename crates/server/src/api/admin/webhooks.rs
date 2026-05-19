@@ -46,7 +46,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(input): Json<NewWebhook>,
 ) -> Result<(StatusCode, Json<WebhookResponse>), ApiError> {
-    validate_new(&input)?;
+    validate_new(&input).await?;
     let webhook = queries::create_webhook(&state.pool, &state.vault, input.clone())
         .await
         .map_err(ApiError::Internal)?;
@@ -62,7 +62,7 @@ pub async fn update(
     Json(input): Json<WebhookUpdate>,
 ) -> Result<Json<WebhookResponse>, ApiError> {
     if let Some(ref url) = input.url {
-        validate_url(url)?;
+        validate_url_async(url).await?;
     }
     if let Some(ref mask) = input.event_mask {
         validate_event_mask(mask)?;
@@ -200,20 +200,27 @@ pub async fn list_deliveries(
     Ok(Json(DeliveriesResponse { deliveries }))
 }
 
-fn validate_new(input: &NewWebhook) -> Result<(), ApiError> {
+async fn validate_new(input: &NewWebhook) -> Result<(), ApiError> {
     if input.name.trim().is_empty() {
         return Err(ApiError::validation("name is required"));
     }
-    validate_url(&input.url)?;
+    validate_url_async(&input.url).await?;
     validate_event_mask(&input.event_mask)?;
     Ok(())
 }
 
-fn validate_url(url: &str) -> Result<(), ApiError> {
+async fn validate_url_async(url: &str) -> Result<(), ApiError> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(ApiError::validation(
             "url must start with http:// or https://",
         ));
+    }
+    // SSRF guard at write time. The dispatcher re-validates at request
+    // time as a TOCTOU defence; rejecting at the admin PATCH gives the
+    // operator immediate feedback instead of a silent "no deliveries
+    // ever happen" mystery.
+    if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(url).await {
+        return Err(ApiError::validation(format!("url rejected: {reason}")));
     }
     Ok(())
 }

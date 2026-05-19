@@ -476,13 +476,16 @@ async fn dispatch(
                 .clamp(1, 3650);
             let cutoff = now_ms() - retention_days * 24 * 60 * 60 * 1000;
             let removed = queries::cleanup_old_audit_log(&state.pool, cutoff).await?;
-            let token_removed =
+            let pwreset_removed =
                 queries::cleanup_expired_password_reset_tokens(&state.pool).await?;
+            let echange_removed =
+                queries::cleanup_expired_email_change_tokens(&state.pool).await?;
             append_log(
                 log,
                 format!(
                     "trimmed {removed} audit rows older than {retention_days}d; \
-                     also dropped {token_removed} expired password-reset tokens"
+                     also dropped {pwreset_removed} expired password-reset tokens \
+                     and {echange_removed} expired email-change tokens"
                 ),
             );
             Ok(())

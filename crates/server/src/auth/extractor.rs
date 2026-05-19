@@ -2,7 +2,6 @@
 //! user (or 401 the request).
 
 use std::net::IpAddr;
-use std::str::FromStr;
 
 use axum::extract::FromRequestParts;
 use axum::http::header::COOKIE;
@@ -12,8 +11,8 @@ use chimpflix_library::UserRole;
 use chimpflix_library::queries;
 
 use crate::api::error::ApiError;
-use crate::api::rate_limit;
-use crate::auth::{COOKIE_NAME, cookie};
+use crate::auth::{cookie, cookie_name};
+use crate::client_ip::EffectiveClientIp;
 use crate::net;
 use crate::state::AppState;
 
@@ -46,12 +45,21 @@ impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        // Network-level bypass: when the request's client IP matches
-        // an operator-configured CIDR, we treat it as the server
-        // owner without requiring a session cookie. Used for LAN
-        // automation (Home Assistant, monitoring scripts, cron jobs)
-        // against an internet-exposed server. Empty list (default)
-        // disables this entirely.
+        // Network-level bypass: when the request's *effective* client
+        // IP matches an operator-configured CIDR, we treat it as the
+        // server owner without requiring a session cookie. Used for
+        // LAN automation (Home Assistant, monitoring scripts, cron
+        // jobs) against an internet-exposed server. Empty list
+        // (default) disables this entirely.
+        //
+        // Security: `EffectiveClientIp` is set by the trusted-proxy
+        // middleware (see [`crate::client_ip`]). The effective IP is
+        // derived from proxy headers ONLY when the immediate peer
+        // is in `TRUSTED_PROXIES`; otherwise it is the peer socket
+        // address. This means a public attacker cannot spoof
+        // `X-Forwarded-For: 192.168.x.x` to gain owner — without a
+        // trusted proxy in front, headers are ignored, and the LAN
+        // CIDR won't match a public peer IP.
         let bypass_raw = state.settings.read().await.auth_bypass_cidrs.clone();
         if !bypass_raw.trim().is_empty() {
             if let Some(ip) = client_ip(parts) {
@@ -81,7 +89,8 @@ impl FromRequestParts<AppState> for AuthUser {
             .get(COOKIE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let raw = cookie::find_cookie(header, COOKIE_NAME).ok_or(ApiError::Unauthorized)?;
+        let raw = cookie::find_cookie(header, cookie_name(state.auth.cookie_secure))
+            .ok_or(ApiError::Unauthorized)?;
         let (session_id, nonce) =
             cookie::parse_value(raw, &state.auth.session_secret).ok_or(ApiError::Unauthorized)?;
 
@@ -90,7 +99,24 @@ impl FromRequestParts<AppState> for AuthUser {
             .map_err(ApiError::Internal)?
             .ok_or(ApiError::Unauthorized)?;
 
-        if session.nonce != nonce || session.expires_at < now_ms() {
+        // Compare hashes — DB stores SHA-256(nonce), cookie carries
+        // the raw nonce. Equal-length-array comparison is fine: any
+        // mismatch fails, and we have no timing-leak risk because the
+        // attacker would need a valid (session_id, raw nonce) pair to
+        // get this far in the first place.
+        let cookie_nonce_hash = queries::hash_session_nonce(&nonce);
+        let now = now_ms();
+        if session.nonce_hash != cookie_nonce_hash || session.expires_at < now {
+            return Err(ApiError::Unauthorized);
+        }
+        // Idle-session timeout: reject anything older than the idle
+        // window since last_seen_at, even if the absolute cap hasn't
+        // elapsed. Protects against "I left my laptop at the coffee
+        // shop two weeks ago" — the session can no longer be silently
+        // resumed. Note: BYPASS_SESSION_ID (network bypass) doesn't
+        // come through here, so this only applies to real cookies.
+        let idle_ms = now - session.last_seen_at;
+        if idle_ms > crate::auth::SESSION_IDLE_TIMEOUT_S * 1000 {
             return Err(ApiError::Unauthorized);
         }
 
@@ -115,13 +141,12 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// Pull the client IP from headers (X-Forwarded-For / X-Real-IP) and
-/// parse it into an IpAddr. Returns None when the headers are absent
-/// or the value is malformed — bypass logic treats "no IP" as "no
+/// Pull the effective client IP stashed by [`crate::client_ip::middleware`].
+/// Returns None when the middleware hasn't run (e.g. in tests that build
+/// an extractor invocation by hand) — bypass logic treats "no IP" as "no
 /// match", which keeps the safe default.
 fn client_ip(parts: &Parts) -> Option<IpAddr> {
-    let raw = rate_limit::header_client_ip(&parts.headers)?;
-    IpAddr::from_str(&raw).ok()
+    parts.extensions.get::<EffectiveClientIp>().map(|e| e.0)
 }
 
 /// Wraps `AuthUser` and additionally enforces `role = owner`. The

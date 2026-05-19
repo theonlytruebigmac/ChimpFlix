@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Json, Response};
 use chimpflix_library::queries;
 use serde::Serialize;
 
+use crate::api::access;
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
@@ -32,9 +33,10 @@ pub struct PreviewManifest {
 
 pub async fn manifest(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<PreviewManifest>, ApiError> {
+    access::ensure_file_accessible(&state, &user, id).await?;
     let record = queries::get_preview_sprite(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?
@@ -51,9 +53,10 @@ pub async fn manifest(
 
 pub async fn sprite(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
+    access::ensure_file_accessible(&state, &user, id).await?;
     let record = queries::get_preview_sprite(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?

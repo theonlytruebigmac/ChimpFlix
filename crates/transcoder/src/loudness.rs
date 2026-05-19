@@ -50,7 +50,7 @@ pub async fn measure(
     let output = cfg
         .background_ffmpeg()
         .args(["-hide_banner", "-nostats", "-i"])
-        .arg(input)
+        .arg(crate::safe_ffmpeg_input(input))
         .args([
             "-vn",
             "-sn",

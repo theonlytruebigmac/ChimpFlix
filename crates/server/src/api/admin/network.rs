@@ -190,6 +190,19 @@ pub async fn test_reachability(
     };
 
     let target = format!("{}/api/v1/health", public_url.trim_end_matches('/'));
+    // SSRF guard. Without it, an owner can set `public_url` to an
+    // internal URL and use the reachability test as a port-scan oracle
+    // (200 vs connection-refused vs timeout reveals which internal
+    // ports are open).
+    if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(&target).await {
+        return Ok(Json(ReachabilityResponse {
+            ok: false,
+            public_url: Some(public_url),
+            status_code: None,
+            latency_ms: None,
+            error: Some(format!("blocked: {reason}")),
+        }));
+    }
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(false)

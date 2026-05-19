@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{HeaderName, HeaderValue, Request, StatusCode, header};
+use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use governor::clock::DefaultClock;
@@ -29,7 +29,17 @@ use governor::{Quota, RateLimiter};
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use crate::client_ip::EffectiveClientIp;
+
 pub type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+
+/// Per-string limiter — used to throttle password resets per recipient
+/// email address (independent of source IP). Defeats the "rotate
+/// botnet IPs to email-bomb one victim" attack the audit flagged: a
+/// distributed attacker can stay under the per-IP cap forever, but
+/// they can't go above 3 resets per hour to any single inbox without
+/// hitting this gate.
+pub type StringLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 
 /// Build a per-IP limiter for auth-style routes: 10 requests / minute
 /// with a burst of 5. Tight enough to stop a brute-force, loose enough
@@ -49,69 +59,53 @@ pub fn admin_limiter() -> Arc<IpLimiter> {
     Arc::new(RateLimiter::keyed(quota))
 }
 
+/// Per-email password-reset limiter: 3 requests / hour per address with
+/// burst of 1. Tight on purpose — a legitimate human resets at most a
+/// couple of times per hour even when troubleshooting; an attacker
+/// trying to spam someone's inbox hits the wall on the second request.
+pub fn reset_email_limiter() -> Arc<StringLimiter> {
+    let quota =
+        Quota::per_hour(NonZeroU32::new(3).unwrap()).allow_burst(NonZeroU32::new(1).unwrap());
+    Arc::new(RateLimiter::keyed(quota))
+}
+
+/// Per-(user, item) limiter for `POST /items/{id}/report-issue`. Each
+/// report fan-outs to every admin's email + creates one notification
+/// row per admin, so unthrottled it's an amplification primitive. Cap
+/// at 5 reports / hour for any given (user, item) pair. Different
+/// items by the same user, or the same item by different users, share
+/// nothing.
+pub fn report_issue_limiter() -> Arc<StringLimiter> {
+    let quota =
+        Quota::per_hour(NonZeroU32::new(5).unwrap()).allow_burst(NonZeroU32::new(2).unwrap());
+    Arc::new(RateLimiter::keyed(quota))
+}
+
 /// Middleware: rejects requests that exceed the per-IP quota. Falls back
 /// to allowing the request through when no peer IP can be determined
 /// (axum's ConnectInfo) — we never want a misconfigured proxy to take
 /// the whole API offline.
+///
+/// The "client IP" here is the effective IP — proxy headers are only
+/// honored when the immediate peer is in `trusted_proxies`. See
+/// [`crate::client_ip`] for the resolution logic; the outer middleware
+/// stashes the resolved IP into request extensions before this layer
+/// runs.
 pub async fn enforce(
     axum::extract::State(limiter): axum::extract::State<Arc<IpLimiter>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let ip = client_ip(&req, peer.ip());
+    let ip = req
+        .extensions()
+        .get::<EffectiveClientIp>()
+        .map(|e| e.0)
+        .unwrap_or_else(|| peer.ip());
     if limiter.check_key(&ip).is_err() {
         return rate_limited_response("too many requests; try again shortly", 60);
     }
     next.run(req).await
-}
-
-/// Pull the client IP, honoring `X-Forwarded-For` when present. We only
-/// trust the leftmost entry — `X-Forwarded-For` is a comma-separated
-/// chain and the leftmost value is the original client. Operators behind
-/// untrusted proxies should strip this header upstream.
-/// Extract the client IP from the request headers — public so login
-/// handlers can use the same logic when recording last-login-from-IP.
-pub fn header_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
-    if let Some(value) = headers
-        .get(HeaderName::from_static("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = value.split(',').next() {
-            let trimmed = first.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    headers
-        .get(HeaderName::from_static("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn client_ip<B>(req: &Request<B>, fallback: IpAddr) -> IpAddr {
-    if let Some(value) = req
-        .headers()
-        .get(HeaderName::from_static("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = value.split(',').next() {
-            if let Ok(parsed) = first.trim().parse::<IpAddr>() {
-                return parsed;
-            }
-        }
-    }
-    if let Some(value) = req
-        .headers()
-        .get(HeaderName::from_static("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
-    {
-        return value;
-    }
-    fallback
 }
 
 fn rate_limited_response(message: &str, retry_after_s: u64) -> Response {

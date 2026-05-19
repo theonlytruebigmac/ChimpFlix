@@ -5,11 +5,14 @@
 //! address everything from one namespace; the underlying handlers reuse
 //! the same logic.
 
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
 use chimpflix_library::{AccessMatrixEntry, NewAuditEntry, SessionSummary, queries};
+
+use crate::client_ip::EffectiveClientIp;
 use serde::{Deserialize, Serialize};
 
 use sha2::Digest as _;
@@ -45,9 +48,14 @@ pub struct SessionsListResponse {
 
 pub async fn list_sessions(
     State(state): State<AppState>,
-    _admin: AdminAuth,
+    AdminAuth(actor): AdminAuth,
 ) -> Result<Json<SessionsListResponse>, ApiError> {
-    let sessions = queries::list_all_sessions(&state.pool)
+    // Non-Owner Admins shouldn't be able to enumerate the Owner's
+    // active sessions (their IPs, UAs, and the bare existence of
+    // current logins). Owners see everything; Admins see Admins + Users.
+    let exclude_owners =
+        !matches!(actor.role, chimpflix_library::UserRole::Owner);
+    let sessions = queries::list_all_sessions_filtered(&state.pool, exclude_owners)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(SessionsListResponse { sessions }))
@@ -228,6 +236,7 @@ pub struct PasswordResetResponse {
 pub async fn send_password_reset(
     State(state): State<AppState>,
     AdminAuth(actor): AdminAuth,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> Result<Json<PasswordResetResponse>, ApiError> {
@@ -269,14 +278,14 @@ pub async fn send_password_reset(
     let token = hex::encode(buf);
     let token_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
     let expires_at = chimpflix_common::now_ms() + PASSWORD_RESET_TTL_S * 1000;
-    let ip = crate::api::rate_limit::header_client_ip(&headers);
+    let ip_str = ip.to_string();
     let user_agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
     queries::create_password_reset_token(
         &state.pool,
         user.id,
         &token_hash,
         expires_at,
-        ip.as_deref(),
+        Some(ip_str.as_str()),
         user_agent,
     )
     .await
@@ -361,10 +370,14 @@ pub async fn send_password_reset(
                 message: format!("Reset email sent to {email}."),
             },
             Err(e) => {
+                // Log the full SMTP error for the operator (lettre's
+                // strings include relay hostnames and credential-
+                // rejection details that don't belong in an admin
+                // toast). Return a generic message to the UI.
                 tracing::warn!(error = %format!("{e:#}"), user_id = user.id, "admin password-reset email send failed");
                 PasswordResetResponse {
                     ok: false,
-                    message: format!("SMTP delivery failed: {e}"),
+                    message: "SMTP delivery failed — check the server logs.".to_string(),
                 }
             }
         }

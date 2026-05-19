@@ -1,5 +1,6 @@
 //! Router assembly.
 
+pub(crate) mod access;
 pub(crate) mod admin;
 mod auth;
 mod chapters;
@@ -28,10 +29,13 @@ mod tags;
 mod trakt;
 mod ws;
 
+use std::time::Duration;
+
 use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
@@ -42,6 +46,20 @@ use crate::state::AppState;
 /// stream a multi-gigabyte body and exhaust the receive buffer before
 /// the handler even sees it.
 const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-route body cap for the auth subrouter — login, register, reset
+/// confirm, 2FA challenge. Every legitimate payload here is a few
+/// hundred bytes; 16 KiB is plenty for inflated JSON and future
+/// fields, and stops a hostile peer from POSTing 16 MiB to the login
+/// endpoint just to make the server allocate.
+const AUTH_BODY_LIMIT_BYTES: usize = 16 * 1024;
+
+/// Hard ceiling for request lifetime on the non-streaming admin/API
+/// surface. Without this, a slowloris-style client can pin a worker
+/// indefinitely by trickling bytes. The streaming routes (HLS
+/// segments, WebSocket) are mounted outside this layer because they
+/// genuinely run for the duration of a playback / live connection.
+const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 pub fn router(state: AppState) -> Router {
     let auth_lim = rate_limit::auth_limiter();
@@ -62,6 +80,23 @@ pub fn router(state: AppState) -> Router {
             "/auth/password-reset/confirm",
             post(auth::confirm_password_reset),
         )
+        // Tight per-route body cap on the auth surface. Every payload
+        // here is a few hundred bytes at most (username + password +
+        // a 64-char token); 16 KiB leaves room for inflated JSON and
+        // future fields without ever inviting a multi-MB attack body
+        // against the routes that gate access to the system. The
+        // global 16 MiB cap further out is the defense for everything
+        // else that isn't an upload route.
+        .layer(RequestBodyLimitLayer::new(AUTH_BODY_LIMIT_BYTES))
+        // Tight per-request timeout on the auth surface. Login /
+        // register / reset bodies are tiny (KB at most); 60s is
+        // generous. The cap prevents slowloris-style attacks against
+        // exactly the routes that gate access to the system. 503 is
+        // the right status for "the server gave up waiting on you".
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ))
         .route_layer(middleware::from_fn_with_state(
             auth_lim.clone(),
             rate_limit::enforce,
@@ -540,6 +575,14 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf::layer,
+        ))
+        // Client-IP resolution runs before csrf + rate-limit + auth so
+        // those layers all read from the same authoritative
+        // `EffectiveClientIp` extension. Outer than csrf in the chain
+        // means it executes earlier in the request.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::client_ip::middleware,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),

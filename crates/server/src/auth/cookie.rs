@@ -45,21 +45,58 @@ fn sign(payload: &str, secret: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Build a Set-Cookie header value for a new session.
+/// Build a Set-Cookie header value for a new session. The cookie name
+/// is `__Host-cf_session` over HTTPS (forces Secure + Path=/ at the
+/// browser level) and `cf_session` over plain HTTP.
 pub fn set_cookie_header(value: &str, max_age_s: i64, secure: bool) -> String {
-    let secure = if secure { "; Secure" } else { "" };
+    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_s}{secure}",
-        name = crate::auth::COOKIE_NAME,
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_s}{secure_attr}",
+        name = crate::auth::cookie_name(secure),
     )
 }
 
 /// Build a Set-Cookie header value that clears the session cookie.
 pub fn clear_cookie_header(secure: bool) -> String {
-    let secure = if secure { "; Secure" } else { "" };
+    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
-        name = crate::auth::COOKIE_NAME,
+        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}",
+        name = crate::auth::cookie_name(secure),
+    )
+}
+
+/// Derive the double-submit CSRF token for a given (session_id, nonce)
+/// tuple. Deterministic: same session always produces the same token,
+/// so we don't need to store anything server-side. Different secret =
+/// different token, so a session_id leak alone doesn't let an attacker
+/// mint a CSRF cookie.
+pub fn csrf_token(session_id: i64, nonce: &[u8; 32], secret: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(b"csrf:");
+    mac.update(&session_id.to_be_bytes());
+    mac.update(nonce);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Build a Set-Cookie header for the CSRF companion cookie. NOT
+/// HttpOnly — the client-side JS in apiFetch must be able to read it
+/// and echo the value in `X-CSRF-Token`. Still scoped Path=/ +
+/// SameSite=Lax + Secure (when applicable) so it shares the session
+/// cookie's protections.
+pub fn set_csrf_cookie_header(value: &str, max_age_s: i64, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{name}={value}; Path=/; SameSite=Lax; Max-Age={max_age_s}{secure_attr}",
+        name = crate::auth::csrf_cookie_name(secure),
+    )
+}
+
+/// Clear the CSRF companion cookie at logout.
+pub fn clear_csrf_cookie_header(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{name}=; Path=/; SameSite=Lax; Max-Age=0{secure_attr}",
+        name = crate::auth::csrf_cookie_name(secure),
     )
 }
 

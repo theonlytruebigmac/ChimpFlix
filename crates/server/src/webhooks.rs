@@ -168,6 +168,30 @@ async fn attempt_once(
     delivery_id: i64,
     payload: &str,
 ) -> AttemptOutcome {
+    // SSRF guard: resolve the URL's hostname and reject before we
+    // open the connection if it points at loopback / RFC1918 / link-local
+    // / cloud-metadata. Without this, an owner-compromised webhook URL
+    // could exfiltrate IAM credentials via 169.254.169.254 and the
+    // response body would be captured straight into webhook_deliveries
+    // for the admin UI to render.
+    if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(&hook.url).await {
+        let _ = queries::record_webhook_attempt(
+            &state.pool,
+            delivery_id,
+            None,
+            None,
+            Some(&format!("ssrf-blocked: {reason}")),
+            false,
+            None,
+        )
+        .await;
+        return AttemptOutcome::Retry {
+            code: None,
+            body: None,
+            error: Some(format!("ssrf-blocked: {reason}")),
+        };
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()

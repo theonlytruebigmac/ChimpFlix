@@ -20,13 +20,26 @@ use crate::state::AppState;
 
 const HSTS_VALUE: &str = "max-age=31536000; includeSubDomains";
 const REFERRER_POLICY: &str = "strict-origin-when-cross-origin";
-const PERMISSIONS_POLICY: &str = "accelerometer=(), camera=(), geolocation=(), gyroscope=(), \
-                                  magnetometer=(), microphone=(), payment=(), usb=()";
+const PERMISSIONS_POLICY: &str = "accelerometer=(), browsing-topics=(), camera=(), \
+                                  display-capture=(), geolocation=(), gyroscope=(), \
+                                  interest-cohort=(), magnetometer=(), microphone=(), \
+                                  payment=(), serial=(), usb=(), xr-spatial-tracking=()";
 const API_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 const X_CONTENT_TYPE: &str = "nosniff";
 const X_FRAME_OPTIONS: &str = "DENY";
 const CROSS_ORIGIN_OPENER: &str = "same-origin";
 const CROSS_ORIGIN_RESOURCE: &str = "same-origin";
+/// API responses are JSON / opaque bytes — no third-party iframes, no
+/// cross-origin scripts. `require-corp` pairs with COOP=same-origin to
+/// enable cross-origin isolation, which protects against Spectre-class
+/// side-channels and is a precondition for high-resolution timers in
+/// any future frontend feature.
+const CROSS_ORIGIN_EMBEDDER: &str = "require-corp";
+/// Disable the legacy XSS auditor. Modern guidance is that `1; mode=block`
+/// introduced known XSS vulnerabilities; `0` is the safe value. (Some
+/// upstream proxies still inject `1; mode=block`; we send `0` explicitly
+/// so it sticks.)
+const X_XSS_PROTECTION: &str = "0";
 
 pub async fn layer(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -70,6 +83,18 @@ pub async fn layer(
         headers,
         HeaderName::from_static("cross-origin-resource-policy"),
         HeaderValue::from_static(CROSS_ORIGIN_RESOURCE),
+    );
+    set_if_absent(
+        headers,
+        HeaderName::from_static("cross-origin-embedder-policy"),
+        HeaderValue::from_static(CROSS_ORIGIN_EMBEDDER),
+    );
+    // Always send X-XSS-Protection: 0 — Traefik / Cloudflare layers in
+    // many setups inject `1; mode=block` by default, which is unsafe.
+    // We overwrite with the modern-recommended value to be sure.
+    headers.insert(
+        HeaderName::from_static("x-xss-protection"),
+        HeaderValue::from_static(X_XSS_PROTECTION),
     );
 
     // HSTS only when we're sure the deployment is HTTPS — see auth/mod.rs

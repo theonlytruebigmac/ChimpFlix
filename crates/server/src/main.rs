@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod client_ip;
 mod events;
 mod file_watcher;
 mod log_buffer;
@@ -11,6 +12,7 @@ mod net;
 mod notifier;
 mod scheduler;
 mod session_watcher;
+mod ssrf;
 mod state;
 mod totp;
 mod trakt_sync;
@@ -96,6 +98,15 @@ async fn main() -> anyhow::Result<()> {
         Ok(0) => {}
         Ok(n) => info!(count = n, "encrypted legacy webhook secrets at rest"),
         Err(e) => warn!(error = %format!("{e:#}"), "webhook secret backfill failed"),
+    }
+    // Same pattern for Trakt OAuth tokens (Phase 53). Per-user access
+    // + refresh tokens were stored as plaintext TEXT; backfill encrypts
+    // them via the vault on every boot until the legacy columns are
+    // empty everywhere.
+    match queries::backfill_trakt_tokens(&pool, &vault).await {
+        Ok(0) => {}
+        Ok(n) => info!(count = n, "encrypted legacy Trakt OAuth tokens at rest"),
+        Err(e) => warn!(error = %format!("{e:#}"), "trakt token backfill failed"),
     }
     // Forward-upgrade rows that were stored before CHIMPFLIX_SECRET_KEY was
     // set. Without this the first vault_get on a plaintext row would
@@ -283,6 +294,29 @@ async fn main() -> anyhow::Result<()> {
 
     let settings = std::sync::Arc::new(tokio::sync::RwLock::new(initial_settings));
 
+    // Trusted-proxy allowlist. Without this, the app refuses to honour
+    // `X-Forwarded-For` / `CF-Connecting-IP` / `X-Real-IP` and falls
+    // back to the peer socket address. Operators behind Traefik should
+    // set this to the Docker bridge (e.g. `172.16.0.0/12`); behind
+    // Cloudflare-fronted Traefik, additionally include Cloudflare's
+    // published ranges so `CF-Connecting-IP` is preferred.
+    let trusted_proxies = std::sync::Arc::new(net::parse_cidr_list(
+        &env::var("TRUSTED_PROXIES").unwrap_or_default(),
+    ));
+    if trusted_proxies.is_empty() {
+        warn!(
+            "TRUSTED_PROXIES is empty — proxy headers (X-Forwarded-For, CF-Connecting-IP, \
+             X-Real-IP) will be ignored. The recorded client IP will be the immediate peer \
+             (likely the Docker bridge). Set TRUSTED_PROXIES=<cidr-list> before exposing \
+             behind a reverse proxy."
+        );
+    } else {
+        info!(
+            count = trusted_proxies.len(),
+            "trusted upstream proxies configured; proxy headers will be honored from listed peers"
+        );
+    }
+
     let state = AppState {
         pool,
         ffmpeg,
@@ -305,6 +339,9 @@ async fn main() -> anyhow::Result<()> {
         log_buffer,
         vault,
         login_attempts: crate::api::rate_limit::AttemptTracker::new(),
+        reset_email_limiter: crate::api::rate_limit::reset_email_limiter(),
+        report_issue_limiter: crate::api::rate_limit::report_issue_limiter(),
+        trusted_proxies,
     };
 
     // Scheduled tasks: flip orphaned `running` rows, seed defaults, spawn
@@ -380,8 +417,14 @@ fn init_tracing(buffer: log_buffer::LogBuffer) {
 }
 
 /// Load the credential vault from `CHIMPFLIX_SECRET_KEY`. If the env var
-/// is unset we boot in plaintext mode and print a ready-to-paste suggested
-/// key so the operator can harden later without hunting for a generator.
+/// is unset we boot in plaintext mode and print a ready-to-paste
+/// suggested key so the operator can harden later without hunting for a
+/// generator. Public deployments (any `APP_PUBLIC_ORIGIN` over https://)
+/// REFUSE to boot in plaintext mode — there's no defensible reason for
+/// an internet-facing instance to store SMTP creds, TOTP secrets, and
+/// the session HMAC in the clear. The operator can opt back in by
+/// setting `CHIMPFLIX_ALLOW_PLAINTEXT_VAULT=1` (intended for testing
+/// only).
 fn load_vault() -> Vault {
     match Vault::from_env() {
         Ok((vault, true)) => {
@@ -389,6 +432,28 @@ fn load_vault() -> Vault {
             vault
         }
         Ok((vault, false)) => {
+            let is_public = env::var("APP_PUBLIC_ORIGIN")
+                .ok()
+                .is_some_and(|origin| origin.starts_with("https://"));
+            let opt_in = env::var("CHIMPFLIX_ALLOW_PLAINTEXT_VAULT")
+                .ok()
+                .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+            if is_public && !opt_in {
+                let suggested = chimpflix_common::generate_master_key_hex();
+                eprintln!(
+                    "FATAL: APP_PUBLIC_ORIGIN looks public (https://...) but \
+                     {} is unset. Plaintext vault mode is forbidden for internet-\
+                     exposed deployments because SMTP creds, TOTP secrets, and the \
+                     session HMAC would land in chimpflix.db in the clear.\n\n\
+                     Restart with:\n    {}={}\n\n\
+                     (Or set CHIMPFLIX_ALLOW_PLAINTEXT_VAULT=1 to override — \
+                     not recommended.)",
+                    chimpflix_common::MASTER_KEY_ENV,
+                    chimpflix_common::MASTER_KEY_ENV,
+                    suggested,
+                );
+                std::process::exit(78); // EX_CONFIG
+            }
             let suggested = chimpflix_common::generate_master_key_hex();
             warn!(
                 "credential vault is in PLAINTEXT mode — secrets in the SQLite file are not \
@@ -406,13 +471,60 @@ fn load_vault() -> Vault {
     }
 }
 
+/// Pull a vault slot, returning None on either "no row" OR "decrypt
+/// failed". Decrypt failures are logged with a loud actionable message
+/// pointing the operator at the recovery path (re-enter via admin UI,
+/// or wipe the row with a DELETE).
+///
+/// This is the boot-resilient wrapper around `queries::vault_get`. A
+/// rotated `CHIMPFLIX_SECRET_KEY` invalidates every previously-encrypted
+/// row; without this helper the first `?` propagation would panic the
+/// whole boot, leaving the operator with a server stuck in a restart
+/// loop instead of one that's up-but-with-broken-integrations.
+async fn vault_get_or_warn(
+    pool: &SqlitePool,
+    vault: &Vault,
+    slot: &'static str,
+) -> Option<String> {
+    match queries::vault_get(pool, vault, slot).await {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(
+                slot,
+                error = %format!("{e:#}"),
+                "vault slot is unreadable — integration disabled for this boot. \
+                 Most likely cause: CHIMPFLIX_SECRET_KEY was rotated. Recover by \
+                 re-entering the credential under Admin → Server → Credentials, \
+                 or clear the slot: `sqlite3 chimpflix.db \"DELETE FROM secrets \
+                 WHERE name='{slot}'\";`",
+            );
+            None
+        }
+    }
+}
+
 /// First-boot one-shot: if `secrets.tmdb` is empty but the legacy
 /// `TMDB_READ_TOKEN` env var is set, copy the value into the vault so the
 /// operator can rotate it from the admin UI from then on. The env var
 /// continues to work for the lifetime of this process.
 async fn maybe_import_tmdb_from_env(pool: &SqlitePool, vault: &Vault) -> anyhow::Result<()> {
-    if queries::vault_get(pool, vault, "tmdb").await?.is_some() {
-        return Ok(());
+    // If the slot is present-and-readable we're done. If the slot is
+    // present-but-unreadable (rotated key), we DON'T silently overwrite
+    // it — the operator needs to explicitly DELETE so the import is
+    // intentional rather than a sneaky env-var override of admin-set
+    // credentials. So: only import when the row genuinely doesn't exist.
+    match queries::vault_get(pool, vault, "tmdb").await {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                "tmdb vault slot exists but couldn't decrypt — skipping TMDB_READ_TOKEN \
+                 env import to avoid clobbering admin-set creds. Re-enter the token \
+                 via Admin → Server → Credentials, or clear the slot first.",
+            );
+            return Ok(());
+        }
     }
     let Ok(raw) = std::env::var("TMDB_READ_TOKEN") else {
         return Ok(());
@@ -430,7 +542,7 @@ async fn build_tmdb_from_vault(
     pool: &SqlitePool,
     vault: &Vault,
 ) -> anyhow::Result<Option<TmdbClient>> {
-    let Some(token) = queries::vault_get(pool, vault, "tmdb").await? else {
+    let Some(token) = vault_get_or_warn(pool, vault, "tmdb").await else {
         return Ok(None);
     };
     // Read the operator's preferred metadata language inline rather
@@ -451,7 +563,7 @@ async fn build_tvdb_from_vault(
     pool: &SqlitePool,
     vault: &Vault,
 ) -> anyhow::Result<Option<TvdbClient>> {
-    let Some(apikey) = queries::vault_get(pool, vault, "tvdb").await? else {
+    let Some(apikey) = vault_get_or_warn(pool, vault, "tvdb").await else {
         return Ok(None);
     };
     Ok(Some(TvdbClient::new(&apikey, None)?))
@@ -461,7 +573,7 @@ async fn build_anilist_from_vault(
     pool: &SqlitePool,
     vault: &Vault,
 ) -> anyhow::Result<Option<AniListClient>> {
-    let token = queries::vault_get(pool, vault, "anilist").await?;
+    let token = vault_get_or_warn(pool, vault, "anilist").await;
     let client = match token {
         Some(t) => AniListClient::with_token(&t),
         None => AniListClient::unauthenticated(),
@@ -473,7 +585,7 @@ async fn build_opensubtitles_from_vault(
     pool: &SqlitePool,
     vault: &Vault,
 ) -> anyhow::Result<Option<OpenSubtitlesClient>> {
-    let Some(raw) = queries::vault_get(pool, vault, "opensubtitles").await? else {
+    let Some(raw) = vault_get_or_warn(pool, vault, "opensubtitles").await else {
         return Ok(None);
     };
     let creds = OpenSubtitlesCreds::parse(&raw)?;
@@ -484,7 +596,7 @@ async fn build_trakt_from_vault(
     pool: &SqlitePool,
     vault: &Vault,
 ) -> anyhow::Result<Option<TraktClient>> {
-    let Some(raw) = queries::vault_get(pool, vault, "trakt").await? else {
+    let Some(raw) = vault_get_or_warn(pool, vault, "trakt").await else {
         return Ok(None);
     };
     let creds = TraktCreds::parse(&raw)?;

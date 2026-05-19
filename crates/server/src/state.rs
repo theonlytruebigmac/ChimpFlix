@@ -8,6 +8,7 @@ use chimpflix_metadata::{
     AniListClient, OpenSubtitlesClient, TmdbClient, TraktClient, TvMazeClient, TvdbClient,
 };
 use chimpflix_transcoder::{FfmpegConfig, TranscodeManager, TranscoderCapabilities};
+use ipnet::IpNet;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
@@ -90,6 +91,22 @@ pub struct AppState {
     /// in-process. Process-local; horizontal scaling would lift this
     /// into a shared store.
     pub login_attempts: crate::api::rate_limit::AttemptTracker,
+    /// Per-email throttle for password-reset requests. Independent of
+    /// the per-IP limiter; together they defeat distributed email-
+    /// bombing of any single inbox.
+    pub reset_email_limiter: Arc<crate::api::rate_limit::StringLimiter>,
+    /// Per-(user_id, item_id) throttle for `POST /items/{id}/report-issue`.
+    /// Each report emails every admin and writes one notification row
+    /// per admin, so unthrottled it's an amplification primitive.
+    pub report_issue_limiter: Arc<crate::api::rate_limit::StringLimiter>,
+    /// Operator-declared list of trusted upstream proxies (Traefik,
+    /// Cloudflare ranges, Docker bridge). The client-IP middleware
+    /// honours `X-Forwarded-For`/`CF-Connecting-IP` only when the
+    /// immediate peer's socket address falls inside one of these CIDRs;
+    /// otherwise the peer IP is used verbatim. Empty (default) =
+    /// ignore proxy headers entirely. Sourced from the
+    /// `TRUSTED_PROXIES` env var at startup.
+    pub trusted_proxies: Arc<Vec<IpNet>>,
 }
 
 impl AppState {

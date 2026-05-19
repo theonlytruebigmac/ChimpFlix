@@ -392,7 +392,22 @@ pub struct Webhook {
     pub id: i64,
     pub name: String,
     pub url: String,
+    /// Decrypted signing secret. NEVER serialized — admin GETs would
+    /// otherwise hand back the live secret in JSON, defeating the
+    /// at-rest encryption. The presence flag + last-4 view below is
+    /// what the admin UI consumes.
+    #[serde(skip)]
     pub secret: Option<String>,
+    /// True when a signing secret is configured. Safe to expose; only
+    /// reveals "is this hook signed at all", not the value.
+    #[serde(rename = "has_secret")]
+    pub has_secret_serialized: bool,
+    /// Last 4 chars of the secret for the admin UI's "ends-in" hint
+    /// (so the operator can verify they pasted the right value into
+    /// a webhook receiver). Hidden in JSON unless we actually have a
+    /// secret to truncate.
+    #[serde(rename = "secret_last4", skip_serializing_if = "Option::is_none")]
+    pub secret_last4_serialized: Option<String>,
     /// JSON-encoded array of event names. The dispatcher filters by this
     /// before delivering to each subscriber.
     pub event_mask: String,
@@ -420,11 +435,22 @@ impl Webhook {
         } else {
             row.try_get::<Option<String>, _>("secret").ok().flatten()
         };
+        let has_secret = secret.is_some();
+        let secret_last4 = secret.as_deref().map(|s| {
+            let n = s.chars().count();
+            if n <= 4 {
+                "****".to_string()
+            } else {
+                s.chars().skip(n - 4).collect::<String>()
+            }
+        });
         Ok(Self {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             url: row.try_get("url")?,
             secret,
+            has_secret_serialized: has_secret,
+            secret_last4_serialized: secret_last4,
             event_mask: row.try_get("event_mask")?,
             enabled: row.try_get::<i64, _>("enabled")? != 0,
             created_at: row.try_get("created_at")?,
@@ -1359,7 +1385,11 @@ pub struct UserWithSecret {
 pub struct SessionRow {
     pub id: i64,
     pub user_id: i64,
-    pub nonce: [u8; 32],
+    /// SHA-256 of the cookie nonce. The cookie still carries the raw
+    /// 32-byte nonce; the DB only stores its hash so a stolen `chimpflix.db`
+    /// can't be turned into a forged session cookie. To verify, hash the
+    /// caller-supplied nonce and compare here.
+    pub nonce_hash: [u8; 32],
     pub expires_at: i64,
     pub last_seen_at: i64,
     pub created_at: i64,
@@ -1412,9 +1442,16 @@ pub fn hash_invite_code(code: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // Auth request bodies
+//
+// These all hold a plaintext password. We DO NOT derive `Debug` on
+// them — a stray `tracing::debug!(?input, ...)` or middleware logger
+// would otherwise dump the credential into logs (this is exactly the
+// shape of the famous Twitter and Heroku credential-leak incidents).
+// Manual `Debug` impls below redact the password field while keeping
+// the rest of the struct legible during debugging.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SetupInput {
     pub username: String,
     pub password: String,
@@ -1427,19 +1464,51 @@ pub struct SetupInput {
     pub email: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl std::fmt::Debug for SetupInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupInput")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .field("email", &self.email)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct LoginInput {
     pub username: String,
     pub password: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl std::fmt::Debug for LoginInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginInput")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct RegisterInput {
     pub code: String,
     pub username: String,
     pub password: String,
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+impl std::fmt::Debug for RegisterInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterInput")
+            // `code` is the invite token — also a credential. Redact it too.
+            .field("code", &"<redacted>")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

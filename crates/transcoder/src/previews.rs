@@ -69,6 +69,9 @@ pub async fn generate_sprite(
     let vf = format!(
         "fps=1/{interval_s},scale={tile_width}:-2,tile={cols}x{rows}"
     );
+    // file: prefix prevents leading-`-` filenames from being parsed as
+    // ffmpeg flags (see crate::safe_ffmpeg_input).
+    let safe_input = crate::safe_ffmpeg_input(input);
     let args = [
         "-hide_banner",
         "-loglevel",
@@ -77,9 +80,7 @@ pub async fn generate_sprite(
         "-skip_frame",
         "nokey",
         "-i",
-        input
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF8 input path"))?,
+        safe_input.as_str(),
         "-vf",
         &vf,
         "-frames:v",

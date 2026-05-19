@@ -72,7 +72,7 @@ pub async fn extract_chapter_thumb(
     let status = ffmpeg
         .background_ffmpeg()
         .args(args)
-        .arg(input)
+        .arg(crate::safe_ffmpeg_input(input))
         .args(["-frames:v", "1", "-vf", &vf, "-q:v", "3"])
         .arg(output)
         .status()

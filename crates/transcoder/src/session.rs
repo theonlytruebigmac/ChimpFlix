@@ -1389,7 +1389,9 @@ async fn spawn_ffmpeg(
     }
     cmd.args(["-ss", &format!("{start_seconds:.3}")])
         .arg("-i")
-        .arg(input);
+        // file: prefix prevents leading-`-` filenames from being parsed
+        // as ffmpeg flags (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(input));
 
     // Branch on whether the video stream gets re-encoded or just
     // remuxed. `Copy` is the fast path — no filters, no encoder, ~90%
@@ -2092,7 +2094,7 @@ async fn extract_full_webvtt_to(
     let status = Command::new(&cfg.ffmpeg)
         .args(["-y", "-loglevel", "error", "-nostdin"])
         .arg("-i")
-        .arg(input)
+        .arg(crate::safe_ffmpeg_input(input))
         .args(["-map", &format!("0:s:{si}")])
         .args(["-c:s", "webvtt"])
         .arg(dest)
@@ -2515,7 +2517,7 @@ async fn extract_text_subtitle(
         .args(["-y", "-loglevel", "error", "-nostdin"])
         .args(["-ss", &format!("{start_seconds:.3}")])
         .arg("-i")
-        .arg(input)
+        .arg(crate::safe_ffmpeg_input(input))
         .args(["-map", &format!("0:s:{si}")])
         .args(["-c:s", codec_arg])
         .arg(&temp_path)

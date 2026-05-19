@@ -1698,13 +1698,56 @@ async function serverCookieHeader(): Promise<string> {
     .join("; ");
 }
 
+/// Pluck the CSRF companion cookie value from any Cookie-header-shaped
+/// string. Used by both the SSR path (cookies served from Next's cookie
+/// jar) and the client path (parsing document.cookie). Cookie name is
+/// `__Host-cf_csrf` over HTTPS, `cf_csrf` on plain HTTP — try both.
+function csrfFromCookieString(raw: string): string | null {
+  for (const chunk of raw.split(";")) {
+    const trimmed = chunk.trim();
+    if (trimmed.startsWith("__Host-cf_csrf=")) {
+      return trimmed.slice("__Host-cf_csrf=".length);
+    }
+    if (trimmed.startsWith("cf_csrf=")) {
+      return trimmed.slice("cf_csrf=".length);
+    }
+  }
+  return null;
+}
+
+/// Client-side CSRF read from `document.cookie`. Returns null on the
+/// server (the SSR path uses csrfFromCookieString directly against the
+/// Next-supplied cookie header).
+function readCsrfToken(): string | null {
+  if (typeof document === "undefined") return null;
+  return csrfFromCookieString(document.cookie);
+}
+
 async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
   const url = buildUrl(path, opts.query);
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  let serverCookies: string | null = null;
   if (isServer() && !opts.noAuth) {
     const cookieHeader = await serverCookieHeader();
-    if (cookieHeader) headers["Cookie"] = cookieHeader;
+    if (cookieHeader) {
+      headers["Cookie"] = cookieHeader;
+      serverCookies = cookieHeader;
+    }
+  }
+  // CSRF double-submit token: read the non-HttpOnly `cf_csrf`
+  // (or `__Host-cf_csrf` over HTTPS) cookie and echo its value in
+  // X-CSRF-Token on every state-changing request. The server rejects
+  // mutating requests where cookie != header. GETs / HEADs are exempt.
+  const method = (opts.method ?? "GET").toUpperCase();
+  const isMutating = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  if (isMutating) {
+    // SSR path: pull the token from the forwarded cookie header we
+    // just built. Client path: parse document.cookie.
+    const csrf = serverCookies
+      ? csrfFromCookieString(serverCookies)
+      : readCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
   }
   const res = await fetch(url, {
     method: opts.method ?? "GET",

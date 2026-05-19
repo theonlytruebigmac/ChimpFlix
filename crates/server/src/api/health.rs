@@ -20,14 +20,16 @@ fn started_at() -> Instant {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-    pub version: &'static str,
     pub uptime_s: u64,
 }
 
+/// Public unauth healthcheck — Traefik / Docker / load balancers hit
+/// this. Intentionally minimal: no `version` (would aid CVE targeting),
+/// no build details, no DB metrics. The authenticated `/server-info`
+/// endpoint surfaces the version field for the admin UI.
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
         uptime_s: started_at().elapsed().as_secs(),
     })
 }

@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use chimpflix_library::{ExternalSubtitle, queries};
 use serde::Serialize;
 
+use crate::api::access;
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
@@ -24,9 +25,10 @@ pub struct ExternalSubtitlesResponse {
 
 pub async fn list_for_item(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<ExternalSubtitlesResponse>, ApiError> {
+    access::ensure_item_accessible(&state, &user, id).await?;
     let subtitles = queries::list_external_subtitles_for_item(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?;
@@ -35,9 +37,10 @@ pub async fn list_for_item(
 
 pub async fn list_for_episode(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<ExternalSubtitlesResponse>, ApiError> {
+    access::ensure_episode_accessible(&state, &user, id).await?;
     let subtitles = queries::list_external_subtitles_for_episode(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?;
@@ -51,9 +54,10 @@ pub async fn list_for_episode(
 /// for a JS renderer to consume later).
 pub async fn serve_file(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
+    access::ensure_external_subtitle_accessible(&state, &user, id).await?;
     let row = queries::get_external_subtitle(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?

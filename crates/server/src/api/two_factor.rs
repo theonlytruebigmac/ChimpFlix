@@ -14,6 +14,9 @@
 //! Enroll/disable/regenerate-codes all require the password re-entry —
 //! a stolen session shouldn't be enough to weaken the account's 2FA.
 
+use std::net::IpAddr;
+
+use axum::Extension;
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -27,6 +30,7 @@ use tracing::{info, warn};
 
 use crate::api::error::ApiError;
 use crate::auth::{AuthUser, SESSION_MAX_AGE_S, cookie, password};
+use crate::client_ip::EffectiveClientIp;
 use crate::state::AppState;
 use crate::totp;
 
@@ -67,12 +71,20 @@ pub async fn status(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct EnrollRequest {
     /// Re-entered current password. We require this even though the
     /// user is already authenticated so a stolen session can't bind a
     /// new TOTP secret to the account.
     pub password: String,
+}
+
+impl std::fmt::Debug for EnrollRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollRequest")
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +102,7 @@ pub struct EnrollResponse {
 
 pub async fn enroll(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<EnrollRequest>,
@@ -120,6 +133,7 @@ pub async fn enroll(
         Some(user.id),
         None,
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(EnrollResponse {
@@ -143,6 +157,7 @@ pub struct VerifyResponse {
 
 pub async fn verify(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<VerifyRequest>,
@@ -188,6 +203,7 @@ pub async fn verify(
         Some(user.id),
         None,
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(VerifyResponse {
@@ -195,13 +211,22 @@ pub async fn verify(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct DisableRequest {
     pub password: String,
 }
 
+impl std::fmt::Debug for DisableRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DisableRequest")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 pub async fn disable(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<DisableRequest>,
@@ -235,6 +260,7 @@ pub async fn disable(
         Some(user.id),
         None,
         &headers,
+        Some(ip),
     )
     .await;
     // Notify admins so they notice if a user voluntarily downgrades.
@@ -246,9 +272,17 @@ pub async fn disable(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct RegenerateRecoveryRequest {
     pub password: String,
+}
+
+impl std::fmt::Debug for RegenerateRecoveryRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegenerateRecoveryRequest")
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -258,6 +292,7 @@ pub struct RegenerateRecoveryResponse {
 
 pub async fn regenerate_recovery_codes(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     user: AuthUser,
     headers: HeaderMap,
     Json(input): Json<RegenerateRecoveryRequest>,
@@ -286,6 +321,7 @@ pub async fn regenerate_recovery_codes(
         Some(user.id),
         None,
         &headers,
+        Some(ip),
     )
     .await;
     Ok(Json(RegenerateRecoveryResponse {
@@ -316,6 +352,7 @@ pub struct AuthResponse {
 
 pub async fn challenge_login(
     State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Json(input): Json<ChallengeLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -377,17 +414,19 @@ pub async fn challenge_login(
             Some(user_id),
             None,
             &headers,
+            Some(ip),
         )
         .await;
         return Err(invalid_credentials());
     }
     state.login_attempts.record_success(&attempt_key).await;
 
-    let ip = crate::api::rate_limit::header_client_ip(&headers);
-    if let Err(e) = queries::record_user_login(&state.pool, user.id, ip.as_deref()).await {
+    let ip_str = ip.to_string();
+    if let Err(e) = queries::record_user_login(&state.pool, user.id, Some(ip_str.as_str())).await {
         warn!(error = %format!("{e:#}"), user_id = user.id, "record_user_login");
     }
-    let cookie_value = issue_session(&state, &user, &headers).await?;
+    let (session_cookie, csrf_cookie) =
+        issue_session(&state, &user, &headers, Some(ip)).await?;
     let used_recovery = input
         .recovery_code
         .as_deref()
@@ -401,13 +440,18 @@ pub async fn challenge_login(
         Some(user_id),
         Some(format!(r#"{{"used_recovery":{used_recovery}}}"#)),
         &headers,
+        Some(ip),
     )
     .await;
 
     let mut response = (StatusCode::OK, Json(AuthResponse { user })).into_response();
-    response.headers_mut().insert(
+    response.headers_mut().append(
         SET_COOKIE,
-        HeaderValue::from_str(&cookie_value).expect("ascii cookie"),
+        HeaderValue::from_str(&session_cookie).expect("ascii cookie"),
+    );
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&csrf_cookie).expect("ascii cookie"),
     );
     // Telemetry-light header — lets the client surface "we used your
     // recovery code, regenerate them" without bloating the body.
@@ -455,15 +499,16 @@ async fn issue_session(
     state: &AppState,
     user: &chimpflix_library::User,
     headers: &HeaderMap,
-) -> Result<String, ApiError> {
+    ip: Option<IpAddr>,
+) -> Result<(String, String), ApiError> {
     let mut nonce = [0u8; 32];
     password::fill_random(&mut nonce).map_err(ApiError::Internal)?;
     let expires_at = now_ms() + SESSION_MAX_AGE_S * 1000;
     let user_agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
-    // Mirror the auth.rs fix: capture the client IP at session creation
-    // so the admin Sessions page can show it rather than "unknown IP".
-    // Same proxy-aware extractor the rate-limiter uses.
-    let ip = crate::api::rate_limit::header_client_ip(headers);
+    // Caller passes the trusted-proxy-resolved IP (Extension<EffectiveClientIp>),
+    // so a spoofed `X-Forwarded-For` from an untrusted peer never lands in
+    // `sessions.last_seen_ip`.
+    let ip = ip.map(|i| i.to_string());
     let session_id = queries::create_session(
         &state.pool,
         user.id,
@@ -476,11 +521,17 @@ async fn issue_session(
     .map_err(ApiError::Internal)?;
 
     let value = cookie::build_value(session_id, &nonce, &state.auth.session_secret);
-    Ok(cookie::set_cookie_header(
+    let session_cookie = cookie::set_cookie_header(
         &value,
         SESSION_MAX_AGE_S,
         state.auth.cookie_secure,
-    ))
+    );
+    // Issue the double-submit CSRF companion cookie. Same shape as
+    // crate::api::auth::issue_session — see the comment there.
+    let csrf = cookie::csrf_token(session_id, &nonce, &state.auth.session_secret);
+    let csrf_cookie =
+        cookie::set_csrf_cookie_header(&csrf, SESSION_MAX_AGE_S, state.auth.cookie_secure);
+    Ok((session_cookie, csrf_cookie))
 }
 
 fn invalid_credentials() -> ApiError {

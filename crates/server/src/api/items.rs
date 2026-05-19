@@ -19,6 +19,12 @@ use crate::auth::AuthUser;
 use crate::state::AppState;
 
 const MAX_POSTER_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// Hard cap on the decoded image dimensions. A 8 KiB JPEG can decode
+/// into a 100k × 100k pixel canvas (40 GB RAM); the upstream byte cap
+/// doesn't catch that. Posters are at most ~2000 px tall in any real
+/// catalog; 8192 px is plenty of slack for HiDPI backdrops.
+const MAX_IMAGE_DIMENSION: u32 = 8192;
 const POSTER_DIR: &str = "posters";
 const BACKDROP_DIR: &str = "backdrops";
 
@@ -46,11 +52,25 @@ fn restrict_access(acc: Option<Vec<i64>>, requested: Option<Vec<i64>>) -> Option
     }
 }
 
+/// Hard cap on the `?q=` substring search. The filter feeds into a
+/// `LIKE '%{q}%'` against `items.title`; without a cap an attacker
+/// could submit a multi-megabyte `q` (under the global 16MB body
+/// limit) and force SQLite to scan against giant strings on every
+/// matching row. 256 chars covers every realistic title search.
+const MAX_SEARCH_Q_BYTES: usize = 256;
+
 pub async fn list(
     State(state): State<AppState>,
     user: AuthUser,
     Query(mut filter): Query<ItemFilter>,
 ) -> Result<Json<ItemPage>, ApiError> {
+    if let Some(ref q) = filter.q {
+        if q.len() > MAX_SEARCH_Q_BYTES {
+            return Err(ApiError::validation(
+                "search query must be at most 256 characters",
+            ));
+        }
+    }
     let acc = access(&state, &user).await?;
     let effective = restrict_access(acc, filter.library_ids.take());
     let page = queries::list_items(&state.pool, filter, user.id, effective.as_deref()).await?;
@@ -771,6 +791,16 @@ pub async fn report_issue(
     Path(id): Path<i64>,
     Json(input): Json<ReportIssueInput>,
 ) -> Result<StatusCode, ApiError> {
+    // Per-(user, item) throttle. Each report fans out to every admin's
+    // email + creates one notification row per admin. Without this gate
+    // a hostile (or just confused) user could spam the admin inbox by
+    // mashing the Report button.
+    let throttle_key = format!("{}:{}", user.id, id);
+    if state.report_issue_limiter.check_key(&throttle_key).is_err() {
+        return Err(ApiError::TooManyRequests(
+            "you've sent several reports for this title recently — try again later".into(),
+        ));
+    }
     // Allowlist the `kind` so the email subject / payload stays tidy
     // and so a buggy/hostile client can't spray arbitrary labels into
     // admin inboxes. Anything outside this set is rejected.
@@ -935,19 +965,26 @@ pub async fn upload_backdrop(
     upload_image_impl(state, user, id, multipart, ImageKind::Backdrop).await
 }
 
-/// Stream the locally-stored image back to the client. No auth required to
-/// view; the URL is opaque (`/poster` resolves to whatever was uploaded).
+/// Stream the locally-stored image back to the client. Auth-gated +
+/// library-access enforced so item ids in libraries the caller can't
+/// see don't leak via the existence-vs-404 channel. Previously these
+/// were fully unauthenticated, which let any internet caller enumerate
+/// item ids from `1..N` and pull artwork.
 pub async fn get_poster_blob(
     State(state): State<AppState>,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
+    crate::api::access::ensure_item_accessible(&state, &user, id).await?;
     serve_image_blob(&state, id, ImageKind::Poster).await
 }
 
 pub async fn get_backdrop_blob(
     State(state): State<AppState>,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
+    crate::api::access::ensure_item_accessible(&state, &user, id).await?;
     serve_image_blob(&state, id, ImageKind::Backdrop).await
 }
 
@@ -1017,10 +1054,10 @@ async fn upload_image_impl(
         }
     }
     let bytes = bytes.ok_or_else(|| ApiError::validation("missing `file` field"))?;
-    let ext = match content_type.as_deref() {
-        Some("image/jpeg") => "jpg",
-        Some("image/png") => "png",
-        Some("image/webp") => "webp",
+    let target_format = match content_type.as_deref() {
+        Some("image/jpeg") => image::ImageFormat::Jpeg,
+        Some("image/png") => image::ImageFormat::Png,
+        Some("image/webp") => image::ImageFormat::WebP,
         Some(other) => {
             return Err(ApiError::validation(format!(
                 "unsupported content-type `{other}` (use image/jpeg, image/png, or image/webp)"
@@ -1028,6 +1065,23 @@ async fn upload_image_impl(
         }
         None => return Err(ApiError::validation("missing content-type")),
     };
+
+    // SECURITY: decode then re-encode through the `image` crate so:
+    //   * SVG / HTML / anything-not-actually-an-image labelled as JPEG
+    //     fails the decode and is rejected here, not after it's been
+    //     written to disk.
+    //   * EXIF / XMP / IPTC metadata (which can leak GPS, camera serial,
+    //     editing history, embedded thumbnails) is stripped by the
+    //     round-trip — the encoder only writes the pixel data.
+    //   * Pixel-flood "decompression bomb" images get bounded by the
+    //     in-memory decode step plus the post-decode dimension check.
+    //
+    // We honour the operator-declared content_type for the OUTPUT format
+    // — re-encoding to a different format would silently break the
+    // upload UX. JPEG quality 90 matches Plex's default.
+    let (sanitized_bytes, ext) =
+        sanitize_image(&bytes, target_format).map_err(ApiError::validation)?;
+    let bytes = sanitized_bytes;
 
     let dir = state.data_dir.join(kind.dir());
     tokio::fs::create_dir_all(&dir)
@@ -1100,4 +1154,46 @@ async fn serve_image_blob(
         .header(header::CONTENT_LENGTH, bytes.len().to_string())
         .body(Body::from(bytes))
         .map_err(|e| ApiError::Internal(e.into()))
+}
+
+/// Decode user-supplied image bytes and re-encode as the requested
+/// format. Returns the cleaned bytes plus the canonical file extension
+/// to use on disk. On any decode error, dimension overflow, or
+/// unexpected pixel-bomb shape, returns an error suitable for an
+/// `ApiError::validation` body — never panics on hostile input.
+///
+/// This is the canonical defense against:
+///   * SVG / HTML / arbitrary blobs labelled as `image/jpeg` — fails
+///     the decode, rejected before any disk write.
+///   * EXIF / XMP / IPTC metadata leaks — the re-encode only writes
+///     pixel data, so GPS / camera serial / editing history are gone.
+///   * Pixel-flood decompression bombs — capped at MAX_IMAGE_DIMENSION
+///     per side before the encoder allocates a buffer.
+fn sanitize_image(
+    raw: &[u8],
+    format: image::ImageFormat,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let decoded = image::load_from_memory(raw)
+        .map_err(|e| format!("image decode failed: {e}"))?;
+    if decoded.width() > MAX_IMAGE_DIMENSION || decoded.height() > MAX_IMAGE_DIMENSION {
+        return Err(format!(
+            "image is too large ({}×{}); max is {MAX_IMAGE_DIMENSION}px per side",
+            decoded.width(),
+            decoded.height(),
+        ));
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut cursor = std::io::Cursor::new(&mut out);
+    decoded
+        .write_to(&mut cursor, format)
+        .map_err(|e| format!("image re-encode failed: {e}"))?;
+    let ext = match format {
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::WebP => "webp",
+        // Sanitizer is only called with the three formats the upload
+        // handler accepts — any other arm is a programmer error.
+        _ => return Err("unsupported image format".to_string()),
+    };
+    Ok((out, ext))
 }
