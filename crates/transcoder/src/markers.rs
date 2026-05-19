@@ -1,19 +1,30 @@
-//! Intro/credits detection via ffmpeg's `blackdetect` filter.
+//! Intro/credits detection.
 //!
-//! Strategy: run ffmpeg in null-output mode with `blackdetect=d=1` to find
-//! every black sequence >= 1s. Parse the stderr log for the
-//! `black_start/black_end/black_duration` triples it emits. We then bucket
-//! the runs:
+//! Two cooperating strategies:
 //!
-//!   * "intro" — first sustained black run that occurs before 600s and
-//!     lasts >= 2s (typical post-cold-open black before the title card).
-//!   * "credits" — black run that begins within the last 8% of the
-//!     duration (or final 60s, whichever is longer).
+//! 1. **Chapter metadata** (best signal, ~free): ffprobe lists any
+//!    `Chapter` entries embedded in the container. We name-match
+//!    titles like "Intro" / "Opening" / "End Credits" / "Outro" to
+//!    intro/credits markers. Authoritative when present — Bluray
+//!    rips and well-mastered MKVs include these.
 //!
-//! This is heuristic, not chapter metadata — it's accurate enough to
-//! drive a "Skip Intro" / "Skip Credits" button in the player. False
-//! positives are unavoidable for movies with mid-film fades; the player
-//! treats markers as soft hints.
+//! 2. **`blackdetect` filter** (heuristic fallback): run ffmpeg in
+//!    null-output mode with `blackdetect=d=1` to find every black
+//!    sequence ≥ 1s. Bucket them:
+//!      * "intro" — first sustained black run that occurs before 600s
+//!        and lasts ≥ 2s (typical post-cold-open black before the
+//!        title card).
+//!      * "credits" — black run that begins within the last 8% of the
+//!        duration (or final 60s, whichever is longer).
+//!
+//! Chapter-derived markers win over blackdetect for the same kind —
+//! they're hand-curated. blackdetect fills in the gap for kinds the
+//! chapters don't cover.
+//!
+//! Heuristic, not perfect — accurate enough to drive a "Skip Intro" /
+//! "Skip Credits" button in the player. False positives are
+//! unavoidable for movies with mid-film fades; the player treats
+//! markers as soft hints.
 //!
 //! No state is persisted by this module — the caller writes detected
 //! ranges into the `markers` table.
@@ -21,10 +32,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tokio::process::Command;
 use tracing::debug;
 
 use crate::FfmpegConfig;
+use crate::probe::{Chapter, probe_chapters};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectedMarker {
@@ -48,16 +59,35 @@ impl MarkerKind {
     }
 }
 
-/// Run ffmpeg blackdetect on the given file and classify the runs.
-/// `duration_ms` is needed for credits detection (relative to the end of
-/// the file). When `None`, only intro detection is attempted.
+/// Detect intro and credits markers on the given file. Combines
+/// chapter-metadata and blackdetect strategies (see module docs).
+/// `duration_ms` is needed for credits detection (relative to the
+/// end of the file). When `None`, only intro detection is attempted.
+///
+/// Errors propagate from the underlying ffprobe/ffmpeg invocations.
+/// Most failures (no chapters, no black runs) are *not* errors —
+/// they just produce empty results for that strategy.
 pub async fn detect_markers(
     cfg: &FfmpegConfig,
     path: &Path,
     duration_ms: Option<i64>,
 ) -> Result<Vec<DetectedMarker>> {
+    // Chapter pass first — cheapest and highest signal. We tolerate
+    // probe failure (chapter pass returning Err) by treating it as
+    // "no chapters" and falling through to blackdetect, rather than
+    // failing the whole detection — many containers ffprobe doesn't
+    // know how to enumerate chapters for still encode just fine.
+    let chapter_markers = match probe_chapters(cfg, path).await {
+        Ok(chapters) => classify_chapters(&chapters, duration_ms),
+        Err(e) => {
+            debug!(path = %path.display(), error = %e, "chapter probe failed; falling back to blackdetect");
+            Vec::new()
+        }
+    };
+
     debug!(path = %path.display(), "blackdetect start");
-    let output = Command::new(&cfg.ffmpeg)
+    let output = cfg
+        .background_ffmpeg()
         .args(["-hide_banner", "-nostats", "-loglevel", "info"])
         .arg("-i")
         .arg(path)
@@ -75,7 +105,87 @@ pub async fn detect_markers(
         runs = runs.len(),
         "blackdetect parsed runs"
     );
-    Ok(classify(runs, duration_ms))
+    let blackdetect_markers = classify(runs, duration_ms);
+
+    Ok(merge_markers(chapter_markers, blackdetect_markers))
+}
+
+/// Map chapter entries onto intro/credits markers via case-insensitive
+/// title matching. The rules below are intentionally narrow — false
+/// positives are worse than no marker (skip-intro yanking the user
+/// into the wrong scene erodes trust).
+///
+/// - `intro` — chapter whose title contains "intro", "opening",
+///   "opening credits", or "opening theme", AND starts in the first
+///   600s of the file (most cold-open intros land there).
+/// - `credits` — chapter whose title contains "credits", "end credits",
+///   "outro", or "closing credits", AND starts in the last 30% of the
+///   file (rules out musical numbers titled "credits" in the middle).
+pub(crate) fn classify_chapters(
+    chapters: &[Chapter],
+    duration_ms: Option<i64>,
+) -> Vec<DetectedMarker> {
+    let mut out = Vec::new();
+    let intro_cutoff = 600_000_i64;
+    // For credits, prefer the last 30% of the file. When duration is
+    // unknown, fall back to "any chapter whose title matches".
+    let credits_threshold = duration_ms.map(|d| (d as f64 * 0.7) as i64);
+    for ch in chapters {
+        let Some(title) = ch.title.as_deref() else {
+            continue;
+        };
+        let lower = title.to_ascii_lowercase();
+        let is_intro = (lower.contains("opening") || lower.contains("intro"))
+            && ch.start_ms <= intro_cutoff;
+        let is_credits = (lower.contains("end credits")
+            || lower.contains("closing credit")
+            || lower == "credits"
+            || lower.contains("outro"))
+            && credits_threshold.is_none_or(|c| ch.start_ms >= c);
+        if is_intro {
+            out.push(DetectedMarker {
+                kind: MarkerKind::Intro,
+                // Anchor from 0 so the skip button advances past the
+                // cold open + title card, not just the chapter mark.
+                start_ms: 0,
+                end_ms: ch.end_ms,
+            });
+        } else if is_credits {
+            let end = duration_ms.unwrap_or(ch.end_ms);
+            out.push(DetectedMarker {
+                kind: MarkerKind::Credits,
+                start_ms: ch.start_ms,
+                end_ms: end,
+            });
+        }
+    }
+    out
+}
+
+/// Combine chapter-derived markers with blackdetect-derived markers.
+/// Chapter wins for any kind it covers — the title-match heuristic
+/// is more reliable than fade-to-black timing. The blackdetect ones
+/// fill in kinds the chapter list didn't cover.
+pub(crate) fn merge_markers(
+    chapter: Vec<DetectedMarker>,
+    blackdetect: Vec<DetectedMarker>,
+) -> Vec<DetectedMarker> {
+    let mut out = chapter;
+    for m in blackdetect {
+        if out.iter().any(|c| c.kind == m.kind) {
+            continue;
+        }
+        out.push(m);
+    }
+    // Stable order keeps the consuming UI predictable — intros before
+    // credits, then by start_ms within each kind.
+    out.sort_by(|a, b| {
+        a.kind
+            .as_str()
+            .cmp(b.kind.as_str())
+            .then(a.start_ms.cmp(&b.start_ms))
+    });
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,5 +295,114 @@ some unrelated log line
     fn no_markers_for_quiet_file() {
         let out = classify(vec![], Some(60 * 60 * 1000));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn classify_chapters_matches_intro_title() {
+        let chapters = vec![
+            Chapter {
+                start_ms: 0,
+                end_ms: 90_000,
+                title: Some("Opening Credits".into()),
+            },
+            Chapter {
+                start_ms: 90_000,
+                end_ms: 1_200_000,
+                title: Some("Episode".into()),
+            },
+        ];
+        let out = classify_chapters(&chapters, Some(1_300_000));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, MarkerKind::Intro);
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[0].end_ms, 90_000);
+    }
+
+    #[test]
+    fn classify_chapters_matches_credits_title() {
+        let chapters = vec![
+            Chapter {
+                start_ms: 0,
+                end_ms: 60_000,
+                title: Some("Cold Open".into()),
+            },
+            Chapter {
+                start_ms: 60_000,
+                end_ms: 1_700_000,
+                title: Some("Main Show".into()),
+            },
+            Chapter {
+                start_ms: 1_700_000,
+                end_ms: 1_800_000,
+                title: Some("End Credits".into()),
+            },
+        ];
+        let out = classify_chapters(&chapters, Some(1_800_000));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, MarkerKind::Credits);
+        assert_eq!(out[0].start_ms, 1_700_000);
+        assert_eq!(out[0].end_ms, 1_800_000);
+    }
+
+    #[test]
+    fn classify_chapters_rejects_early_credits_chapter() {
+        // A chapter named "Credits" in the first 70% of the file is
+        // probably the cast intro for a documentary, not the
+        // post-show roll. Reject so we don't yank the player.
+        let chapters = vec![Chapter {
+            start_ms: 30_000,
+            end_ms: 60_000,
+            title: Some("Credits".into()),
+        }];
+        let out = classify_chapters(&chapters, Some(1_800_000));
+        assert!(out.is_empty(), "got {out:?}");
+    }
+
+    #[test]
+    fn classify_chapters_ignores_untitled() {
+        let chapters = vec![Chapter {
+            start_ms: 0,
+            end_ms: 60_000,
+            title: None,
+        }];
+        let out = classify_chapters(&chapters, Some(1_800_000));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn merge_prefers_chapter_over_blackdetect_for_same_kind() {
+        let chapter = vec![DetectedMarker {
+            kind: MarkerKind::Intro,
+            start_ms: 0,
+            end_ms: 90_000,
+        }];
+        let blackdetect = vec![DetectedMarker {
+            kind: MarkerKind::Intro,
+            start_ms: 0,
+            end_ms: 35_000,
+        }];
+        let out = merge_markers(chapter.clone(), blackdetect);
+        assert_eq!(out.len(), 1);
+        // Chapter-derived value wins.
+        assert_eq!(out[0].end_ms, 90_000);
+    }
+
+    #[test]
+    fn merge_fills_in_kinds_chapters_missed() {
+        let chapter = vec![DetectedMarker {
+            kind: MarkerKind::Intro,
+            start_ms: 0,
+            end_ms: 90_000,
+        }];
+        let blackdetect = vec![DetectedMarker {
+            kind: MarkerKind::Credits,
+            start_ms: 1_700_000,
+            end_ms: 1_800_000,
+        }];
+        let out = merge_markers(chapter, blackdetect);
+        assert_eq!(out.len(), 2);
+        // Sorted: credits ("credits" < "intro" alphabetically).
+        assert_eq!(out[0].kind, MarkerKind::Credits);
+        assert_eq!(out[1].kind, MarkerKind::Intro);
     }
 }

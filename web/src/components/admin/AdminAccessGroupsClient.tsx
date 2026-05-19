@@ -109,7 +109,7 @@ export function AdminAccessGroupsClient({
               type="button"
               onClick={create}
               disabled={creating || !newName.trim()}
-              className="rounded bg-(--color-accent) px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+              className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
             >
               {creating ? "…" : "Add"}
             </button>
@@ -329,7 +329,7 @@ function GroupEditor({
           type="button"
           onClick={saveMeta}
           disabled={!metaDirty || savingMeta}
-          className="rounded bg-(--color-accent) px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+          className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingMeta ? "…" : "Save details"}
         </button>
@@ -368,7 +368,7 @@ function GroupEditor({
           type="button"
           onClick={saveLibs}
           disabled={!libsDirty || savingLibs}
-          className="rounded bg-(--color-accent) px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+          className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingLibs ? "…" : "Save libraries"}
         </button>
@@ -415,7 +415,7 @@ function GroupEditor({
           type="button"
           onClick={saveMembers}
           disabled={!membersDirty || savingMembers}
-          className="rounded bg-(--color-accent) px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+          className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingMembers ? "…" : "Save members"}
         </button>

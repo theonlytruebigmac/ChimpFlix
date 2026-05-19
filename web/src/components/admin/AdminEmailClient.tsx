@@ -234,7 +234,7 @@ export function AdminEmailClient({
           <button
             disabled={!dirty || savingConfig}
             onClick={saveConfig}
-            className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
           >
             {savingConfig ? "Saving…" : "Save SMTP settings"}
           </button>
@@ -266,7 +266,7 @@ export function AdminEmailClient({
           <button
             disabled={savingPassword || !password}
             onClick={savePassword}
-            className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
           >
             {savingPassword ? "Saving…" : status.has_password ? "Rotate" : "Set"}
           </button>

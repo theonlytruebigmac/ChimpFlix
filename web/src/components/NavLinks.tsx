@@ -5,9 +5,70 @@ import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import {
   ChimpFlixApiError,
+  auth as authApi,
   libraries as librariesApi,
   prefs as prefsApi,
+  type UserRole,
 } from "@/lib/chimpflix-api";
+
+// Cache the current user's role in sessionStorage so the "Stats"
+// admin nav link doesn't pop in on every navigation. 5 min TTL is
+// short enough that a role change (promotion / demotion) becomes
+// visible quickly.
+const NAV_ROLE_KEY = "cf_nav_role_v1";
+const NAV_ROLE_TTL_MS = 5 * 60_000;
+
+function readCachedRole(): UserRole | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(NAV_ROLE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { v: UserRole; t: number };
+    if (Date.now() - parsed.t > NAV_ROLE_TTL_MS) return null;
+    return parsed.v;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedRole(value: UserRole | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (value) {
+      window.sessionStorage.setItem(
+        NAV_ROLE_KEY,
+        JSON.stringify({ v: value, t: Date.now() }),
+      );
+    } else {
+      window.sessionStorage.removeItem(NAV_ROLE_KEY);
+    }
+  } catch {
+    // sessionStorage can throw under privacy modes — fall back to fetch.
+  }
+}
+
+function useCurrentUserRole(): UserRole | null {
+  const [role, setRole] = useState<UserRole | null>(() => readCachedRole());
+  useEffect(() => {
+    let cancelled = false;
+    authApi
+      .me()
+      .then(({ user }) => {
+        if (cancelled) return;
+        setRole(user.role);
+        writeCachedRole(user.role);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // 401/403: pretend logged-out so admin items stay hidden.
+        writeCachedRole(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return role;
+}
 
 interface NavLibrary {
   id: number;
@@ -66,8 +127,9 @@ function libraryItem(lib: NavLibrary): NavItem {
   };
 }
 
-export function NavLinks() {
-  const pathname = usePathname() ?? "";
+/// Shared hook — fetches the user's visible libraries once and caches
+/// in sessionStorage. Both the desktop bar and mobile drawer consume it.
+function useNavLibraries(): NavLibrary[] {
   const [libraries, setLibraries] = useState<NavLibrary[]>(
     () => readCached() ?? [],
   );
@@ -98,6 +160,17 @@ export function NavLinks() {
     };
   }, []);
 
+  return libraries;
+}
+
+function navItems(
+  libraries: NavLibrary[],
+  role: UserRole | null,
+  includeOverflow: boolean,
+): {
+  primary: NavItem[];
+  overflow: NavItem[];
+} {
   const inline = libraries.slice(0, INLINE_LIBRARY_LIMIT).map(libraryItem);
   const overflow = libraries.slice(INLINE_LIBRARY_LIMIT).map(libraryItem);
 
@@ -116,18 +189,158 @@ export function NavLinks() {
       match: (p) => p === "/my-list" || p.startsWith("/my-list/"),
     },
   ];
+  // Admin / owner shortcut to the playback dashboard. Drops in
+  // right after My List so the section reads "library nav · admin
+  // nav" — keeps the admin link visible without burying it under
+  // the profile menu.
+  if (role === "admin" || role === "owner") {
+    trailing.push({
+      href: "/settings/admin/status/stats",
+      label: "Stats",
+      match: (p) => p.startsWith("/settings/admin/status/stats"),
+    });
+  }
 
-  const items = [...leading, ...inline, ...trailing];
+  if (includeOverflow) {
+    // Mobile drawer renders everything inline — no overflow split.
+    return {
+      primary: [...leading, ...inline, ...overflow, ...trailing],
+      overflow: [],
+    };
+  }
+  return { primary: [...leading, ...inline, ...trailing], overflow };
+}
+
+export function NavLinks() {
+  const pathname = usePathname() ?? "";
+  const libraries = useNavLibraries();
+  const role = useCurrentUserRole();
+  const { primary, overflow } = navItems(libraries, role, false);
 
   return (
     <nav className="hidden items-center gap-5 text-sm md:flex">
-      {items.map((link) => (
+      {primary.map((link) => (
         <NavLink key={link.href} item={link} active={link.match(pathname)} />
       ))}
       {overflow.length > 0 ? (
         <MoreMenu items={overflow} pathname={pathname} />
       ) : null}
     </nav>
+  );
+}
+
+/// Mobile menu: hamburger button + slide-out drawer covering ~80% of
+/// the viewport. Used in place of `NavLinks` when the desktop bar is
+/// hidden (<md). Render alongside NavLinks in TopNav — the breakpoint
+/// classes handle visibility.
+export function MobileNavTrigger() {
+  const pathname = usePathname() ?? "";
+  const libraries = useNavLibraries();
+  const role = useCurrentUserRole();
+  const { primary } = navItems(libraries, role, true);
+  const [open, setOpen] = useState(false);
+
+  // Close on navigation. usePathname changes when the user taps a
+  // link inside the drawer; that's when we want it to dismiss.
+  // The setState-in-effect is the explicit "external input changed
+  // → reset local state" case the lint rule's documented exceptions
+  // mention (responding to a prop/derived value change).
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setOpen(false);
+  }, [pathname]);
+
+  // Body-scroll lock while the drawer is open so the underlying page
+  // doesn't scroll behind it.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (open) {
+      const prev = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+      return () => {
+        document.body.style.overflow = prev;
+      };
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        aria-label="Open navigation menu"
+        aria-expanded={open}
+        className="flex h-10 w-10 items-center justify-center rounded-md text-white/85 transition-colors hover:bg-white/10 md:hidden"
+      >
+        <HamburgerIcon />
+      </button>
+
+      {open && (
+        <div className="fixed inset-0 z-60 md:hidden">
+          {/* Backdrop */}
+          <button
+            type="button"
+            aria-label="Close menu"
+            onClick={() => setOpen(false)}
+            className="absolute inset-0 bg-black/70"
+          />
+
+          {/* Drawer */}
+          <aside
+            role="dialog"
+            aria-label="Navigation"
+            aria-modal="true"
+            className="relative ml-0 flex h-full w-[80vw] max-w-xs flex-col bg-black shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+              <span className="text-xs font-semibold uppercase tracking-wider text-white/50">
+                Browse
+              </span>
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                aria-label="Close menu"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-white/70 hover:bg-white/10 hover:text-white"
+              >
+                <CloseIcon />
+              </button>
+            </div>
+
+            <ul className="flex-1 overflow-y-auto py-3">
+              {primary.map((item) => {
+                const active = item.match(pathname);
+                return (
+                  <li key={item.href}>
+                    <Link
+                      href={item.href}
+                      onClick={() => setOpen(false)}
+                      aria-current={active ? "page" : undefined}
+                      className={
+                        "block px-5 py-3 text-base transition-colors " +
+                        (active
+                          ? "bg-white/10 font-semibold text-white"
+                          : "text-white/85 hover:bg-white/5 hover:text-white")
+                      }
+                    >
+                      {item.label}
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
+          </aside>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -236,5 +449,42 @@ function MoreMenu({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function HamburgerIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      aria-hidden
+    >
+      <line x1="4" y1="7" x2="20" y2="7" />
+      <line x1="4" y1="12" x2="20" y2="12" />
+      <line x1="4" y1="17" x2="20" y2="17" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      aria-hidden
+    >
+      <line x1="6" y1="6" x2="18" y2="18" />
+      <line x1="18" y1="6" x2="6" y2="18" />
+    </svg>
   );
 }

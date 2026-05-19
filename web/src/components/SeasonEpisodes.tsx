@@ -5,19 +5,6 @@ import { useState } from "react";
 import { formatRuntime, type MediaItem } from "@/lib/chimpflix-types";
 import { plexImage } from "@/lib/image";
 
-type RawEpisode = {
-  ratingKey?: string | number;
-  key?: string;
-  type?: string;
-  title?: string;
-  summary?: string;
-  thumb?: string;
-  art?: string;
-  duration?: number;
-  viewOffset?: number;
-  index?: number;
-};
-
 export function SeasonEpisodes({
   seasons,
   initialEpisodes,
@@ -77,7 +64,7 @@ export function SeasonEpisodes({
   const selectedSeason = seasons.find((s) => s.ratingKey === selectedKey);
 
   return (
-    <section className="border-t border-white/10 px-12 py-8">
+    <section className="border-t border-white/10 px-4 sm:px-8 md:px-12 py-8">
       <div className="mb-6 flex items-center justify-between">
         <h2 className="text-2xl font-medium">Episodes</h2>
         {seasons.length > 1 && (

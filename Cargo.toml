@@ -27,6 +27,10 @@ cron = "0.12"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
+# Tiny IpAddr/CIDR matcher. Used by the network admin to decide whether
+# a request originated on the LAN (for the per-user remote-stream cap)
+# or comes from a bypass-authorised network.
+ipnet = "2"
 # Async SMTP client. Pulled with rustls (no openssl dep) and the tokio1
 # executor so it slots into the existing tokio runtime cleanly.
 lettre = { version = "0.11", default-features = false, features = [

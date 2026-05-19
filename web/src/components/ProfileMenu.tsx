@@ -52,6 +52,10 @@ export function ProfileMenu() {
   useEffect(() => {
     let cancelled = false;
     const cached = readCachedUser();
+    // Hydrate from localStorage cache synchronously so the avatar
+    // doesn't flash empty on every navigation. The async refresh
+    // below overwrites with fresh server data when it lands.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (cached) setUser(cached);
     authApi
       .me()

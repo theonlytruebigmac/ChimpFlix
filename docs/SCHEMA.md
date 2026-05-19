@@ -1,8 +1,14 @@
-# ChimpFlix Database Schema (v0.1 draft)
+# ChimpFlix Database Schema
 
-> Status: **design draft**. SQLite. WAL mode, `foreign_keys=ON`,
-> `synchronous=NORMAL`. All integer IDs are `INTEGER PRIMARY KEY` (rowid
-> aliases — fast and small).
+> SQLite. WAL mode, `foreign_keys=ON`, `synchronous=NORMAL`. All
+> integer IDs are `INTEGER PRIMARY KEY` (rowid aliases — fast and
+> small).
+>
+> **Currency:** the inline CREATE statements below are the original
+> v0.1 design draft. The schema has grown via ~40+ migrations under
+> `crates/library/migrations/` since — see the [**Table
+> inventory**](#table-inventory) at the bottom for the complete
+> current shape. The migrations directory is the source of truth.
 
 ## Conventions
 
@@ -353,3 +359,72 @@ into a corner. We do NOT create them yet.
 - Schema is **not** stable until v0.1.0 tag. Anything before that is fair
   game to rewrite — no migrations preserved across pre-release versions
   until then.
+
+---
+
+## Table inventory
+
+Complete list of tables in the current schema, grouped by domain.
+Cross-reference with `crates/library/migrations/*.sql` for the
+authoritative DDL — each migration is dated + phase-numbered.
+
+### Auth + users
+
+- `users` — accounts; roles `owner` | `user`
+- `sessions` — server-side session rows (cookie holds a signed reference)
+- `user_recovery_codes`, `user_totp` — 2FA enrollment + recovery
+- `invites`, `invite_libraries`, `invite_groups` — invite tokens + pre-bound access
+- `email_change_tokens` — pending email-change verifications
+- `password_reset_tokens` — short-lived reset codes
+- `access_groups`, `access_group_libraries`, `user_access_groups` — group-based library access
+- `library_access` — direct per-user grants
+- `user_hidden_libraries` — per-user library hide prefs
+
+### Library content
+
+- `libraries`, `library_paths` — library configs + their watched roots
+- `library_agents` — per-library priority list of metadata agents
+- `items` — movies + show-roots (`kind` column distinguishes)
+- `seasons`, `episodes` — show structure
+- `genres`, `item_genres` — tagged metadata (read-only, scanner-managed)
+- `people`, `item_credits` — cast + crew rows
+- `item_reviews` — operator/metadata-source reviews
+- `item_extras` — trailers, featurettes, behind-the-scenes
+- `images` — historical poster/backdrop URL list per item
+- `media_files` — concrete file rows
+- `media_streams` — audio/video/subtitle streams per file
+- `markers` — auto-detected intro/credits markers
+- `external_subtitles` — OpenSubtitles + operator uploads
+- `tags`, `item_tags` — operator-owned tags
+- `collections`, `collection_items` — auto (TMDB franchises) + manual + smart collections (`kind` column)
+- `items_fts*` (4 tables) — FTS5 virtual table + shadow tables for search
+
+### Playback + per-user state
+
+- `play_state` — per-user position / watched / view_count
+- `user_my_list` — per-user Watchlist
+- `user_ratings` — per-user 1-10 ratings (Trakt-synced when linked)
+- `user_trakt_tokens` — per-user Trakt OAuth credentials
+- `notifications` — per-user inbox
+
+### Server admin
+
+- `server_settings` — singleton (id=1) row of operator settings
+- `secrets` — encrypted credential vault (TMDB/TVDB/AniList/Trakt/OpenSubtitles/session-HMAC)
+- `audit_log` — admin action history
+- `webhooks`, `webhook_deliveries` — outbound webhook configs + delivery log
+- `scheduled_tasks`, `task_runs` — operator-controlled cron + history
+- `scan_jobs` — per-scan progress + outcome
+- `transcoder_presets` — admin-defined encode profiles
+- `optimized_versions` — queued + completed background re-encodes
+- `trending_cache` — TMDB-trending intersected with local library
+
+### Notes
+
+- `*_fts*` tables are virtual + shadow tables maintained by SQLite's
+  FTS5 module; never written directly.
+- `media_files` has accumulated optional columns across phases for
+  scrub-preview sprites, chapter thumbs, loudness measurements — see
+  the relevant phase migration for column-by-column docs.
+- `collections` was schema-rebuilt twice (phase 36 + phase 41) to add
+  the `kind` column and `rule_json`. See the migrations for the dance.

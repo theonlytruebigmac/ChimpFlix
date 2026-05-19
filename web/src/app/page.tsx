@@ -1,12 +1,15 @@
 import { Suspense } from "react";
+import { CollectionsRail } from "@/components/CollectionsRail";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
+import { RailErrorBoundary } from "@/components/RailErrorBoundary";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
 import { Top10Rail } from "@/components/Top10Rail";
 import { TopNav } from "@/components/TopNav";
 import { pickHeroIndex } from "@/lib/hero";
 import {
+  collections as collectionsApi,
   items as itemsApi,
   libraries as librariesApi,
   playState as playStateApi,
@@ -38,49 +41,67 @@ export default async function Home() {
   return (
     <main className="relative">
       <TopNav />
-      <Suspense fallback={<HeroSkeleton />}>
-        <HomeHero visibleLibIds={visibleLibIds} />
-      </Suspense>
+      <RailErrorBoundary label="HomeHero">
+        <Suspense fallback={<HeroSkeleton />}>
+          <HomeHero visibleLibIds={visibleLibIds} />
+        </Suspense>
+      </RailErrorBoundary>
       <div className="relative z-20 space-y-1 pb-24 pt-4">
-        <Suspense fallback={<RailSkeleton title="Continue Watching" />}>
-          <ContinueWatchingRail />
-        </Suspense>
-        <Suspense fallback={<RailSkeleton title="Recently Added" />}>
-          <RecentlyAddedRail visibleLibIds={visibleLibIds} />
-        </Suspense>
-        <Suspense fallback={null}>
-          <Top10TrendingRail
-            kind="movie"
-            title="Top 10 Movies This Week"
-            visibleLibIds={visibleLibIds}
-          />
-        </Suspense>
-        <Suspense fallback={null}>
-          <Top10TrendingRail
-            kind="show"
-            title="Top 10 Shows This Week"
-            visibleLibIds={visibleLibIds}
-          />
-        </Suspense>
-        {libs.map((lib) => (
-          <Suspense
-            key={`lib-${lib.id}`}
-            fallback={<RailSkeleton title={`New in ${lib.name}`} />}
-          >
-            <LibSectionRail lib={lib} />
+        <RailErrorBoundary label="ContinueWatching">
+          <Suspense fallback={<RailSkeleton title="Continue Watching" />}>
+            <ContinueWatchingRail />
           </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="RecentlyAdded">
+          <Suspense fallback={<RailSkeleton title="Recently Added" />}>
+            <RecentlyAddedRail visibleLibIds={visibleLibIds} />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="Top10Movies">
+          <Suspense fallback={null}>
+            <Top10TrendingRail
+              kind="movie"
+              title="Top 10 Movies This Week"
+              visibleLibIds={visibleLibIds}
+            />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="Top10Shows">
+          <Suspense fallback={null}>
+            <Top10TrendingRail
+              kind="show"
+              title="Top 10 Shows This Week"
+              visibleLibIds={visibleLibIds}
+            />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="Collections">
+          <Suspense fallback={<RailSkeleton title="Collections" />}>
+            <HomeCollectionsRail />
+          </Suspense>
+        </RailErrorBoundary>
+        {libs.map((lib) => (
+          <RailErrorBoundary key={`lib-${lib.id}`} label={`Lib:${lib.name}`}>
+            <Suspense fallback={<RailSkeleton title={`New in ${lib.name}`} />}>
+              <LibSectionRail lib={lib} />
+            </Suspense>
+          </RailErrorBoundary>
         ))}
         {firstMovieLib &&
           MOVIE_GENRES.map((g) => (
-            <Suspense key={`movie-genre-${g}`} fallback={null}>
-              <GenreRail libraryId={firstMovieLib.id} kind="movie" genre={g} />
-            </Suspense>
+            <RailErrorBoundary key={`movie-genre-${g}`} label={`MovieGenre:${g}`}>
+              <Suspense fallback={null}>
+                <GenreRail libraryId={firstMovieLib.id} kind="movie" genre={g} />
+              </Suspense>
+            </RailErrorBoundary>
           ))}
         {firstShowLib &&
           SHOW_GENRES.map((g) => (
-            <Suspense key={`show-genre-${g}`} fallback={null}>
-              <GenreRail libraryId={firstShowLib.id} kind="show" genre={g} />
-            </Suspense>
+            <RailErrorBoundary key={`show-genre-${g}`} label={`ShowGenre:${g}`}>
+              <Suspense fallback={null}>
+                <GenreRail libraryId={firstShowLib.id} kind="show" genre={g} />
+              </Suspense>
+            </RailErrorBoundary>
           ))}
       </div>
       <ModalRoot />
@@ -99,17 +120,27 @@ async function HomeHero({ visibleLibIds }: { visibleLibIds: number[] }) {
       ? Promise.resolve({ items: [] as Awaited<ReturnType<typeof itemsApi.list>>["items"] })
       : itemsApi.list({ page_size: 12, library_ids: visibleLibIds }),
   ]);
-  const onDeck = deckRes.items
-    .map(adaptOnDeck)
-    .filter((it): it is MediaItem & { art: string } => Boolean(it.art));
+  // Accept items with either a true backdrop (`art`) or just a poster
+  // (`thumb`) — Hero.tsx already does `art ?? thumb`. Requiring backdrop
+  // collapses the hero to null on libraries whose metadata source only
+  // shipped posters (common for anime), which in turn collapses the
+  // whole layout because the rails container has no nav clearance.
+  // Prefer art-bearing candidates by listing them first.
+  const hasImage = (it: MediaItem) => Boolean(it.art) || Boolean(it.thumb);
+  const onDeck = deckRes.items.map(adaptOnDeck).filter(hasImage);
   const recent = latest.items
     .map(adaptItem)
-    .filter(
-      (it): it is MediaItem & { art: string } =>
-        Boolean(it.art) && (it.type === "movie" || it.type === "show"),
-    );
-  const pool = [...onDeck, ...recent].slice(0, 5);
-  if (pool.length === 0) return null;
+    .filter((it) => hasImage(it) && (it.type === "movie" || it.type === "show"));
+  const pool = [...onDeck, ...recent]
+    .sort((a, b) => (a.art ? -1 : 0) - (b.art ? -1 : 0))
+    .slice(0, 5);
+  if (pool.length === 0) {
+    // Genuinely empty library: render a nav-height spacer so the first
+    // rail's title doesn't slide under the fixed TopNav. Cheaper than
+    // wedging conditional padding into the rails container, which would
+    // leave a visible gap under the hero in the common case.
+    return <div className="h-20 md:h-24" aria-hidden />;
+  }
   return <Hero item={pool[pickHeroIndex(pool, "home")]} />;
 }
 
@@ -148,15 +179,16 @@ async function Top10TrendingRail({
   // The endpoint returns 200 with an empty array in those cases, so we
   // just bail without surfacing an error to the user.
   if (visibleLibIds.length === 0) return null;
+  let entries: Array<{ rank: number; item: ReturnType<typeof adaptItem> }>;
   try {
     const res = await itemsApi.trending(kind, 10, visibleLibIds);
-    const entries = res.items
+    entries = res.items
       .map(({ rank, ...item }) => ({ rank, item: adaptItem(item) }));
-    if (entries.length === 0) return null;
-    return <Top10Rail title={title} items={entries} />;
   } catch {
     return null;
   }
+  if (entries.length === 0) return null;
+  return <Top10Rail title={title} items={entries} />;
 }
 
 async function LibSectionRail({ lib }: { lib: Library }) {
@@ -167,6 +199,21 @@ async function LibSectionRail({ lib }: { lib: Library }) {
   const items = res.items.map(adaptItem);
   if (items.length === 0) return null;
   return <Rail title={`New in ${lib.name}`} items={items} />;
+}
+
+async function HomeCollectionsRail() {
+  // Server-side access control already filters out collections whose
+  // members all live in libraries this user can't see — so we don't
+  // need a separate visible-lib intersection here.
+  let collections;
+  try {
+    const r = await collectionsApi.list();
+    collections = r.collections;
+  } catch {
+    return null;
+  }
+  if (collections.length === 0) return null;
+  return <CollectionsRail collections={collections} />;
 }
 
 async function GenreRail({

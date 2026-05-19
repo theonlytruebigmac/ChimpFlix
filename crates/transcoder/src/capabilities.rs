@@ -48,6 +48,25 @@ pub struct TranscoderCapabilities {
     /// answer to "does my GPU actually decode this codec?" instead
     /// of inferring from card model and trusting it.
     pub decoders: HwDecoderCapabilities,
+    /// Enumerated GPU devices for the dropdown in admin → Transcoder.
+    /// NVIDIA enumerated via `nvidia-smi` when present; VAAPI via
+    /// glob over `/dev/dri/renderD*`. Empty when neither yields any
+    /// devices (single-GPU box or no GPU acceleration available).
+    pub gpu_devices: Vec<GpuDevice>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuDevice {
+    /// Operator-facing label, e.g. "NVIDIA GeForce RTX 5070 Ti".
+    pub name: String,
+    /// Value to store in `server_settings.transcoder_gpu_device`.
+    /// For NVENC: the index as a string ("0", "1"). For VAAPI: the
+    /// full device path ("/dev/dri/renderD128").
+    pub value: String,
+    /// Which hwaccel this device serves. Helps the UI group/filter
+    /// options when both NVENC + VAAPI cards are present on the
+    /// same box (rare but real).
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -129,7 +148,92 @@ pub async fn detect_capabilities(cfg: &FfmpegConfig) -> TranscoderCapabilities {
         caps.decoders.videotoolbox = probe_decoders_for(cfg, "videotoolbox").await;
     }
 
+    caps.gpu_devices = enumerate_gpu_devices().await;
+
     caps
+}
+
+/// Best-effort GPU device enumeration. Failures are silent — an empty
+/// `gpu_devices` list just means the admin dropdown shows only the
+/// "Auto" option, matching the previous behavior.
+async fn enumerate_gpu_devices() -> Vec<GpuDevice> {
+    let mut out: Vec<GpuDevice> = Vec::new();
+    out.extend(enumerate_nvidia().await);
+    out.extend(enumerate_vaapi().await);
+    out
+}
+
+/// Run `nvidia-smi --query-gpu=index,name --format=csv,noheader,nounits`
+/// and parse the output. Returns empty when the binary isn't on PATH
+/// or when it exits non-zero (no NVIDIA driver, no permissions, etc).
+async fn enumerate_nvidia() -> Vec<GpuDevice> {
+    let output = tokio::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .await;
+    let Ok(output) = output else { return Vec::new() };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|line| {
+            // Format: "0, NVIDIA GeForce RTX 5070 Ti"
+            let mut parts = line.splitn(2, ',');
+            let idx = parts.next()?.trim();
+            let name = parts.next()?.trim();
+            if idx.is_empty() || name.is_empty() {
+                return None;
+            }
+            // Reject malformed index (non-digit) so we don't pass
+            // junk to ffmpeg's `-gpu` flag later.
+            if !idx.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some(GpuDevice {
+                name: format!("NVIDIA: {name} (#{idx})"),
+                value: idx.to_string(),
+                backend: "nvenc".to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Glob `/dev/dri/renderD*` for VAAPI device nodes. Each render node
+/// represents one card; D128 is canonical "first GPU" on Linux,
+/// D129+ second card.
+async fn enumerate_vaapi() -> Vec<GpuDevice> {
+    let mut out: Vec<GpuDevice> = Vec::new();
+    let mut entries = match tokio::fs::read_dir("/dev/dri").await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    while let Ok(Some(ent)) = entries.next_entry().await {
+        let name = ent.file_name();
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.starts_with("renderD") {
+            continue;
+        }
+        let path = format!("/dev/dri/{name}");
+        out.push(GpuDevice {
+            name: format!("VAAPI: {name}"),
+            value: path.clone(),
+            backend: "vaapi".to_string(),
+        });
+    }
+    // Stable order so the UI dropdown doesn't reshuffle between
+    // restarts of the same hardware.
+    out.sort_by(|a, b| a.value.cmp(&b.value));
+    out
 }
 
 /// Codec set we care about for HW decode. Order is most-common

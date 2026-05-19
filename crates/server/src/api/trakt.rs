@@ -63,7 +63,7 @@ pub async fn link_start(
         .await
         .map_err(ApiError::Internal)?;
     let expires_at = Instant::now() + Duration::from_secs(resp.expires_in.max(0) as u64);
-    device_cache().lock().unwrap().insert(
+    device_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
         user.id,
         CachedDevice {
             device_code: resp.device_code.clone(),
@@ -95,7 +95,7 @@ pub async fn link_poll(
     let Some(client) = state.trakt_snapshot().await else {
         return Err(ApiError::validation("Trakt is not configured"));
     };
-    let entry = device_cache().lock().unwrap().remove(&user.id);
+    let entry = device_cache().lock().unwrap_or_else(|e| e.into_inner()).remove(&user.id);
     let Some(entry) = entry else {
         return Err(ApiError::validation(
             "no pending link — call /trakt/link/start first",
@@ -125,7 +125,7 @@ pub async fn link_poll(
         }
         DevicePollResult::Pending | DevicePollResult::SlowDown => {
             // Put it back so the next poll uses the same code.
-            device_cache().lock().unwrap().insert(user.id, entry);
+            device_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(user.id, entry);
             Ok(Json(if matches!(result, DevicePollResult::SlowDown) {
                 LinkPollResponse::SlowDown
             } else {

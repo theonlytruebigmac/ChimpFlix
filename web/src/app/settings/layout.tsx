@@ -17,9 +17,9 @@ export default async function SettingsLayout({
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="mx-auto max-w-7xl px-6 pb-24 pt-28">
-        <header className="mb-6 flex items-baseline justify-between gap-4">
-          <h1 className="text-4xl font-bold tracking-tight">Settings</h1>
+      <div className="mx-auto max-w-7xl px-4 pb-24 pt-24 sm:px-6 sm:pt-28">
+        <header className="mb-6 flex flex-col items-start gap-2 sm:flex-row sm:items-baseline sm:justify-between sm:gap-4">
+          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Settings</h1>
           <div className="text-xs text-white/45">
             Signed in as{" "}
             <span className="text-white/80">

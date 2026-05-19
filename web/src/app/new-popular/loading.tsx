@@ -6,8 +6,8 @@ export default function NewPopularLoading() {
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="pb-24 pt-28">
-        <h1 className="mb-8 px-12 text-4xl font-bold tracking-tight">
+      <div className="pb-24 pt-24 sm:pt-28">
+        <h1 className="mb-8 px-4 sm:px-8 md:px-12 text-4xl font-bold tracking-tight">
           New &amp; Popular
         </h1>
         <div className="space-y-1">

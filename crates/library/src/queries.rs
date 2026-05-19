@@ -247,6 +247,14 @@ pub async fn update_library(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = update.allow_media_deletion {
+        sqlx::query("UPDATE libraries SET allow_media_deletion = ?, updated_at = ? WHERE id = ?")
+            .bind(i64::from(v))
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     tx.commit().await?;
     get_library(pool, id).await
@@ -1473,6 +1481,49 @@ pub async fn list_media_files_in_library(
         .collect()
 }
 
+/// Files in `library_id` that don't already have any auto-detected
+/// markers. Used by the scheduled `detect_markers` task to skip
+/// previously-processed files — keeps the maintenance-window run
+/// idempotent on subsequent runs (only new files get the expensive
+/// blackdetect pass). Operator-triggered re-detection still uses
+/// `list_media_files_in_library` and overwrites via
+/// `replace_auto_markers`.
+pub async fn list_media_files_needing_markers(
+    pool: &SqlitePool,
+    library_id: i64,
+    batch_size: i64,
+) -> Result<Vec<(i64, String, Option<i64>)>> {
+    let limit = batch_size.clamp(1, 1000);
+    let rows = sqlx::query(
+        "SELECT mf.id, mf.path, mf.duration_ms FROM media_files mf
+         LEFT JOIN items i ON i.id = mf.item_id
+         LEFT JOIN episodes e ON e.id = mf.episode_id
+         LEFT JOIN seasons s ON s.id = e.season_id
+         LEFT JOIN items shows ON shows.id = s.show_id
+         WHERE (i.library_id = ? OR shows.library_id = ?)
+           AND mf.removed_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM markers WHERE media_file_id = mf.id AND source = 'auto'
+           )
+         ORDER BY mf.id
+         LIMIT ?",
+    )
+    .bind(library_id)
+    .bind(library_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.try_get::<i64, _>("id")?,
+                r.try_get::<String, _>("path")?,
+                r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+            ))
+        })
+        .collect()
+}
+
 async fn list_streams_for_file(
     pool: &SqlitePool,
     media_file_id: i64,
@@ -1500,6 +1551,28 @@ async fn list_streams_for_file(
         });
     }
     Ok(out)
+}
+
+/// Resolve a media_file row to `(item_id, episode_id)` — exactly one
+/// is non-None for a healthy row. Used by the playback-events
+/// recorder so the start event can be tagged with the right owning
+/// id (movies → item_id, episodes → episode_id) and rolled up at
+/// aggregation time.
+pub async fn media_file_owner(
+    pool: &SqlitePool,
+    file_id: i64,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let row = sqlx::query("SELECT item_id, episode_id FROM media_files WHERE id = ?")
+        .bind(file_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => Ok((
+            r.try_get::<Option<i64>, _>("item_id").ok().flatten(),
+            r.try_get::<Option<i64>, _>("episode_id").ok().flatten(),
+        )),
+        None => Ok((None, None)),
+    }
 }
 
 pub async fn get_media_file_locator(
@@ -1601,6 +1674,13 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<User>> {
 /// Removes a user. ON DELETE CASCADE wipes the user's sessions; play_state
 /// and similar per-user tables behave the same in this schema.
 pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<bool> {
+    // Last-owner guard: the system must always have at least one owner
+    // who can manage everything. Otherwise an admin could end up
+    // unable to mint a fresh owner and the install would be stuck.
+    let target_role = current_user_role(pool, id).await?;
+    if matches!(target_role, Some(UserRole::Owner)) && count_owners(pool).await? <= 1 {
+        anyhow::bail!("cannot delete the last owner — promote another user to owner first");
+    }
     let res = sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -1613,6 +1693,16 @@ pub async fn set_user_role(
     id: i64,
     role: UserRole,
 ) -> Result<Option<User>> {
+    // Same last-owner guard for demotion. Promoting to owner has no
+    // such constraint — extra owners are fine.
+    if !matches!(role, UserRole::Owner) {
+        let current = current_user_role(pool, id).await?;
+        if matches!(current, Some(UserRole::Owner)) && count_owners(pool).await? <= 1 {
+            anyhow::bail!(
+                "cannot demote the last owner — promote another user to owner first"
+            );
+        }
+    }
     let res = sqlx::query(
         "UPDATE users SET role = ?, updated_at = ? WHERE id = ? RETURNING *",
     )
@@ -1622,6 +1712,31 @@ pub async fn set_user_role(
     .fetch_optional(pool)
     .await?;
     res.as_ref().map(User::from_row).transpose()
+}
+
+/// Fetch the current role of a user by id, or `None` if not found.
+/// Internal helper for the last-owner guards.
+async fn current_user_role(pool: &SqlitePool, id: i64) -> Result<Option<UserRole>> {
+    let row = sqlx::query("SELECT role FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let s: String = r.try_get("role")?;
+            Ok(Some(UserRole::from_db(&s)?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Live count of owner-role users. The two callers above use this to
+/// prevent demote/delete actions that would leave the system orphaned.
+pub async fn count_owners(pool: &SqlitePool) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS c FROM users WHERE role = 'owner'")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("c")?)
 }
 
 #[derive(Debug, Default)]
@@ -1828,6 +1943,22 @@ pub async fn find_user_by_id(pool: &SqlitePool, id: i64) -> Result<Option<User>>
         .bind(id)
         .fetch_optional(pool)
         .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(User::from_row(&row)?))
+}
+
+/// Look up the first (oldest) user with `role = 'owner'`. Used by the
+/// network auth-bypass path to map a trusted IP to a concrete user.
+/// `None` is essentially impossible on a healthy deployment — the
+/// setup flow guarantees an owner — but callers should still handle
+/// it gracefully rather than panic.
+pub async fn find_first_owner(pool: &SqlitePool) -> Result<Option<User>> {
+    let Some(row) =
+        sqlx::query("SELECT * FROM users WHERE role = 'owner' ORDER BY id ASC LIMIT 1")
+            .fetch_optional(pool)
+            .await?
     else {
         return Ok(None);
     };
@@ -2471,6 +2602,15 @@ pub async fn delete_user_sessions(pool: &SqlitePool, user_id: i64) -> Result<u64
 
 // Access matrix: every user × library pair, with `allowed` indicating
 // whether the access exists. Used by the admin Access page.
+//
+// `allowed` reflects ONLY direct `library_access` rows — those are what
+// the matrix's checkbox edits. `via_groups` lists access-group names
+// that ALSO grant this user this library; those grants live in
+// `access_group_libraries` × `user_access_groups` and aren't editable
+// from the matrix (the admin manages them under Settings → Users →
+// Groups). The UI surfaces both so admins can see effective access at
+// a glance — without `via_groups` an invite-via-group looked locked
+// out here even though the user could browse fine.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccessMatrixEntry {
     pub user_id: i64,
@@ -2478,13 +2618,28 @@ pub struct AccessMatrixEntry {
     pub library_id: i64,
     pub library_name: String,
     pub allowed: bool,
+    /// Names of access-groups granting this user access to this
+    /// library. Empty when none. Sorted alphabetically.
+    pub via_groups: Vec<String>,
 }
 
 pub async fn access_matrix(pool: &SqlitePool) -> Result<Vec<AccessMatrixEntry>> {
+    // The correlated subquery is per (user, library) pair and emits a
+    // comma-separated string for transport — Vec<String> deserialises
+    // post-fetch. Sorting inside GROUP_CONCAT keeps the order stable so
+    // the rendered "via Friends, Family" string doesn't flicker between
+    // refreshes.
     let rows = sqlx::query(
         "SELECT u.id AS user_id, u.username,
                 l.id AS library_id, l.name AS library_name,
-                CASE WHEN la.user_id IS NULL THEN 0 ELSE 1 END AS allowed
+                CASE WHEN la.user_id IS NULL THEN 0 ELSE 1 END AS allowed,
+                (SELECT GROUP_CONCAT(g.name, '\u{1f}')
+                   FROM user_access_groups uag
+                   JOIN access_group_libraries agl
+                        ON agl.group_id = uag.group_id AND agl.library_id = l.id
+                   JOIN access_groups g ON g.id = uag.group_id
+                  WHERE uag.user_id = u.id
+                  ORDER BY g.name COLLATE NOCASE) AS via_groups
          FROM users u
          CROSS JOIN libraries l
          LEFT JOIN library_access la
@@ -2496,12 +2651,21 @@ pub async fn access_matrix(pool: &SqlitePool) -> Result<Vec<AccessMatrixEntry>> 
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
+        // U+001F (ASCII unit separator) is the GROUP_CONCAT delimiter —
+        // safe because access-group names can't contain control chars.
+        // Falls back to comma split if the value somehow lacks any
+        // separator (single-group case has no delimiter to split on).
+        let via_raw: Option<String> = r.try_get("via_groups").ok().flatten();
+        let via_groups: Vec<String> = via_raw
+            .map(|s| s.split('\u{1f}').map(str::to_owned).collect())
+            .unwrap_or_default();
         out.push(AccessMatrixEntry {
             user_id: r.try_get("user_id")?,
             username: r.try_get("username")?,
             library_id: r.try_get("library_id")?,
             library_name: r.try_get("library_name")?,
             allowed: r.try_get::<i64, _>("allowed")? != 0,
+            via_groups,
         });
     }
     Ok(out)
@@ -2874,9 +3038,9 @@ pub async fn consume_invite(
     if res.rows_affected() == 0 {
         anyhow::bail!("invite is invalid, expired, or already consumed");
     }
-    // Grant any pre-bound libraries. ON CONFLICT IGNORE keeps the call
-    // idempotent if a library row already exists (e.g. retry after a
-    // partial transaction in an earlier version).
+    // Grant any pre-bound libraries directly. ON CONFLICT IGNORE keeps
+    // the call idempotent if a library row already exists (e.g. retry
+    // after a partial transaction in an earlier version).
     sqlx::query(
         "INSERT INTO library_access (user_id, library_id)
          SELECT ?, il.library_id
@@ -2889,9 +3053,33 @@ pub async fn consume_invite(
     .bind(code_hash)
     .execute(&mut *tx)
     .await?;
-    // Fan out pre-bound group memberships the same way. The user's
-    // effective library set automatically picks up the group's
-    // libraries through `user_library_filter`'s UNION.
+    // Materialise each pre-bound group's libraries as direct
+    // `library_access` rows too, so "invite via Friends group" yields
+    // the same end-state as "invite with Movies + Shows checked
+    // individually". Without this, the user could only see those
+    // libraries via the `user_library_filter` UNION through their
+    // group membership — technically functional, but the admin Access
+    // matrix (which renders direct grants) showed them as locked out
+    // and the behaviour diverged from the manual-checkbox path.
+    sqlx::query(
+        "INSERT INTO library_access (user_id, library_id)
+         SELECT ?, agl.library_id
+           FROM invite_groups ig
+           JOIN invites i ON i.id = ig.invite_id
+           JOIN access_group_libraries agl ON agl.group_id = ig.group_id
+          WHERE i.code_hash = ?
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(code_hash)
+    .execute(&mut *tx)
+    .await?;
+    // Preserve the group membership too. Future additions to the group
+    // (admin adds Anime to Friends three months from now) automatically
+    // propagate to existing members via `user_library_filter`'s UNION
+    // — we'd lose that ongoing-template behaviour if we only
+    // materialised the snapshot above. Admins can detach a user from a
+    // group later under Settings → Users → Groups.
     sqlx::query(
         "INSERT INTO user_access_groups (user_id, group_id)
          SELECT ?, ig.group_id
@@ -3087,31 +3275,98 @@ pub async fn scrobble(
 // On-deck
 // ---------------------------------------------------------------------------
 
-const ON_DECK_LIMIT: i64 = 20;
+/// Operator-tunable knobs for the Continue Watching rail. Threaded
+/// through from `server_settings` rather than carried as free args
+/// because the same set of values affects several places (the query
+/// limit + threshold here, plus the dedup post-processing).
+#[derive(Debug, Clone, Copy)]
+pub struct OnDeckOptions {
+    /// Max rows the query returns *before* dedup. We over-fetch so a
+    /// user binging one show doesn't end up with a near-empty rail
+    /// after dedup collapses 19 episodes into 1 tile. The final list
+    /// is also capped by `max_items` after dedup.
+    pub max_items: i64,
+    /// "Watched" threshold (0-100). Items past this percentage drop
+    /// out of the rail because the scrobbler is about to mark them
+    /// watched anyway. Matches the client-side scrobble threshold so
+    /// the tile vanishes the moment we scrobble (no phantom entries).
+    pub played_threshold_pct: i64,
+    /// Drop items whose `last_played_at` is older than this many
+    /// weeks. 0 disables the time-window filter entirely.
+    pub max_age_weeks: i64,
+    /// When true, augment the in-progress list with S(N+1)E01 of
+    /// any show the user has watched at least one episode of (but
+    /// hasn't yet started any episode in season N+1). Plex parity.
+    pub include_premieres: bool,
+}
+
+impl Default for OnDeckOptions {
+    fn default() -> Self {
+        Self {
+            max_items: 40,
+            played_threshold_pct: 90,
+            max_age_weeks: 16,
+            include_premieres: true,
+        }
+    }
+}
 
 pub async fn on_deck(
     pool: &SqlitePool,
     user_id: i64,
     accessible: Option<&[i64]>,
+    options: OnDeckOptions,
 ) -> Result<OnDeckResponse> {
-    // Anything actively watching (5% — 95%) AND not flagged watched yet.
-    // Ordered by most recently played.
+    // Anything actively watching (started but past neither the
+    // "watched" threshold nor the age window) AND not flagged
+    // watched yet. Ordered by most recently played.
+    //
+    // Over-fetch ~2x the user-visible cap so the dedup post-step
+    // (collapse multiple in-progress episodes of one show to one
+    // tile) still has enough rows to fill the rail after collapsing.
+    // SQLite's planner with the index on (user_id, last_played_at)
+    // makes this cheap.
+    let threshold = options.played_threshold_pct.clamp(50, 99);
+    let fetch_limit = (options.max_items * 2).clamp(10, 400);
+    let max_age_weeks = options.max_age_weeks.max(0);
+    let cutoff_ms = if max_age_weeks == 0 {
+        // 0 = disabled — use a value old enough that the filter is a
+        // no-op (Unix epoch start).
+        0
+    } else {
+        now_ms() - max_age_weeks * 7 * 86_400_000
+    };
     let rows = sqlx::query(
         "SELECT * FROM play_state
          WHERE user_id = ?
            AND watched = 0
            AND position_ms > 0
-           AND (duration_ms IS NULL OR position_ms < duration_ms * 95 / 100)
+           AND last_played_at >= ?
+           AND (duration_ms IS NULL OR position_ms < duration_ms * ? / 100)
          ORDER BY last_played_at DESC
          LIMIT ?",
     )
     .bind(user_id)
-    .bind(ON_DECK_LIMIT)
+    .bind(cutoff_ms)
+    .bind(threshold)
+    .bind(fetch_limit)
     .fetch_all(pool)
     .await?;
 
+    // Dedupe show entries: a user partway through a show should see ONE
+    // Continue Watching tile for that show — the most recently played
+    // episode — not one tile per in-progress episode. Netflix does the
+    // same. Rows are already ordered by last_played_at DESC, so the
+    // first episode we see for a given show_id is the right one to
+    // surface. Movies have no analogous dedup (one play_state per movie
+    // already; multiple play_states for one movie isn't a concept here).
     let mut out = Vec::new();
+    let mut seen_show_ids = std::collections::HashSet::<i64>::new();
+    let cap = options.max_items.max(1) as usize;
     for r in rows {
+        if out.len() >= cap {
+            break;
+        }
         let item_id: Option<i64> = r.try_get("item_id")?;
         let episode_id: Option<i64> = r.try_get("episode_id")?;
 
@@ -3130,6 +3385,9 @@ pub async fn on_deck(
         } else if let Some(eid) = episode_id {
             if let Some(detail) = get_episode_detail(pool, eid, user_id, accessible).await? {
                 let show_id = detail.episode.show_id;
+                if !seen_show_ids.insert(show_id) {
+                    continue;
+                }
                 if let Some(show) = get_item(pool, show_id, user_id, accessible).await? {
                     out.push(OnDeckEntry::Episode {
                         episode: detail.episode,
@@ -3141,7 +3399,119 @@ pub async fn on_deck(
         }
     }
 
+    // Season-premiere augmentation. For shows the user has watched
+    // any episode of but isn't actively in-progress on right now,
+    // surface the first episode of the next-up season if one exists
+    // and they haven't started it. Run AFTER the in-progress dedup
+    // so an actively-watched show always shows its current episode,
+    // not the upcoming premiere (which is rarer + later).
+    if options.include_premieres && out.len() < cap {
+        let premieres = list_user_show_premieres(pool, user_id).await?;
+        for (show_id, episode_id) in premieres {
+            if out.len() >= cap {
+                break;
+            }
+            if !seen_show_ids.insert(show_id) {
+                continue;
+            }
+            let Some(detail) = get_episode_detail(pool, episode_id, user_id, accessible).await?
+            else {
+                continue;
+            };
+            let Some(show) = get_item(pool, show_id, user_id, accessible).await? else {
+                continue;
+            };
+            // Stub play_state for an unstarted episode — the UI
+            // surface uses these fields to render thumbnails /
+            // progress bars; zeros render as "ready to play"
+            // without any progress indicator.
+            let play_state = PlayStateForItem {
+                position_ms: 0,
+                duration_ms: detail.episode.duration_ms,
+                watched: false,
+                view_count: 0,
+                last_played_at: now_ms(),
+            };
+            out.push(OnDeckEntry::Episode {
+                episode: detail.episode,
+                show,
+                play_state,
+            });
+        }
+    }
+
     Ok(OnDeckResponse { items: out })
+}
+
+/// For each show the user has started or finished any episode of,
+/// find the lowest S(N+1)E01 they haven't yet started. Returns
+/// `(show_id, episode_id)` pairs in show_id order. Used by `on_deck`
+/// when `include_premieres` is true.
+///
+/// Definition of "next-up season": the smallest `season_number`
+/// strictly greater than the maximum season the user has any
+/// play_state row for. We pick the smallest so a user who watched
+/// S1 and skipped S2 + S3 sees S2E1 as their next premiere — not
+/// S4E1 — matching the "missed it, here's where you left off
+/// chronologically" intent.
+async fn list_user_show_premieres(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<(i64, i64)>> {
+    // Two CTEs because SQLite rejects aggregate functions inside a
+    // correlated subquery's WHERE — `... AND s2.season_number = MIN(s.season_number)`
+    // surfaces as "misuse of aggregate function". We compute the
+    // per-show next_season in `next_seasons`, then the outer SELECT's
+    // subquery references it as a plain column.
+    let rows = sqlx::query(
+        "WITH user_show_max AS (
+             SELECT s.show_id AS show_id, MAX(s.season_number) AS max_season
+             FROM play_state ps
+             JOIN episodes e ON ps.episode_id = e.id
+             JOIN seasons s ON e.season_id = s.id
+             WHERE ps.user_id = ?
+               AND (ps.watched = 1 OR ps.position_ms > 0)
+             GROUP BY s.show_id
+         ),
+         next_seasons AS (
+             SELECT usm.show_id AS show_id, MIN(s.season_number) AS next_season
+             FROM user_show_max usm
+             JOIN seasons s ON s.show_id = usm.show_id
+             WHERE s.season_number > usm.max_season
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM episodes e3
+                   JOIN play_state ps3 ON ps3.episode_id = e3.id
+                   WHERE e3.season_id = s.id AND ps3.user_id = ?
+               )
+             GROUP BY usm.show_id
+         )
+         SELECT
+             ns.show_id AS show_id,
+             ns.next_season AS next_season,
+             (SELECT e2.id
+                FROM episodes e2
+                JOIN seasons s2 ON e2.season_id = s2.id
+                WHERE s2.show_id = ns.show_id
+                  AND s2.season_number = ns.next_season
+                  AND e2.episode_number = 1
+                LIMIT 1) AS episode_id
+         FROM next_seasons ns
+         ORDER BY ns.show_id ASC",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let show_id: i64 = r.try_get("show_id")?;
+        let episode_id: Option<i64> = r.try_get("episode_id").ok().flatten();
+        if let Some(eid) = episode_id {
+            out.push((show_id, eid));
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -3393,6 +3763,89 @@ pub async fn purge_removed_media_files(
 
     // Items split by kind: movies are orphans when their files are
     // gone; shows are orphans when their seasons are gone.
+    let r = sqlx::query(
+        "DELETE FROM items
+         WHERE (kind = 'movie' AND NOT EXISTS (SELECT 1 FROM media_files WHERE item_id = items.id))
+            OR (kind = 'show'  AND NOT EXISTS (SELECT 1 FROM seasons WHERE show_id = items.id))",
+    )
+    .execute(pool)
+    .await?;
+    report.items_purged = r.rows_affected();
+
+    Ok(report)
+}
+
+/// Operator-initiated delete of specific `media_files` rows. Skips
+/// the soft-delete + grace-window dance — this is the path behind the
+/// item modal's "Delete from disk" button. Caller is responsible for
+/// having checked that the owning library has `allow_media_deletion`
+/// turned on and that the actor is an owner.
+///
+/// Returns the same `PurgeReport` shape as the scheduled purge so the
+/// admin UI / API consumer can show the same summary. `purged_paths`
+/// includes preview sprite paths in addition to the source file paths
+/// — both need on-disk cleanup by the caller.
+pub async fn delete_media_files_force(
+    pool: &SqlitePool,
+    file_ids: &[i64],
+) -> Result<PurgeReport> {
+    let mut report = PurgeReport::default();
+    if file_ids.is_empty() {
+        return Ok(report);
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(file_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Collect the on-disk artefacts we need to clean up after the row
+    // DELETE: the source file path itself, and the preview sprite path
+    // (when present). FK cascade drops media_streams / markers /
+    // optimized_versions rows but doesn't touch the filesystem.
+    let select_sql = format!(
+        "SELECT path, preview_sprite_path FROM media_files WHERE id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&select_sql);
+    for id in file_ids {
+        q = q.bind(*id);
+    }
+    let rows = q.fetch_all(pool).await?;
+    for row in rows {
+        let path: String = row.try_get("path")?;
+        report.purged_paths.push(path);
+        if let Ok(Some(sprite)) = row.try_get::<Option<String>, _>("preview_sprite_path") {
+            report.purged_paths.push(sprite);
+        }
+    }
+
+    let delete_sql = format!("DELETE FROM media_files WHERE id IN ({placeholders})");
+    let mut q = sqlx::query(&delete_sql);
+    for id in file_ids {
+        q = q.bind(*id);
+    }
+    let r = q.execute(pool).await?;
+    report.files_purged = r.rows_affected();
+
+    // Cascade orphan sweep — same order + logic as `purge_removed_media_files`.
+    // Pulled out as the shared semantics rather than DRYing because the
+    // existing function builds its DELETE off `removed_at` which the
+    // force path bypasses entirely.
+    let r = sqlx::query(
+        "DELETE FROM episodes
+         WHERE NOT EXISTS (SELECT 1 FROM media_files WHERE episode_id = episodes.id)",
+    )
+    .execute(pool)
+    .await?;
+    report.episodes_purged = r.rows_affected();
+
+    let r = sqlx::query(
+        "DELETE FROM seasons
+         WHERE NOT EXISTS (SELECT 1 FROM episodes WHERE season_id = seasons.id)",
+    )
+    .execute(pool)
+    .await?;
+    report.seasons_purged = r.rows_affected();
+
     let r = sqlx::query(
         "DELETE FROM items
          WHERE (kind = 'movie' AND NOT EXISTS (SELECT 1 FROM media_files WHERE item_id = items.id))
@@ -3715,6 +4168,71 @@ pub async fn set_item_duration_if_null(
     Ok(())
 }
 
+/// Reset an item to its filename-derived state by clearing every
+/// metadata provider linkage and the metadata fields those providers
+/// populated. Used by the admin "Unmatch" action when a TMDB match was
+/// wrong — afterwards `Fix Match` can re-bind to the correct title.
+///
+/// What's cleared:
+///   - External IDs: tmdb_id, imdb_id, tvdb_id, anilist_id
+///   - Auto-collection link: collection_id (drops out of franchise rails)
+///   - Provider-supplied text: summary, tagline, original_title, rating_audience, logo_path
+///   - Provider-supplied associations: item_credits, item_extras, item_genres
+///   - `refreshed_at` (so the next scheduled refresh will retry)
+///   - `locked_fields` (a stale match's locks shouldn't survive an unmatch)
+///
+/// What's kept:
+///   - title, sort_title, year (filename-derived; FileParser regenerates
+///     them anyway on the next scan)
+///   - duration_ms (probed from the file, not the provider)
+///   - poster/backdrop cached via `item_images` — those clear when the
+///     next match arrives via `store_image`, and leaving them avoids a
+///     jarring placeholder flash between unmatch and re-match.
+pub async fn unmatch_item(pool: &SqlitePool, item_id: i64) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let now = now_ms();
+    let updated = sqlx::query(
+        "UPDATE items SET
+            tmdb_id = NULL,
+            imdb_id = NULL,
+            tvdb_id = NULL,
+            anilist_id = NULL,
+            collection_id = NULL,
+            summary = NULL,
+            tagline = NULL,
+            original_title = NULL,
+            rating_audience = NULL,
+            logo_path = NULL,
+            refreshed_at = NULL,
+            locked_fields = '[]',
+            updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(now)
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM item_credits WHERE item_id = ?")
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM item_extras WHERE item_id = ?")
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM item_genres WHERE item_id = ?")
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 // Per-field lock check. `locked_fields` is a JSON array stored on the
 // items row; reading once and passing to `pick` is cheaper than checking
 // `locked_fields LIKE '%title%'` in SQL for each field.
@@ -3994,43 +4512,107 @@ pub async fn find_collection_by_tmdb(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectionRow {
     pub id: i64,
-    pub tmdb_id: i64,
+    pub tmdb_id: Option<i64>,
+    /// `auto` = TMDB-discovered franchise (members via items.collection_id);
+    /// `manual` = admin-curated grouping (members via collection_items);
+    /// `smart` = rule-evaluated grouping (members computed from rule_json).
+    pub kind: String,
     pub name: String,
+    pub sort_title: Option<String>,
     pub overview: Option<String>,
+    pub description: Option<String>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    pub created_by_user_id: Option<i64>,
+    /// Whitelisted rule DSL for smart collections; NULL otherwise.
+    /// See [`SmartRule`] for the parsed form.
+    pub rule_json: Option<String>,
     pub item_count: i64,
 }
 
-/// All collections that have at least one item in the user's accessible
-/// libraries. Ordered alphabetically by name.
+fn map_collection_row(r: &SqliteRow, count: i64) -> Result<CollectionRow> {
+    Ok(CollectionRow {
+        id: r.try_get("id")?,
+        tmdb_id: r.try_get("tmdb_id")?,
+        kind: r.try_get("kind")?,
+        name: r.try_get("name")?,
+        sort_title: r.try_get("sort_title")?,
+        overview: r.try_get("overview")?,
+        description: r.try_get("description")?,
+        poster_path: r.try_get("poster_path")?,
+        backdrop_path: r.try_get("backdrop_path")?,
+        created_by_user_id: r.try_get("created_by_user_id")?,
+        rule_json: r.try_get("rule_json").ok().flatten(),
+        item_count: count,
+    })
+}
+
+/// All collections (auto + manual + smart) with at least one item
+/// visible to the user. Auto + manual are aggregated via SQL; smart
+/// collections are listed with `item_count = 0` here (computing the
+/// rule for every smart row in the list would be expensive) and the
+/// detail endpoint runs the rule on demand.
+///
+/// `include_auto` controls whether TMDB-discovered franchise rows
+/// (kind = 'auto') are returned. The Collections rail on the home
+/// page omits them so a fresh server doesn't surface dozens of "John
+/// Wick Collection"-style rails before the operator has set up any
+/// user-curated collections of their own. The admin panel passes
+/// `true` so operators can see + manage everything the scanner found.
 pub async fn list_collections(
     pool: &SqlitePool,
     accessible: Option<&[i64]>,
+    include_auto: bool,
 ) -> Result<Vec<CollectionRow>> {
     let lib_filter = library_filter_sql("i.library_id", accessible);
+    // Membership CTE: auto rows join via items.collection_id, manual rows
+    // via the collection_items junction. Auto leg is skipped entirely
+    // when `include_auto = false` so we don't pay for COUNT work on rows
+    // we're about to filter out at the outer level.
+    let auto_leg = if include_auto {
+        format!(
+            "SELECT c.id AS cid, i.id AS iid
+             FROM collections c
+             INNER JOIN items i ON i.collection_id = c.id
+             WHERE c.kind = 'auto' AND {lib_filter}
+             UNION ALL"
+        )
+    } else {
+        String::new()
+    };
+    let outer_kind_filter = if include_auto {
+        ""
+    } else {
+        // Drop auto rows from the result set even though the membership
+        // CTE didn't add them — defends against stray auto rows being
+        // counted as zero-member entries via the LEFT JOIN.
+        "AND c.kind != 'auto'"
+    };
     let sql = format!(
-        "SELECT c.id, c.tmdb_id, c.name, c.overview, c.poster_path, c.backdrop_path,
-                COUNT(i.id) AS item_count
+        "WITH visible_members AS (
+             {auto_leg}
+             SELECT ci.collection_id AS cid, i.id AS iid
+             FROM collection_items ci
+             INNER JOIN items i ON i.id = ci.item_id
+             INNER JOIN collections c ON c.id = ci.collection_id
+             WHERE c.kind = 'manual' AND {lib_filter}
+         )
+         SELECT c.id, c.tmdb_id, c.kind, c.name, c.sort_title, c.overview,
+                c.description, c.poster_path, c.backdrop_path,
+                c.created_by_user_id, c.rule_json,
+                COUNT(vm.iid) AS item_count
          FROM collections c
-         INNER JOIN items i ON i.collection_id = c.id
-         WHERE {lib_filter}
+         LEFT JOIN visible_members vm ON vm.cid = c.id
+         WHERE (c.kind != 'smart' OR vm.cid IS NULL) {outer_kind_filter}
          GROUP BY c.id
-         HAVING item_count > 0
-         ORDER BY c.name COLLATE NOCASE ASC"
+         HAVING c.kind = 'smart' OR item_count > 0
+         ORDER BY COALESCE(c.sort_title, c.name) COLLATE NOCASE ASC"
     );
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
-    rows.into_iter()
+    rows.iter()
         .map(|r| {
-            Ok(CollectionRow {
-                id: r.try_get("id")?,
-                tmdb_id: r.try_get("tmdb_id")?,
-                name: r.try_get("name")?,
-                overview: r.try_get("overview")?,
-                poster_path: r.try_get("poster_path")?,
-                backdrop_path: r.try_get("backdrop_path")?,
-                item_count: r.try_get("item_count")?,
-            })
+            let count: i64 = r.try_get("item_count")?;
+            map_collection_row(r, count)
         })
         .collect()
 }
@@ -4040,35 +4622,63 @@ pub async fn get_collection(
     collection_id: i64,
     accessible: Option<&[i64]>,
 ) -> Result<Option<CollectionRow>> {
-    // Only expose the collection if the user can see at least one item in
-    // it — otherwise it's effectively a stub for content they don't have.
+    // First fetch kind so we know which membership path to count.
+    let kind_row = sqlx::query("SELECT kind FROM collections WHERE id = ?")
+        .bind(collection_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(kr) = kind_row else { return Ok(None) };
+    let kind: String = kr.try_get("kind")?;
+
     let lib_filter = library_filter_sql("i.library_id", accessible);
-    let sql = format!(
-        "SELECT c.id, c.tmdb_id, c.name, c.overview, c.poster_path, c.backdrop_path,
-                COUNT(i.id) AS item_count
-         FROM collections c
-         LEFT JOIN items i ON i.collection_id = c.id AND {lib_filter}
-         WHERE c.id = ?
-         GROUP BY c.id"
-    );
+    let sql = match kind.as_str() {
+        "manual" => format!(
+            "SELECT c.id, c.tmdb_id, c.kind, c.name, c.sort_title, c.overview,
+                    c.description, c.poster_path, c.backdrop_path,
+                    c.created_by_user_id, c.rule_json,
+                    COUNT(i.id) AS item_count
+             FROM collections c
+             LEFT JOIN collection_items ci ON ci.collection_id = c.id
+             LEFT JOIN items i ON i.id = ci.item_id AND {lib_filter}
+             WHERE c.id = ?
+             GROUP BY c.id"
+        ),
+        "smart" => {
+            // Membership for smart collections is rule-driven and not
+            // joinable here in a generic way; we fetch the row only,
+            // and the caller (`list_items_in_collection`) runs the
+            // rule to derive members + the actual count on demand.
+            "SELECT c.id, c.tmdb_id, c.kind, c.name, c.sort_title, c.overview,
+                    c.description, c.poster_path, c.backdrop_path,
+                    c.created_by_user_id, c.rule_json,
+                    0 AS item_count
+             FROM collections c
+             WHERE c.id = ?".to_string()
+        }
+        _ => format!(
+            "SELECT c.id, c.tmdb_id, c.kind, c.name, c.sort_title, c.overview,
+                    c.description, c.poster_path, c.backdrop_path,
+                    c.created_by_user_id, c.rule_json,
+                    COUNT(i.id) AS item_count
+             FROM collections c
+             LEFT JOIN items i ON i.collection_id = c.id AND {lib_filter}
+             WHERE c.id = ?
+             GROUP BY c.id"
+        ),
+    };
     let row = sqlx::query(&sql)
         .bind(collection_id)
         .fetch_optional(pool)
         .await?;
     let Some(row) = row else { return Ok(None) };
     let count: i64 = row.try_get("item_count")?;
-    if count == 0 {
+    // Manual + smart collections with zero accessible members are
+    // still visible to admins; auto collections with zero members are
+    // effectively orphan stubs and hidden.
+    if count == 0 && kind == "auto" {
         return Ok(None);
     }
-    Ok(Some(CollectionRow {
-        id: row.try_get("id")?,
-        tmdb_id: row.try_get("tmdb_id")?,
-        name: row.try_get("name")?,
-        overview: row.try_get("overview")?,
-        poster_path: row.try_get("poster_path")?,
-        backdrop_path: row.try_get("backdrop_path")?,
-        item_count: count,
-    }))
+    Ok(Some(map_collection_row(&row, count)?))
 }
 
 pub async fn list_items_in_collection(
@@ -4077,12 +4687,40 @@ pub async fn list_items_in_collection(
     user_id: i64,
     accessible: Option<&[i64]>,
 ) -> Result<Vec<ListedItem>> {
+    // Discover kind to pick the membership path. Three SQL shapes:
+    //  - auto: items.collection_id, ordered by release year + sort_title
+    //  - manual: collection_items junction, ordered by sort_order
+    //  - smart: rule_json compiled to a WHERE clause + dynamic joins
+    let kind_row = sqlx::query("SELECT kind, rule_json FROM collections WHERE id = ?")
+        .bind(collection_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(kr) = kind_row else { return Ok(Vec::new()) };
+    let kind: String = kr.try_get("kind")?;
+
+    if kind == "smart" {
+        let rule_json: Option<String> = kr.try_get("rule_json").ok().flatten();
+        let Some(rule_json) = rule_json else {
+            return Ok(Vec::new());
+        };
+        return list_items_via_smart_rule(pool, &rule_json, user_id, accessible).await;
+    }
+
     let lib_filter = library_filter_sql("i.library_id", accessible);
-    let sql = format!(
-        "{ITEM_SELECT}
-         WHERE i.collection_id = ? AND {lib_filter}
-         ORDER BY i.year IS NULL, i.year ASC, i.sort_title COLLATE NOCASE ASC"
-    );
+    let sql = if kind == "manual" {
+        format!(
+            "{ITEM_SELECT}
+             INNER JOIN collection_items ci ON ci.item_id = i.id
+             WHERE ci.collection_id = ? AND {lib_filter}
+             ORDER BY ci.sort_order ASC, ci.added_at ASC"
+        )
+    } else {
+        format!(
+            "{ITEM_SELECT}
+             WHERE i.collection_id = ? AND {lib_filter}
+             ORDER BY i.year IS NULL, i.year ASC, i.sort_title COLLATE NOCASE ASC"
+        )
+    };
     let rows = sqlx::query(&sql)
         .bind(user_id)
         .bind(collection_id)
@@ -4095,6 +4733,359 @@ pub async fn list_items_in_collection(
             Ok(ListedItem { item, play_state })
         })
         .collect()
+}
+
+async fn list_items_via_smart_rule(
+    pool: &SqlitePool,
+    rule_json: &str,
+    user_id: i64,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<ListedItem>> {
+    use crate::smart_rule::{Bind, SmartRule, compile_to_sql};
+
+    let rule: SmartRule = serde_json::from_str(rule_json)?;
+    let compiled = compile_to_sql(&rule)?;
+    let lib_filter = library_filter_sql("i.library_id", accessible);
+    let joins = compiled.joins.join("\n");
+    let sql = format!(
+        "{ITEM_SELECT}
+         {joins}
+         WHERE {} AND {lib_filter}
+         GROUP BY i.id
+         ORDER BY i.sort_title COLLATE NOCASE ASC
+         LIMIT 500",
+        compiled.where_clause
+    );
+    let mut q = sqlx::query(&sql).bind(user_id);
+    for bind in &compiled.bindings {
+        q = match bind {
+            Bind::Text(s) => q.bind(s.clone()),
+            Bind::Int(n) => q.bind(*n),
+            Bind::Real(f) => q.bind(*f),
+        };
+    }
+    let rows = q.fetch_all(pool).await?;
+    rows.iter()
+        .map(|r| {
+            let item = Item::from_row(r)?;
+            let play_state = PlayStateForItem::from_columns(r)?;
+            Ok(ListedItem { item, play_state })
+        })
+        .collect()
+}
+
+// ─── Manual collections: CRUD + membership ──────────────────────────────
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct NewManualCollection {
+    pub name: String,
+    pub sort_title: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct ManualCollectionUpdate {
+    pub name: Option<String>,
+    pub sort_title: Option<Option<String>>,
+    pub description: Option<Option<String>>,
+    pub poster_path: Option<Option<String>>,
+    pub backdrop_path: Option<Option<String>>,
+}
+
+/// Insert a manual collection owned by `actor_user_id`. Returns the new
+/// row id. Caller is expected to have validated `name` is non-empty.
+pub async fn create_manual_collection(
+    pool: &SqlitePool,
+    input: NewManualCollection,
+    actor_user_id: i64,
+) -> Result<i64> {
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO collections
+            (tmdb_id, kind, name, sort_title, description, created_by_user_id, created_at, updated_at)
+         VALUES (NULL, 'manual', ?, ?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(input.name)
+    .bind(input.sort_title)
+    .bind(input.description)
+    .bind(actor_user_id)
+    .bind(now)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct NewSmartCollection {
+    pub name: String,
+    pub sort_title: Option<String>,
+    pub description: Option<String>,
+    /// Pre-compiled rule JSON. Caller is expected to have validated
+    /// this via `smart_rule::compile_to_sql` so that we don't store
+    /// an unloadable rule.
+    pub rule_json: String,
+}
+
+pub async fn create_smart_collection(
+    pool: &SqlitePool,
+    input: NewSmartCollection,
+    actor_user_id: i64,
+) -> Result<i64> {
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO collections
+            (tmdb_id, kind, name, sort_title, description,
+             created_by_user_id, rule_json, created_at, updated_at)
+         VALUES (NULL, 'smart', ?, ?, ?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(input.name)
+    .bind(input.sort_title)
+    .bind(input.description)
+    .bind(actor_user_id)
+    .bind(input.rule_json)
+    .bind(now)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+/// Update a smart collection's rule_json (with optional name/description
+/// changes). Returns false for non-existent or non-smart rows.
+pub async fn update_smart_collection_rule(
+    pool: &SqlitePool,
+    collection_id: i64,
+    rule_json: &str,
+) -> Result<bool> {
+    let kind_row = sqlx::query("SELECT kind FROM collections WHERE id = ?")
+        .bind(collection_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(kr) = kind_row else { return Ok(false) };
+    let kind: String = kr.try_get("kind")?;
+    if kind != "smart" {
+        return Ok(false);
+    }
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE collections SET rule_json = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(rule_json)
+    .bind(now)
+    .bind(collection_id)
+    .execute(pool)
+    .await?;
+    Ok(true)
+}
+
+pub async fn delete_smart_collection(
+    pool: &SqlitePool,
+    collection_id: i64,
+) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM collections WHERE id = ? AND kind = 'smart'")
+        .bind(collection_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Patch fields on a manual collection. Returns false if the collection
+/// doesn't exist or isn't manual (auto collections aren't editable).
+pub async fn update_manual_collection(
+    pool: &SqlitePool,
+    collection_id: i64,
+    patch: ManualCollectionUpdate,
+) -> Result<bool> {
+    // Verify kind first — refusing to ever touch auto rows from this path.
+    let kind_row = sqlx::query("SELECT kind FROM collections WHERE id = ?")
+        .bind(collection_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(kr) = kind_row else { return Ok(false) };
+    let kind: String = kr.try_get("kind")?;
+    if kind != "manual" {
+        return Ok(false);
+    }
+
+    let now = now_ms();
+    // Build the SET clause dynamically; SQLite happily takes COALESCE
+    // pairs but we want to differentiate "field omitted" from
+    // "field set to null" (the double-Option pattern), so emit only the
+    // columns the caller actually included.
+    let mut parts: Vec<&str> = Vec::new();
+    if patch.name.is_some() {
+        parts.push("name = ?");
+    }
+    if patch.sort_title.is_some() {
+        parts.push("sort_title = ?");
+    }
+    if patch.description.is_some() {
+        parts.push("description = ?");
+    }
+    if patch.poster_path.is_some() {
+        parts.push("poster_path = ?");
+    }
+    if patch.backdrop_path.is_some() {
+        parts.push("backdrop_path = ?");
+    }
+    if parts.is_empty() {
+        return Ok(true);
+    }
+    parts.push("updated_at = ?");
+
+    let sql = format!(
+        "UPDATE collections SET {} WHERE id = ?",
+        parts.join(", ")
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = patch.name {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.sort_title {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.description {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.poster_path {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.backdrop_path {
+        q = q.bind(v);
+    }
+    q = q.bind(now).bind(collection_id);
+    q.execute(pool).await?;
+    Ok(true)
+}
+
+/// Drop a manual collection (and via ON DELETE CASCADE, its junction
+/// rows). Returns false for unknown ids and auto collections.
+pub async fn delete_manual_collection(
+    pool: &SqlitePool,
+    collection_id: i64,
+) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM collections WHERE id = ? AND kind = 'manual'")
+        .bind(collection_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Append items to a manual collection. New entries land at the end
+/// (current max sort_order + 1, +2, …). Existing entries are skipped
+/// (INSERT OR IGNORE). Returns the count of rows actually inserted.
+pub async fn add_items_to_manual_collection(
+    pool: &SqlitePool,
+    collection_id: i64,
+    item_ids: &[i64],
+) -> Result<u64> {
+    if item_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = now_ms();
+    let max_row = sqlx::query(
+        "SELECT COALESCE(MAX(sort_order), -1) AS max_so
+         FROM collection_items WHERE collection_id = ?",
+    )
+    .bind(collection_id)
+    .fetch_one(pool)
+    .await?;
+    let mut next: i64 = max_row.try_get::<i64, _>("max_so")? + 1;
+    let mut inserted: u64 = 0;
+    let mut tx = pool.begin().await?;
+    for &iid in item_ids {
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO collection_items
+                (collection_id, item_id, sort_order, added_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(collection_id)
+        .bind(iid)
+        .bind(next)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() > 0 {
+            inserted += 1;
+            next += 1;
+        }
+    }
+    // Bump the parent collection's updated_at so the UI's "last modified"
+    // is meaningful and the existing list_collections ordering stays
+    // accurate for any tooling that sorts by it.
+    sqlx::query("UPDATE collections SET updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+pub async fn remove_item_from_manual_collection(
+    pool: &SqlitePool,
+    collection_id: i64,
+    item_id: i64,
+) -> Result<bool> {
+    let now = now_ms();
+    let mut tx = pool.begin().await?;
+    let res = sqlx::query(
+        "DELETE FROM collection_items
+         WHERE collection_id = ? AND item_id = ?",
+    )
+    .bind(collection_id)
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() > 0 {
+        sqlx::query("UPDATE collections SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(collection_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Replace the membership ordering for a manual collection. The input
+/// list defines both *which items are members* and *what order they
+/// appear in*. Items not in the list are removed; items present but
+/// not already in the collection are added.
+pub async fn replace_manual_collection_items(
+    pool: &SqlitePool,
+    collection_id: i64,
+    ordered_item_ids: &[i64],
+) -> Result<()> {
+    let now = now_ms();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM collection_items WHERE collection_id = ?")
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+    for (idx, &iid) in ordered_item_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO collection_items
+                (collection_id, item_id, sort_order, added_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(collection_id)
+        .bind(iid)
+        .bind(idx as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE collections SET updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ─── TVMaze (fill-nulls fallback for shows) ────────────────────────────────
@@ -5228,6 +6219,34 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.transcoder_background_preset {
+        sqlx::query("UPDATE server_settings SET transcoder_background_preset = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.transcoder_max_background_concurrent {
+        sqlx::query(
+            "UPDATE server_settings SET transcoder_max_background_concurrent = ? WHERE id = 1",
+        )
+        .bind(v)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(v) = patch.transcoder_hdr_tonemap_enabled {
+        sqlx::query(
+            "UPDATE server_settings SET transcoder_hdr_tonemap_enabled = ? WHERE id = 1",
+        )
+        .bind(i64::from(v))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(v) = patch.transcoder_hdr_tonemap_algo {
+        sqlx::query("UPDATE server_settings SET transcoder_hdr_tonemap_algo = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.email_smtp_host {
         sqlx::query("UPDATE server_settings SET email_smtp_host = ? WHERE id = 1")
             .bind(v)
@@ -5266,6 +6285,216 @@ pub async fn update_server_settings(
     }
     if let Some(v) = patch.totp_enforcement {
         sqlx::query("UPDATE server_settings SET totp_enforcement = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.maintenance_window_start {
+        sqlx::query("UPDATE server_settings SET maintenance_window_start = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.maintenance_window_end {
+        sqlx::query("UPDATE server_settings SET maintenance_window_end = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.scan_automatically {
+        sqlx::query("UPDATE server_settings SET scan_automatically = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.detect_markers_on_add {
+        sqlx::query("UPDATE server_settings SET detect_markers_on_add = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.continue_watching_max_items {
+        sqlx::query("UPDATE server_settings SET continue_watching_max_items = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.continue_watching_max_age_weeks {
+        sqlx::query(
+            "UPDATE server_settings SET continue_watching_max_age_weeks = ? WHERE id = 1",
+        )
+        .bind(v)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(v) = patch.continue_watching_include_premieres {
+        sqlx::query(
+            "UPDATE server_settings SET continue_watching_include_premieres = ? WHERE id = 1",
+        )
+        .bind(i64::from(v))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(v) = patch.video_completion_behaviour {
+        if !matches!(
+            v.as_str(),
+            "threshold_pct" | "first_credits_marker" | "earliest_of_both"
+        ) {
+            anyhow::bail!(
+                "video_completion_behaviour must be threshold_pct / first_credits_marker / earliest_of_both"
+            );
+        }
+        sqlx::query("UPDATE server_settings SET video_completion_behaviour = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.video_played_threshold_pct {
+        sqlx::query("UPDATE server_settings SET video_played_threshold_pct = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.database_cache_size_mb {
+        sqlx::query("UPDATE server_settings SET database_cache_size_mb = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.audio_normalize_enabled {
+        sqlx::query("UPDATE server_settings SET audio_normalize_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.scanner_nice_level {
+        sqlx::query("UPDATE server_settings SET scanner_nice_level = ? WHERE id = 1")
+            .bind(v.clamp(0, 19))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.preroll_path {
+        sqlx::query("UPDATE server_settings SET preroll_path = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.preroll_enabled {
+        sqlx::query("UPDATE server_settings SET preroll_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.transcoder_hevc_encoding_mode {
+        if !matches!(v.as_str(), "off" | "when_client_supports" | "always") {
+            anyhow::bail!(
+                "transcoder_hevc_encoding_mode must be off / when_client_supports / always"
+            );
+        }
+        sqlx::query("UPDATE server_settings SET transcoder_hevc_encoding_mode = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.transcoder_gpu_device {
+        // Whitelist the format. "auto" is the sentinel; numeric
+        // indexes are accepted for NVENC; render device paths are
+        // accepted for VAAPI. Anything else is a typo or an attempt
+        // to inject arbitrary args.
+        let valid = v == "auto"
+            || v.chars().all(|c| c.is_ascii_digit())
+            || (v.starts_with("/dev/dri/renderD")
+                && v["/dev/dri/renderD".len()..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit()));
+        if !valid {
+            anyhow::bail!(
+                "transcoder_gpu_device must be 'auto', a numeric index, or '/dev/dri/renderD<N>'"
+            );
+        }
+        sqlx::query("UPDATE server_settings SET transcoder_gpu_device = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.transcoder_max_cpu_concurrent {
+        sqlx::query("UPDATE server_settings SET transcoder_max_cpu_concurrent = ? WHERE id = 1")
+            .bind(v.clamp(1, 16))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.transcoder_reaper_idle_threshold_ms {
+        sqlx::query(
+            "UPDATE server_settings SET transcoder_reaper_idle_threshold_ms = ? WHERE id = 1",
+        )
+        .bind(v)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(v) = patch.max_remote_streams_per_user {
+        sqlx::query("UPDATE server_settings SET max_remote_streams_per_user = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.lan_networks {
+        sqlx::query("UPDATE server_settings SET lan_networks = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.auth_bypass_cidrs {
+        sqlx::query("UPDATE server_settings SET auth_bypass_cidrs = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.bind_interface {
+        // Sanity-check the format if non-empty so we don't store
+        // garbage that'll fail to parse at next startup.
+        let trimmed = v.trim();
+        if !trimmed.is_empty() && trimmed.parse::<std::net::SocketAddr>().is_err() {
+            anyhow::bail!(
+                "bind_interface must be empty or a SocketAddr (e.g. 192.168.1.50:8080)"
+            );
+        }
+        sqlx::query("UPDATE server_settings SET bind_interface = ? WHERE id = 1")
+            .bind(trimmed)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.metadata_language {
+        // Lightweight BCP-47 sanity: length-bound + alphanumerics/dashes
+        // only. We don't try to validate against a full registry — TMDB
+        // will silently return original-language fallbacks for tags it
+        // doesn't recognise, which is the right failure mode (no error,
+        // just no localisation).
+        let trimmed = v.trim();
+        if trimmed.is_empty() || trimmed.len() > 12 {
+            anyhow::bail!(
+                "metadata_language must be a 1–12 char BCP-47 tag (e.g. en-US, ja-JP)"
+            );
+        }
+        if !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            anyhow::bail!(
+                "metadata_language must contain only ASCII letters, digits, and dashes"
+            );
+        }
+        sqlx::query("UPDATE server_settings SET metadata_language = ? WHERE id = 1")
+            .bind(trimmed)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.recently_added_days {
+        if !(0..=365).contains(&v) {
+            anyhow::bail!(
+                "recently_added_days must be between 0 and 365 (0 disables the badge)"
+            );
+        }
+        sqlx::query("UPDATE server_settings SET recently_added_days = ? WHERE id = 1")
             .bind(v)
             .execute(&mut *tx)
             .await?;
@@ -5805,13 +7034,16 @@ pub async fn create_scheduled_task(
     let now = now_ms();
     let id: i64 = sqlx::query(
         "INSERT INTO scheduled_tasks
-            (kind, name, cron_expr, params_json, enabled, next_run_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (kind, name, cron_expr, frequency, requires_maintenance_window,
+             params_json, enabled, next_run_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(&input.kind)
     .bind(&input.name)
     .bind(&input.cron_expr)
+    .bind(&input.frequency)
+    .bind(i64::from(input.requires_maintenance_window))
     .bind(&input.params_json)
     .bind(i64::from(input.enabled))
     .bind(next_run_at)
@@ -5848,6 +7080,24 @@ pub async fn update_scheduled_task(
             .bind(id)
             .execute(&mut *tx)
             .await?;
+    }
+    if let Some(v) = &update.frequency {
+        sqlx::query("UPDATE scheduled_tasks SET frequency = ?, updated_at = ? WHERE id = ?")
+            .bind(v)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = update.requires_maintenance_window {
+        sqlx::query(
+            "UPDATE scheduled_tasks SET requires_maintenance_window = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(i64::from(v))
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(v) = &update.params_json {
         sqlx::query("UPDATE scheduled_tasks SET params_json = ?, updated_at = ? WHERE id = ?")
@@ -6328,6 +7578,25 @@ pub async fn add_tag_to_item(
     })
 }
 
+/// Variant for bulk operations: resolve the tag by name first. Returns
+/// `true` only when both the tag existed AND the binding existed.
+pub async fn remove_tag_from_item_by_name(
+    pool: &SqlitePool,
+    item_id: i64,
+    name: &str,
+) -> Result<bool> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    let tag_id: Option<i64> = sqlx::query_scalar("SELECT id FROM tags WHERE name = ? COLLATE NOCASE")
+        .bind(trimmed)
+        .fetch_optional(pool)
+        .await?;
+    let Some(tag_id) = tag_id else { return Ok(false) };
+    remove_tag_from_item(pool, item_id, tag_id).await
+}
+
 pub async fn remove_tag_from_item(
     pool: &SqlitePool,
     item_id: i64,
@@ -6470,6 +7739,267 @@ pub async fn get_preview_sprite(
         tile_cols: row.try_get("preview_tile_cols")?,
         tile_count: row.try_get("preview_tile_count")?,
     }))
+}
+
+// ─── Chapter thumbnails ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MediaFileForChapterThumbs {
+    pub id: i64,
+    pub path: String,
+}
+
+/// Files that haven't had their chapter-thumb pass run yet. We use a
+/// nullable timestamp column rather than a boolean so a future
+/// "regenerate after X days" sweep can compare timestamps directly.
+pub async fn list_media_files_needing_chapter_thumbs(
+    pool: &SqlitePool,
+    library_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<MediaFileForChapterThumbs>> {
+    let rows = if let Some(lid) = library_id {
+        sqlx::query(
+            "SELECT mf.id AS id, mf.path AS path
+             FROM media_files mf
+             LEFT JOIN items i ON i.id = mf.item_id
+             LEFT JOIN episodes e ON e.id = mf.episode_id
+             LEFT JOIN seasons s ON s.id = e.season_id
+             WHERE mf.chapter_thumbs_generated_at IS NULL
+               AND mf.removed_at IS NULL
+               AND (i.library_id = ? OR s.show_id IN
+                    (SELECT id FROM items WHERE library_id = ?))
+             LIMIT ?",
+        )
+        .bind(lid)
+        .bind(lid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT id, path FROM media_files
+             WHERE chapter_thumbs_generated_at IS NULL AND removed_at IS NULL
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.iter()
+        .map(|row| {
+            Ok(MediaFileForChapterThumbs {
+                id: row.try_get("id")?,
+                path: row.try_get("path")?,
+            })
+        })
+        .collect()
+}
+
+/// Stamp `chapter_thumbs_generated_at` + record how many chapters the
+/// file had. `chapter_count = 0` is a valid "no chapters" result — we
+/// still set the timestamp so the next task run doesn't re-probe.
+pub async fn record_chapter_thumbs_generated(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    chapter_count: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE media_files
+         SET chapter_thumbs_generated_at = ?, chapter_count = ?
+         WHERE id = ?",
+    )
+    .bind(now_ms())
+    .bind(chapter_count)
+    .bind(media_file_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Look up a media_file's stored chapter count + processing timestamp.
+/// Returns `None` if the file is unknown; returns `Some((None, _))`
+/// for a file that hasn't been processed yet.
+pub async fn get_chapter_thumbs_status(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Option<(Option<i64>, Option<i64>)>> {
+    let row = sqlx::query(
+        "SELECT chapter_thumbs_generated_at, chapter_count, path
+         FROM media_files WHERE id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some((
+        row.try_get::<Option<i64>, _>("chapter_thumbs_generated_at")
+            .ok()
+            .flatten(),
+        row.try_get::<Option<i64>, _>("chapter_count").ok().flatten(),
+    )))
+}
+
+/// Resolve the disk path for a media_file. Used by the chapter-thumb
+/// API to feed `probe_chapters` without rehydrating the full row.
+pub async fn get_media_file_path(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT path FROM media_files WHERE id = ?")
+        .bind(media_file_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get("path").ok()))
+}
+
+// ─── Loudness analysis ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MediaFileForLoudness {
+    pub id: i64,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LoudnessMeasurement {
+    pub integrated: f64,
+    pub true_peak: f64,
+    pub lra: f64,
+    pub threshold: f64,
+}
+
+/// Files that haven't had loudness analysis run yet. Skips files
+/// without duration (probe must have failed) since loudnorm wants a
+/// known audio stream.
+pub async fn list_media_files_needing_loudness(
+    pool: &SqlitePool,
+    library_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<MediaFileForLoudness>> {
+    let rows = if let Some(lid) = library_id {
+        sqlx::query(
+            "SELECT mf.id AS id, mf.path AS path
+             FROM media_files mf
+             LEFT JOIN items i ON i.id = mf.item_id
+             LEFT JOIN episodes e ON e.id = mf.episode_id
+             LEFT JOIN seasons s ON s.id = e.season_id
+             WHERE mf.loudnorm_analyzed_at IS NULL
+               AND mf.removed_at IS NULL
+               AND mf.duration_ms IS NOT NULL
+               AND (i.library_id = ? OR s.show_id IN
+                    (SELECT id FROM items WHERE library_id = ?))
+             LIMIT ?",
+        )
+        .bind(lid)
+        .bind(lid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT id, path FROM media_files
+             WHERE loudnorm_analyzed_at IS NULL
+               AND removed_at IS NULL
+               AND duration_ms IS NOT NULL
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.iter()
+        .map(|row| {
+            Ok(MediaFileForLoudness {
+                id: row.try_get("id")?,
+                path: row.try_get("path")?,
+            })
+        })
+        .collect()
+}
+
+/// Stamp the four loudnorm values. `None` means "we ran the analysis
+/// but the file had no audio / silent input" — still updates the
+/// timestamp so we don't re-probe.
+pub async fn record_loudness_measurement(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    m: Option<LoudnessMeasurement>,
+) -> Result<()> {
+    let now = now_ms();
+    match m {
+        Some(m) => {
+            sqlx::query(
+                "UPDATE media_files SET
+                    loudnorm_integrated = ?,
+                    loudnorm_true_peak = ?,
+                    loudnorm_lra = ?,
+                    loudnorm_threshold = ?,
+                    loudnorm_analyzed_at = ?
+                 WHERE id = ?",
+            )
+            .bind(m.integrated)
+            .bind(m.true_peak)
+            .bind(m.lra)
+            .bind(m.threshold)
+            .bind(now)
+            .bind(media_file_id)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "UPDATE media_files SET loudnorm_analyzed_at = ? WHERE id = ?",
+            )
+            .bind(now)
+            .bind(media_file_id)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Fetch stored loudness for a file. Returns `None` when analysis
+/// hasn't been run OR the analysis found no audio stream (both cases
+/// have NULL integrated / etc.).
+pub async fn get_loudness_measurement(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Option<LoudnessMeasurement>> {
+    let row = sqlx::query(
+        "SELECT loudnorm_integrated, loudnorm_true_peak,
+                loudnorm_lra, loudnorm_threshold
+         FROM media_files WHERE id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let integrated: Option<f64> = row
+        .try_get::<Option<f64>, _>("loudnorm_integrated")
+        .ok()
+        .flatten();
+    let true_peak: Option<f64> = row
+        .try_get::<Option<f64>, _>("loudnorm_true_peak")
+        .ok()
+        .flatten();
+    let lra: Option<f64> = row
+        .try_get::<Option<f64>, _>("loudnorm_lra")
+        .ok()
+        .flatten();
+    let threshold: Option<f64> = row
+        .try_get::<Option<f64>, _>("loudnorm_threshold")
+        .ok()
+        .flatten();
+    match (integrated, true_peak, lra, threshold) {
+        (Some(i), Some(t), Some(l), Some(th)) => Ok(Some(LoudnessMeasurement {
+            integrated: i,
+            true_peak: t,
+            lra: l,
+            threshold: th,
+        })),
+        _ => Ok(None),
+    }
 }
 
 // ─── External subtitles ────────────────────────────────────────────────────
@@ -6786,6 +8316,577 @@ fn masked_last4(plaintext: &str) -> String {
     } else {
         chars[chars.len() - 4..].iter().collect()
     }
+}
+
+// ─── Playback events (admin Stats page) ───────────────────────────────────
+//
+// One row per "interesting moment" in a stream — start, complete, etc.
+// Drives the Tautulli-style stats dashboard: recent activity feed, top
+// users / top items leaderboards, transcode mix, now-playing snapshot.
+//
+// Insertion sites are intentionally narrow: the stream handler emits
+// `start` events (with decision/codecs/IP/UA) and the scrobble handler
+// emits `complete` events. Progress / pause / resume / stop are
+// schema-supported but not currently emitted — adding them later is a
+// one-call-site change because all the aggregation queries already
+// filter by event_type as needed.
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlaybackEventInput<'a> {
+    pub user_id: i64,
+    pub item_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    pub media_file_id: Option<i64>,
+    pub event_type: &'a str,
+    pub position_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub decision: Option<&'a str>,
+    pub video_codec: Option<&'a str>,
+    pub audio_codec: Option<&'a str>,
+    pub container: Option<&'a str>,
+    /// Cumulative bytes served by the session emitting this event.
+    /// Populated on `stop` events from the transcoder's per-session
+    /// counter; `start` / `complete` events leave it None.
+    pub bytes_sent: Option<i64>,
+    pub ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub session_token: Option<&'a str>,
+}
+
+impl<'a> PlaybackEventInput<'a> {
+    /// Constructor that defaults every optional field to None. Use
+    /// `.with_*` setters (just direct field assignment via struct
+    /// update syntax in practice) to fill what's relevant per
+    /// event-type. Saves call sites from listing every None field
+    /// when emitting a minimal event.
+    pub fn new(user_id: i64, event_type: &'a str) -> Self {
+        Self {
+            user_id,
+            item_id: None,
+            episode_id: None,
+            media_file_id: None,
+            event_type,
+            position_ms: None,
+            duration_ms: None,
+            decision: None,
+            video_codec: None,
+            audio_codec: None,
+            container: None,
+            bytes_sent: None,
+            ip: None,
+            user_agent: None,
+            session_token: None,
+        }
+    }
+}
+
+/// Append a playback event. Fire-and-forget — failures are logged at
+/// the call site, never bubble up to the user's request. Stats are
+/// observability, not load-bearing for playback.
+pub async fn record_playback_event(
+    pool: &SqlitePool,
+    ev: PlaybackEventInput<'_>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO playback_events (
+            user_id, item_id, episode_id, media_file_id, event_type,
+            occurred_at, position_ms, duration_ms, decision,
+            video_codec, audio_codec, container, bytes_sent,
+            ip, user_agent, session_token
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(ev.user_id)
+    .bind(ev.item_id)
+    .bind(ev.episode_id)
+    .bind(ev.media_file_id)
+    .bind(ev.event_type)
+    .bind(now_ms())
+    .bind(ev.position_ms)
+    .bind(ev.duration_ms)
+    .bind(ev.decision)
+    .bind(ev.video_codec)
+    .bind(ev.audio_codec)
+    .bind(ev.container)
+    .bind(ev.bytes_sent)
+    .bind(ev.ip)
+    .bind(ev.user_agent)
+    .bind(ev.session_token)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsActivityRow {
+    pub id: i64,
+    pub occurred_at: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub event_type: String,
+    pub decision: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub container: Option<String>,
+    pub ip: Option<String>,
+    pub item_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    /// Display title — movie title or "<show> — <episode title>".
+    pub title: Option<String>,
+}
+
+/// Recent activity feed for the admin Stats page. Joins to users,
+/// items, and episodes so the UI gets pre-stitched display strings
+/// in one round trip. `limit` clamped to [1, 200]. Pass `user_id` to
+/// scope the feed to a single user (drill-in from the Top Users
+/// list).
+pub async fn list_playback_activity(
+    pool: &SqlitePool,
+    limit: i64,
+    before_id: Option<i64>,
+    user_id: Option<i64>,
+) -> Result<Vec<StatsActivityRow>> {
+    let limit = limit.clamp(1, 200);
+    let before_clause = if before_id.is_some() {
+        "AND pe.id < ?"
+    } else {
+        ""
+    };
+    let user_clause = if user_id.is_some() {
+        "AND pe.user_id = ?"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT pe.id, pe.occurred_at, pe.user_id, u.username,
+                pe.event_type, pe.decision, pe.video_codec, pe.audio_codec,
+                pe.container, pe.ip,
+                pe.item_id, pe.episode_id,
+                COALESCE(
+                    i.title,
+                    show.title || ' — ' || ep.title
+                ) AS title
+         FROM playback_events pe
+         JOIN users u ON u.id = pe.user_id
+         LEFT JOIN items i ON i.id = pe.item_id
+         LEFT JOIN episodes ep ON ep.id = pe.episode_id
+         LEFT JOIN seasons s ON s.id = ep.season_id
+         LEFT JOIN items show ON show.id = s.show_id
+         WHERE 1=1 {before_clause} {user_clause}
+         ORDER BY pe.id DESC
+         LIMIT ?"
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(b) = before_id {
+        q = q.bind(b);
+    }
+    if let Some(u) = user_id {
+        q = q.bind(u);
+    }
+    q = q.bind(limit);
+    let rows = q.fetch_all(pool).await?;
+    rows.iter()
+        .map(|r| {
+            Ok(StatsActivityRow {
+                id: r.try_get("id")?,
+                occurred_at: r.try_get("occurred_at")?,
+                user_id: r.try_get("user_id")?,
+                username: r.try_get("username")?,
+                event_type: r.try_get("event_type")?,
+                decision: r.try_get::<Option<String>, _>("decision").ok().flatten(),
+                video_codec: r.try_get::<Option<String>, _>("video_codec").ok().flatten(),
+                audio_codec: r.try_get::<Option<String>, _>("audio_codec").ok().flatten(),
+                container: r.try_get::<Option<String>, _>("container").ok().flatten(),
+                ip: r.try_get::<Option<String>, _>("ip").ok().flatten(),
+                item_id: r.try_get::<Option<i64>, _>("item_id").ok().flatten(),
+                episode_id: r.try_get::<Option<i64>, _>("episode_id").ok().flatten(),
+                title: r.try_get::<Option<String>, _>("title").ok().flatten(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsTopUserRow {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    /// Count of `start` events in the window — distinct streams.
+    pub play_count: i64,
+    /// Count of `complete` events — actually-finished streams.
+    pub completions: i64,
+    /// Most recent event timestamp.
+    pub last_seen_at: Option<i64>,
+}
+
+/// Top users by play count over the last N days. Includes completions
+/// so the UI can show "started 12, finished 4" at a glance.
+pub async fn top_users_by_plays(
+    pool: &SqlitePool,
+    since_ms: i64,
+    limit: i64,
+) -> Result<Vec<StatsTopUserRow>> {
+    let limit = limit.clamp(1, 50);
+    let rows = sqlx::query(
+        "SELECT u.id AS user_id, u.username, u.display_name,
+                SUM(CASE WHEN pe.event_type = 'start' THEN 1 ELSE 0 END) AS play_count,
+                SUM(CASE WHEN pe.event_type = 'complete' THEN 1 ELSE 0 END) AS completions,
+                MAX(pe.occurred_at) AS last_seen_at
+         FROM playback_events pe
+         JOIN users u ON u.id = pe.user_id
+         WHERE pe.occurred_at >= ?
+         GROUP BY u.id
+         ORDER BY play_count DESC, last_seen_at DESC
+         LIMIT ?",
+    )
+    .bind(since_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(StatsTopUserRow {
+                user_id: r.try_get("user_id")?,
+                username: r.try_get("username")?,
+                display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten(),
+                play_count: r.try_get("play_count")?,
+                completions: r.try_get("completions")?,
+                last_seen_at: r.try_get::<Option<i64>, _>("last_seen_at").ok().flatten(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsTopItemRow {
+    pub item_id: Option<i64>,
+    pub title: String,
+    pub kind: String,
+    pub play_count: i64,
+    pub last_played_at: Option<i64>,
+    pub year: Option<i32>,
+}
+
+/// Top items by play count. For TV shows we roll episodes up under
+/// their parent show; movies are counted directly. `start` events
+/// only — completions would skew toward short content.
+pub async fn top_items_by_plays(
+    pool: &SqlitePool,
+    since_ms: i64,
+    limit: i64,
+) -> Result<Vec<StatsTopItemRow>> {
+    let limit = limit.clamp(1, 50);
+    let rows = sqlx::query(
+        "WITH events AS (
+             -- Movie events: direct item_id.
+             SELECT pe.item_id AS rolled_id, pe.occurred_at
+             FROM playback_events pe
+             WHERE pe.event_type = 'start'
+               AND pe.occurred_at >= ?
+               AND pe.item_id IS NOT NULL
+             UNION ALL
+             -- Episode events: roll up to the parent show via seasons.show_id.
+             SELECT s.show_id AS rolled_id, pe.occurred_at
+             FROM playback_events pe
+             JOIN episodes ep ON ep.id = pe.episode_id
+             JOIN seasons s ON s.id = ep.season_id
+             WHERE pe.event_type = 'start'
+               AND pe.occurred_at >= ?
+               AND pe.episode_id IS NOT NULL
+         )
+         SELECT i.id AS item_id, i.title, i.kind, i.year,
+                COUNT(*) AS play_count,
+                MAX(events.occurred_at) AS last_played_at
+         FROM events
+         JOIN items i ON i.id = events.rolled_id
+         GROUP BY i.id
+         ORDER BY play_count DESC, last_played_at DESC
+         LIMIT ?",
+    )
+    .bind(since_ms)
+    .bind(since_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(StatsTopItemRow {
+                item_id: r.try_get::<Option<i64>, _>("item_id").ok().flatten(),
+                title: r.try_get("title")?,
+                kind: r.try_get("kind")?,
+                play_count: r.try_get("play_count")?,
+                last_played_at: r.try_get::<Option<i64>, _>("last_played_at").ok().flatten(),
+                year: r.try_get::<Option<i32>, _>("year").ok().flatten(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct StatsOverview {
+    pub total_plays: i64,
+    pub completions: i64,
+    pub direct_plays: i64,
+    pub transcoded_plays: i64,
+    pub unique_users: i64,
+}
+
+/// Aggregate counters for the Stats page hero tiles. One query, window
+/// is the last N days.
+pub async fn stats_overview(pool: &SqlitePool, since_ms: i64) -> Result<StatsOverview> {
+    let row = sqlx::query(
+        "SELECT
+            SUM(CASE WHEN event_type = 'start' THEN 1 ELSE 0 END) AS total_plays,
+            SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END) AS completions,
+            SUM(CASE WHEN event_type = 'start' AND decision = 'direct' THEN 1 ELSE 0 END)
+                AS direct_plays,
+            SUM(CASE WHEN event_type = 'start' AND decision = 'transcode' THEN 1 ELSE 0 END)
+                AS transcoded_plays,
+            COUNT(DISTINCT user_id) AS unique_users
+         FROM playback_events
+         WHERE occurred_at >= ?",
+    )
+    .bind(since_ms)
+    .fetch_one(pool)
+    .await?;
+    Ok(StatsOverview {
+        total_plays: row.try_get::<Option<i64>, _>("total_plays").ok().flatten().unwrap_or(0),
+        completions: row.try_get::<Option<i64>, _>("completions").ok().flatten().unwrap_or(0),
+        direct_plays: row.try_get::<Option<i64>, _>("direct_plays").ok().flatten().unwrap_or(0),
+        transcoded_plays: row
+            .try_get::<Option<i64>, _>("transcoded_plays")
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+        unique_users: row.try_get::<i64, _>("unique_users")?,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsDailyBucket {
+    /// Local-date bucket key as `YYYY-MM-DD` (UTC). Empty days inside
+    /// the window are returned with zero counts so the chart renders a
+    /// continuous x-axis instead of skipping gaps.
+    pub day: String,
+    pub starts: i64,
+    pub completions: i64,
+}
+
+/// Per-day play counts for the activity chart. Window is the last N
+/// days inclusive of today. Empty buckets are filled in so the chart
+/// stays gap-free even on a quiet server.
+pub async fn plays_per_day(
+    pool: &SqlitePool,
+    days: i64,
+) -> Result<Vec<StatsDailyBucket>> {
+    let days = days.clamp(1, 365);
+    let now = now_ms();
+    let since_ms_value = now - days * 86_400_000;
+    // SQLite's `date(epoch, 'unixepoch')` produces `YYYY-MM-DD`. Group
+    // by that and pivot start vs complete in a single scan.
+    let rows = sqlx::query(
+        "SELECT date(occurred_at / 1000, 'unixepoch') AS day,
+                SUM(CASE WHEN event_type = 'start' THEN 1 ELSE 0 END) AS starts,
+                SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END) AS completions
+         FROM playback_events
+         WHERE occurred_at >= ?
+         GROUP BY day
+         ORDER BY day ASC",
+    )
+    .bind(since_ms_value)
+    .fetch_all(pool)
+    .await?;
+    let mut found: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for r in &rows {
+        let d: String = r.try_get("day")?;
+        let s: i64 = r.try_get("starts")?;
+        let c: i64 = r.try_get("completions")?;
+        found.insert(d, (s, c));
+    }
+    // Walk forward `days` days from the start of the window so empty
+    // days show as zero rather than dropping out of the series.
+    let mut out = Vec::with_capacity(days as usize);
+    for n in 0..days {
+        let bucket_ms = since_ms_value + n * 86_400_000;
+        let day = format_yyyymmdd_utc(bucket_ms);
+        let (starts, completions) = found.get(&day).copied().unwrap_or((0, 0));
+        out.push(StatsDailyBucket {
+            day,
+            starts,
+            completions,
+        });
+    }
+    Ok(out)
+}
+
+/// Format an epoch-ms value as a `YYYY-MM-DD` UTC date string. Used by
+/// `plays_per_day` to fill gaps; chrono is already a workspace dep via
+/// other crates so reaching for it here is free.
+fn format_yyyymmdd_utc(epoch_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "????-??-??".to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsHourBucket {
+    pub hour: i64,
+    pub starts: i64,
+}
+
+/// Histogram of play starts by hour-of-day (0..=23). Useful for "when
+/// does my household actually watch" — Plex/Tautulli's most popular
+/// chart. Bucket aligned to server local time so it matches the
+/// operator's intuition rather than UTC.
+pub async fn plays_per_hour(pool: &SqlitePool, days: i64) -> Result<Vec<StatsHourBucket>> {
+    let days = days.clamp(1, 365);
+    let since = now_ms() - days * 86_400_000;
+    let rows = sqlx::query(
+        "SELECT CAST(strftime('%H', occurred_at / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                COUNT(*) AS starts
+         FROM playback_events
+         WHERE event_type = 'start' AND occurred_at >= ?
+         GROUP BY hour",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    let mut found: [i64; 24] = [0; 24];
+    for r in &rows {
+        let h: i64 = r.try_get("hour")?;
+        let s: i64 = r.try_get("starts")?;
+        if (0..24).contains(&h) {
+            found[h as usize] = s;
+        }
+    }
+    Ok((0..24)
+        .map(|h| StatsHourBucket {
+            hour: h,
+            starts: found[h as usize],
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsLibraryBucket {
+    pub library_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub starts: i64,
+}
+
+/// Top libraries by play count in the window. Movies join through
+/// `items.library_id` directly; episodes roll up via
+/// `episodes → seasons → items.library_id` (the parent show carries
+/// the library reference). UNION-ALL pattern mirrors `top_items_by_plays`.
+pub async fn top_libraries_by_plays(
+    pool: &SqlitePool,
+    days: i64,
+    limit: i64,
+) -> Result<Vec<StatsLibraryBucket>> {
+    let days = days.clamp(1, 365);
+    let limit = limit.clamp(1, 50);
+    let since = now_ms() - days * 86_400_000;
+    let rows = sqlx::query(
+        "WITH events AS (
+             SELECT i.library_id AS lib_id
+             FROM playback_events pe
+             JOIN items i ON i.id = pe.item_id
+             WHERE pe.event_type = 'start'
+               AND pe.occurred_at >= ?
+               AND pe.item_id IS NOT NULL
+             UNION ALL
+             SELECT show.library_id AS lib_id
+             FROM playback_events pe
+             JOIN episodes ep ON ep.id = pe.episode_id
+             JOIN seasons s ON s.id = ep.season_id
+             JOIN items show ON show.id = s.show_id
+             WHERE pe.event_type = 'start'
+               AND pe.occurred_at >= ?
+               AND pe.episode_id IS NOT NULL
+         )
+         SELECT l.id AS library_id, l.name, l.kind, COUNT(*) AS starts
+         FROM events
+         JOIN libraries l ON l.id = events.lib_id
+         GROUP BY l.id
+         ORDER BY starts DESC, l.name COLLATE NOCASE ASC
+         LIMIT ?",
+    )
+    .bind(since)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(StatsLibraryBucket {
+                library_id: r.try_get("library_id")?,
+                name: r.try_get("name")?,
+                kind: r.try_get("kind")?,
+                starts: r.try_get("starts")?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsPlatformBucket {
+    /// Coarse-grained platform name derived from the user-agent
+    /// string. The list is intentionally small — operators want "are
+    /// they on a phone or a TV", not the full UA — and falls into
+    /// "Other" when the UA doesn't match any pattern.
+    pub platform: String,
+    pub starts: i64,
+}
+
+/// Top platforms over the window. The bucketing is purely
+/// pattern-matching against the user_agent string; we keep it in SQL
+/// (CASE WHEN LIKE) so the dashboard can render a sorted list with
+/// one round trip and no per-row UA-parsing logic in Rust.
+pub async fn top_platforms(
+    pool: &SqlitePool,
+    days: i64,
+    limit: i64,
+) -> Result<Vec<StatsPlatformBucket>> {
+    let days = days.clamp(1, 365);
+    let limit = limit.clamp(1, 50);
+    let since = now_ms() - days * 86_400_000;
+    let rows = sqlx::query(
+        "SELECT CASE
+                  WHEN user_agent IS NULL OR user_agent = '' THEN 'Unknown'
+                  WHEN user_agent LIKE '%Android%' THEN 'Android'
+                  WHEN user_agent LIKE '%iPhone%' OR user_agent LIKE '%iPad%' THEN 'iOS'
+                  WHEN user_agent LIKE '%Mac OS%' AND user_agent NOT LIKE '%Chrome%'
+                       AND user_agent NOT LIKE '%Firefox%' THEN 'macOS'
+                  WHEN user_agent LIKE '%Tizen%' THEN 'Samsung TV'
+                  WHEN user_agent LIKE '%Web0S%' OR user_agent LIKE '%webOS%' THEN 'LG TV'
+                  WHEN user_agent LIKE '%AppleTV%' OR user_agent LIKE '%tvOS%' THEN 'Apple TV'
+                  WHEN user_agent LIKE '%Roku%' THEN 'Roku'
+                  WHEN user_agent LIKE '%Edg/%' THEN 'Edge'
+                  WHEN user_agent LIKE '%Firefox%' THEN 'Firefox'
+                  WHEN user_agent LIKE '%Chrome%' THEN 'Chrome'
+                  WHEN user_agent LIKE '%Safari%' THEN 'Safari'
+                  ELSE 'Other'
+                END AS platform,
+                COUNT(*) AS starts
+         FROM playback_events
+         WHERE event_type = 'start' AND occurred_at >= ?
+         GROUP BY platform
+         ORDER BY starts DESC
+         LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(StatsPlatformBucket {
+                platform: r.try_get("platform")?,
+                starts: r.try_get("starts")?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

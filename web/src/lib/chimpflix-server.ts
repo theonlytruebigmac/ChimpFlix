@@ -24,10 +24,25 @@ export async function requireUser(currentPath: string): Promise<User> {
 
 /// Resolves the current user and verifies they hold the `owner` role.
 /// Non-owners are bounced to the user-facing settings page so they see a
-/// useful destination instead of a bare 403.
+/// useful destination instead of a bare 403. Use for the most sensitive
+/// pages — credentials, library mounts, server URLs, owner-role
+/// mutations.
 export async function requireOwner(currentPath: string): Promise<User> {
   const user = await requireUser(currentPath);
   if (user.role !== "owner") {
+    redirect("/settings");
+  }
+  return user;
+}
+
+/// Resolves the current user and verifies they hold either `owner` or
+/// `admin` role. Use for routine admin-surface pages (Users, Access,
+/// Groups, Library Settings, Tasks, etc.) — handlers further enforce
+/// the role hierarchy when acting on a specific target so admins
+/// never modify owner accounts.
+export async function requireAdmin(currentPath: string): Promise<User> {
+  const user = await requireUser(currentPath);
+  if (user.role !== "owner" && user.role !== "admin") {
     redirect("/settings");
   }
   return user;

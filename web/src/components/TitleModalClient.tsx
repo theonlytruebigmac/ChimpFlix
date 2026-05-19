@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { useRouter } from "next/navigation";
 import { brandNameUpper } from "@/lib/env";
 import {
   displayTitle,
@@ -20,9 +22,11 @@ import {
   auth as authApi,
   collections as collectionsApi,
   items as itemsApi,
+  libraries as librariesApi,
   playState as playStateApi,
   ratings as ratingsApi,
   tags as tagsApi,
+  type Collection,
   type CollectionDetail,
   type Credit,
   type Extra,
@@ -86,7 +90,7 @@ function useThemeMusic(tvdbId: number | null, enabled: boolean) {
     audio.loop = true;
     audio.volume = 0.35;
     audio.preload = "auto";
-    let teardown = () => {
+    const teardown = () => {
       audio.pause();
       audio.src = "";
     };
@@ -230,7 +234,6 @@ function TitleModalView({ data }: { data: ModalData }) {
       cancelPendingPrewarm();
       void cancelPrewarm();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -1099,11 +1102,26 @@ function AdminActions({
   detail: ItemDetail;
   onUpdated: (next: ItemDetail) => void;
 }) {
+  const router = useRouter();
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const [user, setUser] = useState<User | null>(null);
   const [open, setOpen] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [showMatch, setShowMatch] = useState(false);
+  const [showDelete, setShowDelete] = useState(false);
+  const [showAddToCollection, setShowAddToCollection] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [detectingMarkers, setDetectingMarkers] = useState(false);
+  /// Brief one-shot toast for fire-and-forget admin actions
+  /// (currently the marker-detect kickoff). The backend returns 202
+  /// with "queued: N" and runs the work in the background, so the
+  /// menu shows a quick acknowledgement and disappears.
+  const [actionToast, setActionToast] = useState<string | null>(null);
+  // Whether the OWNING library has `allow_media_deletion = true`.
+  // Fetched once on mount (per modal open). null = unknown / not yet
+  // loaded; the Delete menu item only renders when true so the
+  // operator doesn't see a destructive option that will server-reject.
+  const [allowDelete, setAllowDelete] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -1117,6 +1135,26 @@ function AdminActions({
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    // Skip the libraries fetch for non-owners — they can't act on the
+    // result anyway and the endpoint may not be reachable.
+    if (!user || user.role !== "owner") return;
+    let cancelled = false;
+    librariesApi
+      .list()
+      .then((r) => {
+        if (cancelled) return;
+        const lib = r.libraries.find((l) => l.id === detail.library_id);
+        setAllowDelete(lib?.allow_media_deletion ?? false);
+      })
+      .catch(() => {
+        if (!cancelled) setAllowDelete(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user, detail.library_id]);
 
   if (!user || user.role !== "owner") return null;
 
@@ -1134,13 +1172,51 @@ function AdminActions({
     }
   }
 
+  async function detectMarkers() {
+    if (detectingMarkers) return;
+    setDetectingMarkers(true);
+    setOpen(false);
+    try {
+      const { queued } = await itemsApi.detectMarkers(detail.id);
+      setActionToast(
+        queued === 0
+          ? "No files to scan."
+          : `Marker detection queued for ${queued} file${queued === 1 ? "" : "s"}.`,
+      );
+      // Auto-clear after a beat so the toast doesn't linger past the
+      // next modal interaction.
+      window.setTimeout(() => setActionToast(null), 4000);
+    } catch (e) {
+      setActionToast(
+        e instanceof Error ? `Failed: ${e.message}` : `Failed: ${String(e)}`,
+      );
+    } finally {
+      setDetectingMarkers(false);
+    }
+  }
+
+  function onDeleted(report: { items_purged: number }) {
+    // If the cascade swept the item itself, no point in keeping the
+    // modal open against a now-dead id — pop the URL back to the
+    // page that opened us and let the rails re-fetch.
+    if (report.items_purged > 0) {
+      router.back();
+    }
+    // Otherwise (cascade didn't reach the item — partial show
+    // delete), close the delete dialog but leave the modal so the
+    // operator can decide what to do next.
+  }
+
   return (
     <>
       <div className="relative">
         <button
+          ref={triggerRef}
           type="button"
           onClick={() => setOpen((o) => !o)}
           aria-label="Admin actions"
+          aria-haspopup="menu"
+          aria-expanded={open}
           className="flex h-11 w-11 items-center justify-center rounded-full border-2 border-white/60 text-white transition-colors hover:border-white"
         >
           <svg
@@ -1155,33 +1231,75 @@ function AdminActions({
             <circle cx="19" cy="12" r="2" />
           </svg>
         </button>
-        {open && (
-          <div
-            role="menu"
-            className="absolute right-0 top-full z-30 mt-2 w-48 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl"
-          >
-            <MenuItem
-              onClick={() => {
-                setOpen(false);
-                setShowEdit(true);
-              }}
-            >
-              Edit Metadata…
-            </MenuItem>
-            <MenuItem
-              onClick={() => {
-                setOpen(false);
-                setShowMatch(true);
-              }}
-            >
-              Fix Match…
-            </MenuItem>
-            <MenuItem onClick={refresh} disabled={refreshing}>
-              {refreshing ? "Refreshing…" : "Refresh metadata"}
-            </MenuItem>
+        {actionToast && (
+          <div className="absolute right-0 top-full z-30 mt-2 w-64 rounded-md border border-white/15 bg-(--color-surface) px-3 py-2 text-xs text-white/80 shadow-2xl">
+            {actionToast}
           </div>
         )}
       </div>
+      <AdminActionsMenu
+        open={open}
+        anchorRef={triggerRef}
+        onClose={() => setOpen(false)}
+        items={[
+          {
+            kind: "item",
+            label: "Edit Metadata…",
+            icon: PencilIcon,
+            onClick: () => {
+              setOpen(false);
+              setShowEdit(true);
+            },
+          },
+          {
+            kind: "item",
+            label: "Fix Match…",
+            icon: TargetIcon,
+            onClick: () => {
+              setOpen(false);
+              setShowMatch(true);
+            },
+          },
+          {
+            kind: "item",
+            label: refreshing ? "Refreshing…" : "Refresh metadata",
+            icon: RefreshIcon,
+            disabled: refreshing,
+            onClick: refresh,
+          },
+          {
+            kind: "item",
+            label: detectingMarkers ? "Detecting…" : "Detect markers",
+            icon: WaveIcon,
+            disabled: detectingMarkers,
+            onClick: detectMarkers,
+          },
+          {
+            kind: "item",
+            label: "Add to collection…",
+            icon: FolderPlusIcon,
+            onClick: () => {
+              setOpen(false);
+              setShowAddToCollection(true);
+            },
+          },
+          ...(allowDelete
+            ? ([
+                { kind: "separator" as const },
+                {
+                  kind: "item" as const,
+                  label: "Delete from disk…",
+                  icon: TrashIcon,
+                  destructive: true,
+                  onClick: () => {
+                    setOpen(false);
+                    setShowDelete(true);
+                  },
+                },
+              ] as const)
+            : []),
+        ]}
+      />
       {showEdit && (
         <EditMetadataDialog
           detail={detail}
@@ -1196,31 +1314,554 @@ function AdminActions({
           onApplied={(next) => onUpdated(next)}
         />
       )}
+      {showDelete && (
+        <DeleteMediaDialog
+          detail={detail}
+          onClose={() => setShowDelete(false)}
+          onDeleted={onDeleted}
+        />
+      )}
+      {showAddToCollection && (
+        <AddToCollectionDialog
+          itemId={detail.id}
+          itemTitle={detail.title}
+          onClose={() => setShowAddToCollection(false)}
+        />
+      )}
     </>
   );
 }
 
-function MenuItem({
-  children,
-  onClick,
-  disabled,
+/// Mini dialog opened from the item modal's admin menu. Lists existing
+/// manual collections with one-click "Add" buttons, plus an inline
+/// quick-create. Auto collections aren't shown — they're TMDB-driven
+/// and rejected server-side anyway.
+function AddToCollectionDialog({
+  itemId,
+  itemTitle,
+  onClose,
 }: {
-  children: React.ReactNode;
-  onClick: () => void;
-  disabled?: boolean;
+  itemId: number;
+  itemTitle: string;
+  onClose: () => void;
 }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      role="menuitem"
-      className="block w-full px-4 py-2 text-left text-sm transition-colors hover:bg-white/10 disabled:opacity-50"
+  const [manualCollections, setManualCollections] = useState<Collection[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [newName, setNewName] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await collectionsApi.list();
+      setManualCollections(r.collections.filter((c) => c.kind === "manual"));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    collectionsApi
+      .list()
+      .then((r) => {
+        if (cancelled) return;
+        setManualCollections(r.collections.filter((c) => c.kind === "manual"));
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function addTo(collectionId: number, name: string) {
+    setBusyId(collectionId);
+    setError(null);
+    try {
+      const r = await collectionsApi.addItems(collectionId, [itemId]);
+      setToast(
+        r.inserted > 0
+          ? `Added to “${name}”.`
+          : `Already in “${name}”.`,
+      );
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function createAndAdd(e: React.FormEvent) {
+    e.preventDefault();
+    const name = newName.trim();
+    if (!name || creating) return;
+    setCreating(true);
+    setError(null);
+    try {
+      const { id } = await collectionsApi.create({ name });
+      await collectionsApi.addItems(id, [itemId]);
+      setToast(`Created “${name}” and added this item.`);
+      setNewName("");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  // Portal: same reason as EditMetadata/FixMatch — the parent TitleModal
+  // card's `zfModalIn` transform animation establishes a containing
+  // block for fixed descendants, so without the portal this dialog
+  // opens wherever the modal card is on screen instead of centered.
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
-      {children}
-    </button>
+      <div className="w-full max-w-md rounded-lg border border-white/15 bg-neutral-950 p-6 shadow-2xl space-y-4">
+        <div className="flex items-baseline justify-between gap-2">
+          <h2 className="text-lg font-semibold">Add to collection</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs text-white/55 hover:text-white"
+          >
+            Close
+          </button>
+        </div>
+        <p className="text-xs text-white/55">
+          Add <span className="font-medium text-white/80">{itemTitle}</span>{" "}
+          to one or more manual collections.
+        </p>
+
+        {error && (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            {error}
+          </div>
+        )}
+        {toast && (
+          <div className="rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white/80">
+            {toast}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="text-xs text-white/50">Loading…</div>
+        ) : manualCollections.length === 0 ? (
+          <div className="rounded border border-dashed border-white/15 bg-white/2 px-3 py-4 text-center text-xs text-white/50">
+            No manual collections yet. Create one below.
+          </div>
+        ) : (
+          <ul className="max-h-60 divide-y divide-white/5 overflow-y-auto rounded border border-white/10">
+            {manualCollections.map((c) => (
+              <li
+                key={c.id}
+                className="flex items-center gap-2 px-3 py-2 text-sm"
+              >
+                <span className="grow truncate">{c.name}</span>
+                <span className="shrink-0 text-xs tabular-nums text-white/50">
+                  {c.item_count}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => addTo(c.id, c.name)}
+                  disabled={busyId === c.id}
+                  className="rounded border border-white/15 px-2 py-0.5 text-xs text-white/80 hover:bg-white/5 disabled:opacity-50"
+                >
+                  {busyId === c.id ? "Adding…" : "Add"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <form onSubmit={createAndAdd} className="flex items-end gap-2">
+          <div className="grow">
+            <label className="mb-1 block text-xs font-medium text-white/80">
+              Create new
+            </label>
+            <input
+              type="text"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              maxLength={200}
+              placeholder="Collection name"
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-1.5 text-sm outline-none focus:border-white/30"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={!newName.trim() || creating}
+            className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+          >
+            {creating ? "Creating…" : "Create & add"}
+          </button>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
+
+/// Confirmation dialog for the hard-delete-from-disk path. Shows the
+/// item name + file count, requires the operator to type the title
+/// (matching Plex's destructive-action pattern), and displays the
+/// resulting cascade summary on completion. No retry — failure
+/// surfaces the error and the operator can dismiss and try again.
+function DeleteMediaDialog({
+  detail,
+  onClose,
+  onDeleted,
+}: {
+  detail: ItemDetail;
+  onClose: () => void;
+  onDeleted: (report: { items_purged: number }) => void;
+}) {
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<{
+    files_deleted: number;
+    episodes_purged: number;
+    seasons_purged: number;
+    items_purged: number;
+    paths: string[];
+  } | null>(null);
+
+  // For movies we have a file count locally; for shows we know how
+  // many seasons but the per-episode file count is paged behind
+  // season-detail fetches. "All files in this show" is honest
+  // without pretending we know an exact number.
+  const fileSummary =
+    detail.kind === "movie"
+      ? `${detail.files.length} file${detail.files.length === 1 ? "" : "s"}`
+      : `every episode file across ${detail.seasons.length} season${detail.seasons.length === 1 ? "" : "s"}`;
+
+  // Require the operator to type the title — same pattern Plex uses
+  // for destructive bulk actions. Case-insensitive trim-match keeps
+  // it ergonomic but still deliberate.
+  const confirmed =
+    confirmation.trim().toLowerCase() === detail.title.toLowerCase();
+
+  async function performDelete() {
+    if (!confirmed || busy || done) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await itemsApi.deleteMedia(detail.id);
+      setDone(r);
+      // Defer the parent callback so the operator can see the
+      // result summary before the modal pops away.
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function dismiss() {
+    if (done) onDeleted({ items_purged: done.items_purged });
+    onClose();
+  }
+
+  // Portal: same reason as the other in-modal dialogs.
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) dismiss();
+      }}
+    >
+      <div className="w-full max-w-md rounded-lg border border-red-500/30 bg-neutral-950 p-6 shadow-2xl">
+        <h2 className="text-lg font-semibold text-red-300">
+          Delete from disk
+        </h2>
+        {done ? (
+          <>
+            <p className="mt-3 text-sm text-white/80">
+              Deleted{" "}
+              <span className="font-medium">
+                {done.files_deleted} file{done.files_deleted === 1 ? "" : "s"}
+              </span>
+              {done.episodes_purged > 0 && (
+                <>, {done.episodes_purged} episode{done.episodes_purged === 1 ? "" : "s"}</>
+              )}
+              {done.seasons_purged > 0 && (
+                <>, {done.seasons_purged} season{done.seasons_purged === 1 ? "" : "s"}</>
+              )}
+              {done.items_purged > 0 && (
+                <>, {done.items_purged} item{done.items_purged === 1 ? "" : "s"}</>
+              )}
+              .
+            </p>
+            {done.paths.length > 0 && (
+              <div className="mt-3 max-h-40 overflow-y-auto rounded border border-white/10 bg-black/40 p-2 font-mono text-[11px] text-white/55">
+                {done.paths.map((p) => (
+                  <div key={p} className="truncate">{p}</div>
+                ))}
+              </div>
+            )}
+            <div className="mt-5 flex justify-end">
+              <button
+                type="button"
+                onClick={dismiss}
+                className="rounded-md bg-white/10 px-4 py-2 text-sm font-semibold text-white hover:bg-white/20"
+              >
+                Close
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="mt-3 text-sm text-white/80">
+              Permanently delete <span className="font-medium">{detail.title}</span>{" "}
+              ({fileSummary}) from disk. The media file
+              {detail.files.length === 1 ? "" : "s"}, episodes, seasons, and
+              orphan rows are removed immediately — no grace window, no undo.
+            </p>
+            <p className="mt-3 text-xs text-white/55">
+              Type{" "}
+              <span className="rounded bg-white/10 px-1 py-0.5 font-mono text-white/80">
+                {detail.title}
+              </span>{" "}
+              to confirm.
+            </p>
+            <input
+              type="text"
+              value={confirmation}
+              onChange={(e) => setConfirmation(e.target.value)}
+              placeholder={detail.title}
+              className="mt-2 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-red-500/60"
+              autoFocus
+            />
+            {error && (
+              <div className="mt-3 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                {error}
+              </div>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={busy}
+                className="rounded-md border border-white/15 px-4 py-2 text-sm text-white/80 hover:bg-white/5 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={performDelete}
+                disabled={!confirmed || busy}
+                className="rounded-md bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+              >
+                {busy ? "Deleting…" : "Delete permanently"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// ─── Admin actions menu (portal) ───────────────────────────────────────────
+//
+// Rendered via `createPortal` to document.body so the dropdown isn't
+// clipped by the modal card's `overflow-hidden` (needed for rounded
+// corners) or the hero image container's (needed for image cropping).
+// Positioned `fixed`, anchored to the trigger's bottom-right via
+// `getBoundingClientRect()` on open. Closes on outside click, Escape,
+// and on window resize / modal scroll (re-opening will reposition).
+//
+// Item list is data-driven (Plex-style) so adding new actions later is
+// just an array push — icons live below as small inline SVG components.
+
+type AdminMenuItem =
+  | { kind: "item"; label: string; icon: React.ComponentType; onClick: () => void; disabled?: boolean; destructive?: boolean }
+  | { kind: "separator" };
+
+function AdminActionsMenu({
+  open,
+  anchorRef,
+  onClose,
+  items,
+}: {
+  open: boolean;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+  items: ReadonlyArray<AdminMenuItem>;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  // Anchor position computed from the trigger's bounding rect. `null`
+  // before the first open (no SSR mismatch — portal mounts client-side).
+  const [coords, setCoords] = useState<{ top: number; right: number } | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const button = anchorRef.current;
+    if (!button) return;
+    const update = () => {
+      const r = button.getBoundingClientRect();
+      setCoords({
+        top: r.bottom + 8,
+        right: Math.max(8, window.innerWidth - r.right),
+      });
+    };
+    update();
+    // Reposition on window resize. Modal scroll fires on the backdrop
+    // container; we listen with capture so we catch it regardless of
+    // which scroll container moved.
+    const onScroll = () => onClose();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [open, anchorRef, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (menuRef.current?.contains(target)) return;
+      if (anchorRef.current?.contains(target)) return;
+      onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, anchorRef, onClose]);
+
+  if (!open || !coords) return null;
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      ref={menuRef}
+      role="menu"
+      style={{ top: coords.top, right: coords.right }}
+      className="fixed z-70 w-56 overflow-hidden rounded-md border border-white/10 bg-(--color-surface) py-1 shadow-2xl ring-1 ring-black/40"
+    >
+      {items.map((it, i) => {
+        if (it.kind === "separator") {
+          return <div key={`sep-${i}`} className="my-1 h-px bg-white/8" aria-hidden />;
+        }
+        const Icon = it.icon;
+        return (
+          <button
+            key={it.label}
+            type="button"
+            role="menuitem"
+            onClick={it.onClick}
+            disabled={it.disabled}
+            className={`flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 ${
+              it.destructive
+                ? "text-red-300 hover:bg-red-500/15"
+                : "text-white/90 hover:bg-white/8"
+            }`}
+          >
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center text-white/60">
+              <Icon />
+            </span>
+            <span className="flex-1 truncate">{it.label}</span>
+          </button>
+        );
+      })}
+    </div>,
+    document.body,
+  );
+}
+
+// ─── Menu icons ───────────────────────────────────────────────────────────
+// 16px stroke icons in the lucide style. Inline so the menu doesn't pull
+// in an icon library for six glyphs.
+
+const IconBase = ({ children }: { children: React.ReactNode }) => (
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden
+  >
+    {children}
+  </svg>
+);
+
+const PencilIcon = () => (
+  <IconBase>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+  </IconBase>
+);
+const TargetIcon = () => (
+  <IconBase>
+    <circle cx="12" cy="12" r="10" />
+    <circle cx="12" cy="12" r="6" />
+    <circle cx="12" cy="12" r="2" />
+  </IconBase>
+);
+const RefreshIcon = () => (
+  <IconBase>
+    <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+    <path d="M21 3v5h-5" />
+    <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+    <path d="M3 21v-5h5" />
+  </IconBase>
+);
+const WaveIcon = () => (
+  <IconBase>
+    <path d="M2 12h2l3-9 4 18 3-12 3 6 2-3h3" />
+  </IconBase>
+);
+const FolderPlusIcon = () => (
+  <IconBase>
+    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+    <line x1="12" y1="11" x2="12" y2="17" />
+    <line x1="9" y1="14" x2="15" y2="14" />
+  </IconBase>
+);
+const TrashIcon = () => (
+  <IconBase>
+    <polyline points="3 6 5 6 21 6" />
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+    <path d="M10 11v6" />
+    <path d="M14 11v6" />
+    <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
+  </IconBase>
+);
 
 // ─── Cast & Crew ───────────────────────────────────────────────────────────
 

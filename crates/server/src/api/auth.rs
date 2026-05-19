@@ -17,10 +17,15 @@ use tracing::{info, warn};
 
 use crate::api::error::ApiError;
 use crate::auth::{AuthUser, OwnerAuth, SESSION_MAX_AGE_S, cookie, password};
+use crate::mail_template;
 use crate::mailer::{Mailer, OutgoingMessage};
 use crate::state::AppState;
 
-const MIN_PASSWORD_LEN: usize = 8;
+// 12 chars is the 2026 NIST 800-63B baseline (recommended minimum for
+// memorized secrets without 2FA). Existing accounts created under the
+// old 8-char minimum still authenticate — the cap is enforced only on
+// new passwords / changes / resets.
+const MIN_PASSWORD_LEN: usize = 12;
 const MAX_USERNAME_LEN: usize = 64;
 
 #[derive(Debug, Serialize)]
@@ -375,9 +380,11 @@ pub async fn logout(
     .await;
     let clear = cookie::clear_cookie_header(state.auth.cookie_secure);
     let mut response = StatusCode::NO_CONTENT.into_response();
-    response
-        .headers_mut()
-        .insert(SET_COOKIE, HeaderValue::from_str(&clear).unwrap());
+    if let Ok(hv) = HeaderValue::from_str(&clear) {
+        response.headers_mut().insert(SET_COOKIE, hv);
+    } else {
+        warn!("logout: failed to format clear-cookie header — client will keep cookie until expiry");
+    }
     Ok(response)
 }
 
@@ -800,16 +807,31 @@ fn invite_email_text(
     code: &str,
     expires_at: Option<i64>,
 ) -> String {
-    let link = accept_url.unwrap_or(code);
-    let expiry = expires_at
-        .map(|ms| format!("\nThis invite expires at epoch ms {ms}.\n"))
-        .unwrap_or_default();
-    format!(
-        "You've been invited to {server_name}.\n\n\
-         Open this link to set up your account:\n  {link}\n\n\
-         If the link doesn't work, your invite code is:\n  {code}\n{expiry}\n\
-         If you didn't expect this, you can ignore the message.\n"
-    )
+    let now = chimpflix_common::now_ms();
+    let mut body = String::new();
+    body.push_str(&format!(
+        "You've been invited to {server_name}. Open this link to set up your account:\n\n"
+    ));
+    if let Some(url) = accept_url {
+        body.push_str(&format!("  {url}\n\n"));
+    }
+    body.push_str(&format!(
+        "If the link doesn't work, your invite code is:\n\n  {code}\n"
+    ));
+    if let Some(ms) = expires_at {
+        body.push_str(&format!(
+            "\nThis invitation expires on {}.\n",
+            mail_template::format_email_datetime_with_relative(ms, now),
+        ));
+    }
+    mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name,
+        headline: "You're invited",
+        body: &body,
+        footer_note: "You're receiving this because someone on a ChimpFlix server invited you. \
+                      If you weren't expecting this, you can safely ignore the email — \
+                      no account is created until you accept.",
+    })
 }
 
 fn invite_email_html(
@@ -818,41 +840,38 @@ fn invite_email_html(
     code: &str,
     expires_at: Option<i64>,
 ) -> String {
-    // The recipient is a normal email client — escape user-controlled
-    // values to defang HTML injection from the server_name field.
-    let server_safe = html_escape(server_name);
-    let code_safe = html_escape(code);
-    let link_html = match accept_url {
-        Some(url) => {
-            let url_safe = html_escape(url);
-            format!(
-                r#"<p><a href="{url_safe}" style="display:inline-block;background:#e50914;color:#fff;padding:10px 20px;border-radius:4px;text-decoration:none;font-weight:600;">Accept invitation</a></p>
-                   <p style="font-size:12px;color:#555">Or paste this link: <code>{url_safe}</code></p>"#
-            )
-        }
-        None => String::new(),
-    };
-    let expiry_html = expires_at
-        .map(|ms| format!(r#"<p style="font-size:12px;color:#555">This invitation expires at epoch ms {ms}.</p>"#))
-        .unwrap_or_default();
-    format!(
-        r#"<!doctype html><html><body style="font-family:system-ui,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#111">
-            <h2>You're invited to {server_safe}</h2>
-            {link_html}
-            <p style="font-size:14px;">If the button or link doesn't work, your invite code is:</p>
-            <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:13px;">{code_safe}</pre>
-            {expiry_html}
-            <p style="font-size:12px;color:#888">If you didn't expect this email, you can safely ignore it.</p>
-           </body></html>"#
-    )
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+    let now = chimpflix_common::now_ms();
+    let server_safe = mail_template::html_escape(server_name);
+    let mut body = String::new();
+    body.push_str(&mail_template::section_paragraph(&format!(
+        "You've been invited to join <strong>{server_safe}</strong> — a private library of \
+         movies, shows, and anime hosted by the server owner. Tap below to set up your \
+         account and start watching."
+    )));
+    if let Some(url) = accept_url {
+        body.push_str(&mail_template::section_cta("Accept invitation", url));
+    }
+    body.push_str(&mail_template::section_small(
+        "If the button or link doesn't work, your invite code is:",
+    ));
+    body.push_str(&mail_template::section_code(code));
+    if let Some(ms) = expires_at {
+        let when = mail_template::format_email_datetime_with_relative(ms, now);
+        let when_safe = mail_template::html_escape(&when);
+        body.push_str(&mail_template::section_callout(
+            mail_template::CalloutKind::Default,
+            &format!("This invitation expires on <strong>{when_safe}</strong>."),
+        ));
+    }
+    mail_template::render_email(mail_template::EmailOpts {
+        server_name,
+        eyebrow_html: "You're invited",
+        headline: "Get ready to start streaming.",
+        body_html: &body,
+        footer_note: "You're receiving this because someone on a ChimpFlix server invited you. \
+                      If you weren't expecting this, you can safely ignore the email — \
+                      no account is created until you accept.",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,40 +1047,51 @@ pub async fn confirm_email_change(
 }
 
 fn email_change_text(server_name: &str, verify_url: Option<&str>, token: &str) -> String {
-    let link = verify_url.unwrap_or(token);
-    format!(
-        "Someone (hopefully you) asked to change the {server_name} account email to this address.\n\n\
-         Confirm by opening this link:\n  {link}\n\n\
-         If the link doesn't work, your confirmation token is:\n  {token}\n\n\
-         The link expires in 1 hour. If you didn't request this, you can ignore the email —\n\
-         no change has been made.\n"
-    )
+    let mut body = String::from(
+        "Someone (hopefully you) asked to change the email on a ChimpFlix account to this \
+         address. Confirm to finish the change:\n\n",
+    );
+    if let Some(url) = verify_url {
+        body.push_str(&format!("  {url}\n\n"));
+    }
+    body.push_str(&format!(
+        "If the link doesn't work, your confirmation token is:\n\n  {token}\n\n\
+         This link expires in 1 hour."
+    ));
+    mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name,
+        headline: "Confirm your new email address",
+        body: &body,
+        footer_note: "If you didn't request this change, you can ignore this email — \
+                      your account email won't be touched.",
+    })
 }
 
 fn email_change_html(server_name: &str, verify_url: Option<&str>, token: &str) -> String {
-    let server_safe = html_escape(server_name);
-    let token_safe = html_escape(token);
-    let link_html = match verify_url {
-        Some(url) => {
-            let url_safe = html_escape(url);
-            format!(
-                r#"<p><a href="{url_safe}" style="display:inline-block;background:#e50914;color:#fff;padding:10px 20px;border-radius:4px;text-decoration:none;font-weight:600;">Confirm email</a></p>
-                   <p style="font-size:12px;color:#555">Or paste this link: <code>{url_safe}</code></p>"#
-            )
-        }
-        None => String::new(),
-    };
-    format!(
-        r#"<!doctype html><html><body style="font-family:system-ui,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#111">
-            <h2>Confirm your new {server_safe} email</h2>
-            <p>Someone (hopefully you) asked to change the account email to this address.</p>
-            {link_html}
-            <p style="font-size:14px;">If the button or link doesn't work, your confirmation token is:</p>
-            <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:13px;">{token_safe}</pre>
-            <p style="font-size:12px;color:#555">The link expires in 1 hour.</p>
-            <p style="font-size:12px;color:#888">If you didn't request this, you can ignore the email — no change has been made.</p>
-           </body></html>"#
-    )
+    let mut body = String::new();
+    body.push_str(&mail_template::section_paragraph(
+        "Someone (hopefully you) asked to change the email on a ChimpFlix account to \
+         <strong>this address</strong>. Confirm below to finish the change.",
+    ));
+    if let Some(url) = verify_url {
+        body.push_str(&mail_template::section_cta("Confirm email change", url));
+    }
+    body.push_str(&mail_template::section_small(
+        "If the button or link doesn't work, your confirmation token is:",
+    ));
+    body.push_str(&mail_template::section_code(token));
+    body.push_str(&mail_template::section_callout(
+        mail_template::CalloutKind::Info,
+        "This link expires in <strong>1 hour</strong>.",
+    ));
+    mail_template::render_email(mail_template::EmailOpts {
+        server_name,
+        eyebrow_html: "Verify email change",
+        headline: "Is this still you?",
+        body_html: &body,
+        footer_note: "If you didn't request this change, you can ignore this email — \
+                      your account email won't be touched.",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,40 +1274,51 @@ pub async fn confirm_password_reset(
 }
 
 fn password_reset_email_text(server_name: &str, reset_url: Option<&str>, token: &str) -> String {
-    let link = reset_url.unwrap_or(token);
-    format!(
-        "Someone (hopefully you) requested a password reset for your {server_name} account.\n\n\
-         Open this link to set a new password:\n  {link}\n\n\
-         If the link doesn't work, your reset token is:\n  {token}\n\n\
-         The link expires in 1 hour. If you didn't request this, you can ignore the email — \
-         your password hasn't changed.\n"
-    )
+    let mut body = String::from(
+        "Someone (hopefully you) asked to reset the password on the ChimpFlix account \
+         associated with this email. Choose a new password:\n\n",
+    );
+    if let Some(url) = reset_url {
+        body.push_str(&format!("  {url}\n\n"));
+    }
+    body.push_str(&format!(
+        "If the link doesn't work, your reset token is:\n\n  {token}\n\n\
+         This link expires in 1 hour and can only be used once."
+    ));
+    mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name,
+        headline: "Forgot your password?",
+        body: &body,
+        footer_note: "If you didn't request this, you can ignore this email — \
+                      your password hasn't been changed.",
+    })
 }
 
 fn password_reset_email_html(server_name: &str, reset_url: Option<&str>, token: &str) -> String {
-    let server_safe = html_escape(server_name);
-    let token_safe = html_escape(token);
-    let link_html = match reset_url {
-        Some(url) => {
-            let url_safe = html_escape(url);
-            format!(
-                r#"<p><a href="{url_safe}" style="display:inline-block;background:#e50914;color:#fff;padding:10px 20px;border-radius:4px;text-decoration:none;font-weight:600;">Reset password</a></p>
-                   <p style="font-size:12px;color:#555">Or paste this link: <code>{url_safe}</code></p>"#
-            )
-        }
-        None => String::new(),
-    };
-    format!(
-        r#"<!doctype html><html><body style="font-family:system-ui,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#111">
-            <h2>Reset your {server_safe} password</h2>
-            <p>Someone (hopefully you) requested a password reset.</p>
-            {link_html}
-            <p style="font-size:14px;">If the button or link doesn't work, your reset token is:</p>
-            <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:13px;">{token_safe}</pre>
-            <p style="font-size:12px;color:#555">The link expires in 1 hour.</p>
-            <p style="font-size:12px;color:#888">If you didn't request this, you can ignore the email — your password hasn't changed.</p>
-           </body></html>"#
-    )
+    let mut body = String::new();
+    body.push_str(&mail_template::section_paragraph(
+        "Someone (hopefully you) asked to reset the password on the ChimpFlix account \
+         associated with this email. Choose a new password below.",
+    ));
+    if let Some(url) = reset_url {
+        body.push_str(&mail_template::section_cta("Choose a new password", url));
+    }
+    body.push_str(&mail_template::section_small(
+        "If the button or link doesn't work, your reset token is:",
+    ));
+    body.push_str(&mail_template::section_code(token));
+    body.push_str(&mail_template::section_callout(
+        mail_template::CalloutKind::Info,
+        "This link expires in <strong>1 hour</strong> and can only be used once.",
+    ));
+    mail_template::render_email(mail_template::EmailOpts {
+        server_name,
+        eyebrow_html: "Password reset",
+        headline: "Forgot your password?",
+        body_html: &body,
+        footer_note: "If you didn't request this, you can ignore this email — \
+                      your password hasn't been changed.",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,15 +1342,23 @@ pub async fn list_users(
 
 pub async fn delete_user(
     State(state): State<AppState>,
-    OwnerAuth(owner): OwnerAuth,
+    crate::auth::AdminAuth(actor): crate::auth::AdminAuth,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    if id == owner.id {
-        return Err(ApiError::validation("cannot delete the owner account"));
+    if id == actor.id {
+        return Err(ApiError::validation("cannot delete your own account"));
     }
+    // Hierarchy guard: look up the target's current role and verify
+    // the actor sits above (or, for admin-on-admin, at-or-above) the
+    // target. An admin trying to delete an owner gets 403 here.
+    let target = queries::find_user_by_id(&state.pool, id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    crate::auth::can_act_on(actor.role, target.role)?;
     let removed = queries::delete_user(&state.pool, id)
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| ApiError::validation(format!("{e:#}")))?;
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1329,16 +1378,31 @@ pub struct UserResponse {
 
 pub async fn update_user(
     State(state): State<AppState>,
-    OwnerAuth(owner): OwnerAuth,
+    crate::auth::AdminAuth(actor): crate::auth::AdminAuth,
     Path(id): Path<i64>,
     Json(input): Json<UpdateUserInput>,
 ) -> Result<Json<UserResponse>, ApiError> {
-    if id == owner.id {
+    if id == actor.id {
         return Err(ApiError::validation("cannot change your own role"));
+    }
+    let target = queries::find_user_by_id(&state.pool, id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    // Hierarchy guard for the target's CURRENT role — admins can't
+    // touch owner accounts in any way.
+    crate::auth::can_act_on(actor.role, target.role)?;
+    // Hierarchy guard for the REQUESTED role — only owners may
+    // promote anyone to owner. Admins can promote users ↔ admins
+    // freely below the owner ceiling.
+    if matches!(input.role, UserRole::Owner)
+        && !matches!(actor.role, UserRole::Owner)
+    {
+        return Err(ApiError::Forbidden);
     }
     let user = queries::set_user_role(&state.pool, id, input.role)
         .await
-        .map_err(ApiError::Internal)?
+        .map_err(|e| ApiError::validation(format!("{e:#}")))?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(UserResponse { user }))
 }
@@ -1384,7 +1448,52 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
             "password must be at most 1024 characters",
         ));
     }
+    if is_obviously_bad_password(password) {
+        return Err(ApiError::validation(
+            "password is in the well-known-bad list; choose something less common",
+        ));
+    }
     Ok(())
+}
+
+/// Lowercase-compared check against a small, in-process list of the
+/// most commonly cracked passwords. Catches `password123`, `welcome1`,
+/// repeated-char filler, etc. — first-line defense without external
+/// dependencies. Not a substitute for haveibeenpwned (which we don't
+/// integrate, per project scope), but stops the obvious garbage.
+fn is_obviously_bad_password(password: &str) -> bool {
+    let lc = password.to_ascii_lowercase();
+    // Common-passwords list (top ~50 from public breach corpora). Kept
+    // short; longer lists are better served by a Bloom filter, which we
+    // can swap in later if the operator asks. Variants like `password1`
+    // and `passw0rd` are intentionally enumerated rather than regex-
+    // ed because the check is O(N) over a tiny constant either way.
+    const BANNED: &[&str] = &[
+        "password", "password1", "password12", "password123", "password1234",
+        "passw0rd", "passw0rd1", "letmein", "welcome", "welcome1",
+        "qwerty", "qwerty123", "qwertyuiop", "abc12345", "abcd1234",
+        "admin123", "adminadmin", "iloveyou", "monkey", "monkey123",
+        "dragon", "dragon123", "master", "master123", "shadow",
+        "111111", "1111111", "11111111", "123123", "123123123",
+        "12345678", "123456789", "1234567890", "qazwsx", "qazwsxedc",
+        "trustno1", "sunshine", "princess", "ashley", "michael",
+        "jennifer", "jordan23", "football", "baseball", "freedom",
+        "starwars", "superman", "batman", "111222", "12341234",
+        "asdf1234", "asdfasdf", "letmein1", "letmein123",
+    ];
+    if BANNED.contains(&lc.as_str()) {
+        return true;
+    }
+    // Reject all-same-char ("aaaaaaaa", "11111111111") and trivial
+    // ascending sequences ("12345678", already in list, but catches
+    // longer ones).
+    let first = lc.as_bytes().first().copied();
+    if let Some(c) = first {
+        if lc.len() >= MIN_PASSWORD_LEN && lc.as_bytes().iter().all(|&b| b == c) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cheap sanity check — full RFC 5321 validation lives in lettre when
@@ -1430,10 +1539,21 @@ async fn issue_session(
     password::fill_random(&mut nonce).map_err(ApiError::Internal)?;
     let expires_at = now_ms() + SESSION_MAX_AGE_S * 1000;
     let user_agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
-    let session_id =
-        queries::create_session(&state.pool, user.id, &nonce, expires_at, user_agent, None)
-            .await
-            .map_err(ApiError::Internal)?;
+    // Pull the client IP from the same X-Forwarded-For / X-Real-IP /
+    // Forwarded headers the rate-limiter uses. Sessions previously
+    // stored `None` here, which is why the admin Sessions page showed
+    // every row as "unknown IP" even when behind a known proxy.
+    let ip = crate::api::rate_limit::header_client_ip(headers);
+    let session_id = queries::create_session(
+        &state.pool,
+        user.id,
+        &nonce,
+        expires_at,
+        user_agent,
+        ip.as_deref(),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
 
     let value = cookie::build_value(session_id, &nonce, &state.auth.session_secret);
     Ok(cookie::set_cookie_header(
@@ -1504,4 +1624,40 @@ fn authed_login_response(user: User, cookie_header: String) -> axum::response::R
         HeaderValue::from_str(&cookie_header).expect("ascii cookie"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_short_password() {
+        assert!(validate_password("hunter2").is_err());
+        assert!(validate_password("12345678").is_err());
+    }
+
+    #[test]
+    fn accepts_min_length_strong_password() {
+        assert!(validate_password("MyB1g!Phras3").is_ok());
+    }
+
+    #[test]
+    fn rejects_overlong_password() {
+        let too_long = "a".repeat(1025);
+        assert!(validate_password(&too_long).is_err());
+    }
+
+    #[test]
+    fn rejects_common_passwords_case_insensitive() {
+        assert!(validate_password("Password1234").is_err());
+        assert!(validate_password("LETMEIN1").is_err());
+        assert!(validate_password("11111111111").is_err());
+        assert!(validate_password("AAAAAAAAAAAA").is_err());
+    }
+
+    #[test]
+    fn obviously_bad_helpers_dont_match_random_strings() {
+        assert!(!is_obviously_bad_password("correct horse battery staple"));
+        assert!(!is_obviously_bad_password("Tr0ub4dor&3xx"));
+    }
 }

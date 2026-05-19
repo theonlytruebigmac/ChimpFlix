@@ -10,34 +10,47 @@ export function AdminLogsClient({ initial }: { initial: LogLine[] }) {
   const [level, setLevel] = useState<string>("INFO");
   const [paused, setPaused] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const levelRef = useRef(level);
+  // Mirror `paused` into a ref so the polling interval (which runs with
+  // an empty dep array to avoid re-creating the timer every render) can
+  // read the latest value. The ref writes have to live in an effect;
+  // assigning .current during render violates React purity.
   const pausedRef = useRef(paused);
-  levelRef.current = level;
-  pausedRef.current = paused;
+  useEffect(() => {
+    pausedRef.current = paused;
+  }, [paused]);
 
+  // Fetch immediately whenever `level` changes (the dropdown), and
+  // re-arm a polling tick that uses the same level. Without this the
+  // dropdown sat on stale results for up to one REFRESH_INTERVAL_MS
+  // tick — making it look like the filter wasn't doing anything.
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    async function tick() {
-      if (!pausedRef.current) {
-        try {
-          const r = await adminApi.logs({ level: levelRef.current, limit: 200 });
-          if (cancelled) return;
-          setLines(r.lines);
-          setError(null);
-        } catch (e) {
-          if (cancelled) return;
-          setError(e instanceof Error ? e.message : String(e));
-        }
+    async function fetchOnce() {
+      try {
+        const r = await adminApi.logs({ level, limit: 200 });
+        if (cancelled) return;
+        setLines(r.lines);
+        setError(null);
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
       }
-      if (!cancelled) timer = setTimeout(tick, REFRESH_INTERVAL_MS);
     }
-    timer = setTimeout(tick, REFRESH_INTERVAL_MS);
+    void fetchOnce();
+    function schedule() {
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        if (!pausedRef.current) await fetchOnce();
+        if (!cancelled) schedule();
+      }, REFRESH_INTERVAL_MS);
+    }
+    schedule();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, []);
+  }, [level]);
 
   return (
     <div className="space-y-3">

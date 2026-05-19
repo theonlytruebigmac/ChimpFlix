@@ -47,9 +47,17 @@ pub async fn create(
     Json(input): Json<NewScheduledTask>,
 ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
     validate_kind(&input.kind)?;
-    let next = scheduler::next_after(&input.cron_expr, now_ms())
-        .map_err(|e| ApiError::validation(format!("{e:#}")))?;
+    validate_frequency(&input.frequency)?;
     validate_params(&input.kind, &input.params_json)?;
+    let next = scheduler::compute_next_run_with_settings(
+        &state,
+        &input.frequency,
+        &input.cron_expr,
+        now_ms(),
+        input.requires_maintenance_window,
+    )
+    .await
+    .map_err(|e| ApiError::validation(format!("{e:#}")))?;
 
     let task = queries::create_scheduled_task(&state.pool, input.clone(), next)
         .await
@@ -67,28 +75,44 @@ pub async fn update(
     headers: HeaderMap,
     Json(input): Json<ScheduledTaskUpdate>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if queries::get_scheduled_task(&state.pool, id)
+    let existing = queries::get_scheduled_task(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?
-        .is_none()
-    {
-        return Err(ApiError::NotFound);
+        .ok_or(ApiError::NotFound)?;
+    if let Some(ref freq) = input.frequency {
+        validate_frequency(freq)?;
     }
-    let recomputed_next = if let Some(ref expr) = input.cron_expr {
+    if let Some(ref params) = input.params_json {
+        validate_params(&existing.kind, params)?;
+    }
+
+    // Recompute next_run_at if any schedule-affecting field is being
+    // changed (frequency, cron, or window toggle). Merge the requested
+    // patch with the existing row to feed the computer the *effective*
+    // new state.
+    let schedule_changed = input.frequency.is_some()
+        || input.cron_expr.is_some()
+        || input.requires_maintenance_window.is_some();
+    let recomputed_next = if schedule_changed {
+        let freq = input
+            .frequency
+            .as_deref()
+            .unwrap_or(existing.frequency.as_str());
+        let cron = input
+            .cron_expr
+            .as_deref()
+            .unwrap_or(existing.cron_expr.as_str());
+        let requires = input
+            .requires_maintenance_window
+            .unwrap_or(existing.requires_maintenance_window);
         Some(
-            scheduler::next_after(expr, now_ms())
+            scheduler::compute_next_run_with_settings(&state, freq, cron, now_ms(), requires)
+                .await
                 .map_err(|e| ApiError::validation(format!("{e:#}")))?,
         )
     } else {
         None
     };
-    if let Some(ref params) = input.params_json {
-        let existing = queries::get_scheduled_task(&state.pool, id)
-            .await
-            .map_err(ApiError::Internal)?
-            .ok_or(ApiError::NotFound)?;
-        validate_params(&existing.kind, params)?;
-    }
 
     let task = queries::update_scheduled_task(&state.pool, id, input.clone(), recomputed_next)
         .await
@@ -162,6 +186,32 @@ fn validate_kind(kind: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Accept any of the frequency enum values understood by the scheduler.
+/// `custom` requires a valid cron_expr (validated later when the
+/// computer parses it); other values use the fixed-interval table.
+fn validate_frequency(frequency: &str) -> Result<(), ApiError> {
+    const VALID: &[&str] = &[
+        "manual",
+        "hourly",
+        "every_3_hours",
+        "every_6_hours",
+        "every_12_hours",
+        "daily",
+        "every_3_days",
+        "weekly",
+        "monthly",
+        "on_change",
+        "custom",
+    ];
+    if !VALID.contains(&frequency) {
+        return Err(ApiError::validation(format!(
+            "unknown frequency `{frequency}` — valid: {}",
+            VALID.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn validate_params(kind: &str, params_json: &str) -> Result<(), ApiError> {
     let parsed: serde_json::Value = serde_json::from_str(params_json)
         .map_err(|e| ApiError::validation(format!("params_json must be JSON: {e}")))?;
@@ -170,13 +220,17 @@ fn validate_params(kind: &str, params_json: &str) -> Result<(), ApiError> {
     }
     // Kind-specific shape checks.
     match kind {
-        "scan_library" | "detect_markers" => {
+        "scan_library" => {
             if !parsed.get("library_id").and_then(|v| v.as_i64()).is_some() {
                 return Err(ApiError::validation(format!(
                     "{kind} requires params.library_id (integer)"
                 )));
             }
         }
+        // `detect_markers` accepts an OPTIONAL library_id; omitted =
+        // run for every library. The scheduler dispatch iterates
+        // libraries when missing. The Plex-style simple-view toggle
+        // relies on this — the row it creates has empty params.
         _ => {}
     }
     Ok(())

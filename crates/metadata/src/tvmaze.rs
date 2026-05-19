@@ -45,13 +45,22 @@ impl TvMazeClient {
     /// Single-best-match search. TVMaze's /singlesearch returns the top
     /// scoring hit directly, which is what we want for an automatic
     /// fallback — Fix Match doesn't currently surface TVMaze candidates.
+    ///
+    /// We deliberately do NOT pass `embed=externals` here. TVMaze
+    /// returns the `externals` block (imdb / thetvdb / tvrage ids) at
+    /// the top level of the `/singlesearch/shows` response already,
+    /// and `embed=externals` is rejected by the endpoint as "Invalid
+    /// embed type" — only the per-id `/shows/:id` endpoint accepts
+    /// embeds. Spamming the param against singlesearch produced the
+    /// log flood that surfaced this. The `From<RawShow>` impl below
+    /// still checks both top-level + nested for forward compatibility.
     pub async fn lookup_show(&self, query: &str) -> Result<Option<TvMazeShow>> {
         let path = "/singlesearch/shows";
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .http
             .get(&url)
-            .query(&[("q", query), ("embed", "externals")])
+            .query(&[("q", query)])
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -145,9 +154,11 @@ struct RawEmbedded {
 
 impl From<RawShow> for TvMazeShow {
     fn from(r: RawShow) -> Self {
-        // `externals` can be at the top level (when ?embed=externals) or
-        // nested under _embedded depending on TVMaze response shape; check
-        // both.
+        // `/singlesearch/shows` returns `externals` at the top level
+        // for free. `/shows/:id?embed=externals` nests it under
+        // `_embedded.externals`. We don't use that endpoint today but
+        // check both shapes anyway — cheap insurance and matches the
+        // wire format whichever endpoint a future caller picks.
         let externals = r.externals.or(r.embedded.and_then(|e| e.externals));
         Self {
             tvmaze_id: r.id,

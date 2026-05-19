@@ -21,6 +21,10 @@ export function NotificationsBell() {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<Notification[] | null>(null);
   const [loading, setLoading] = useState(false);
+  // Snapshot of `Date.now()` taken at popover open. Used by row
+  // renders to compute "X minutes ago" without calling Date.now()
+  // during render (which is impure under strict mode).
+  const [openedAtMs, setOpenedAtMs] = useState<number>(0);
   const wrapRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -65,6 +69,7 @@ export function NotificationsBell() {
 
   async function openAndLoad() {
     setOpen(true);
+    setOpenedAtMs(Date.now());
     if (items === null) {
       setLoading(true);
       try {
@@ -126,7 +131,10 @@ export function NotificationsBell() {
       {open && (
         <div
           role="menu"
-          className="absolute right-0 top-full z-50 mt-2 w-96 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
+          // On mobile (≤sm) snap the popover to ~90vw and right-align it
+          // tightly so it fits a 360px viewport with the bell's right-2
+          // padding. At sm+ it widens to a fixed 24rem (384px).
+          className="fixed right-2 top-16 z-50 w-[calc(100vw-1rem)] max-w-sm overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:right-0 sm:top-full sm:mt-2 sm:w-96"
         >
           <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
             <div className="text-xs font-semibold uppercase tracking-wider text-white/55">
@@ -157,6 +165,7 @@ export function NotificationsBell() {
                 <NotificationRow
                   key={n.id}
                   notification={n}
+                  nowMs={openedAtMs}
                   onMarkRead={() => markOne(n.id)}
                 />
               ))}
@@ -169,14 +178,18 @@ export function NotificationsBell() {
 
 function NotificationRow({
   notification,
+  nowMs,
   onMarkRead,
 }: {
   notification: Notification;
+  /// Captured at popover-open time by the parent so we don't call
+  /// the impure `Date.now()` during render.
+  nowMs: number;
   onMarkRead: () => void;
 }) {
   const unread = !notification.read_at;
   const { title, body, href } = render(notification);
-  const ageMin = Math.max(1, Math.floor((Date.now() - notification.created_at) / 60_000));
+  const ageMin = Math.max(1, Math.floor((nowMs - notification.created_at) / 60_000));
 
   const inner = (
     <div className="flex items-start gap-3 px-3 py-2.5">

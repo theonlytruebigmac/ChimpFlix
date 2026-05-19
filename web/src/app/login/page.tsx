@@ -21,7 +21,12 @@ function LoginContent() {
   const next = search.get("next") || "/";
   const invite = search.get("invite")?.trim() ?? "";
 
-  const [mode, setMode] = useState<Mode | null>(null);
+  // If we landed with an invite code in the URL we know the user wants
+  // to register; otherwise wait for the server to tell us whether to
+  // show setup (first-run) or normal login. Initialising from the
+  // search param here avoids a setState-in-effect for the deterministic
+  // case (no extra render, no React purity violation).
+  const [mode, setMode] = useState<Mode | null>(invite ? "register" : null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -33,13 +38,11 @@ function LoginContent() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // First-run detection. Priority: invite link → register form, otherwise
-  // the server's setup-needed flag chooses between setup vs login.
+  // First-run detection. The invite-present path is handled at useState
+  // init above; here we only need the async server status check when
+  // mode is still null (no invite, server hasn't replied yet).
   useEffect(() => {
-    if (invite) {
-      setMode("register");
-      return;
-    }
+    if (mode !== null) return;
     let cancelled = false;
     auth
       .status()
@@ -59,7 +62,7 @@ function LoginContent() {
     return () => {
       cancelled = true;
     };
-  }, [invite]);
+  }, [mode]);
 
   function setModeAndReset(next: Mode) {
     setMode(next);
@@ -174,7 +177,7 @@ function LoginContent() {
                   onChange={(e) => setTotpCode(e.target.value)}
                   placeholder={useRecovery ? "xxxx-xxxx-xxxx-xxxx" : "123 456"}
                   maxLength={useRecovery ? 32 : 8}
-                  className="w-full rounded bg-white/10 px-3 py-2 font-mono outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                  className="w-full rounded bg-white/10 px-3 py-3 text-center text-lg font-mono tracking-widest outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                 />
                 <span className="mt-1 block text-xs text-white/40">
                   {useRecovery
@@ -212,7 +215,7 @@ function LoginContent() {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   maxLength={64}
-                  className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                  className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                 />
               </label>
 
@@ -226,7 +229,7 @@ function LoginContent() {
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
                     maxLength={64}
-                    className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                    className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                   />
                 </label>
               )}
@@ -242,7 +245,7 @@ function LoginContent() {
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     maxLength={320}
-                    className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                    className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                   />
                   <span className="mt-1 block text-xs text-white/40">
                     Required for self-service password reset.
@@ -264,7 +267,7 @@ function LoginContent() {
                   maxLength={1024}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                  className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                 />
               </label>
             </>
@@ -284,7 +287,7 @@ function LoginContent() {
           <button
             type="submit"
             disabled={busy}
-            className="w-full rounded bg-(--color-accent) px-3 py-2 font-semibold text-white transition disabled:opacity-50"
+            className="w-full rounded bg-(--color-accent) px-3 py-3 text-base font-semibold text-white transition disabled:opacity-50"
           >
             {busy
               ? "…"

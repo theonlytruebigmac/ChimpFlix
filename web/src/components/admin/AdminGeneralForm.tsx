@@ -139,7 +139,7 @@ export function AdminGeneralForm({ initial }: Props) {
         <button
           type="submit"
           disabled={!dirty || saving}
-          className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
         >
           {saving ? "Saving…" : "Save changes"}
         </button>

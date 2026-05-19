@@ -46,7 +46,7 @@ export function AdminPrivacyClient({ initial }: { initial: boolean }) {
         <button
           disabled={busy || optIn === initial}
           onClick={save}
-          className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
         >
           {busy ? "Saving…" : "Save"}
         </button>

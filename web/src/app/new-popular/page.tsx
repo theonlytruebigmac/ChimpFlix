@@ -35,8 +35,8 @@ export default async function NewPopularPage() {
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="pb-24 pt-28">
-        <h1 className="mb-8 px-12 text-4xl font-bold tracking-tight">
+      <div className="pb-24 pt-24 sm:pt-28">
+        <h1 className="mb-8 px-4 sm:px-8 md:px-12 text-4xl font-bold tracking-tight">
           New &amp; Popular
         </h1>
         <div className="space-y-1">
@@ -112,17 +112,18 @@ async function Top10TrendingRail({
 }) {
   // No-op when TMDB isn't configured or refresh_trending hasn't run.
   if (visibleLibIds.length === 0) return null;
+  let entries: Array<{ rank: number; item: ReturnType<typeof adaptItem> }>;
   try {
     const res = await itemsApi.trending(kind, 10, visibleLibIds);
-    const entries = res.items.map(({ rank, ...item }) => ({
+    entries = res.items.map(({ rank, ...item }) => ({
       rank,
       item: adaptItem(item),
     }));
-    if (entries.length === 0) return null;
-    return <Top10Rail title={title} items={entries} />;
   } catch {
     return null;
   }
+  if (entries.length === 0) return null;
+  return <Top10Rail title={title} items={entries} />;
 }
 
 async function TopRatedRail({

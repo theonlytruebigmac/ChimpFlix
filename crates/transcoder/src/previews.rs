@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use tokio::process::Command;
 use tracing::debug;
 
 use crate::FfmpegConfig;
@@ -93,7 +92,8 @@ pub async fn generate_sprite(
     ];
 
     debug!(?args, "ffmpeg preview sprite");
-    let status = Command::new(&ffmpeg.ffmpeg)
+    let status = ffmpeg
+        .background_ffmpeg()
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -131,7 +131,8 @@ async fn probe_tile_height(
     sprite: &Path,
     rows: u32,
 ) -> Result<u32> {
-    let output = Command::new(&ffmpeg.ffprobe)
+    let output = ffmpeg
+        .background_ffprobe()
         .args([
             "-v",
             "error",

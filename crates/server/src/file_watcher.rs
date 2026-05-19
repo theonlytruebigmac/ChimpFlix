@@ -43,9 +43,16 @@ pub fn spawn(state: AppState) {
 }
 
 async fn run(state: AppState) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+    // Bounded so a sudden burst of filesystem events (mass rename, full
+    // library restore, rsync sweep) can't grow the channel without limit
+    // and OOM the server. 4096 events is plenty for normal use — typical
+    // scan storms produce 100s of events, never 1000s. When full, the
+    // notify callback drops the overflowing event; we recover via the
+    // 30s periodic re-sync that re-scans library roots regardless.
+    let (tx, mut rx) =
+        mpsc::channel::<notify::Result<notify::Event>>(4096);
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
+        let _ = tx.try_send(res);
     })?;
 
     // Track currently-watched paths so the periodic re-poll only arms
@@ -207,18 +214,53 @@ async fn spawn_scan(state: AppState, library_id: i64) {
     let tvmaze = state.tvmaze.clone();
     let hub = state.hub.clone();
     let cache_root = state.transcoder.cache_root().to_path_buf();
+    let state_for_markers = state.clone();
     tokio::spawn(async move {
         let emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
             hub.publish(crate::events::Event::Scan(evt));
         });
-        if let Err(e) = chimpflix_library::run_scan(
-            pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job.id,
+        let result = chimpflix_library::run_scan(
+            pool.clone(),
+            ffmpeg,
+            tmdb,
+            tvdb,
+            anilist,
+            tvmaze,
+            library_id,
+            job.id,
             Some(cache_root),
             emitter,
         )
-        .await
-        {
+        .await;
+        if let Err(e) = result {
             warn!(library_id, job_id = job.id, error = %format!("{e:#}"), "file watcher scan failed");
+            return;
         }
+        // Optional post-scan trigger: detect markers for any file the
+        // scan introduced that doesn't have auto markers yet. Off by
+        // default — gated on `detect_markers_on_add` because the
+        // blackdetect pass costs ~30s/45min-episode and not every
+        // operator wants that overhead on every drop.
+        let on_add = state_for_markers.settings.read().await.detect_markers_on_add;
+        if !on_add {
+            return;
+        }
+        // 256 caps a single scan from queueing thousands of jobs at
+        // once — typical drops are 1–20 files; an rsync of a season
+        // pack still fits comfortably. Excess gets picked up by the
+        // next scan or the scheduled `detect_markers` task.
+        let files =
+            match queries::list_media_files_needing_markers(&pool, library_id, 256).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(library_id, error = %format!("{e:#}"), "file watcher: marker query failed");
+                    return;
+                }
+            };
+        if files.is_empty() {
+            return;
+        }
+        info!(library_id, count = files.len(), "file watcher: queueing markers for new files");
+        crate::api::markers::spawn_detection(&state_for_markers, files);
     });
 }

@@ -18,7 +18,7 @@ use serde::Serialize;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use crate::hwaccel::{EncoderPreset, HwAccel};
+use crate::hwaccel::{EncoderPreset, HwAccel, VideoCodec};
 use crate::FfmpegConfig;
 
 /// What ffmpeg is doing with the source video stream for this session.
@@ -117,6 +117,12 @@ pub struct SessionSnapshot {
     /// "▌▌ paused" pill and gives the reaper enough info to avoid
     /// killing sessions that intentionally aren't producing.
     pub paused: bool,
+    /// Cumulative bytes served from this session (segment + playlist
+    /// GETs). Resets to zero on session start; updated by the stream
+    /// handlers via `Session::add_bytes_served`. Surfaced in the
+    /// admin Now Playing tile and flushed to the playback_events
+    /// table on session close.
+    pub bytes_served: i64,
 }
 
 const SESSION_ID_BYTES: usize = 16;
@@ -144,6 +150,89 @@ const FALLBACK_VARIANT_NAME: &str = "v2";
 const DEFAULT_TARGET_HEIGHT: u32 = 720;
 const DEFAULT_TARGET_VIDEO_BITRATE_BPS: u64 = 2_500_000;
 pub const HLS_SEGMENT_DURATION_S: u32 = 6;
+
+/// HDR → SDR tonemap settings, threaded from `server_settings` into
+/// the per-session filter chain. Bundled so adding new tonemap dials
+/// doesn't grow `start()` / `build_command()`'s already-long parameter
+/// list further.
+#[derive(Debug, Clone)]
+pub struct TonemapConfig {
+    /// When false the tonemap filter is omitted entirely — HDR
+    /// sources go through the SDR pipeline as-is (washed out, but
+    /// lower CPU cost and what some operators prefer when their
+    /// clients render HDR client-side).
+    pub enabled: bool,
+    /// Algorithm passed to ffmpeg's `tonemap=tonemap=<algo>` filter.
+    /// One of: hable | reinhard | mobius | bt2390 | clip | linear.
+    /// Validated upstream so we don't bother re-validating here.
+    pub algorithm: String,
+}
+
+impl Default for TonemapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            algorithm: "hable".to_string(),
+        }
+    }
+}
+
+/// Per-file EBU R 128 measurements from the `analyze_loudness`
+/// scheduled task. When present at session-create time, the
+/// transcoder runs loudnorm in two-pass mode (linear=true) using
+/// these as the `measured_*` parameters — produces sample-accurate
+/// normalisation without runtime dynamic-range compression.
+#[derive(Debug, Clone, Copy)]
+pub struct LoudnessTarget {
+    pub measured_i: f64,
+    pub measured_tp: f64,
+    pub measured_lra: f64,
+    pub measured_thresh: f64,
+}
+
+/// Build the loudnorm filter chain. When measurements are supplied,
+/// runs in two-pass mode with `linear=true` (the high-fidelity path
+/// — no real-time dynamic-range compression). Without measurements,
+/// falls back to the single-pass approximation (`I=-16:LRA=11:TP=-1.5`)
+/// which works on any input but uses streaming-window estimates.
+///
+/// Targets are the EBU R 128 broadcast defaults (I = -16 LUFS for
+/// stereo, LRA = 11 LU, TP = -1.5 dBTP) — matches Plex's "volume
+/// leveling" output level so a library normalized by either tool
+/// plays at roughly the same loudness.
+fn build_loudnorm_filter(target: Option<&LoudnessTarget>) -> String {
+    match target {
+        Some(t) => format!(
+            "loudnorm=I=-16:LRA=11:TP=-1.5:\
+             measured_I={:.2}:measured_TP={:.2}:\
+             measured_LRA={:.2}:measured_thresh={:.2}:\
+             linear=true:print_format=summary",
+            t.measured_i, t.measured_tp, t.measured_lra, t.measured_thresh
+        ),
+        None => "loudnorm=I=-16:LRA=11:TP=-1.5".to_string(),
+    }
+}
+
+impl TonemapConfig {
+    /// Build the prefix filter chain that maps HDR → SDR. Empty
+    /// string when tonemap is off or the source isn't HDR — both
+    /// cases mean "no extra filtering, just feed the encoder direct".
+    pub fn build_chain(&self, hdr_format: Option<&str>) -> String {
+        let is_hdr = matches!(hdr_format, Some("hdr10" | "hlg" | "dovi"));
+        if !is_hdr || !self.enabled {
+            return String::new();
+        }
+        // Linearize → tonemap → convert back to BT.709 SDR.
+        // `desat=0` keeps colors saturated; ffmpeg's default 2.0
+        // looks dull. Trailing comma matters — the caller splices
+        // this string in front of `scale=...` and expects a clean
+        // filter boundary.
+        format!(
+            "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap={}:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,",
+            self.algorithm
+        )
+    }
+}
 
 /// Sidecar WebVTT subtitle exposed via the master playlist as an
 /// `#EXT-X-MEDIA:TYPE=SUBTITLES` track. When present, the main
@@ -258,6 +347,13 @@ pub struct Session {
     /// immediately. See [`WebVttSidecar`].
     pub webvtt_sidecar: Option<WebVttSidecar>,
     last_seen: AtomicI64,
+    /// Cumulative bytes served from this session (segment GETs +
+    /// master / variant playlist GETs). Incremented by the stream
+    /// handlers via [`Self::add_bytes_served`]; flushed to the
+    /// `playback_events` table at session-close time so the admin
+    /// Stats page can show per-stream bandwidth without per-segment
+    /// DB writes.
+    bytes_served: AtomicI64,
     /// Pause state — set true while the ffmpeg child is SIGSTOP'd.
     /// Used by the keepalive reaper to avoid killing a session that's
     /// intentionally suspended (paused for a long time), and surfaced
@@ -267,6 +363,28 @@ pub struct Session {
     _child: Mutex<Child>,
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Log when the Session struct is dropped so we can correlate
+        // ffmpeg deaths with our own kill paths. If we see this BEFORE
+        // the "ffmpeg child exited" log, our code (reaper, DELETE,
+        // unmount cleanup, etc.) killed it. If we see "child exited"
+        // BEFORE this Drop, ffmpeg died on its own (OOM, GPU crash,
+        // internal error) — investigate at the kernel/driver level.
+        let pid = self
+            ._child
+            .lock()
+            .ok()
+            .and_then(|c| c.id());
+        info!(
+            session_id = %self.id,
+            ?pid,
+            elapsed_ms = now_ms() - self.created_at,
+            "session struct dropped (kill_on_drop will signal ffmpeg)",
+        );
+    }
+}
+
 impl Session {
     pub fn touch(&self) {
         self.last_seen.store(now_ms(), Ordering::Relaxed);
@@ -274,6 +392,26 @@ impl Session {
 
     pub fn last_seen(&self) -> i64 {
         self.last_seen.load(Ordering::Relaxed)
+    }
+
+    /// Add `n` bytes to the rolling per-session bandwidth counter.
+    /// Called from the segment + playlist handlers after a response
+    /// body has been written. Relaxed ordering is fine here — we read
+    /// the value once at session-close time and slight delivery-order
+    /// reordering against a concurrent read doesn't affect the
+    /// "bytes served by this stream" aggregate.
+    pub fn add_bytes_served(&self, n: u64) {
+        // Saturate at i64::MAX so a runaway counter can't wrap. The
+        // i64 limit is ~9.2 EB, well beyond any realistic stream.
+        let n = n.min(i64::MAX as u64) as i64;
+        self.bytes_served.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Snapshot of cumulative bytes served. Used by the manager when
+    /// emitting the `stop` event on session close so the admin Stats
+    /// page can show per-stream bandwidth.
+    pub fn bytes_served(&self) -> i64 {
+        self.bytes_served.load(Ordering::Relaxed)
     }
 
     pub fn is_paused(&self) -> bool {
@@ -467,6 +605,14 @@ impl TranscodeManager {
         })
     }
 
+    /// Read accessor for the capability probe — callers (the session
+    /// API in particular) need to know which encoders are actually
+    /// available before deciding whether to request HEVC.
+    pub fn capabilities(&self) -> Arc<crate::TranscoderCapabilities> {
+        self.inner.capabilities.clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         media_file_id: i64,
@@ -495,6 +641,10 @@ impl TranscodeManager {
         source_video_codec: Option<&str>,
         source_audio_codec: Option<&str>,
         source_pix_fmt: Option<&str>,
+        tonemap: TonemapConfig,
+        target_video_codec: VideoCodec,
+        gpu_device: &str,
+        loudness_target: Option<LoudnessTarget>,
     ) -> Result<Arc<Session>> {
         let id = generate_id();
         let session_dir = self.inner.cache_root.join(&id);
@@ -515,14 +665,18 @@ impl TranscodeManager {
         };
 
         // ABR is only safe on the reencode-without-burn path. A subtitle
-        // burn would require duplicating the `subtitles=` filter into
+        // BURN would require duplicating the `subtitles=` filter into
         // each split branch — workable but error-prone (the filter
         // re-opens the file for each branch); we save that for a future
-        // refactor. Copy sessions can't ABR at all because there's no
-        // encoder to retarget. Fallback also has to be strictly smaller
-        // than the primary or it adds no value.
+        // refactor. Sidecar (text) subtitles don't touch the video
+        // filter graph at all, so they compose fine with ABR. Copy
+        // sessions can't ABR because there's no encoder to retarget.
+        // Fallback also has to be strictly smaller than the primary or
+        // it adds no value.
+        let subtitle_is_burn = subtitle_index.is_some()
+            && !subtitle_codec.is_some_and(is_text_subtitle_codec);
         let abr_eligible = matches!(video_treatment, VideoTreatment::Reencode)
-            && subtitle_index.is_none();
+            && !subtitle_is_burn;
         let resolved_fallback = if abr_eligible {
             fallback_variant.and_then(|(fh, fbps)| {
                 let fh = fh.clamp(144, 2160);
@@ -549,10 +703,39 @@ impl TranscodeManager {
         // through. Used by the master playlist's CODECS attribute
         // and by the container-format gating below.
         let output_video_codec = match video_treatment {
-            VideoTreatment::Reencode => "h264".to_string(),
+            VideoTreatment::Reencode => target_video_codec.label().to_string(),
             VideoTreatment::Copy => source_video_codec
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_else(|| "h264".to_string()),
+        };
+        // HEVC inside MPEG-TS is fraught — every browser that
+        // understands HEVC expects it inside fMP4 (#EXT-X-MAP +
+        // hvc1 tag). Force-upgrade the container when the operator
+        // (or auto-fallback) picked HEVC, regardless of what the
+        // request asked for. H264 keeps the operator's container
+        // choice.
+        let container_format = if matches!(target_video_codec, VideoCodec::Hevc)
+            && matches!(video_treatment, VideoTreatment::Reencode)
+        {
+            ContainerFormat::Fmp4
+        } else {
+            container_format
+        };
+        // HEVC ABR: enabled on hardware encoders (NVENC / QSV / VAAPI
+        // / VideoToolbox / AMF — each session gets its own GPU
+        // encoder context so two parallel sub-pipelines compose
+        // fine) but DISABLED on software libx265 (single-process
+        // x265 keeps shared state across encoder contexts and dual
+        // sub-pipelines can deadlock on rate-control coordination).
+        // The conservative choice — if the operator paid for an HEVC
+        // GPU they get the better experience; software-fallback HEVC
+        // sessions still play, just without the secondary variant.
+        let resolved_fallback = if matches!(target_video_codec, VideoCodec::Hevc)
+            && matches!(hwaccel, crate::HwAccel::None)
+        {
+            None
+        } else {
+            resolved_fallback
         };
         let output_audio_codec = match audio_treatment {
             AudioTreatment::Reencode => "aac".to_string(),
@@ -699,6 +882,7 @@ impl TranscodeManager {
             target_video_bitrate_bps,
             hwaccel,
             encoder_preset,
+            target_video_codec,
             video_treatment,
             audio_treatment,
             audio_bitrate_bps,
@@ -709,6 +893,9 @@ impl TranscodeManager {
             source_is_10bit,
             webvtt_sidecar.is_some(),
             &id,
+            &tonemap,
+            gpu_device,
+            loudness_target.as_ref(),
         )
         .await?;
 
@@ -737,6 +924,7 @@ impl TranscodeManager {
             audio_normalize,
             webvtt_sidecar,
             last_seen: AtomicI64::new(now),
+            bytes_served: AtomicI64::new(0),
             paused: AtomicBool::new(false),
             _child: Mutex::new(child),
         });
@@ -825,20 +1013,47 @@ impl TranscodeManager {
     }
 
     pub async fn delete(&self, id: &str) -> bool {
+        self.delete_returning(id).await.is_some()
+    }
+
+    /// Same as `delete` but returns a snapshot of the session before
+    /// it was destroyed — used by the server-crate hooks that emit
+    /// `stop` events to the playback_events table so the admin Stats
+    /// page can show per-stream bandwidth (`bytes_served`) and final
+    /// session metadata. Returns None if there was no such session.
+    pub async fn delete_returning(&self, id: &str) -> Option<SessionSnapshot> {
         let session = self
             .inner
             .sessions
             .write()
             .expect("sessions lock")
             .remove(id);
-        let Some(session) = session else {
-            return false;
+        let session = session?;
+        // Build the snapshot before dropping the Arc so `bytes_served`
+        // captures the cumulative count before the encoder dies.
+        let snapshot = SessionSnapshot {
+            id: session.id.clone(),
+            user_id: session.user_id,
+            media_file_id: session.media_file_id,
+            start_position_ms: session.start_position_ms,
+            duration_ms: session.duration_ms,
+            created_at: session.created_at,
+            last_seen_at: session.last_seen(),
+            encoder: session.hwaccel.label().to_string(),
+            video_treatment: session.video_treatment,
+            audio_treatment: session.audio_treatment,
+            source_height: session.source_height,
+            target_height: session.target_height,
+            target_video_bitrate_bps: session.target_video_bitrate_bps,
+            encoder_preset: session.encoder_preset.label().to_string(),
+            paused: session.is_paused(),
+            bytes_served: session.bytes_served(),
         };
         let path = session.output_dir.clone();
         drop(session); // Dropping kills the ffmpeg child via kill_on_drop.
         let _ = tokio::fs::remove_dir_all(&path).await;
         info!(session_id = id, "transcode session deleted");
-        true
+        Some(snapshot)
     }
 
     /// Snapshot of every currently-running session. Used by the admin
@@ -863,34 +1078,40 @@ impl TranscodeManager {
                 target_video_bitrate_bps: s.target_video_bitrate_bps,
                 encoder_preset: s.encoder_preset.label().to_string(),
                 paused: s.is_paused(),
+                bytes_served: s.bytes_served(),
             })
             .collect()
     }
 
-    pub async fn reap_idle(&self, idle_threshold_ms: i64) -> usize {
+    pub async fn reap_idle(&self, idle_threshold_ms: i64) -> Vec<SessionSnapshot> {
         let now = now_ms();
         let stale: Vec<String> = {
             let map = self.inner.sessions.read().expect("sessions lock");
             map.iter()
-                // Paused sessions intentionally don't write new
-                // segments, so their last_seen will fall behind. The
-                // player's keepalive ping bumps last_seen during pause
-                // but we double-protect here by skipping the reap
-                // entirely while paused — a user could miss the
-                // keepalive window (network blip) but they're still
-                // actively watching from the browser's perspective.
-                .filter(|(_, s)| !s.is_paused() && now - s.last_seen() > idle_threshold_ms)
+                // Reap if last_seen has fallen behind, regardless of
+                // pause state. The player's keepalive ping bumps
+                // last_seen every 60s while the page is alive (even
+                // when the video is paused), so a genuinely-active
+                // paused user stays safe. Skipping paused sessions
+                // entirely (the previous policy) leaked them whenever
+                // a mobile user backgrounded the app without an
+                // explicit teardown — the SIGSTOP'd ffmpeg held GPU
+                // resources indefinitely and starved subsequent
+                // sessions on the same card.
+                .filter(|(_, s)| now - s.last_seen() > idle_threshold_ms)
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        let count = stale.len();
+        let mut reaped = Vec::with_capacity(stale.len());
         for id in stale {
-            self.delete(&id).await;
+            if let Some(snap) = self.delete_returning(&id).await {
+                reaped.push(snap);
+            }
         }
-        if count > 0 {
-            debug!(count, "reaped idle transcode sessions");
+        if !reaped.is_empty() {
+            debug!(count = reaped.len(), "reaped idle transcode sessions");
         }
-        count
+        reaped
     }
 
     /// Cache root for this transcoder. Exposed so callers (the
@@ -964,18 +1185,39 @@ impl TranscodeManager {
 
     /// Spawn a background task that periodically reaps idle sessions.
     pub fn spawn_reaper(&self, idle_threshold_ms: i64, interval_s: u64) {
+        self.spawn_reaper_with_hook(idle_threshold_ms, interval_s, |_| {});
+    }
+
+    /// Same as `spawn_reaper`, but invokes `on_reaped` once per
+    /// reaped session with its final snapshot — server-crate uses
+    /// this to emit `stop` events to `playback_events` so the admin
+    /// Stats page can attribute bandwidth + final session metadata
+    /// without a per-segment DB write.
+    pub fn spawn_reaper_with_hook<F>(
+        &self,
+        idle_threshold_ms: i64,
+        interval_s: u64,
+        on_reaped: F,
+    ) where
+        F: Fn(SessionSnapshot) + Send + Sync + 'static,
+    {
         let manager = self.clone();
+        let on_reaped = std::sync::Arc::new(on_reaped);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(interval_s));
             tick.tick().await; // skip the immediate tick
             loop {
                 tick.tick().await;
-                manager.reap_idle(idle_threshold_ms).await;
+                let reaped = manager.reap_idle(idle_threshold_ms).await;
+                for snap in reaped {
+                    on_reaped(snap);
+                }
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn spawn_ffmpeg(
     cfg: &FfmpegConfig,
@@ -991,6 +1233,7 @@ async fn spawn_ffmpeg(
     target_video_bitrate_bps: u64,
     hwaccel: HwAccel,
     encoder_preset: EncoderPreset,
+    target_video_codec: VideoCodec,
     video_treatment: VideoTreatment,
     audio_treatment: AudioTreatment,
     audio_bitrate_bps: u64,
@@ -1006,6 +1249,9 @@ async fn spawn_ffmpeg(
     // directly.
     using_sidecar_subtitle: bool,
     session_id: &str,
+    tonemap: &TonemapConfig,
+    gpu_device: &str,
+    loudness_target: Option<&LoudnessTarget>,
 ) -> Result<Child> {
     // fMP4 segments live under .m4s; TS segments under .ts. Init
     // segment (init.mp4) only exists for fMP4 — ffmpeg writes it
@@ -1036,7 +1282,17 @@ async fn spawn_ffmpeg(
     // will fail loudly and the captured stderr will tell us what to do
     // next.
     let mut cmd = Command::new(&cfg.ffmpeg);
-    cmd.arg("-y").args(["-loglevel", "warning"]);
+    // `-nostdin` is critical when ffmpeg's stdin is wired to /dev/null
+    // (as we do via `cmd.stdin(Stdio::null())` further down). Without
+    // it, ffmpeg's interactive-mode tty handling reads stdin looking
+    // for keypresses, hits immediate EOF, and after some buffered
+    // encoding has flushed it interprets that as "user signalled exit"
+    // and terminates silently with no error in stderr. Symptom: the
+    // session monitor sees segments grow to ~100-200, then ffmpeg
+    // disappears around the 40-90s mark with stderr_tail showing only
+    // the harmless init warnings. Same flag is already present on the
+    // webvtt-extract and gop-probe ffmpeg calls (search the file).
+    cmd.args(["-y", "-nostdin", "-loglevel", "warning"]);
     // Bigger probe window applied to every session. The default
     // 5 MB / 5 s probe routinely fails on Bluray rips with multiple
     // subtitle / audio / attachment streams — ffmpeg gives up with
@@ -1051,7 +1307,7 @@ async fn spawn_ffmpeg(
     // only VAAPI's `-vaapi_device /dev/dri/renderD128`). Must come
     // before `-i` because ffmpeg ties hardware contexts to the input
     // they're declared near.
-    hwaccel.pre_input_args(&mut cmd, use_hwaccel_decode);
+    hwaccel.pre_input_args_with_device(&mut cmd, use_hwaccel_decode, gpu_device);
     // Keep frames on GPU end-to-end for the common reencode case
     // when nothing in the filter graph needs CPU-side frames. This
     // saves the GPU→CPU→GPU roundtrip that would otherwise eat
@@ -1142,7 +1398,7 @@ async fn spawn_ffmpeg(
     // burn, no scaling, no HDR tonemap). See `pick_video_treatment`
     // in stream.rs.
     let kind = subtitle_kind(subtitle_codec);
-    let needs_tonemap = matches!(hdr_format, Some("hdr10" | "hlg" | "dovi"));
+    let needs_tonemap = matches!(hdr_format, Some("hdr10" | "hlg" | "dovi")) && tonemap.enabled;
     // Helper to emit one variant's audio + HLS muxer args. ffmpeg's
     // CLI grammar is "each output file is preceded by the args that
     // apply to it"; chaining outputs is just calling this twice with
@@ -1174,12 +1430,21 @@ async fn spawn_ffmpeg(
                     // extracted-subtitle path doesn't need copyts so
                     // audio packets are already 0-anchored from the
                     // input seek.
-                    let mut af: Vec<&str> = Vec::new();
+                    let mut af: Vec<String> = Vec::new();
                     if audio_normalize {
-                        af.push("loudnorm=I=-16:LRA=11:TP=-1.5");
+                        // Two-pass mode when stored measurements
+                        // are available — feeds the precise input
+                        // characteristics so the filter produces
+                        // truly linear (no dynamic-range adjustment)
+                        // output at the target. Single-pass otherwise
+                        // (analysis hasn't been run, or analysis
+                        // found no audio); single-pass works fine but
+                        // approximates because it has to estimate
+                        // from a streaming window.
+                        af.push(build_loudnorm_filter(loudness_target));
                     }
                     if needs_inline_burn_alignment {
-                        af.push("asetpts=PTS-STARTPTS");
+                        af.push("asetpts=PTS-STARTPTS".to_string());
                     }
                     if !af.is_empty() {
                         let chain = af.join(",");
@@ -1228,21 +1493,18 @@ async fn spawn_ffmpeg(
         // sidecar mode is on.
         let burn_text =
             !using_sidecar_subtitle && subtitle_index.is_some() && !needs_filter_complex;
-        // HDR → SDR tonemap, only when the source is actually HDR. The
-        // chain is libzimg (zscale) + libavfilter's tonemap — both
-        // ship with most builds of ffmpeg. Without it, libx264 +
-        // yuv420p gets a flat, washed-out picture from HDR10/HLG/DV
-        // sources.
-        let tonemap = if needs_tonemap {
-            // Linearize → tonemap (Hable for HDR10, reasonable
-            // default) → convert back to BT.709 SDR. `desat=0` keeps
-            // colors saturated; the default 2.0 looks dull. Single
-            // line — ffmpeg's filter parser is whitespace-sensitive
-            // inside a chain.
-            "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,"
-        } else {
-            ""
-        };
+        // HDR → SDR tonemap, only when the source is actually HDR and
+        // the operator hasn't disabled tonemap globally. The chain is
+        // libzimg (zscale) + libavfilter's tonemap — both ship with
+        // most builds of ffmpeg. Without it, libx264 + yuv420p gets a
+        // flat, washed-out picture from HDR10/HLG/DV sources.
+        //
+        // Algorithm is operator-configurable via
+        // `server_settings.transcoder_hdr_tonemap_algo`; default
+        // `hable` matches the value this was hard-coded to before
+        // phase 30.
+        let tonemap_chain = tonemap.build_chain(hdr_format);
+        let tonemap = tonemap_chain.as_str();
         // Encoders that need their frames in a specific GPU memory
         // format get a small filter appended at the end (e.g.
         // `,format=nv12,hwupload` for VAAPI). For software + NVENC +
@@ -1296,7 +1558,7 @@ async fn spawn_ffmpeg(
 
                 // Variant 1 (primary).
                 cmd.args(["-map", "[v1]"]);
-                hwaccel.apply_encoder(&mut cmd, target_video_bitrate_bps, encoder_preset);
+                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
 
                 // Variant 2 (fallback).
@@ -1304,7 +1566,7 @@ async fn spawn_ffmpeg(
                     .as_ref()
                     .expect("fallback_paths set when fallback_variant set");
                 cmd.args(["-map", "[v2]"]);
-                hwaccel.apply_encoder(&mut cmd, fb_bitrate, encoder_preset);
+                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, fb_bitrate, encoder_preset);
                 emit_output(&mut cmd, fb_manifest, fb_segments, audio_index);
             }
             (_, true) => {
@@ -1343,7 +1605,7 @@ async fn spawn_ffmpeg(
                      [vs]{scale},setpts=PTS-STARTPTS{hw_suffix}[v]"
                 );
                 cmd.args(["-filter_complex", &fc]).args(["-map", "[v]"]);
-                hwaccel.apply_encoder(&mut cmd, target_video_bitrate_bps, encoder_preset);
+                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
             }
             (None, false) => {
@@ -1414,7 +1676,7 @@ async fn spawn_ffmpeg(
                     vf = format!("{vf}{hw_suffix}");
                 }
                 cmd.args(["-vf", &vf]).args(["-map", "0:v:0"]);
-                hwaccel.apply_encoder(&mut cmd, target_video_bitrate_bps, encoder_preset);
+                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
             }
         }
@@ -1493,6 +1755,64 @@ async fn spawn_ffmpeg(
     // when ffmpeg crashes via signal (SEGV on a bad codec/decoder
     // pairing) and no error line gets printed, only the tail of
     // benign warnings preceding the crash.
+    let pid_for_monitor = child.id();
+    // Heartbeat monitor: log "still alive" every 15s with the wall-clock
+    // age + segment count. When a session mysteriously stops producing
+    // segments, this lets the operator see at a glance whether the
+    // process is alive-but-stalled (segments same, pid still there) or
+    // gone (no heartbeat after time T). Stops on its own when the pid
+    // disappears.
+    if let Some(pid_u32) = pid_for_monitor {
+        let session_id_str = session_id.to_string();
+        let session_dir_str = session_dir.to_path_buf();
+        let started_at = std::time::Instant::now();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.tick().await; // skip immediate
+            loop {
+                tick.tick().await;
+                // kill(pid, 0) returns 0 if process exists, -1 + ESRCH
+                // if not. Doesn't actually signal anything.
+                let alive = unsafe { libc::kill(pid_u32 as libc::pid_t, 0) == 0 };
+                if !alive {
+                    info!(
+                        session_id = %session_id_str,
+                        pid = pid_u32,
+                        elapsed_s = started_at.elapsed().as_secs(),
+                        "session monitor: ffmpeg pid no longer alive — stopping monitor",
+                    );
+                    break;
+                }
+                // Count segment files across all variant dirs.
+                let mut seg_count = 0_usize;
+                if let Ok(mut entries) = tokio::fs::read_dir(&session_dir_str).await {
+                    while let Ok(Some(e)) = entries.next_entry().await {
+                        if let Ok(ft) = e.file_type().await {
+                            if ft.is_dir() {
+                                if let Ok(mut inner) = tokio::fs::read_dir(e.path()).await {
+                                    while let Ok(Some(f)) = inner.next_entry().await {
+                                        if let Some(name) = f.file_name().to_str() {
+                                            if name.starts_with("seg-") && name.ends_with(".ts") {
+                                                seg_count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                info!(
+                    session_id = %session_id_str,
+                    pid = pid_u32,
+                    elapsed_s = started_at.elapsed().as_secs(),
+                    seg_count,
+                    "session monitor: ffmpeg still alive",
+                );
+            }
+        });
+    }
+
     if let Some(stderr) = child.stderr.take() {
         let session_id_str = session_id.to_string();
         let pid = child.id();
@@ -1532,9 +1852,52 @@ async fn spawn_ffmpeg(
             } else {
                 ring.into_iter().collect::<Vec<_>>().join(" | ")
             };
+            // Capture exit status via waitpid(WNOHANG). We don't call
+            // tokio's Child::wait anywhere (the Child handle sits in the
+            // Session mutex unawaited), so the child becomes a zombie
+            // after exit until something reaps it. waitpid here reaps
+            // and gives us the exit code or signal — critical for
+            // diagnosing "ffmpeg silently died after N seconds" cases
+            // where the stderr_tail is just innocent init warnings.
+            // Tiny PID-reuse race with the eventual kill_on_drop is
+            // acceptable: the alternative is never knowing what killed
+            // ffmpeg.
+            let exit_detail = if let Some(pid_u32) = pid {
+                let mut status: libc::c_int = 0;
+                let r = unsafe {
+                    libc::waitpid(
+                        pid_u32 as libc::pid_t,
+                        &mut status,
+                        libc::WNOHANG,
+                    )
+                };
+                if r > 0 {
+                    let low = status & 0x7f;
+                    if low == 0 {
+                        format!("exited code={}", (status >> 8) & 0xff)
+                    } else if low != 0x7f {
+                        let signal = low;
+                        let coredump = (status & 0x80) != 0;
+                        format!(
+                            "killed signal={signal}{}",
+                            if coredump { " (coredump)" } else { "" },
+                        )
+                    } else {
+                        format!("raw_status={status}")
+                    }
+                } else if r == 0 {
+                    "still running (stderr closed without exit?)".to_string()
+                } else {
+                    let errno = std::io::Error::last_os_error();
+                    format!("waitpid_err={errno}")
+                }
+            } else {
+                "no pid captured".to_string()
+            };
             warn!(
                 session_id = %session_id_str,
                 pid = ?pid,
+                exit = %exit_detail,
                 stderr_tail = %tail,
                 "ffmpeg child exited (stderr closed) — session will produce no further segments",
             );
@@ -2308,5 +2671,73 @@ mod signal {
     #[cfg(not(unix))]
     pub fn send(_pid: u32, _kind: Kind) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoudnessTarget, TonemapConfig, build_loudnorm_filter};
+
+    #[test]
+    fn loudnorm_filter_without_measurement_is_single_pass() {
+        let s = build_loudnorm_filter(None);
+        assert!(s.starts_with("loudnorm=I=-16:LRA=11:TP=-1.5"));
+        assert!(!s.contains("measured_I"));
+        assert!(!s.contains("linear=true"));
+    }
+
+    #[test]
+    fn loudnorm_filter_with_measurement_emits_two_pass_params() {
+        let t = LoudnessTarget {
+            measured_i: -19.5,
+            measured_tp: -2.1,
+            measured_lra: 9.3,
+            measured_thresh: -29.4,
+        };
+        let s = build_loudnorm_filter(Some(&t));
+        assert!(s.contains("measured_I=-19.50"));
+        assert!(s.contains("measured_TP=-2.10"));
+        assert!(s.contains("measured_LRA=9.30"));
+        assert!(s.contains("measured_thresh=-29.40"));
+        assert!(s.contains("linear=true"));
+    }
+
+    #[test]
+    fn tonemap_chain_empty_for_sdr_source() {
+        let cfg = TonemapConfig::default();
+        assert_eq!(cfg.build_chain(None), "");
+        assert_eq!(cfg.build_chain(Some("bt709")), "");
+    }
+
+    #[test]
+    fn tonemap_chain_empty_when_disabled() {
+        let cfg = TonemapConfig {
+            enabled: false,
+            algorithm: "hable".to_string(),
+        };
+        assert_eq!(cfg.build_chain(Some("hdr10")), "");
+        assert_eq!(cfg.build_chain(Some("dovi")), "");
+    }
+
+    #[test]
+    fn tonemap_chain_injects_algorithm_for_hdr_source() {
+        let cfg = TonemapConfig {
+            enabled: true,
+            algorithm: "mobius".to_string(),
+        };
+        let chain = cfg.build_chain(Some("hdr10"));
+        assert!(chain.contains("tonemap=tonemap=mobius"));
+        assert!(chain.ends_with(','), "trailing comma keeps caller splice clean: {chain:?}");
+    }
+
+    #[test]
+    fn tonemap_chain_default_matches_legacy_hable() {
+        // Regression guard — phase 30 split the hard-coded chain into
+        // this builder; the default output must match the previous
+        // hard-coded value verbatim so existing HDR sources keep
+        // looking identical.
+        let cfg = TonemapConfig::default();
+        let expected = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,";
+        assert_eq!(cfg.build_chain(Some("hdr10")), expected);
     }
 }

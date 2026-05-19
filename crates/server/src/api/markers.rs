@@ -94,7 +94,7 @@ pub async fn detect_for_library(
 /// Kicks off a sequential background task that runs detection on each file
 /// in turn. Sequential rather than concurrent because each ffmpeg pass
 /// pegs a CPU core; running them in parallel just thrashes.
-fn spawn_detection(state: &AppState, files: Vec<(i64, String, Option<i64>)>) {
+pub(crate) fn spawn_detection(state: &AppState, files: Vec<(i64, String, Option<i64>)>) {
     let pool = state.pool.clone();
     let ffmpeg = state.ffmpeg.clone();
     tokio::spawn(async move {

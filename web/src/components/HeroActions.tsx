@@ -66,7 +66,6 @@ export function HeroActions({
       cancelPendingPrewarm();
       void cancelPrewarm();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (

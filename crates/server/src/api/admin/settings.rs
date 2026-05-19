@@ -104,6 +104,41 @@ fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
             ));
         }
     }
+    if let Some(ref s) = patch.transcoder_background_preset {
+        if !matches!(
+            s.as_str(),
+            "ultrafast"
+                | "superfast"
+                | "veryfast"
+                | "faster"
+                | "fast"
+                | "medium"
+                | "slow"
+                | "slower"
+        ) {
+            return Err(ApiError::validation(
+                "transcoder_background_preset must be a libx264 preset name \
+                 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower)",
+            ));
+        }
+    }
+    if let Some(n) = patch.transcoder_max_background_concurrent {
+        if !(1..=16).contains(&n) {
+            return Err(ApiError::validation(
+                "transcoder_max_background_concurrent must be between 1 and 16",
+            ));
+        }
+    }
+    if let Some(ref s) = patch.transcoder_hdr_tonemap_algo {
+        if !matches!(
+            s.as_str(),
+            "hable" | "reinhard" | "mobius" | "bt2390" | "clip" | "linear"
+        ) {
+            return Err(ApiError::validation(
+                "transcoder_hdr_tonemap_algo must be one of: hable, reinhard, mobius, bt2390, clip, linear",
+            ));
+        }
+    }
     if let Some(n) = patch.transcoder_max_concurrent {
         if !(1..=64).contains(&n) {
             return Err(ApiError::validation(
@@ -203,7 +238,62 @@ fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
             ));
         }
     }
+    if let Some(ref s) = patch.maintenance_window_start {
+        validate_hhmm(s, "maintenance_window_start")?;
+    }
+    if let Some(ref s) = patch.maintenance_window_end {
+        validate_hhmm(s, "maintenance_window_end")?;
+    }
+    if let Some(n) = patch.continue_watching_max_items {
+        if !(1..=200).contains(&n) {
+            return Err(ApiError::validation(
+                "continue_watching_max_items must be between 1 and 200",
+            ));
+        }
+    }
+    if let Some(n) = patch.continue_watching_max_age_weeks {
+        if !(0..=520).contains(&n) {
+            return Err(ApiError::validation(
+                "continue_watching_max_age_weeks must be between 0 (disable) and 520 (~10 years)",
+            ));
+        }
+    }
+    if let Some(n) = patch.video_played_threshold_pct {
+        if !(50..=99).contains(&n) {
+            return Err(ApiError::validation(
+                "video_played_threshold_pct must be between 50 and 99",
+            ));
+        }
+    }
+    if let Some(n) = patch.database_cache_size_mb {
+        if !(0..=4096).contains(&n) {
+            return Err(ApiError::validation(
+                "database_cache_size_mb must be between 0 (SQLite default) and 4096",
+            ));
+        }
+    }
     // Silence the unused `json!` import when downstream features go away.
     let _ = json!({});
+    Ok(())
+}
+
+fn validate_hhmm(s: &str, field: &str) -> Result<(), ApiError> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ApiError::validation(format!(
+            "{field} must be HH:MM (24-hour)"
+        )));
+    }
+    let h: u32 = parts[0]
+        .parse()
+        .map_err(|_| ApiError::validation(format!("{field} hour must be 0-23")))?;
+    let m: u32 = parts[1]
+        .parse()
+        .map_err(|_| ApiError::validation(format!("{field} minute must be 0-59")))?;
+    if h >= 24 || m >= 60 {
+        return Err(ApiError::validation(format!(
+            "{field} must be HH:MM with hour 0-23 and minute 0-59"
+        )));
+    }
     Ok(())
 }

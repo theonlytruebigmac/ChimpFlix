@@ -11,6 +11,8 @@ import {
   episodes as episodesApi,
   externalSubtitles as externalSubtitlesApi,
   items as itemsApi,
+  playState as playStateApi,
+  preroll as prerollApi,
   previews as previewsApi,
   seasons as seasonsApi,
   type EpisodeDetail,
@@ -22,6 +24,7 @@ import {
   type PreviewManifest,
   type User,
 } from "@/lib/chimpflix-api";
+import { PrerollGate } from "@/components/PrerollGate";
 import { plexImage } from "@/lib/image";
 import { requireUser } from "@/lib/chimpflix-server";
 
@@ -490,7 +493,32 @@ export default async function WatchPage({
     { audio: audioFromQuery, subtitle: subtitleFromQuery },
   );
 
-  return (
+  // Pull the server-configured played threshold so the player auto-
+  // scrobbles at the operator's chosen percentage instead of a baked
+  // 90%. On error (e.g. brief network blip) fall back to 90 so the
+  // page still renders rather than hard-failing the watch flow.
+  let playedThresholdPct = 90;
+  let completionBehaviour: string = "threshold_pct";
+  try {
+    const cfg = await playStateApi.config();
+    playedThresholdPct = cfg.played_threshold_pct;
+    completionBehaviour = cfg.completion_behaviour;
+  } catch {
+    // Keep defaults.
+  }
+
+  // Check whether a pre-roll is configured + enabled. Fetched here on
+  // the server so the wrapper can decide synchronously whether to
+  // gate the player. Failures fall through to no-preroll.
+  let prerollUrl: string | null = null;
+  try {
+    const ps = await prerollApi.status();
+    if (ps.enabled && ps.url) prerollUrl = ps.url;
+  } catch {
+    // No-op.
+  }
+
+  const player = (
     <ChimpFlixPlayer
       title={resolved.title}
       subtitle={resolved.subtitle}
@@ -512,6 +540,13 @@ export default async function WatchPage({
       seasonEpisodes={resolved.seasonEpisodes}
       previewManifest={resolved.previewManifest}
       versions={resolved.versions}
+      playedThresholdPct={playedThresholdPct}
+      completionBehaviour={completionBehaviour}
     />
   );
+
+  if (prerollUrl) {
+    return <PrerollGate prerollUrl={prerollUrl}>{player}</PrerollGate>;
+  }
+  return player;
 }

@@ -117,6 +117,11 @@ pub struct Library {
     /// Where this library appears. One of: "home_and_search" | "search_only"
     /// | "hidden".
     pub visibility: String,
+    /// When true, the item detail modal exposes a "Delete from disk"
+    /// button that hard-deletes the media file (and cascades orphan
+    /// rows) immediately, no grace window. Default false so a casual
+    /// operator can't blow away a library by clicking the wrong button.
+    pub allow_media_deletion: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -139,6 +144,7 @@ pub struct LibraryUpdate {
     pub episode_naming: Option<String>,
     pub certification_country: Option<String>,
     pub visibility: Option<String>,
+    pub allow_media_deletion: Option<bool>,
 }
 
 impl Library {
@@ -162,6 +168,12 @@ impl Library {
             visibility: row
                 .try_get::<String, _>("visibility")
                 .unwrap_or_else(|_| "home_and_search".to_string()),
+            allow_media_deletion: row
+                .try_get::<Option<i64>, _>("allow_media_deletion")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -212,6 +224,17 @@ pub struct ScheduledTask {
     pub kind: String,
     pub name: String,
     pub cron_expr: String,
+    /// Friendly schedule label. When != "custom", `cron_expr` is ignored
+    /// at runtime and the scheduler computes `next_run_at` from
+    /// `frequency + last_finished_at`. See the phase 29 migration for
+    /// the supported values.
+    pub frequency: String,
+    /// When true, the computed `next_run_at` is snapped forward to the
+    /// next opening of the server's maintenance window (see
+    /// `ServerSettings::maintenance_window_*`). Heavy tasks like full
+    /// scans default to true so they don't run during prime-time
+    /// playback hours.
+    pub requires_maintenance_window: bool,
     pub params_json: String,
     pub enabled: bool,
     pub last_run_at: Option<i64>,
@@ -230,6 +253,17 @@ impl ScheduledTask {
             kind: row.try_get("kind")?,
             name: row.try_get("name")?,
             cron_expr: row.try_get("cron_expr")?,
+            frequency: row
+                .try_get::<Option<String>, _>("frequency")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "custom".to_string()),
+            requires_maintenance_window: row
+                .try_get::<Option<i64>, _>("requires_maintenance_window")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
             params_json: row.try_get("params_json")?,
             enabled: row.try_get::<i64, _>("enabled")? != 0,
             last_run_at: row.try_get::<Option<i64>, _>("last_run_at").ok().flatten(),
@@ -253,7 +287,19 @@ impl ScheduledTask {
 pub struct NewScheduledTask {
     pub kind: String,
     pub name: String,
+    /// Optional. When `frequency` is `custom`, this MUST be a valid 5-/
+    /// 6-/7-field cron expression and is the source of truth. Otherwise
+    /// it's preserved verbatim but ignored by the scheduler.
+    #[serde(default = "default_cron_expr")]
     pub cron_expr: String,
+    /// One of: manual | hourly | every_3_hours | every_6_hours |
+    /// every_12_hours | daily | every_3_days | weekly | monthly |
+    /// on_change | custom. Defaults to `custom` for back-compat with
+    /// the previous cron-only API.
+    #[serde(default = "default_frequency")]
+    pub frequency: String,
+    #[serde(default)]
+    pub requires_maintenance_window: bool,
     #[serde(default = "default_params_json")]
     pub params_json: String,
     #[serde(default = "default_enabled")]
@@ -266,6 +312,15 @@ fn default_params_json() -> String {
 fn default_enabled() -> bool {
     true
 }
+fn default_frequency() -> String {
+    "custom".to_string()
+}
+fn default_cron_expr() -> String {
+    // Hourly. Only consulted when `frequency = custom`; everything else
+    // ignores cron_expr at runtime, but we need a value to satisfy the
+    // NOT NULL column constraint.
+    "0 0 * * * *".to_string()
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ScheduledTaskUpdate {
@@ -273,6 +328,10 @@ pub struct ScheduledTaskUpdate {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_maintenance_window: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1074,10 +1133,25 @@ pub struct OnDeckResponse {
 // Users & sessions
 // ---------------------------------------------------------------------------
 
+/// Three-tier role hierarchy:
+/// - `Owner` — root account. Manages every other account (including other
+///   owners) and is the only role that can promote/demote owners. There
+///   must always be at least one owner; the queries layer enforces this
+///   via a count check before any owner-removing mutation.
+/// - `Admin` — delegated administrator. Manages users + other admins
+///   (CRUD, password reset, 2FA reset, role changes within the
+///   admin/user tier), but cannot touch owner accounts in any way.
+/// - `User` — regular viewer. No administrative powers.
+///
+/// The hierarchy ordering (`Owner > Admin > User`) is encoded in
+/// [`Self::tier`] — actors can only manage targets strictly below their
+/// own tier, with the exception that admins can demote/delete other
+/// admins (same tier) but never owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     Owner,
+    Admin,
     User,
 }
 
@@ -1085,6 +1159,7 @@ impl UserRole {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Owner => "owner",
+            Self::Admin => "admin",
             Self::User => "user",
         }
     }
@@ -1092,9 +1167,26 @@ impl UserRole {
     pub fn from_db(s: &str) -> anyhow::Result<Self> {
         match s {
             "owner" => Ok(Self::Owner),
+            "admin" => Ok(Self::Admin),
             "user" => Ok(Self::User),
             other => anyhow::bail!("unknown user role: {other}"),
         }
+    }
+
+    /// Hierarchy ranking. Higher = more privileged.
+    pub fn tier(&self) -> u8 {
+        match self {
+            Self::Owner => 2,
+            Self::Admin => 1,
+            Self::User => 0,
+        }
+    }
+
+    /// True for any administrative role (`Owner` or `Admin`). Used by
+    /// the `AdminAuth` extractor and most admin-surface authorization
+    /// checks that don't need to distinguish between the two.
+    pub fn is_admin_or_owner(&self) -> bool {
+        matches!(self, Self::Owner | Self::Admin)
     }
 }
 
@@ -1397,6 +1489,27 @@ pub struct ServerSettings {
     /// aggressively the planner enforces hardware acceleration.
     /// See the phase20 migration comment for what each mode means.
     pub transcoder_hw_strictness: String,
+    // ---- Background / optimize_versions (phase 30) ----------------------
+    /// libx264 preset used by the `optimize_versions` task when
+    /// pre-encoding optimized files. Trades CPU time for output size.
+    /// Values: ultrafast | superfast | veryfast | faster | fast |
+    /// medium | slow | slower. Default `veryfast` matches the
+    /// previous hard-coded value.
+    pub transcoder_background_preset: String,
+    /// Cap on concurrent jobs the `optimize_versions` task processes
+    /// per tick. Default 1 — background work shouldn't starve live
+    /// transcodes on a small machine.
+    pub transcoder_max_background_concurrent: i64,
+    // ---- HDR tone mapping (phase 30) -----------------------------------
+    /// When true (default), HDR sources are tone-mapped to SDR via
+    /// zscale + tonemap. When false the filter is skipped — saves
+    /// CPU but HDR sources will look flat/washed-out on SDR clients.
+    pub transcoder_hdr_tonemap_enabled: bool,
+    /// Tonemap algorithm string passed to the `tonemap=tonemap=`
+    /// argument. One of: hable | reinhard | mobius | bt2390 | clip |
+    /// linear. Default `hable` is the previously hard-coded value
+    /// and a reasonable middle ground.
+    pub transcoder_hdr_tonemap_algo: String,
     // ---- SMTP / email (phase 21) ---------------------------------------
     /// SMTP server hostname (e.g. "smtp.example.com"). When None, the
     /// Mailer treats email as disabled and feature code calling
@@ -1418,6 +1531,115 @@ pub struct ServerSettings {
     /// When "required", any user without verified 2FA is forced through
     /// enrollment before login completes.
     pub totp_enforcement: String,
+    // ---- Maintenance window (phase 29) ---------------------------------
+    /// HH:MM (24-hour) in server-local time. The window during which
+    /// scheduled tasks marked `requires_maintenance_window` are allowed
+    /// to run. Default 02:00 → 09:00. If the end time is <= the start
+    /// the window wraps midnight.
+    pub maintenance_window_start: String,
+    pub maintenance_window_end: String,
+    // ---- Library (phase 34) ---------------------------------------------
+    /// When true (default), the filesystem watcher is spawned at
+    /// startup and library scans fire within seconds of a file
+    /// appearing/disappearing on disk. When false, only manual or
+    /// scheduled scans run. Read once at startup — toggling requires
+    /// a server restart.
+    pub scan_automatically: bool,
+    /// When true, completing a library scan (via file_watcher) queues
+    /// `detect_markers` for every newly-discovered file that lacks
+    /// auto markers. Off by default — blackdetect is expensive and the
+    /// scheduled `detect_markers` task already covers bulk catch-up.
+    /// Matches Plex's "Detect intro/credits when media is added."
+    pub detect_markers_on_add: bool,
+    // ---- Playback / library (phase 31) ---------------------------------
+    /// Hard cap on the Continue Watching rail. Default 40.
+    pub continue_watching_max_items: i64,
+    /// In-progress items last played more than this many weeks ago
+    /// are filtered out of the Continue Watching rail. Default 16.
+    /// Set 0 to disable the time window entirely.
+    pub continue_watching_max_age_weeks: i64,
+    /// When true (default), the on_deck query augments its
+    /// in-progress results with S(N+1)E01 of any show the user has
+    /// watched at least one episode of. Off skips that augmentation
+    /// entirely. Matches Plex's "Include season premieres in
+    /// Continue Watching" toggle.
+    pub continue_watching_include_premieres: bool,
+    /// Single threshold for "this counts as watched" (1-99). Used by
+    /// the client to auto-scrobble at this position and by the
+    /// on-deck query to filter items past this point. Default 90.
+    pub video_played_threshold_pct: i64,
+    /// Drives auto-scrobble + on-deck filter. See migration phase 46.
+    /// One of `threshold_pct` / `first_credits_marker` / `earliest_of_both`.
+    pub video_completion_behaviour: String,
+    /// Megabytes of memory the SQLite page cache may consume per
+    /// connection. Applied via `PRAGMA cache_size` at pool open.
+    /// Default 64. Set 0 to leave SQLite's default in place.
+    pub database_cache_size_mb: i64,
+    /// Default loudness normalization on every transcode session. When
+    /// true, sessions apply the ffmpeg `loudnorm` filter (using stored
+    /// per-file measurements when available, else generic targets).
+    /// Per-session override still possible via the player. Off by
+    /// default.
+    pub audio_normalize_enabled: bool,
+    /// `nice -n <level>` wrapper for ffmpeg/ffprobe invocations from
+    /// the scanner and scheduled tasks (previews, chapter thumbs,
+    /// loudness, marker detection). 0 disables the wrapper. Range
+    /// 1..=19 (standard Unix nice). Read at server startup —
+    /// changes require a restart.
+    pub scanner_nice_level: i64,
+    /// Filename of the uploaded pre-roll video relative to
+    /// `<data_dir>/preroll/`, or None when none is set. Cleared by the
+    /// admin via DELETE /admin/preroll.
+    pub preroll_path: Option<String>,
+    /// Master switch for pre-roll playback. When ON and `preroll_path`
+    /// is set, the player runs the pre-roll first; user prefs can
+    /// override per-user.
+    pub preroll_enabled: bool,
+    /// HEVC output mode for transcode sessions:
+    /// `off` | `when_client_supports` | `always`. See migration phase 43.
+    pub transcoder_hevc_encoding_mode: String,
+    /// GPU device override: "auto" (default), a numeric NVENC index
+    /// ("0", "1"), or a VAAPI render path ("/dev/dri/renderD129").
+    /// Multi-GPU pinning; single-GPU boxes leave as "auto".
+    pub transcoder_gpu_device: String,
+    /// Cap on concurrent software-encoder (libx264 / libx265) sessions.
+    /// Independent of `transcoder_max_concurrent`, which gates the
+    /// total. Default 1 — a single CPU encode already pegs N cores;
+    /// queueing additional ones starves any parallel GPU session.
+    pub transcoder_max_cpu_concurrent: i64,
+    // ---- Network policy (phase 32) -------------------------------------
+    /// Milliseconds an HLS session can go without a keepalive before
+    /// the reaper kills it. Default 90_000 (was the previous hard-
+    /// coded value). Lower for snappier mobile cleanup; raise on
+    /// flaky-network deployments.
+    pub transcoder_reaper_idle_threshold_ms: i64,
+    /// Cap on concurrent transcode sessions per user when the request
+    /// originates from outside `lan_networks`. 0 disables the cap.
+    pub max_remote_streams_per_user: i64,
+    /// Comma-separated CIDR list. Anything matching is treated as
+    /// local: bypasses the remote-streams cap and is shown as a "LAN"
+    /// session in the admin dashboard. Empty = no LAN inference.
+    pub lan_networks: String,
+    /// Comma-separated CIDR list. Requests from a matching IP skip
+    /// the cookie/session check and run as the server owner. Useful
+    /// for Home Assistant / LAN automation; do NOT include public
+    /// CIDRs.
+    pub auth_bypass_cidrs: String,
+    /// Operator-set bind override. Empty (default) honors `BIND_ADDR`
+    /// env (which itself defaults to `0.0.0.0:8080`). Non-empty values
+    /// like `192.168.1.50:8080` pin the listener to a specific NIC at
+    /// next restart.
+    pub bind_interface: String,
+    /// BCP-47 language tag used for TMDB metadata fetches (overview,
+    /// tagline, localized titles). Defaults to `en-US`. TMDB falls
+    /// back to the original language when no translation exists for
+    /// the requested tag — niche anime overviews may still come back
+    /// in Japanese for that reason.
+    pub metadata_language: String,
+    /// Days an item stays badged as "Recently Added" in the UI.
+    /// 0 disables the badge entirely; 14 is the default and matches
+    /// the original hardcoded window from the Card component.
+    pub recently_added_days: i64,
     /// JSON-encoded escape-hatch storage for fields added by later phases
     /// without their own migration.
     pub extras_json: String,
@@ -1441,6 +1663,27 @@ impl ServerSettings {
                 .flatten(),
             transcoder_encoder_preset: row.try_get("transcoder_encoder_preset")?,
             transcoder_hw_strictness: row.try_get("transcoder_hw_strictness")?,
+            transcoder_background_preset: row
+                .try_get::<Option<String>, _>("transcoder_background_preset")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "veryfast".to_string()),
+            transcoder_max_background_concurrent: row
+                .try_get::<Option<i64>, _>("transcoder_max_background_concurrent")
+                .ok()
+                .flatten()
+                .unwrap_or(1),
+            transcoder_hdr_tonemap_enabled: row
+                .try_get::<Option<i64>, _>("transcoder_hdr_tonemap_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+                != 0,
+            transcoder_hdr_tonemap_algo: row
+                .try_get::<Option<String>, _>("transcoder_hdr_tonemap_algo")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "hable".to_string()),
             email_smtp_host: row
                 .try_get::<Option<String>, _>("email_smtp_host")
                 .ok()
@@ -1470,6 +1713,130 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "optional".to_string()),
+            maintenance_window_start: row
+                .try_get::<Option<String>, _>("maintenance_window_start")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "02:00".to_string()),
+            maintenance_window_end: row
+                .try_get::<Option<String>, _>("maintenance_window_end")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "09:00".to_string()),
+            scan_automatically: row
+                .try_get::<Option<i64>, _>("scan_automatically")
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+                != 0,
+            detect_markers_on_add: row
+                .try_get::<Option<i64>, _>("detect_markers_on_add")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            continue_watching_max_items: row
+                .try_get::<Option<i64>, _>("continue_watching_max_items")
+                .ok()
+                .flatten()
+                .unwrap_or(40),
+            continue_watching_max_age_weeks: row
+                .try_get::<Option<i64>, _>("continue_watching_max_age_weeks")
+                .ok()
+                .flatten()
+                .unwrap_or(16),
+            continue_watching_include_premieres: row
+                .try_get::<Option<i64>, _>("continue_watching_include_premieres")
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+                != 0,
+            video_played_threshold_pct: row
+                .try_get::<Option<i64>, _>("video_played_threshold_pct")
+                .ok()
+                .flatten()
+                .unwrap_or(90),
+            video_completion_behaviour: row
+                .try_get::<Option<String>, _>("video_completion_behaviour")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "threshold_pct".to_string()),
+            database_cache_size_mb: row
+                .try_get::<Option<i64>, _>("database_cache_size_mb")
+                .ok()
+                .flatten()
+                .unwrap_or(64),
+            audio_normalize_enabled: row
+                .try_get::<Option<i64>, _>("audio_normalize_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            scanner_nice_level: row
+                .try_get::<Option<i64>, _>("scanner_nice_level")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            preroll_path: row
+                .try_get::<Option<String>, _>("preroll_path")
+                .ok()
+                .flatten(),
+            preroll_enabled: row
+                .try_get::<Option<i64>, _>("preroll_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            transcoder_hevc_encoding_mode: row
+                .try_get::<Option<String>, _>("transcoder_hevc_encoding_mode")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "off".to_string()),
+            transcoder_gpu_device: row
+                .try_get::<Option<String>, _>("transcoder_gpu_device")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "auto".to_string()),
+            transcoder_max_cpu_concurrent: row
+                .try_get::<Option<i64>, _>("transcoder_max_cpu_concurrent")
+                .ok()
+                .flatten()
+                .unwrap_or(1),
+            transcoder_reaper_idle_threshold_ms: row
+                .try_get::<Option<i64>, _>("transcoder_reaper_idle_threshold_ms")
+                .ok()
+                .flatten()
+                .unwrap_or(90_000),
+            max_remote_streams_per_user: row
+                .try_get::<Option<i64>, _>("max_remote_streams_per_user")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            lan_networks: row
+                .try_get::<Option<String>, _>("lan_networks")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            auth_bypass_cidrs: row
+                .try_get::<Option<String>, _>("auth_bypass_cidrs")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            bind_interface: row
+                .try_get::<Option<String>, _>("bind_interface")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            metadata_language: row
+                .try_get::<Option<String>, _>("metadata_language")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "en-US".to_string()),
+            recently_added_days: row
+                .try_get::<Option<i64>, _>("recently_added_days")
+                .ok()
+                .flatten()
+                .unwrap_or(14),
             extras_json: row.try_get("extras_json")?,
             updated_at: row.try_get("updated_at")?,
             updated_by: row.try_get::<Option<i64>, _>("updated_by").ok().flatten(),
@@ -1510,6 +1877,14 @@ pub struct ServerSettingsUpdate {
     pub transcoder_encoder_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hw_strictness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_background_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_max_background_concurrent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_hdr_tonemap_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_hdr_tonemap_algo: Option<String>,
     // Email / SMTP — every nullable field uses double-Option so the admin
     // UI can both clear and unset values without ambiguity.
     #[serde(
@@ -1550,6 +1925,56 @@ pub struct ServerSettingsUpdate {
     pub email_from_name: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp_enforcement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_window_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_window_end: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_automatically: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect_markers_on_add: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_watching_max_items: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_watching_max_age_weeks: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_watching_include_premieres: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_played_threshold_pct: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_completion_behaviour: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_cache_size_mb: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_normalize_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_nice_level: Option<i64>,
+    /// Outer Option = whether to update; inner = the value (None
+    /// clears the field via SET preroll_path = NULL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preroll_path: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preroll_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_hevc_encoding_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_gpu_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_max_cpu_concurrent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_reaper_idle_threshold_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_remote_streams_per_user: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_networks: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_bypass_cidrs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_interface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recently_added_days: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras_json: Option<String>,
 }

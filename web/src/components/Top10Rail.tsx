@@ -23,7 +23,7 @@ export function Top10Rail({
   if (items.length === 0) return null;
   return (
     <section
-      className="zf-rise-in px-12 pb-1 pt-1"
+      className="zf-rise-in px-4 sm:px-8 md:px-12 pb-1 pt-1"
       style={{ contentVisibility: "auto", containIntrinsicSize: "260px" }}
     >
       <h2 className="mb-3 flex items-baseline gap-2 text-[1.4rem] font-semibold tracking-tight">

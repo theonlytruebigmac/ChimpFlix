@@ -22,6 +22,7 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
     items: [
       { href: "/settings/admin", label: "Dashboard" },
       { href: "/settings/admin/status/alerts", label: "Alerts" },
+      { href: "/settings/admin/status/stats", label: "Stats" },
     ],
     disabled: [],
   },
@@ -41,10 +42,14 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
   {
     title: "Library",
     items: [
+      { href: "/settings/admin/library", label: "Library Settings" },
       { href: "/settings/admin/library/libraries", label: "Libraries" },
+      { href: "/settings/admin/library/collections", label: "Collections" },
       { href: "/settings/admin/library/agents", label: "Metadata Agents" },
       { href: "/settings/admin/library/scheduled-tasks", label: "Scheduled Tasks" },
       { href: "/settings/admin/library/optimized", label: "Optimized Versions" },
+      { href: "/settings/admin/library/items", label: "Bulk operations" },
+      { href: "/settings/admin/library/preroll", label: "Pre-roll" },
     ],
     disabled: [],
   },
@@ -72,8 +77,21 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
   },
 ];
 
+// Flat list of every nav href, computed once. Used to pick the single
+// "deepest" matching item so a parent page (e.g. /settings/admin/library —
+// "Library Settings") doesn't co-highlight when the user is on a child
+// route (/settings/admin/library/agents). Naive `startsWith(item.href)`
+// matched both.
+const ALL_HREFS: string[] = GROUPS.flatMap((g) => g.items.map((i) => i.href));
+
 export function AdminNav() {
   const pathname = usePathname() ?? "";
+  // Longest-match wins. A child route matches both its own href (exact)
+  // and every ancestor href (`startsWith(`${h}/`)`); keeping only the
+  // longest one yields the most specific item.
+  const activeHref = ALL_HREFS.filter(
+    (h) => h === pathname || pathname.startsWith(`${h}/`),
+  ).reduce((longest, h) => (h.length > longest.length ? h : longest), "");
 
   return (
     <nav className="flex flex-col gap-6 text-sm">
@@ -84,9 +102,7 @@ export function AdminNav() {
           </div>
           <ul className="flex flex-col gap-px">
             {group.items.map((item) => {
-              const isActive =
-                item.href === pathname ||
-                (item.href !== "/settings/admin" && pathname.startsWith(item.href));
+              const isActive = item.href === activeHref;
               const isDisabled = group.disabled?.includes(item.href) ?? false;
               const base =
                 "block rounded-md px-3 py-1.5 transition-colors";

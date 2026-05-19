@@ -32,9 +32,12 @@ export function SettingsEmailChangeClient({ initial }: Props) {
   const [autoVerifying, setAutoVerifying] = useState(false);
 
   // If we landed here via the email link, auto-consume the token and
-  // clear it from the URL so a reload doesn't double-submit.
+  // clear it from the URL so a reload doesn't double-submit. The
+  // setState before the async call is the "show loading state, then
+  // resolve" pattern — documented exception to set-state-in-effect.
   useEffect(() => {
     if (!tokenFromQuery || autoVerifying) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setAutoVerifying(true);
     (async () => {
       try {
@@ -140,7 +143,7 @@ export function SettingsEmailChangeClient({ initial }: Props) {
           <button
             type="submit"
             disabled={busy || !newEmail || !password}
-            className="rounded bg-(--color-accent) px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+            className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
           >
             {busy ? "Sending…" : "Send verification email"}
           </button>
@@ -198,7 +201,7 @@ function FirstTimeEmailForm({
         <button
           type="submit"
           disabled={busy || !email}
-          className="rounded bg-(--color-accent) px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+          className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
         >
           {busy ? "…" : "Set email"}
         </button>

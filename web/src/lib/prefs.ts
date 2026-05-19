@@ -9,7 +9,7 @@
 // `updatePrefs` is sync; UI components can call it inside event handlers
 // and re-read via the hook on the next render.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 
 export interface Prefs {
   trailerMuted: boolean;
@@ -86,26 +86,48 @@ function write(p: Prefs): void {
   }
 }
 
-export function usePrefs(): [Prefs, (patch: Partial<Prefs>) => void] {
-  const [prefs, setPrefs] = useState<Prefs>(DEFAULT);
+// useSyncExternalStore-compatible subscribe — listens to both our
+// in-tab change event and cross-tab storage events so prefs updates
+// in one tab propagate to every other open tab in real time.
+function subscribePrefs(callback: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(CHANGE_EVENT, callback);
+  window.addEventListener("storage", callback);
+  return () => {
+    window.removeEventListener(CHANGE_EVENT, callback);
+    window.removeEventListener("storage", callback);
+  };
+}
 
-  useEffect(() => {
-    setPrefs(read());
-    function onChange() {
-      setPrefs(read());
-    }
-    window.addEventListener(CHANGE_EVENT, onChange);
-    window.addEventListener("storage", onChange);
-    return () => {
-      window.removeEventListener(CHANGE_EVENT, onChange);
-      window.removeEventListener("storage", onChange);
-    };
-  }, []);
+// Cache the snapshot so React's useSyncExternalStore identity check
+// is stable until a real change happens; otherwise read() would return
+// a fresh object every call and trigger infinite re-renders.
+let snapshotCache: Prefs = DEFAULT;
+let snapshotKey = "";
+function getPrefsSnapshot(): Prefs {
+  if (typeof window === "undefined") return DEFAULT;
+  const raw = window.localStorage.getItem(STORAGE_KEY) ?? "";
+  if (raw === snapshotKey) return snapshotCache;
+  snapshotKey = raw;
+  snapshotCache = read();
+  return snapshotCache;
+}
+function getServerSnapshot(): Prefs {
+  return DEFAULT;
+}
+
+export function usePrefs(): [Prefs, (patch: Partial<Prefs>) => void] {
+  const prefs = useSyncExternalStore(
+    subscribePrefs,
+    getPrefsSnapshot,
+    getServerSnapshot,
+  );
 
   const update = useCallback((patch: Partial<Prefs>) => {
     const next = { ...read(), ...patch };
-    setPrefs(next);
     write(next);
+    // write() already dispatches CHANGE_EVENT which re-triggers
+    // useSyncExternalStore's subscriber → fresh snapshot pulled.
   }, []);
 
   return [prefs, update];

@@ -1,10 +1,10 @@
 //! /api/v1/collections handlers — movie franchises (TMDB collections).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use chimpflix_library::queries::{self, CollectionRow};
 use chimpflix_library::ListedItem;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
@@ -21,12 +21,25 @@ pub struct CollectionsResponse {
     pub collections: Vec<CollectionRow>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    /// Include auto (TMDB-discovered franchise) collections alongside
+    /// the user-curated manual + smart ones. Defaults to false — the
+    /// home rail caller wants a clean slate until the operator sets up
+    /// collections of their own, while the admin panel passes
+    /// `?include_auto=true` to manage everything.
+    #[serde(default)]
+    pub include_auto: bool,
+}
+
 pub async fn list(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<CollectionsResponse>, ApiError> {
     let acc = access(&state, &user).await?;
-    let collections = queries::list_collections(&state.pool, acc.as_deref()).await?;
+    let collections =
+        queries::list_collections(&state.pool, acc.as_deref(), q.include_auto).await?;
     Ok(Json(CollectionsResponse { collections }))
 }
 

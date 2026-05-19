@@ -86,6 +86,27 @@ body {
   animation: zfSlideUpIn 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* Double-tap-to-seek flash. Pops in scaled-down + transparent, scales
+   up to full size while becoming briefly visible, then fades out. The
+   total duration matches the JS timeout that clears the React state. */
+@keyframes zfSeekFlash {
+  0% {
+    opacity: 0;
+    transform: translateY(-50%) scale(0.7);
+  }
+  20% {
+    opacity: 1;
+    transform: translateY(-50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-50%) scale(1);
+  }
+}
+.zf-seek-flash {
+  animation: zfSeekFlash 600ms ease-out forwards;
+}
+
 /* Image lazy fade. Pair with `data-zf-img` on the <img> and set the
    wrapper's bg to a placeholder color. The image starts at opacity 0
    and the inline `onLoad` handler bumps it to 1 once decoded. */
@@ -97,11 +118,27 @@ img[data-zf-fade].zf-loaded {
   opacity: 1;
 }
 
+/* iOS Safari auto-zooms into any focused input whose font-size is < 16px.
+   Most of our admin/settings forms use text-sm (14px) for compact density,
+   which triggers the zoom and ruins the layout on phones. Bumping the
+   input/select/textarea font-size to 16px below the `sm` breakpoint
+   prevents the zoom without changing desktop appearance. `:not()` excludes
+   checkboxes/radios where font-size doesn't matter and changing it would
+   shift sizing oddly. */
+@media (max-width: 639px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .zf-fade-in,
   .zf-modal-backdrop,
   .zf-modal-in,
-  .zf-rise-in {
+  .zf-rise-in,
+  .zf-seek-flash {
     animation: none;
   }
   img[data-zf-fade] {

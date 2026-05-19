@@ -70,6 +70,9 @@ function LibraryCard({
   const [visibility, setVisibility] = useState<LibraryVisibility>(
     lib.visibility,
   );
+  const [allowMediaDeletion, setAllowMediaDeletion] = useState<boolean>(
+    lib.allow_media_deletion ?? false,
+  );
   const [agents, setAgents] = useState<LibraryAgent[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -251,7 +254,8 @@ function LibraryCard({
     sortOrder !== lib.episode_sort_order ||
     naming !== lib.episode_naming ||
     country !== lib.certification_country ||
-    visibility !== lib.visibility;
+    visibility !== lib.visibility ||
+    allowMediaDeletion !== (lib.allow_media_deletion ?? false);
 
   async function saveFields() {
     setBusy(true);
@@ -263,6 +267,9 @@ function LibraryCard({
       if (naming !== lib.episode_naming) patch.episode_naming = naming;
       if (country !== lib.certification_country) patch.certification_country = country;
       if (visibility !== lib.visibility) patch.visibility = visibility;
+      if (allowMediaDeletion !== (lib.allow_media_deletion ?? false)) {
+        patch.allow_media_deletion = allowMediaDeletion;
+      }
       const { library } = await librariesApi.update(lib.id, patch);
       onUpdated(library);
       setSaved(true);
@@ -369,7 +376,7 @@ function LibraryCard({
               <button
                 onClick={saveFields}
                 disabled={!fieldsDirty || busy}
-                className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+                className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
               >
                 {busy ? "Saving…" : "Save"}
               </button>
@@ -378,6 +385,32 @@ function LibraryCard({
               )}
               {error && <span className="text-xs text-red-400">{error}</span>}
             </div>
+          </section>
+
+          <section>
+            <h3 className="mb-3 text-sm font-semibold uppercase tracking-wider text-white/40">
+              Danger zone
+            </h3>
+            <label className="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+              <input
+                type="checkbox"
+                checked={allowMediaDeletion}
+                onChange={(e) => setAllowMediaDeletion(e.target.checked)}
+                className="mt-1"
+              />
+              <div>
+                <div className="font-medium text-amber-200">
+                  Allow operator to delete media files from disk
+                </div>
+                <div className="mt-1 text-xs text-white/55">
+                  When on, the item detail modal exposes a Delete button
+                  that hard-deletes media files and orphan rows
+                  immediately — no grace window, no undo. Off by default
+                  so a wrong click can&apos;t blow away a library. Save
+                  after toggling to apply.
+                </div>
+              </div>
+            </label>
           </section>
 
           <section>
@@ -453,8 +486,8 @@ function LibraryCard({
               cascades to orphan episodes / seasons / items. The
               scheduled tasks (weekly verify, daily purge after 7
               days) run automatically; these buttons are the on-demand
-              path for "I just deleted something and want it cleaned
-              up now".
+              path for &ldquo;I just deleted something and want it cleaned
+              up now&rdquo;.
             </p>
             <div className="flex flex-wrap items-center gap-2">
               <ActionButton
@@ -745,7 +778,7 @@ function AgentPriorityEditor({
         <button
           onClick={save}
           disabled={!dirty || busy}
-          className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
         >
           {busy ? "Saving…" : "Save agent order"}
         </button>

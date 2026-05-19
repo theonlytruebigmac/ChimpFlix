@@ -1,8 +1,17 @@
-# ChimpFlix API (v0.1 draft)
+# ChimpFlix API
 
-> Status: **design draft**. Base path: `/api/v1`. JSON for request and
-> response bodies. WebSocket at `/api/v1/ws`. Auth via httpOnly signed
-> cookie set by `POST /auth/login`.
+> Base path: `/api/v1`. JSON for request and response bodies. WebSocket
+> at `/api/v1/ws`. Auth via httpOnly signed cookie set by
+> `POST /auth/login`.
+>
+> **Currency:** the prose below (auth, items, play-state, streaming,
+> images, websocket) is the original v0.1 design draft. The endpoint
+> surface has grown substantially since — see the [**Endpoint
+> reference**](#endpoint-reference) at the bottom for the complete
+> list grouped by category. Bodies for the newer endpoints are
+> deliberately left as a pointer to source; the handler modules under
+> `crates/server/src/api/` are short, self-explanatory, and the
+> source of truth.
 
 ## Conventions
 
@@ -454,5 +463,159 @@ Auth required.
 - API tokens / programmatic clients (cookies-only for now).
 - Pagination cursors (offset pagination is fine for v0.1 library sizes).
 - Per-field selective response (no GraphQL, no sparse fieldsets).
-- Webhooks for external integrations.
 - Public/anonymous endpoints beyond `/health`.
+
+---
+
+## Endpoint reference
+
+Complete route list grouped by category. All routes are prefixed with
+`/api/v1` except where noted. **Admin** group requires the
+`OwnerAuth` extractor; everything else accepts any signed-in user
+(some delegate finer-grained access checks per-resource).
+
+### Auth & users
+
+- `POST   /auth/setup` — first-run owner creation
+- `POST   /auth/login`, `POST /auth/logout`
+- `GET    /auth/status`, `GET /auth/me`, `PATCH /auth/me`
+- `POST   /auth/me/password`
+- `POST   /auth/me/email/request-change`, `POST /auth/me/email/confirm`
+- `GET    /auth/me/sessions`, `DELETE /auth/me/sessions/{id}`
+- `POST   /auth/sessions/revoke-others`
+- `POST   /auth/register`, `GET /auth/users`, `PATCH /auth/users/{id}`, `DELETE /auth/users/{id}`
+- `GET    /auth/invites`, `POST /auth/invites`, `DELETE /auth/invites/{id}`
+- `POST   /auth/password-reset/request`, `POST /auth/password-reset/confirm`
+- `GET    /auth/2fa/status`, `POST /auth/2fa/enroll`, `POST /auth/2fa/verify`, `POST /auth/2fa/disable`, `POST /auth/2fa/recovery-codes/regenerate`
+- `POST   /auth/2fa/login`
+
+### Libraries & items
+
+- `GET    /libraries`, `POST /libraries`, `GET /libraries/{id}`, `PATCH /libraries/{id}`, `DELETE /libraries/{id}`
+- `GET    /libraries/{id}/access`, `PUT /libraries/{id}/access`
+- `POST   /libraries/{id}/scan`, `GET /libraries/{id}/scans`
+- `GET    /libraries/{id}/stats`
+- `POST   /libraries/{id}/verify`, `POST /libraries/{id}/purge`
+- `POST   /libraries/{id}/detect-markers`, `POST /libraries/{id}/refresh-metadata`, `POST /libraries/{id}/generate-previews`
+- `GET    /scans/{id}`
+- `GET    /items`, `GET /items/trending`
+- `GET    /items/{id}`, `PATCH /items/{id}`
+- `DELETE /items/{id}/media` (gated by library `allow_media_deletion`)
+- `GET    /items/{id}/trailer`, `GET /items/{id}/similar`, `GET /items/{id}/reviews`
+- `POST   /items/{id}/refresh`, `GET /items/{id}/match-search`, `POST /items/{id}/match-apply`
+- `PATCH  /items/{id}/credits`
+- `GET    /items/{id}/tmdb-posters`, `POST /items/{id}/poster/from-tmdb`
+- `POST   /items/{id}/poster`, `GET /items/{id}/poster/blob`
+- `POST   /items/{id}/backdrop`, `GET /items/{id}/backdrop/blob`
+- `POST   /items/{id}/detect-markers`
+- `GET    /items/{id}/rating`, `PUT /items/{id}/rating`, `DELETE /items/{id}/rating` (Trakt)
+- `GET    /items/{id}/external-subtitles`
+- `GET    /items/{id}/tags`, `POST /items/{id}/tags`, `DELETE /items/{id}/tags/{tag_id}`
+- `GET    /tags`
+- `GET    /seasons/{id}`
+- `GET    /episodes/{id}`, `DELETE /episodes/{id}/media`
+- `GET    /episodes/{id}/rating`, `PUT /episodes/{id}/rating`, `DELETE /episodes/{id}/rating`
+- `GET    /episodes/{id}/external-subtitles`
+
+### Collections (manual + smart + auto)
+
+- `GET    /collections`, `GET /collections/{id}`
+- `GET    /collections/{id}/poster/blob`, `GET /collections/{id}/backdrop/blob`
+
+### Streaming (routes)
+
+- `POST   /stream/sessions`, `POST /stream/prewarm`
+- `DELETE /stream/sessions/{id}`, `POST /stream/sessions/{id}/close` (sendBeacon alias)
+- `POST   /stream/sessions/{id}/pause`, `POST /stream/sessions/{id}/resume`
+- `GET    /stream/sessions/{id}/master.m3u8`
+- `GET    /stream/sessions/{id}/{variant}/{name}` (segments + variant playlists)
+- `GET    /stream/{file_id}/direct`
+
+### Media-file ancillary
+
+- `GET    /media-files/{id}/preview/manifest`, `GET /media-files/{id}/preview/sprite` (BIF)
+- `GET    /media-files/{id}/chapters`, `GET /media-files/{id}/chapters/{index}/thumb`
+- `GET    /external-subtitles/{id}/file`
+
+### Play state (routes)
+
+- `POST   /play-state`, `POST /play-state/scrobble`, `POST /play-state/watched`
+- `GET    /play-state/on-deck`, `GET /play-state/history`
+- `GET    /play-state/config`
+
+### Per-user
+
+- `GET    /my-list`, `POST /my-list/{item_id}`, `DELETE /my-list/{item_id}`
+- `GET    /prefs/hidden-libraries`, `PUT /prefs/hidden-libraries`
+- `GET    /notifications`, `GET /notifications/unread-count`, `POST /notifications/{id}/read`, `POST /notifications/read-all`
+
+### Trakt
+
+- `POST   /trakt/link/start`, `POST /trakt/link/poll`, `GET /trakt/status`, `POST /trakt/unlink`
+- `POST   /trakt/sync-now`
+
+### Pre-roll
+
+- `GET    /preroll/blob`
+
+### Admin — server + observability
+
+- `GET    /admin/dashboard`, `GET /admin/library-health`
+- `GET    /admin/audit`, `GET /admin/logs`, `GET /admin/alerts`
+- `GET    /admin/settings`, `PATCH /admin/settings`
+- `GET    /admin/settings/email`, `PUT/DELETE /admin/settings/email/password`, `POST /admin/settings/email/test`
+- `GET    /admin/agents`, `GET /admin/secrets`, `PUT/DELETE /admin/secrets/{name}`, `POST /admin/secrets/{name}/test`
+- `GET    /admin/network`, `PATCH /admin/network`, `POST /admin/network/test-reachability`
+- `GET    /admin/privacy`, `PATCH /admin/privacy`
+
+### Admin — transcoder
+
+- `GET    /admin/transcoder/capabilities`
+- `GET    /admin/transcoder/presets`, `POST /admin/transcoder/presets`, `PATCH/DELETE /admin/transcoder/presets/{id}`
+- `GET    /admin/optimized`, `POST /admin/optimized`, `DELETE /admin/optimized/{id}`
+
+### Admin — scheduled tasks
+
+- `GET    /admin/tasks`, `POST /admin/tasks`, `PATCH/DELETE /admin/tasks/{id}`, `POST /admin/tasks/{id}/run`, `GET /admin/tasks/{id}/runs`
+
+### Admin — libraries + collections
+
+- `GET    /admin/libraries/{id}/agents`, `PUT /admin/libraries/{id}/agents`
+- `POST   /admin/collections`, `PATCH/DELETE /admin/collections/{id}`
+- `POST   /admin/collections/{id}/items` (add), `PUT /admin/collections/{id}/items` (reorder), `DELETE /admin/collections/{id}/items/{item_id}`
+- `POST   /admin/collections/{id}/poster`, `POST /admin/collections/{id}/backdrop`
+- `POST   /admin/smart-collections`, `PUT /admin/smart-collections/{id}/rule`
+- `POST   /admin/items/bulk/refresh-metadata`, `POST /admin/items/bulk/add-tag`, `POST /admin/items/bulk/remove-tag`, `POST /admin/items/bulk/detect-markers`
+
+### Admin — users + access
+
+- `GET    /admin/sessions`, `DELETE /admin/sessions/{id}`
+- `GET    /admin/users/{id}/sessions`, `DELETE /admin/users/{id}/sessions`
+- `POST   /admin/users/{id}/2fa/reset`, `POST /admin/users/{id}/unlock-attempts`
+- `GET    /admin/access`, `PUT /admin/access`
+- `GET    /admin/access-groups`, `POST /admin/access-groups`, `GET/PATCH/DELETE /admin/access-groups/{id}`
+- `PUT    /admin/access-groups/{id}/libraries`, `PUT /admin/access-groups/{id}/members`
+- `GET    /admin/users/{id}/access-groups`, `PUT /admin/users/{id}/access-groups`
+
+### Admin — webhooks
+
+- `GET    /admin/webhooks`, `POST /admin/webhooks`, `PATCH/DELETE /admin/webhooks/{id}`
+- `POST   /admin/webhooks/{id}/test`, `GET /admin/webhooks/{id}/deliveries`
+
+### Admin — backups + maintenance
+
+- `POST   /admin/backup` (one-shot snapshot)
+- `GET    /admin/backups`, `GET /admin/backups/{filename}/download`, `DELETE /admin/backups/{filename}`
+- `POST   /admin/backups/{filename}/stage-restore`, `POST /admin/backups/cancel-restore`
+- `POST   /admin/maintenance/verify-all`, `POST /admin/maintenance/purge-all`
+- `POST   /admin/maintenance/vacuum`, `POST /admin/maintenance/clear-transcode-cache`
+
+### Admin — pre-roll
+
+- `GET    /admin/preroll`, `POST /admin/preroll` (multipart upload), `DELETE /admin/preroll`
+
+### Health, info & WebSocket (routes)
+
+- `GET    /health` (no auth; also at `/health` outside `/api/v1` for k8s/docker probes)
+- `GET    /server-info`
+- `WS     /ws`

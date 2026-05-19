@@ -13,7 +13,7 @@ export default async function HistoryPage() {
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="px-12 pb-24 pt-28">
+      <div className="px-4 sm:px-8 md:px-12 pb-24 pt-24 sm:pt-28">
         <h1 className="mb-6 text-4xl font-bold tracking-tight">
           Watch History
         </h1>

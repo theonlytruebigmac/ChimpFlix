@@ -36,12 +36,12 @@ export function Hero({ item }: { item: MediaItem }) {
           doesn't catch a hard band. */}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-80 bg-linear-to-t from-(--color-background) via-(--color-background)/70 to-transparent" />
 
-      <div className="relative z-10 flex h-full max-w-2xl flex-col justify-end px-12 pb-36">
-        <h1 className="mb-5 text-5xl font-black uppercase leading-[0.95] tracking-tight drop-shadow-lg sm:text-6xl">
+      <div className="relative z-10 flex h-full max-w-2xl flex-col justify-end px-4 pb-20 sm:px-8 sm:pb-28 md:px-12 md:pb-36">
+        <h1 className="mb-4 text-3xl font-black uppercase leading-[0.95] tracking-tight drop-shadow-lg sm:mb-5 sm:text-5xl md:text-6xl">
           {displayTitle(item)}
         </h1>
         {item.summary && (
-          <p className="mb-7 line-clamp-3 max-w-lg text-base leading-relaxed text-white/90 drop-shadow">
+          <p className="mb-5 line-clamp-3 max-w-lg text-sm leading-relaxed text-white/90 drop-shadow sm:mb-7 sm:text-base">
             {item.summary}
           </p>
         )}

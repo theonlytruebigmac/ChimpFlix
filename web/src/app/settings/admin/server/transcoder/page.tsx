@@ -17,6 +17,7 @@ export default async function AdminTranscoderPage() {
       />
       <AdminTranscoderClient
         capabilities={caps.capabilities}
+        cacheRoot={caps.cache_root}
         presets={presets.presets}
         settings={settings.settings}
       />

@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import {
   useCallback,
   useEffect,
+  useId,
+  useMemo,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -15,6 +17,7 @@ import {
   stream as streamApi,
   playState as playStateApi,
 } from "@/lib/chimpflix-api";
+import { ChaptersControl } from "@/components/ChaptersControl";
 import { detectClientCapabilities } from "@/lib/client-caps";
 import {
   cssFontFamilyForSubtitlePref,
@@ -185,6 +188,15 @@ interface Props {
   /// treated as the active one; switching versions just swaps the id
   /// the session is built against, preserving playback position.
   versions?: VersionChoice[];
+  /// Operator-configured threshold (1–99) at which we auto-scrobble
+  /// the session as watched. Comes from `/play-state/config` so the
+  /// player stays in sync with the server's source of truth. Default
+  /// 90 matches the historical baked-in value.
+  playedThresholdPct?: number;
+  /// One of `threshold_pct` / `first_credits_marker` /
+  /// `earliest_of_both`. Drives the scrobble decision alongside
+  /// `playedThresholdPct`. Default `threshold_pct` when omitted.
+  completionBehaviour?: string;
 }
 
 export interface PreviewManifest {
@@ -196,8 +208,31 @@ export interface PreviewManifest {
   tile_count: number;
 }
 
+/// iOS Safari (and standalone iPhone PWAs) doesn't implement
+/// `Element.requestFullscreen`; you have to call
+/// `webkitEnterFullscreen()` on the HTMLVideoElement itself. That
+/// method shows iOS's native video player chrome (not ours), but
+/// at least the video covers the screen. Better than nothing —
+/// without this fallback iPhone users have no way to leave the
+/// pillarboxed inline player view.
+function tryWebkitVideoFullscreen(video: HTMLVideoElement | null): void {
+  if (!video) return;
+  const v = video as HTMLVideoElement & {
+    webkitEnterFullscreen?: () => void;
+  };
+  if (typeof v.webkitEnterFullscreen === "function") {
+    try {
+      v.webkitEnterFullscreen();
+    } catch {
+      // Best-effort; nothing else we can do here.
+    }
+  }
+}
+
 const PLAY_STATE_INTERVAL_MS = 10_000;
-const SCROBBLE_THRESHOLD = 0.9;
+/// Fallback threshold when the prop isn't passed (e.g. an older route
+/// still wraps the player). Matches the value this used to be baked at.
+const DEFAULT_SCROBBLE_THRESHOLD = 0.9;
 const COUNTDOWN_WINDOW_SECONDS = 10;
 const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
 
@@ -251,18 +286,34 @@ export function ChimpFlixPlayer({
   seasonEpisodes,
   previewManifest,
   versions,
+  playedThresholdPct,
+  completionBehaviour,
 }: Props) {
+  // Normalize the configured threshold to a fraction (0-1) once. Clamp
+  // to a sane band to defend against the API returning garbage.
+  const scrobbleThreshold =
+    playedThresholdPct == null
+      ? DEFAULT_SCROBBLE_THRESHOLD
+      : Math.min(0.99, Math.max(0.5, playedThresholdPct / 100));
   const router = useRouter();
   const [prefs] = usePrefs();
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hideTimerRef = useRef<number | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  // Late-bound ref to seekBy so callbacks declared before seekBy (Media
+  // Session, etc.) can route through the source-time-aware seek path
+  // without TDZ errors from a direct reference.
+  const seekByRef = useRef<((delta: number) => void) | null>(null);
+  // True while the user is mid-scrub (pointer down on the progress bar).
+  // The stall watchdog and auto-skip-intro effects check this to avoid
+  // yanking currentTime in the middle of a user-initiated seek.
+  const scrubbingRef = useRef(false);
   const scrobbledRef = useRef(false);
   /// Backend session id for the currently-mounted HLS stream. The
   /// session-creation effect sets this; the pause/resume + scrub
-  /// pre-warm + bandwidth-downgrade hooks read it. `null` for a
-  /// direct-play session (no transcoder session to pause/resume).
+  /// pre-warm hooks read it. `null` for a direct-play session (no
+  /// transcoder session to pause/resume).
   const activeSessionIdRef = useRef<string | null>(null);
   // Captured the resume position so a track switch mid-playback comes back
   // to roughly where the user was, not the original startPositionMs.
@@ -306,6 +357,15 @@ export function ChimpFlixPlayer({
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showControls, setShowControls] = useState(true);
+  /// Touch-only: brief overlay rendered on the side that was just
+  /// double-tapped, fading out after ~600ms. `null` = none. The number
+  /// is the delta in seconds (negative for back, positive for forward)
+  /// so the overlay can render "-10s" / "+10s".
+  const [seekFlash, setSeekFlash] = useState<{
+    side: "left" | "right";
+    delta: number;
+    nonce: number;
+  } | null>(null);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   // Local selection state. `undefined` = transcoder default. For subtitles
   // we use `null` to mean "explicitly off" (no subtitle_index sent).
@@ -372,12 +432,14 @@ export function ChimpFlixPlayer({
 
   // Hydrate subtitle prefs from localStorage. Offset is per-file
   // (each title has its own sync drift); appearance is global
-  // (users want consistent styling across the library). Both
-  // saves are debounced via the setter writing on every change —
-  // localStorage writes are sync but tiny, so the simple approach
-  // is fine.
+  // (users want consistent styling across the library). This is
+  // "sync to external state" (the localStorage is the source of truth
+  // across mounts) so the setState-in-effect is the right pattern —
+  // the alternative would be a useSyncExternalStore wrapper for
+  // negligible benefit. Block-level disable covers each call site.
   useEffect(() => {
     if (typeof window === "undefined") return;
+    /* eslint-disable react-hooks/set-state-in-effect */
     try {
       const offsetRaw = window.localStorage.getItem(
         OFFSET_STORAGE_PREFIX + activeMediaFileId,
@@ -399,6 +461,7 @@ export function ChimpFlixPlayer({
     } catch {
       // Corrupt localStorage or quota issue; fall back to defaults.
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [activeMediaFileId]);
 
   useEffect(() => {
@@ -604,11 +667,16 @@ export function ChimpFlixPlayer({
   // node and rewrite its rules whenever the prefs change. The
   // `cf-cue-{id}` class scopes the rules to this one video so multiple
   // open tabs / PiP windows don't fight each other.
-  const videoScopeRef = useRef(
-    `cf-cue-${Math.random().toString(36).slice(2, 10)}`,
-  );
+  // React's useId guarantees a stable, render-deterministic identifier
+  // per component instance — replaces a Math.random() in useRef that
+  // violated component purity and could collide across tabs. The
+  // class is derived directly (no ref indirection) so it's safe to
+  // read during render — fixes the prior `Cannot access refs during
+  // render` lint.
+  const cueScopeId = useId();
+  const cueClass = `cf-cue-${cueScopeId.replace(/:/g, "")}`;
   useEffect(() => {
-    const id = videoScopeRef.current;
+    const id = cueClass;
     let styleEl = document.getElementById(id) as HTMLStyleElement | null;
     if (!styleEl) {
       styleEl = document.createElement("style");
@@ -633,12 +701,12 @@ export function ChimpFlixPlayer({
       // style node is cheap; let it persist for the page lifetime.
     };
   }, [
+    cueClass,
     prefs.subtitleBackground,
     prefs.subtitleColor,
     prefs.subtitleFontScale,
     prefs.subtitleFontFamily,
   ]);
-  const cueClass = videoScopeRef.current;
   const [tracksOpen, setTracksOpen] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [speedOpen, setSpeedOpen] = useState(false);
@@ -652,6 +720,7 @@ export function ChimpFlixPlayer({
   /// button. Off by default; the panel only samples while visible so
   /// it carries no cost when closed.
   const [statsOpen, setStatsOpen] = useState(false);
+  const [hotkeysOpen, setHotkeysOpen] = useState(false);
   // Derived: the marker (if any) that contains the current playback time.
   const activeMarkerOverlay = activeMarker(currentTime * 1000, markers);
   // Track the intro markers we've already auto-skipped this session so
@@ -666,9 +735,18 @@ export function ChimpFlixPlayer({
   const activeVersion = versions?.find(
     (v) => v.media_file_id === activeMediaFileId,
   );
-  const activeAudioTracks = activeVersion?.audioTracks ?? audioTracks ?? [];
-  const activeSubtitleTracks =
-    activeVersion?.subtitleTracks ?? subtitleTracks ?? [];
+  // Memoised so downstream useCallback deps don't churn every render.
+  // The fallback chain produces a new array literal each time without
+  // useMemo, which makes the `?? []` reference unstable and forces
+  // any consumer's deps to invalidate on every render.
+  const activeAudioTracks = useMemo(
+    () => activeVersion?.audioTracks ?? audioTracks ?? [],
+    [activeVersion, audioTracks],
+  );
+  const activeSubtitleTracks = useMemo(
+    () => activeVersion?.subtitleTracks ?? subtitleTracks ?? [],
+    [activeVersion, subtitleTracks],
+  );
 
   /// Swap the file the session is built against. Resets embedded
   /// audio/subtitle selections — indices are 0-based within the FILE's
@@ -916,8 +994,20 @@ export function ChimpFlixPlayer({
           const HlsModule = (await import("hls.js")).default;
           if (cancelled) return;
           if (HlsModule.isSupported()) {
+            // Mobile browsers have tighter memory + worker constraints
+            // than desktop. iOS Safari especially will kill a tab whose
+            // MSE buffer crosses ~150 MB; Android Chrome throttles
+            // workers in fullscreen. So we halve the buffers and turn
+            // off the worker on touch devices — playback gets slightly
+            // less stutter cushion, but we stop hitting the OOM /
+            // worker-killed paths that manifest as a freeze after 15-30s.
+            const isMobile =
+              typeof window !== "undefined" &&
+              typeof navigator !== "undefined" &&
+              (window.matchMedia?.("(hover: none) and (pointer: coarse)").matches ||
+                /android|iphone|ipad|ipod/i.test(navigator.userAgent));
             const hls = new HlsModule({
-              enableWorker: true,
+              enableWorker: !isMobile,
               // WebVTT subtitle sidecar support. When the master
               // playlist carries an `#EXT-X-MEDIA:TYPE=SUBTITLES`
               // group (server-side: text subs go out as sidecar
@@ -936,21 +1026,20 @@ export function ChimpFlixPlayer({
               // Keep 30 s of played-out segments in the back buffer so
               // small back-seeks (re-watching a line of dialog) don't
               // need to refetch. Larger back buffer trades RAM for
-              // smoother scrubbing.
-              backBufferLength: 30,
+              // smoother scrubbing. Trimmed on mobile.
+              backBufferLength: isMobile ? 10 : 30,
               // Forward buffer targets. ffmpeg writes a 6 s segment
               // every ~1 s on a healthy box (NVDEC + NVENC pipeline),
-              // so we can comfortably target a 60 s ahead buffer.
-              // The bigger the forward buffer, the more cushion against
-              // an ffmpeg stutter or a brief network blip — the random
-              // pauses users see are almost always "ahead buffer fell
-              // to 0 before next segment was ready".
-              maxBufferLength: 60,
-              maxMaxBufferLength: 120,
+              // so we can comfortably target a 60 s ahead buffer on
+              // desktop. Mobile gets a tighter 30s window to avoid
+              // tripping the browser's memory-pressure killer.
+              maxBufferLength: isMobile ? 30 : 60,
+              maxMaxBufferLength: isMobile ? 60 : 120,
               // Hard cap on buffer size in MB. 1080p ~5 Mbps × 60 s ≈
-              // 38 MB; 200 MB gives us headroom for spikes without
-              // letting one tab eat a gigabyte.
-              maxBufferSize: 200 * 1000 * 1000,
+              // 38 MB; desktop gets 200 MB of headroom, mobile capped
+              // at 60 MB which is well under iOS Safari's per-tab MSE
+              // budget (~150 MB before the OS kills the page).
+              maxBufferSize: isMobile ? 60 * 1000 * 1000 : 200 * 1000 * 1000,
               // First-manifest timeouts have to cover the server's 15s
               // wait for ffmpeg to write `index.m3u8`. Under-budgeting
               // here was the cause of the "Auto quality won't start"
@@ -1072,32 +1161,80 @@ export function ChimpFlixPlayer({
       setError("Server returned an unplayable session");
     }
 
-    // Also fire the DELETE on `pagehide` (tab close, navigation away from
-    // the SPA) — React's unmount cleanup can race with the browser
-    // tearing down the page and a normal `fetch` gets aborted. The
-    // `keepalive: true` flag tells the browser to let the request
-    // outlive the page.
+    // Tear down the transcode session. Tries sendBeacon first (most
+    // reliable for unload-time requests, especially in PWA standalone
+    // mode where fetch+keepalive has been seen to drop on force-close),
+    // then falls back to fetch+keepalive for in-SPA navigation cases.
     function teardownSession() {
       if (!sessionId) return;
+      const closeUrl = `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/close`;
+      const deleteUrl = `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}`;
       try {
-        fetch(`/api/v1/stream/sessions/${encodeURIComponent(sessionId)}`, {
+        if (
+          typeof navigator !== "undefined" &&
+          typeof navigator.sendBeacon === "function"
+        ) {
+          // sendBeacon is fire-and-forget POST; the browser guarantees
+          // delivery even if the page is unloading. Empty body — the
+          // session id is encoded in the URL.
+          const beaconOk = navigator.sendBeacon(closeUrl, new Blob());
+          if (beaconOk) return;
+        }
+        // Fallback: in-SPA cleanup where the page isn't going away,
+        // or browsers without sendBeacon (very old). DELETE keeps the
+        // existing semantics for hand-rolled testing.
+        fetch(deleteUrl, {
           method: "DELETE",
           keepalive: true,
           credentials: "include",
         }).catch(() => {});
       } catch {
-        // Fetch can throw synchronously during unload on some browsers —
-        // we tried, the server-side reaper will mop up either way.
+        // Fetch / sendBeacon can throw synchronously during unload on
+        // some browsers — we tried, the 90s server-side reaper will
+        // mop up either way.
       }
     }
-    window.addEventListener("pagehide", teardownSession);
+    // pagehide is the canonical "the page is going away" signal. We use
+    // `event.persisted` to distinguish bfcache (page may come back, don't
+    // tear down) from real unload (close, hard navigation, system kill).
+    // On mobile this catches force-close of the PWA: Chrome fires pagehide
+    // with persisted=false when the OS unloads the page. App-switch (where
+    // the user comes back) only fires visibilitychange, not pagehide, so
+    // we don't falsely kill sessions for backgrounding. The server's
+    // 90s reaper picks up sessions where pagehide didn't fire at all
+    // (sudden process kill, network blip during keepalive).
+    const onPageHide = (e: PageTransitionEvent) => {
+      if (e.persisted) return;
+      teardownSession();
+    };
+    window.addEventListener("pagehide", onPageHide);
+
+    // Page Lifecycle freeze/resume — Chrome (incl. PWAs) can freeze
+    // backgrounded tabs to save memory after 5+ minutes idle. While
+    // frozen, all JS pauses, including our 60s keepalive interval.
+    // On resume we fire one keepalive immediately so the next 60s
+    // tick doesn't race the server's idle-reaper threshold.
+    //
+    // No-op on browsers that don't fire these events — the keepalive
+    // interval continues working normally for active tabs.
+    const onResume = () => {
+      if (!sessionId) return;
+      fetch(
+        `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/master.m3u8`,
+        { credentials: "include" },
+      ).catch(() => {
+        // Network blip on resume — the next interval tick will retry.
+      });
+    };
+    document.addEventListener("resume", onResume);
 
     start();
 
     return () => {
       cancelled = true;
       cleanup();
-      window.removeEventListener("pagehide", teardownSession);
+      window.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("resume", onResume);
       if (keepaliveTimer !== null) {
         window.clearInterval(keepaliveTimer);
       }
@@ -1161,11 +1298,6 @@ export function ChimpFlixPlayer({
     const onPlay = () => {
       setPlaying(true);
       setAutoplayBlocked(false);
-      // Resume the backend encoder if it was paused — the previous
-      // `pause` call SIGSTOP'd ffmpeg, so we need to wake it back up
-      // before the player tries to fetch the next segment.
-      const sid = activeSessionIdRef.current;
-      if (sid) streamApi.resumeSession(sid).catch(() => {});
     };
     const onPause = () => setPlaying(false);
     const onWaiting = () => setLoading(true);
@@ -1210,6 +1342,113 @@ export function ChimpFlixPlayer({
     };
   }, [attemptPlay, autoplayBlocked, durationMs]);
 
+  // Stall-recovery watchdog. Two paths to detect a stall:
+  //   1. `waiting` event — the browser tells us directly that playback
+  //      has paused because the source buffer is empty. Fast and exact.
+  //      We arm a short timer on `waiting` and disarm on `playing`/`pause`.
+  //   2. Polling fallback — for the silent decoder wedge case where no
+  //      event fires but currentTime stops moving. Slower (6s).
+  // The kick is the same in both cases: ask HLS to resume loading, nudge
+  // currentTime to wake the decoder, and re-issue play(). If kicks pile
+  // up in a minute, the stream itself is the problem — surface the
+  // error overlay so the user can refresh.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const WAITING_TIMEOUT_MS = 4000;
+    const POLL_STALL_MS = 6000;
+    const KICK_WINDOW_MS = 60_000;
+    const MAX_KICKS = 3;
+    let lastAdvanceAt = Date.now();
+    let lastTime = video.currentTime;
+    let waitingTimer: number | null = null;
+    const kicks: number[] = [];
+    const tryKick = (reason: "waiting" | "poll") => {
+      if (video.paused || video.ended) return;
+      // Don't kick during a user-initiated scrub — the +0.001 nudge
+      // would compete with the drag and visibly skip the playhead.
+      if (scrubbingRef.current || video.seeking) return;
+      const now = Date.now();
+      while (kicks.length && kicks[0] < now - KICK_WINDOW_MS) kicks.shift();
+      if (kicks.length >= MAX_KICKS) {
+        setError("Playback stalled and could not recover. Try refreshing.");
+        return;
+      }
+      kicks.push(now);
+      lastAdvanceAt = now;
+      lastTime = video.currentTime;
+      const hls = hlsRef.current;
+      if (hls) {
+        try {
+          hls.startLoad();
+        } catch {}
+      }
+      try {
+        // Tiny forward nudge wakes a wedged decoder. A no-op assignment
+        // is sometimes ignored; +0.001 forces a real seek that pulls
+        // the next available sample from the source buffer. Capped at
+        // duration so we don't try to seek past the end.
+        const target = video.currentTime + 0.001;
+        if (
+          !Number.isFinite(video.duration) ||
+          target < video.duration - 0.1
+        ) {
+          video.currentTime = target;
+        }
+      } catch {}
+      void video.play().catch(() => {});
+      // Re-arm the waiting timer if the kick was triggered by it —
+      // a kick that didn't help should trigger another after the
+      // same threshold.
+      if (reason === "waiting" && waitingTimer === null) {
+        waitingTimer = window.setTimeout(
+          () => tryKick("waiting"),
+          WAITING_TIMEOUT_MS,
+        );
+      }
+    };
+    const onWaiting = () => {
+      if (waitingTimer !== null) return;
+      waitingTimer = window.setTimeout(
+        () => tryKick("waiting"),
+        WAITING_TIMEOUT_MS,
+      );
+    };
+    const cancelWaiting = () => {
+      if (waitingTimer !== null) {
+        window.clearTimeout(waitingTimer);
+        waitingTimer = null;
+      }
+    };
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("playing", cancelWaiting);
+    video.addEventListener("pause", cancelWaiting);
+    video.addEventListener("seeking", cancelWaiting);
+    const onTick = () => {
+      if (video.paused || video.ended || video.seeking) {
+        lastAdvanceAt = Date.now();
+        lastTime = video.currentTime;
+        return;
+      }
+      if (video.currentTime > lastTime + 0.05) {
+        lastAdvanceAt = Date.now();
+        lastTime = video.currentTime;
+        return;
+      }
+      if (Date.now() - lastAdvanceAt < POLL_STALL_MS) return;
+      tryKick("poll");
+    };
+    const interval = window.setInterval(onTick, 2000);
+    return () => {
+      window.clearInterval(interval);
+      cancelWaiting();
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("playing", cancelWaiting);
+      video.removeEventListener("pause", cancelWaiting);
+      video.removeEventListener("seeking", cancelWaiting);
+    };
+  }, []);
+
   // Apply persisted prefs (volume, muted, playback rate) on mount.
   useEffect(() => {
     const video = videoRef.current;
@@ -1243,6 +1482,107 @@ export function ChimpFlixPlayer({
     };
   }, []);
 
+  // Screen Wake Lock. While the user is actively watching (playing,
+  // page visible) we hold a screen wake lock so the phone doesn't dim
+  // and turn off mid-episode. The lock auto-releases on visibility
+  // change to hidden (browser policy) so we re-acquire on the visible
+  // transition. Gracefully no-op on browsers without the API.
+  useEffect(() => {
+    if (typeof navigator === "undefined") return;
+    const wl = (navigator as Navigator & {
+      wakeLock?: {
+        request: (type: "screen") => Promise<{
+          released: boolean;
+          release: () => Promise<void>;
+        }>;
+      };
+    }).wakeLock;
+    if (!wl) return;
+    let sentinel: { release: () => Promise<void> } | null = null;
+    let cancelled = false;
+    const acquire = async () => {
+      if (cancelled || !playing) return;
+      if (document.visibilityState !== "visible") return;
+      try {
+        const s = await wl.request("screen");
+        if (cancelled) {
+          await s.release().catch(() => {});
+          return;
+        }
+        sentinel = s;
+      } catch {
+        // NotAllowed (page hidden, low battery saver, etc.) — skip.
+      }
+    };
+    const release = async () => {
+      const s = sentinel;
+      sentinel = null;
+      if (s) await s.release().catch(() => {});
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void acquire();
+      }
+    };
+    if (playing) void acquire();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      cancelled = true;
+      void release();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [playing]);
+
+  // Media Session API. Wires up lock-screen and notification-shade
+  // playback controls on Android (and iOS Safari). Without this the
+  // OS shows generic "Chrome is playing audio" controls; with it we
+  // get title and play/pause/seek buttons. Seeks route through
+  // `seekByRef` so transcode sessions (HLS media-time != source-time)
+  // get the same source-time-aware seek path as the on-screen buttons —
+  // calling video.currentTime directly here would jump to the wrong
+  // position once `-ss N` offset is in play.
+  useEffect(() => {
+    if (typeof navigator === "undefined") return;
+    if (!("mediaSession" in navigator)) return;
+    const ms = navigator.mediaSession;
+    const v = videoRef.current;
+    if (!v) return;
+    ms.metadata = new MediaMetadata({
+      title,
+      artist: subtitle ?? undefined,
+    });
+    const onPlay = () => {
+      void v.play().catch(() => {});
+    };
+    const onPause = () => v.pause();
+    const onSeekBackward = (details: MediaSessionActionDetails) => {
+      const offset = details.seekOffset ?? 10;
+      seekByRef.current?.(-offset);
+    };
+    const onSeekForward = (details: MediaSessionActionDetails) => {
+      const offset = details.seekOffset ?? 10;
+      seekByRef.current?.(offset);
+    };
+    try {
+      ms.setActionHandler("play", onPlay);
+      ms.setActionHandler("pause", onPause);
+      ms.setActionHandler("seekbackward", onSeekBackward);
+      ms.setActionHandler("seekforward", onSeekForward);
+    } catch {
+      // Some browsers don't support all action types.
+    }
+    return () => {
+      try {
+        ms.setActionHandler("play", null);
+        ms.setActionHandler("pause", null);
+        ms.setActionHandler("seekbackward", null);
+        ms.setActionHandler("seekforward", null);
+      } catch {
+        // ignore
+      }
+    };
+  }, [title, subtitle]);
+
   // Periodic play-state updates + scrobble at threshold.
   useEffect(() => {
     const video = videoRef.current;
@@ -1274,26 +1614,53 @@ export function ChimpFlixPlayer({
           duration_ms: knownDurationMs,
         })
         .catch(() => {});
-      if (
-        !scrobbledRef.current &&
-        knownDurationMs &&
-        positionMs / knownDurationMs >= SCROBBLE_THRESHOLD
-      ) {
-        scrobbledRef.current = true;
-        playStateApi.scrobble(target).catch(() => {});
+      if (!scrobbledRef.current && knownDurationMs) {
+        // Threshold scrobble: position past the configured percentage.
+        const pastThreshold =
+          positionMs / knownDurationMs >= scrobbleThreshold;
+        // Credits-marker scrobble: any auto-detected `credits` marker
+        // whose start_ms we've passed. Used when the operator picks
+        // `first_credits_marker` or `earliest_of_both`. The first
+        // such marker (markers are sorted by start_ms upstream) wins.
+        const behaviour = completionBehaviour ?? "threshold_pct";
+        const wantMarker =
+          behaviour === "first_credits_marker" ||
+          behaviour === "earliest_of_both";
+        const firstCredits = wantMarker
+          ? markers?.find((m) => m.kind === "credits") ?? null
+          : null;
+        const pastCreditsMarker =
+          firstCredits != null && positionMs >= firstCredits.start_ms;
+        // `first_credits_marker` falls back to the threshold when the
+        // file has no marker — otherwise long files without detected
+        // markers would never scrobble.
+        const shouldScrobble = (() => {
+          switch (behaviour) {
+            case "first_credits_marker":
+              return firstCredits ? pastCreditsMarker : pastThreshold;
+            case "earliest_of_both":
+              return pastCreditsMarker || pastThreshold;
+            default:
+              return pastThreshold;
+          }
+        })();
+        if (shouldScrobble) {
+          scrobbledRef.current = true;
+          playStateApi.scrobble(target).catch(() => {});
+        }
       }
     }
 
     const interval = window.setInterval(report, PLAY_STATE_INTERVAL_MS);
     const onPause = () => {
+      // Just persist position. We used to also SIGSTOP ffmpeg here to
+      // save GPU during long pauses, but the mobile-PWA pause/play
+      // event pair is unreliable (Chrome PWA fires `pause` on visibility
+      // hints + various lifecycle moments without a matching `play`),
+      // which left ffmpeg permanently SIGSTOP'd and the player wedged.
+      // NVENC is cheap enough that letting the encoder run ahead is
+      // strictly better than the leak risk.
       report();
-      // Tell the backend to SIGSTOP its ffmpeg child while the user
-      // is paused — stops the encoder from filling the segment cache
-      // and frees the GPU for other sessions on the box. The keepalive
-      // ping continues independently so the server's idle reaper
-      // doesn't kill the session while it's paused. Fire-and-forget.
-      const sid = activeSessionIdRef.current;
-      if (sid) streamApi.pauseSession(sid).catch(() => {});
     };
     const onEnded = () => report();
     // Seeking is the one input where a 10 s poll can drop the user's
@@ -1314,7 +1681,69 @@ export function ChimpFlixPlayer({
       video.removeEventListener("seeked", onSeeked);
       report();
     };
-  }, [itemId, episodeId, videoDuration]);
+  }, [itemId, episodeId, videoDuration, scrobbleThreshold, markers, completionBehaviour]);
+
+  // Stats: emit `pause` / `resume` events for the admin Stats engagement
+  // metrics. Pause is debounced 3s so seek-driven micro-pauses don't
+  // flood the events table — only intentional "I stepped away" pauses
+  // count. Resume only fires when a preceding pause was actually
+  // emitted, so a transient pause→play (seek, autoplay handoff) is a
+  // no-op end-to-end. Fire-and-forget; the stats DB can never disrupt
+  // playback.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (itemId == null && episodeId == null) return;
+    const target: { item_id?: number; episode_id?: number } = episodeId
+      ? { episode_id: episodeId }
+      : { item_id: itemId };
+
+    let pendingPause: number | null = null;
+    let pauseEmitted = false;
+
+    const positionMs = () =>
+      Math.floor(video.currentTime * 1000 + sessionStartMsRef.current);
+
+    const cancelPending = () => {
+      if (pendingPause != null) {
+        window.clearTimeout(pendingPause);
+        pendingPause = null;
+      }
+    };
+
+    const onPause = () => {
+      cancelPending();
+      // 3s debounce — quick pauses from seek/autoplay handoff don't
+      // count. The browser fires `pause` ahead of `seeking` for
+      // user-initiated seeks, so debouncing here also covers that
+      // path without a separate seek listener.
+      pendingPause = window.setTimeout(() => {
+        pendingPause = null;
+        if (!video.paused) return;
+        playStateApi
+          .event({ kind: "pause", position_ms: positionMs(), ...target })
+          .catch(() => {});
+        pauseEmitted = true;
+      }, 3_000);
+    };
+
+    const onPlay = () => {
+      cancelPending();
+      if (!pauseEmitted) return;
+      pauseEmitted = false;
+      playStateApi
+        .event({ kind: "resume", position_ms: positionMs(), ...target })
+        .catch(() => {});
+    };
+
+    video.addEventListener("pause", onPause);
+    video.addEventListener("play", onPlay);
+    return () => {
+      cancelPending();
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("play", onPlay);
+    };
+  }, [itemId, episodeId]);
 
   // Auto-advance to next episode.
   useEffect(() => {
@@ -1328,66 +1757,6 @@ export function ChimpFlixPlayer({
     video.addEventListener("ended", onEnded);
     return () => video.removeEventListener("ended", onEnded);
   }, [nextHref, router, autoNextCancelled, prefs.autoplayNext]);
-
-  // Bandwidth-aware quality downgrade — only as a last-resort
-  // session restart. HLS.js handles the common case in-session via
-  // ABR: the master playlist advertises both the primary and
-  // fallback variants, and HLS.js picks adaptively based on its own
-  // bandwidth estimate. We only kick a server-side session restart
-  // when even the fallback variant can't keep up — meaning the
-  // client is too slow for the lowest ABR tier we ship (typically
-  // 480p / 1.2 Mbps).
-  //
-  // The threshold is HLS.js's currently-loaded level's bitrate × 0.8.
-  // When that holds for ≥ 3 consecutive samples (15 s wall clock)
-  // AND HLS.js is already pinned to the lowest level it can pick,
-  // we step the entire session down to the next quality tier below
-  // what's currently the lowest. Anything HLS.js can handle in-
-  // session is left to HLS.js.
-  useEffect(() => {
-    // Auto only. An explicit user pick respects their intent.
-    if (qualitySel.height !== null) return;
-    const resolved = sessionStatus?.height;
-    if (!resolved) return;
-    const SAMPLE_INTERVAL_MS = 5_000;
-    const REQUIRED_LOW_SAMPLES = 3;
-    let consecutiveLow = 0;
-    const tick = window.setInterval(() => {
-      const hls = hlsRef.current;
-      if (!hls) return;
-      const levels = hls.levels;
-      if (!levels || levels.length === 0) return;
-      const lowestLevelIdx = 0; // levels are sorted ascending by bitrate
-      // If HLS.js isn't already on the lowest level (or auto-picked
-      // it), let HLS.js's own ABR handle the downshift — no server
-      // restart needed.
-      const activeLevel =
-        hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel;
-      if (activeLevel !== lowestLevelIdx) return;
-      const lowestBitrate = levels[lowestLevelIdx].bitrate;
-      const bw = hls.bandwidthEstimate;
-      if (!Number.isFinite(bw) || bw <= 0) return;
-      if (bw < lowestBitrate * 0.8) {
-        consecutiveLow += 1;
-      } else {
-        consecutiveLow = 0;
-      }
-      if (consecutiveLow >= REQUIRED_LOW_SAMPLES) {
-        // Find a tier below the current resolved one. If we're
-        // already at the bottom of the picker, leave alone — the
-        // user is just on a too-slow link and a restart wouldn't
-        // help.
-        const nextDown = QUALITY_OPTIONS.find(
-          (q) => q.height !== null && q.height < resolved,
-        );
-        if (!nextDown) return;
-        window.clearInterval(tick);
-        setQualitySel(nextDown);
-      }
-    }, SAMPLE_INTERVAL_MS);
-    return () => window.clearInterval(tick);
-  }, [qualitySel.height, sessionStatus?.height]);
-
 
   // Idle-hide controls.
   const resetHide = useCallback(() => {
@@ -1478,6 +1847,102 @@ export function ChimpFlixPlayer({
     },
     [seekTo],
   );
+  // Keep the late-bound ref pointed at the latest seekBy so MediaSession
+  // and any other early-declared callback can call through it.
+  useEffect(() => {
+    seekByRef.current = seekBy;
+  }, [seekBy]);
+
+  /// Double-tap-to-seek for touch devices. Tap the left third → -10s,
+  /// the right third → +10s. Single tap on the video still toggles
+  /// play/pause; we suppress that toggle on the SECOND tap of a
+  /// double-tap so the user doesn't get two play state flips. Mouse
+  /// clicks bypass this entirely and go straight to togglePlay (the
+  /// existing onClick handler) — Chrome fires both pointerup and click
+  /// on a mouse, so we identify mice via `pointerType !== "touch"`.
+  const lastTapRef = useRef<{ at: number; x: number; w: number } | null>(null);
+  const seekFlashIdRef = useRef(0);
+  const suppressNextClickRef = useRef(false);
+  const lastClickPointerTypeRef = useRef<"mouse" | "touch" | "pen">("mouse");
+  const onVideoPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLVideoElement>) => {
+      // Capture the pointer type so the subsequent synthetic `click`
+      // can branch on touch-vs-mouse semantics (touch → toggle controls,
+      // mouse → toggle play).
+      lastClickPointerTypeRef.current =
+        e.pointerType === "touch" || e.pointerType === "pen"
+          ? e.pointerType
+          : "mouse";
+      // Mouse + pen keep the original tap-to-play-or-pause flow. Only
+      // touch gets the seek gesture.
+      if (e.pointerType !== "touch") return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const w = rect.width;
+      const now = Date.now();
+      const prev = lastTapRef.current;
+      // Same horizontal third + within 280ms = double-tap.
+      const sameSide = (a: number, b: number) =>
+        (a < w / 3 && b < w / 3) || (a > (2 * w) / 3 && b > (2 * w) / 3);
+      if (prev && now - prev.at < 280 && sameSide(prev.x, x)) {
+        e.preventDefault();
+        // Swallow the click that the browser would otherwise emit for
+        // the second tap — stops it from also triggering togglePlay.
+        // `stopPropagation` doesn't suppress the click; the synthetic
+        // click fires from the touch sequence regardless. So we set a
+        // ref that the video's onClick checks and ignores once. The
+        // timeout guards against the case where the synthetic click
+        // never fires (touch cancelled, finger dragged off target):
+        // without it, the suppression would leak and silently swallow
+        // an unrelated subsequent tap.
+        suppressNextClickRef.current = true;
+        window.setTimeout(() => {
+          suppressNextClickRef.current = false;
+        }, 500);
+        const delta = x < w / 2 ? -10 : 10;
+        seekBy(delta);
+        seekFlashIdRef.current += 1;
+        setSeekFlash({
+          side: delta < 0 ? "left" : "right",
+          delta,
+          nonce: seekFlashIdRef.current,
+        });
+        // Auto-clear the flash after the animation finishes so a
+        // re-tap of the same side fires a fresh animation rather than
+        // continuing the previous one.
+        const myNonce = seekFlashIdRef.current;
+        window.setTimeout(() => {
+          setSeekFlash((cur) => (cur?.nonce === myNonce ? null : cur));
+        }, 650);
+        lastTapRef.current = null;
+        return;
+      }
+      lastTapRef.current = { at: now, x, w };
+    },
+    [seekBy],
+  );
+  const onVideoClick = useCallback(() => {
+    if (suppressNextClickRef.current) {
+      suppressNextClickRef.current = false;
+      return;
+    }
+    // Mobile vs desktop tap semantics: on touch, a tap reveals/hides the
+    // controls overlay so the user can then pick a control (play, seek,
+    // tracks). Pause-on-tap is a desktop pattern that's actively wrong
+    // on phones — every tap pausing makes the menu buttons feel
+    // unresponsive because the user has to "wake" the controls without
+    // also pausing playback. On mouse, tap-to-toggle-play stays.
+    if (lastClickPointerTypeRef.current === "touch") {
+      setShowControls((v) => !v);
+      if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = window.setTimeout(() => {
+        const vid = videoRef.current;
+        if (vid && !vid.paused) setShowControls(false);
+      }, 3000);
+      return;
+    }
+    togglePlay();
+  }, [togglePlay]);
 
   // Scrub-time pre-warm. Called by ProgressBar after the user holds
   // a drag position for ~350 ms. Fires a `createSession` at the
@@ -1545,7 +2010,7 @@ export function ChimpFlixPlayer({
           // takes the normal cold-start path.
         });
     },
-    [activeMediaFileId, audioSel, subtitleSel, qualitySel],
+    [activeMediaFileId, audioSel, subtitleSel, qualitySel, subtitleOffsetMs],
   );
 
   // Auto-skip intros. Fires once per intro per session: when the
@@ -1553,9 +2018,12 @@ export function ChimpFlixPlayer({
   // remember the start_ms so a user who manually scrubs back doesn't
   // get yanked forward again. Credits markers are intentionally NOT
   // auto-skipped — many shows put post-credits scenes in there.
+  // Suppressed during scrubbing so a user dragging through an intro
+  // region doesn't get the playhead yanked to the credits mid-drag.
   useEffect(() => {
     if (!prefs.autoSkipIntro) return;
     if (!activeMarkerOverlay || activeMarkerOverlay.kind !== "intro") return;
+    if (scrubbingRef.current) return;
     if (skippedIntrosRef.current.has(activeMarkerOverlay.start_ms)) return;
     skippedIntrosRef.current.add(activeMarkerOverlay.start_ms);
     seekTo(activeMarkerOverlay.end_ms / 1000);
@@ -1569,11 +2037,28 @@ export function ChimpFlixPlayer({
   }, []);
 
   const toggleFullscreen = useCallback(() => {
+    // Standard path first — works on every desktop browser + Android
+    // Chrome and the Chrome PWA on every platform we care about.
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
-    } else {
-      containerRef.current?.requestFullscreen().catch(() => {});
+      return;
     }
+    if (containerRef.current?.requestFullscreen) {
+      containerRef.current
+        .requestFullscreen()
+        .catch(() => {
+          // Spec-compliant call rejected; try the iOS Safari
+          // video-element path below as a fallback.
+          tryWebkitVideoFullscreen(videoRef.current);
+        });
+      return;
+    }
+    // iOS Safari (including standalone PWAs) doesn't implement
+    // Element.requestFullscreen for arbitrary elements — only
+    // HTMLVideoElement.webkitEnterFullscreen on the video itself.
+    // Falls back to that here so iPhone users can actually go
+    // fullscreen from the player UI.
+    tryWebkitVideoFullscreen(videoRef.current);
   }, []);
 
   const togglePip = useCallback(async () => {
@@ -1732,6 +2217,14 @@ export function ChimpFlixPlayer({
           setStatsOpen((v) => !v);
           resetHide();
           break;
+        case "?":
+          // Shift+/ on US layouts, ? on most others. Toggle the
+          // shortcut overlay so first-time users can discover the
+          // hotkeys without RTFM.
+          e.preventDefault();
+          setHotkeysOpen((v) => !v);
+          resetHide();
+          break;
         case ">":
         case ".":
           if (e.shiftKey || e.key === ">") {
@@ -1781,7 +2274,8 @@ export function ChimpFlixPlayer({
         ref={videoRef}
         playsInline
         autoPlay
-        onClick={togglePlay}
+        onClick={onVideoClick}
+        onPointerUp={onVideoPointerUp}
         crossOrigin="anonymous"
         className={`h-full w-full bg-black ${cueClass}`}
       >
@@ -1810,11 +2304,42 @@ export function ChimpFlixPlayer({
         />
       )}
 
+      {hotkeysOpen && (
+        <HotkeysOverlay onClose={() => setHotkeysOpen(false)} />
+      )}
+
+      {/* Double-tap-seek flash overlay (touch only). The `key` forces a
+          remount on each new seek so the CSS animation restarts even
+          when the side is unchanged. */}
+      {seekFlash && (
+        <div
+          key={seekFlash.nonce}
+          aria-hidden
+          className={`zf-seek-flash pointer-events-none absolute top-1/2 z-30 flex h-32 w-32 -translate-y-1/2 items-center justify-center rounded-full bg-white/15 backdrop-blur-sm ${
+            seekFlash.side === "left" ? "left-4 sm:left-12" : "right-4 sm:right-12"
+          }`}
+        >
+          <div className="flex flex-col items-center text-white">
+            {seekFlash.side === "left" ? (
+              <Rewind10Icon />
+            ) : (
+              <Forward10Icon />
+            )}
+            <span className="mt-1 text-xs font-semibold">
+              {seekFlash.delta > 0 ? "+10s" : "-10s"}
+            </span>
+          </div>
+        </div>
+      )}
+
       {activeMarkerOverlay && (
         <button
           type="button"
           onClick={() => seekTo(activeMarkerOverlay.end_ms / 1000)}
-          className="pointer-events-auto absolute bottom-32 right-8 z-30 rounded-md border border-white/30 bg-white/95 px-6 py-2.5 text-sm font-semibold text-black shadow-2xl transition-all hover:scale-[1.03] hover:bg-white"
+          // Sits just above the control bar; on mobile we keep it
+          // closer to the right edge but reachable (smaller padding,
+          // 12rem from bottom to clear the wider mobile control row).
+          className="pointer-events-auto absolute bottom-28 right-3 z-30 rounded-md border border-white/30 bg-white/95 px-4 py-2 text-sm font-semibold text-black shadow-2xl transition-all hover:scale-[1.03] hover:bg-white sm:bottom-32 sm:right-8 sm:px-6 sm:py-2.5"
         >
           {markerLabel(activeMarkerOverlay)}
         </button>
@@ -1841,23 +2366,40 @@ export function ChimpFlixPlayer({
           showControls ? "opacity-100" : "opacity-0"
         }`}
       >
-        {/* Top bar — minimal: back affordance only. */}
+        {/* Top bar — back link + title (title hides on desktop because
+            the bottom row already shows it there). */}
         <div className="pointer-events-auto absolute inset-x-0 top-0 bg-linear-to-b from-black/80 to-transparent">
-          <div className="flex items-start gap-6 px-8 py-5">
+          <div className="flex items-center gap-3 pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] pt-[max(0.75rem,env(safe-area-inset-top))] pb-3 sm:gap-6 sm:pl-[max(2rem,env(safe-area-inset-left))] sm:pr-[max(2rem,env(safe-area-inset-right))] sm:pt-[max(1.25rem,env(safe-area-inset-top))] sm:pb-5">
             <Link
               href={backHref}
               aria-label="Back"
-              className="flex items-center gap-2 rounded-full p-2 -m-2 text-white/85 transition-colors hover:text-white"
+              className="flex shrink-0 items-center gap-2 rounded-full p-2 -m-2 text-white/85 transition-colors hover:text-white"
             >
               <BackIcon />
-              <span className="text-sm font-medium">Back</span>
+              <span className="hidden text-sm font-medium sm:inline">Back</span>
             </Link>
+            {/* Title in the top bar on mobile only — desktop keeps it
+                centered in the bottom row where it's always paired with
+                the controls. */}
+            <div className="min-w-0 flex-1 sm:hidden">
+              <div className="truncate text-sm font-semibold leading-tight">
+                {title}
+              </div>
+              {subtitle && (
+                <div className="mt-0.5 truncate text-xs text-white/70">
+                  {subtitle}
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
-        {/* Bottom controls. */}
-        <div className="pointer-events-auto absolute inset-x-0 bottom-0 bg-linear-to-t from-black/85 to-transparent px-8 pb-6 pt-16">
-          <div className="flex items-center gap-3">
+        {/* Bottom controls. Tighter padding on phones so the button row
+            doesn't get crowded; mobile chrome already has thumb-reach
+            margins via the bottom-bar gradient. Safe-area-inset offsets
+            push controls clear of iOS home indicator + landscape notch. */}
+        <div className="pointer-events-auto absolute inset-x-0 bottom-0 bg-linear-to-t from-black/85 to-transparent pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-12 sm:pl-[max(2rem,env(safe-area-inset-left))] sm:pr-[max(2rem,env(safe-area-inset-right))] sm:pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:pt-16">
+          <div className="flex items-center gap-2 sm:gap-3">
             {/*
               Current position, left of the bar. Always visible so the
               user can see exactly where they are without having to
@@ -1875,6 +2417,9 @@ export function ChimpFlixPlayer({
                 bufferedEnd={bufferedEnd}
                 onSeek={seekTo}
                 onSeekHint={prewarmAtPosition}
+                onScrubChange={(s) => {
+                  scrubbingRef.current = s;
+                }}
                 previewManifest={previewManifest}
                 markers={markers}
               />
@@ -1893,8 +2438,8 @@ export function ChimpFlixPlayer({
             </button>
           </div>
 
-          <div className="mt-2 flex items-center gap-4">
-            <div className="flex shrink-0 items-center gap-5">
+          <div className="mt-2 flex items-center gap-2 sm:gap-4">
+            <div className="flex shrink-0 items-center gap-1 sm:gap-5">
               <IconButton
                 onClick={togglePlay}
                 aria-label={playing ? "Pause" : "Play"}
@@ -1920,7 +2465,10 @@ export function ChimpFlixPlayer({
                 onVolumeChange={setVolumeValue}
               />
             </div>
-            <div className="min-w-0 grow text-center">
+            {/* Hide the title strip on phones — the bottom row needs
+                every pixel for controls. Title is in the top bar
+                already on mobile via the back-link area. */}
+            <div className="hidden min-w-0 grow text-center sm:block">
               <div className="truncate text-sm font-semibold leading-tight">
                 {title}
               </div>
@@ -1930,7 +2478,7 @@ export function ChimpFlixPlayer({
                 </div>
               )}
             </div>
-            <div className="flex shrink-0 items-center gap-5">
+            <div className="ml-auto flex shrink-0 items-center gap-1 sm:ml-0 sm:gap-5">
               {nextHref && (
                 <Link
                   href={nextHref}
@@ -1975,6 +2523,10 @@ export function ChimpFlixPlayer({
                 onClose={() => setSpeedOpen(false)}
                 onSelect={setSpeed}
               />
+              <ChaptersControl
+                mediaFileId={mediaFileId}
+                onSeekTo={seekTo}
+              />
               <IconButton
                 onClick={togglePip}
                 aria-label={
@@ -2018,7 +2570,7 @@ function IconButton({
     <button
       type="button"
       {...props}
-      className={`flex h-10 w-10 items-center justify-center text-white/90 transition-colors hover:text-white ${className}`}
+      className={`flex h-11 w-11 items-center justify-center text-white/90 transition-colors hover:text-white ${className}`}
     >
       {children}
     </button>
@@ -2129,7 +2681,11 @@ function TracksControl({
       {open && (
         <div
           role="menu"
-          className={`absolute bottom-full right-0 mb-3 grid overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm ${widthClass}`}
+          // Bottom-sheet on phones: full-width minus 0.5rem margin,
+          // pinned to the bottom of the viewport, scrollable if the
+          // contents overflow. Reverts to the anchored popover at sm+
+          // so the existing desktop layout is untouched.
+          className={`fixed inset-x-2 bottom-2 z-50 grid max-h-[75vh] overflow-y-auto rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:max-h-none sm:overflow-hidden ${widthClass}`}
         >
           {hasVersion && (
             <VersionColumn
@@ -2336,7 +2892,7 @@ function SubtitleSettingsControl({
       {open && (
         <div
           role="menu"
-          className="absolute bottom-full right-0 mb-3 w-96 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
+          className="fixed inset-x-2 bottom-2 z-50 max-h-[75vh] overflow-y-auto rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:max-h-none sm:w-96 sm:overflow-hidden"
         >
           <div className="border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
             Subtitle settings
@@ -2653,7 +3209,7 @@ function NextEpisodeCountdown({
   onCancel: () => void;
 }) {
   return (
-    <div className="pointer-events-auto absolute bottom-28 right-8 z-30 w-80 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm">
+    <div className="pointer-events-auto absolute bottom-24 right-2 left-2 z-30 max-w-sm overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:bottom-28 sm:right-8 sm:left-auto sm:w-80">
       {thumb && (
         // eslint-disable-next-line @next/next/no-img-element
         <img
@@ -2744,7 +3300,10 @@ function VolumeControl({
         aria-valuemin={0}
         aria-valuemax={1}
         aria-valuenow={effectiveVolume}
-        className={`relative h-1 cursor-pointer overflow-hidden rounded-full bg-white/30 transition-all duration-150 ${
+        // Hidden on mobile — touch users adjust volume via OS controls,
+        // and a hover-reveal slider is unreachable without a pointer.
+        // The mute toggle stays available for both.
+        className={`relative hidden h-1 cursor-pointer overflow-hidden rounded-full bg-white/30 transition-all duration-150 sm:block ${
           hovered ? "ml-1 w-24 opacity-100" : "ml-0 w-0 opacity-0"
         }`}
       >
@@ -2801,7 +3360,7 @@ function SpeedControl({
       {open && (
         <div
           role="menu"
-          className="absolute bottom-full right-0 mb-3 w-32 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
+          className="fixed inset-x-2 bottom-2 z-50 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:w-32"
         >
           <ul className="py-2">
             {SPEED_OPTIONS.map((opt) => {
@@ -2897,7 +3456,7 @@ function EpisodesControl({
       {open && (
         <div
           role="menu"
-          className="absolute bottom-full right-0 mb-3 w-md overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm"
+          className="fixed inset-x-2 bottom-2 z-50 max-h-[75vh] overflow-y-auto rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:max-h-none sm:w-md sm:overflow-hidden"
         >
           {seasonLabel && (
             <div className="border-b border-white/10 px-4 py-3 text-sm font-semibold">
@@ -2971,6 +3530,101 @@ function EpisodeRow({
         </div>
       </Link>
     </li>
+  );
+}
+
+function HotkeysOverlay({ onClose }: { onClose: () => void }) {
+  // Esc to dismiss. The player's global keyboard handler also has a
+  // `?` toggle so opening + closing with the same key works without
+  // needing a second listener here.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  // Two columns of {keys, action} for the hotkey reference. Keep the
+  // action labels short — this overlay isn't documentation, it's a
+  // glance-and-go reminder. `?` toggles itself so the user can
+  // dismiss with the same key they opened it with.
+  const groups: ReadonlyArray<{ title: string; items: ReadonlyArray<[string, string]> }> = [
+    {
+      title: "Playback",
+      items: [
+        ["Space / k", "Play / Pause"],
+        ["←  /  →", "Seek 10s back / fwd"],
+        ["j  /  l", "Seek 10s back / fwd"],
+        ["Home / End", "Seek to start / end"],
+        [".  /  ,", "Speed up / slow down"],
+      ],
+    },
+    {
+      title: "Volume + display",
+      items: [
+        ["↑  /  ↓", "Volume up / down"],
+        ["m", "Mute"],
+        ["f", "Fullscreen"],
+        ["p", "Picture-in-picture"],
+        ["c", "Toggle subtitles"],
+      ],
+    },
+    {
+      title: "Overlays",
+      items: [
+        ["s", "Stats for nerds"],
+        ["?", "This help"],
+        ["Esc", "Close overlay"],
+      ],
+    },
+  ];
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Keyboard shortcuts"
+      className="absolute inset-0 z-40 flex items-center justify-center bg-black/80 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-full w-full max-w-2xl overflow-y-auto rounded-lg border border-white/20 bg-neutral-950/95 p-6 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-baseline justify-between gap-2">
+          <h2 className="text-lg font-semibold">Keyboard shortcuts</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs text-white/55 hover:text-white"
+          >
+            Close (Esc)
+          </button>
+        </div>
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+          {groups.map((g) => (
+            <div key={g.title}>
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-white/45">
+                {g.title}
+              </h3>
+              <dl className="space-y-1.5">
+                {g.items.map(([keys, action]) => (
+                  <div
+                    key={keys}
+                    className="flex items-baseline justify-between gap-3"
+                  >
+                    <dt className="font-mono text-xs text-white/85">{keys}</dt>
+                    <dd className="text-right text-xs text-white/65">{action}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3257,6 +3911,7 @@ function ProgressBar({
   bufferedEnd,
   onSeek,
   onSeekHint,
+  onScrubChange,
   previewManifest,
   markers,
 }: {
@@ -3273,6 +3928,11 @@ function ProgressBar({
   /// session at the target so the actual seek-on-release is near-
   /// instant. Optional — ProgressBar works without it.
   onSeekHint?: (t: number) => void;
+  /// Fires whenever the user enters / exits scrub mode. The parent
+  /// uses this to suppress the stall watchdog's currentTime nudge and
+  /// the auto-skip-intro effect from firing mid-drag, both of which
+  /// would yank the playhead from under the user.
+  onScrubChange?: (scrubbing: boolean) => void;
   previewManifest?: PreviewManifest;
   /// Intro / credits / chapter regions to overlay as colored
   /// segments. Each marker spans [start_ms, end_ms] on the source
@@ -3292,6 +3952,23 @@ function ProgressBar({
   // would session-restart on every micromove past the buffer.
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const hintTimerRef = useRef<number | null>(null);
+  // Mirrored width of the progress track. Read during render to map
+  // `hoverX` → time; updated by a ResizeObserver. Storing in state
+  // (vs. reading trackRef.current.getBoundingClientRect() at render
+  // time) is what keeps the component pure under strict mode.
+  const [trackWidth, setTrackWidth] = useState(0);
+  useEffect(() => {
+    const node = trackRef.current;
+    if (!node) return;
+    setTrackWidth(node.getBoundingClientRect().width);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) setTrackWidth(entry.contentRect.width);
+    });
+    ro.observe(node);
+    return () => ro.disconnect();
+  }, []);
 
   const pointToTime = useCallback(
     (clientX: number): number => {
@@ -3310,6 +3987,7 @@ function ProgressBar({
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
     setScrubbing(true);
+    onScrubChange?.(true);
     const initial = pointToTime(e.clientX);
     setScrubTime(initial);
 
@@ -3335,6 +4013,7 @@ function ProgressBar({
     };
     const onUp = () => {
       setScrubbing(false);
+      onScrubChange?.(false);
       setScrubTime(null);
       if (hintTimerRef.current !== null) {
         window.clearTimeout(hintTimerRef.current);
@@ -3366,9 +4045,8 @@ function ProgressBar({
   const progress = duration > 0 ? (displayTime / duration) * 100 : 0;
   const expanded = hovering || scrubbing;
   const hoverTime =
-    hoverX !== null && duration > 0
-      ? (hoverX / (trackRef.current?.getBoundingClientRect().width ?? 1)) *
-        duration
+    hoverX !== null && duration > 0 && trackWidth > 0
+      ? (hoverX / trackWidth) * duration
       : null;
 
   return (
@@ -3833,23 +4511,3 @@ function SpeedIcon() {
   );
 }
 
-function StatsIcon() {
-  return (
-    <svg
-      width="22"
-      height="22"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <line x1="4" y1="20" x2="4" y2="12" />
-      <line x1="10" y1="20" x2="10" y2="6" />
-      <line x1="16" y1="20" x2="16" y2="14" />
-      <line x1="20" y1="20" x2="20" y2="9" />
-    </svg>
-  );
-}

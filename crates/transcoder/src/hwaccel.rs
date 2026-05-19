@@ -107,15 +107,161 @@ impl HwAccel {
     }
 
     fn is_available(self, caps: &TranscoderCapabilities) -> bool {
-        let encoder = match self {
-            Self::None => return true,
-            Self::Nvenc => "h264_nvenc",
-            Self::Qsv => "h264_qsv",
-            Self::Vaapi => "h264_vaapi",
-            Self::Videotoolbox => "h264_videotoolbox",
-            Self::Amf => "h264_amf",
+        self.is_available_for(VideoCodec::H264, caps)
+    }
+
+    /// Same idea as [`is_available`] but parameterised by output codec.
+    /// HEVC has its own per-vendor encoder names — `hevc_nvenc`,
+    /// `hevc_qsv`, etc. Software libx265 is always available when
+    /// the operator ships libx265 in the ffmpeg build (true for our
+    /// docker base, but not necessarily for a stripped distro
+    /// install), so we check `hevc_encoders` even for `Self::None`.
+    pub fn is_available_for(self, codec: VideoCodec, caps: &TranscoderCapabilities) -> bool {
+        let list = match codec {
+            VideoCodec::H264 => &caps.h264_encoders,
+            VideoCodec::Hevc => &caps.hevc_encoders,
         };
-        caps.h264_encoders.iter().any(|e| e == encoder)
+        let encoder = match (self, codec) {
+            (Self::None, VideoCodec::H264) => return true,
+            (Self::None, VideoCodec::Hevc) => "libx265",
+            (Self::Nvenc, VideoCodec::H264) => "h264_nvenc",
+            (Self::Nvenc, VideoCodec::Hevc) => "hevc_nvenc",
+            (Self::Qsv, VideoCodec::H264) => "h264_qsv",
+            (Self::Qsv, VideoCodec::Hevc) => "hevc_qsv",
+            (Self::Vaapi, VideoCodec::H264) => "h264_vaapi",
+            (Self::Vaapi, VideoCodec::Hevc) => "hevc_vaapi",
+            (Self::Videotoolbox, VideoCodec::H264) => "h264_videotoolbox",
+            (Self::Videotoolbox, VideoCodec::Hevc) => "hevc_videotoolbox",
+            (Self::Amf, VideoCodec::H264) => "h264_amf",
+            (Self::Amf, VideoCodec::Hevc) => "hevc_amf",
+        };
+        list.iter().any(|e| e == encoder)
+    }
+}
+
+/// Output video codec for a transcode session. Driven by
+/// `transcoder_hevc_encoding_mode` + client capability hint at
+/// session-create time. HEVC produces ~30% smaller files at the
+/// same visual quality but isn't universally supported in browsers
+/// (Safari yes, Chrome partial, Firefox no without
+/// `media.wmf.hevc.enabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+}
+
+impl VideoCodec {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+}
+
+impl HwAccel {
+    /// Codec-aware encoder argument generator. Mirrors `apply_encoder`
+    /// but switches the `-c:v` value (plus a few flag tweaks for HEVC)
+    /// based on the requested output codec. HEVC outputs are forced
+    /// to `main` profile + level 4.0 (the conservative-compat tier
+    /// that covers 1080p@60); 10-bit / 4K HEVC is a future expansion.
+    pub fn apply_encoder_for(
+        self,
+        cmd: &mut Command,
+        codec: VideoCodec,
+        bitrate_bps: u64,
+        preset: EncoderPreset,
+    ) {
+        if matches!(codec, VideoCodec::H264) {
+            self.apply_encoder(cmd, bitrate_bps, preset);
+            return;
+        }
+        let target = bitrate_bps.to_string();
+        let maxrate = (bitrate_bps + bitrate_bps / 16).to_string();
+        let bufsize = (bitrate_bps * 2).to_string();
+        match self {
+            Self::None => {
+                // libx265 presets line up with libx264's; same dial.
+                let p = match preset {
+                    EncoderPreset::Speed => "ultrafast",
+                    EncoderPreset::Balanced => "veryfast",
+                    EncoderPreset::Quality => "medium",
+                };
+                cmd.args(["-c:v", "libx265"])
+                    .args(["-preset", p])
+                    .args(["-b:v", &target])
+                    .args(["-maxrate", &maxrate])
+                    .args(["-bufsize", &bufsize])
+                    .args(["-pix_fmt", "yuv420p"])
+                    .args(["-tag:v", "hvc1"]); // fMP4/Safari friendly
+            }
+            Self::Nvenc => {
+                let p = match preset {
+                    EncoderPreset::Speed => "p1",
+                    EncoderPreset::Balanced => "p4",
+                    EncoderPreset::Quality => "p6",
+                };
+                cmd.args(["-c:v", "hevc_nvenc"])
+                    .args(["-preset", p])
+                    .args(["-tune", "ll"])
+                    .args(["-rc", "vbr"])
+                    .args(["-b:v", &target])
+                    .args(["-maxrate", &maxrate])
+                    .args(["-bufsize", &bufsize])
+                    .args(["-tag:v", "hvc1"]);
+            }
+            Self::Qsv => {
+                let p = match preset {
+                    EncoderPreset::Speed => "ultrafast",
+                    EncoderPreset::Balanced => "veryfast",
+                    EncoderPreset::Quality => "medium",
+                };
+                cmd.args(["-c:v", "hevc_qsv"])
+                    .args(["-preset", p])
+                    .args(["-b:v", &target])
+                    .args(["-maxrate", &maxrate])
+                    .args(["-bufsize", &bufsize])
+                    .args(["-tag:v", "hvc1"]);
+            }
+            Self::Vaapi => {
+                let q = match preset {
+                    EncoderPreset::Speed => "28",
+                    EncoderPreset::Balanced => "23",
+                    EncoderPreset::Quality => "18",
+                };
+                cmd.args(["-c:v", "hevc_vaapi"])
+                    .args(["-global_quality", q])
+                    .args(["-b:v", &target])
+                    .args(["-maxrate", &maxrate])
+                    .args(["-bufsize", &bufsize])
+                    .args(["-tag:v", "hvc1"]);
+            }
+            Self::Videotoolbox => {
+                let realtime = match preset {
+                    EncoderPreset::Speed => "1",
+                    EncoderPreset::Balanced | EncoderPreset::Quality => "0",
+                };
+                cmd.args(["-c:v", "hevc_videotoolbox"])
+                    .args(["-realtime", realtime])
+                    .args(["-b:v", &target])
+                    .args(["-maxrate", &maxrate])
+                    .args(["-tag:v", "hvc1"]);
+            }
+            Self::Amf => {
+                let q = match preset {
+                    EncoderPreset::Speed => "speed",
+                    EncoderPreset::Balanced => "balanced",
+                    EncoderPreset::Quality => "quality",
+                };
+                cmd.args(["-c:v", "hevc_amf"])
+                    .args(["-quality", q])
+                    .args(["-b:v", &target])
+                    .args(["-maxrate", &maxrate])
+                    .args(["-bufsize", &bufsize])
+                    .args(["-tag:v", "hvc1"]);
+            }
+        }
     }
 
     /// Short label for logs / dashboard rendering.
@@ -173,10 +319,38 @@ impl HwAccel {
     /// AV1 while a GTX 1050 doesn't) without baking a card-model
     /// database in here.
     pub fn pre_input_args(self, cmd: &mut Command, use_hwaccel_decode: bool) {
-        // VAAPI always needs the device declaration even when we're
-        // not asking for VAAPI decode — the encoder side uses it too.
+        self.pre_input_args_with_device(cmd, use_hwaccel_decode, "auto");
+    }
+
+    /// Variant that honors a per-session device override. `device` is
+    /// the value of `transcoder_gpu_device`: "auto" → driver-pick
+    /// (existing behaviour), a numeric index → NVENC `-gpu N`, a
+    /// `/dev/dri/renderD<N>` path → VAAPI device override. Garbage
+    /// values silently fall through to "auto" — bad combinations
+    /// (e.g. picking renderD128 when NVENC is active) shouldn't
+    /// kill playback, just lose the override.
+    pub fn pre_input_args_with_device(
+        self,
+        cmd: &mut Command,
+        use_hwaccel_decode: bool,
+        device: &str,
+    ) {
         if matches!(self, Self::Vaapi) {
-            cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
+            // Honor a VAAPI render-node override; fall through to the
+            // canonical D128 default when "auto" or any non-VAAPI
+            // value is passed.
+            let path = if device.starts_with("/dev/dri/renderD") {
+                device
+            } else {
+                "/dev/dri/renderD128"
+            };
+            cmd.args(["-vaapi_device", path]);
+        }
+        if matches!(self, Self::Nvenc) && device.chars().all(|c| c.is_ascii_digit()) && !device.is_empty() {
+            // NVENC selects the device via -gpu <index>. Has to land
+            // before -i. Skipped when device is "auto" (NVENC picks
+            // the first usable card).
+            cmd.args(["-gpu", device]);
         }
         if !use_hwaccel_decode {
             return;
@@ -378,6 +552,7 @@ mod tests {
             h264_encoders: h264.iter().map(|s| s.to_string()).collect(),
             hevc_encoders: vec![],
             decoders: Default::default(),
+            gpu_devices: vec![],
         }
     }
 

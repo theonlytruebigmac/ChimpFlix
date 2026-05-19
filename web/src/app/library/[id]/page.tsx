@@ -14,7 +14,6 @@ import {
 } from "@/lib/chimpflix-api";
 import { adaptItem } from "@/lib/chimpflix-adapt";
 import { requireUser } from "@/lib/chimpflix-server";
-import type { MediaItem } from "@/lib/chimpflix-types";
 
 const RAIL_PAGE_SIZE = 20;
 
@@ -93,11 +92,18 @@ async function LibraryHero({ lib, kind }: { lib: Library; kind: ItemKind }) {
     kind,
     page_size: 12,
   });
+  // Same rationale as HomeHero: accept items with art or thumb (Hero
+  // falls back to thumb internally), and render a nav-height spacer if
+  // the library is truly empty so the rails section clears the fixed
+  // TopNav.
   const pool = res.items
     .map(adaptItem)
-    .filter((it): it is MediaItem & { art: string } => Boolean(it.art))
+    .filter((it) => Boolean(it.art) || Boolean(it.thumb))
+    .sort((a, b) => (a.art ? -1 : 0) - (b.art ? -1 : 0))
     .slice(0, 5);
-  if (pool.length === 0) return null;
+  if (pool.length === 0) {
+    return <div className="h-20 md:h-24" aria-hidden />;
+  }
   return <Hero item={pool[pickHeroIndex(pool, `library-${lib.id}`)]} />;
 }
 

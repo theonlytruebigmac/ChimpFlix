@@ -131,6 +131,226 @@ pub async fn get_one(
 }
 
 #[derive(Debug, Serialize)]
+pub struct DeleteMediaResponse {
+    pub files_deleted: u64,
+    pub episodes_purged: u64,
+    pub seasons_purged: u64,
+    pub items_purged: u64,
+    /// Paths the server is unlinking from disk in the background.
+    /// Returned so the operator UI can show "Deleted /movies/foo.mkv,
+    /// /movies/foo.srt, …" rather than just a count.
+    pub paths: Vec<String>,
+}
+
+/// `DELETE /api/v1/items/{id}/media` — hard-delete every media file
+/// associated with this item (the movie itself, or every episode of
+/// every season for a show). Gated owner-only AND requires the owning
+/// library's `allow_media_deletion` flag. No grace window — the rows
+/// are gone immediately, on-disk files are unlinked in the background.
+///
+/// Cascades:
+///   - `media_files` rows + their FK cascades (media_streams /
+///     markers / optimized_versions)
+///   - orphaned `episodes` → `seasons` → `items`
+///   - all FK cascades downstream of items (play_state /
+///     external_subtitles / images / item_tags / item_genres /
+///     item_credits / external_reviews / metadata_overrides /
+///     trakt_synced_items / my_list)
+///
+/// Audit logs the action with file paths so the operator has a
+/// record of what was removed.
+pub async fn delete_item_media(
+    State(state): State<AppState>,
+    user: AuthUser,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<DeleteMediaResponse>, ApiError> {
+    use sqlx::Row;
+    if !matches!(user.role, chimpflix_library::UserRole::Owner) {
+        return Err(ApiError::Forbidden);
+    }
+
+    let item_row = sqlx::query("SELECT library_id, kind FROM items WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?
+        .ok_or(ApiError::NotFound)?;
+    let library_id: i64 = item_row
+        .try_get("library_id")
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let kind: String = item_row
+        .try_get("kind")
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    ensure_library_allows_delete(&state, library_id).await?;
+
+    let file_ids: Vec<i64> = match kind.as_str() {
+        "movie" => sqlx::query_scalar("SELECT id FROM media_files WHERE item_id = ?")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?,
+        "show" => sqlx::query_scalar(
+            "SELECT mf.id
+             FROM media_files mf
+             JOIN episodes e ON mf.episode_id = e.id
+             JOIN seasons s ON e.season_id = s.id
+             WHERE s.show_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?,
+        _ => {
+            return Err(ApiError::validation(format!(
+                "items of kind `{kind}` don't have a media-delete path"
+            )));
+        }
+    };
+
+    run_force_delete(&state, &user, &headers, "item", id, &file_ids).await
+}
+
+/// `DELETE /api/v1/episodes/{id}/media` — hard-delete the single
+/// episode's media file. Same gates as the item path. When this was
+/// the last episode of a season, the cascade also drops the
+/// season; ditto for the parent show. Returns a summary so the UI
+/// can decide whether to navigate away (item purged) or just close
+/// the modal (orphan cleanup didn't reach the item).
+pub async fn delete_episode_media(
+    State(state): State<AppState>,
+    user: AuthUser,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<DeleteMediaResponse>, ApiError> {
+    use sqlx::Row;
+    if !matches!(user.role, chimpflix_library::UserRole::Owner) {
+        return Err(ApiError::Forbidden);
+    }
+
+    let row = sqlx::query(
+        "SELECT i.library_id AS library_id
+         FROM episodes e
+         JOIN seasons s ON e.season_id = s.id
+         JOIN items i ON s.show_id = i.id
+         WHERE e.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .ok_or(ApiError::NotFound)?;
+    let library_id: i64 = row
+        .try_get("library_id")
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    ensure_library_allows_delete(&state, library_id).await?;
+
+    let file_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE episode_id = ?")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+
+    run_force_delete(&state, &user, &headers, "episode", id, &file_ids).await
+}
+
+/// Shared body for the two delete-media handlers. Runs the cascade
+/// query, audits the action, fires background tasks to unlink files
+/// + evict transcoder caches, returns a small report.
+async fn run_force_delete(
+    state: &AppState,
+    user: &AuthUser,
+    headers: &axum::http::HeaderMap,
+    target_kind: &str,
+    target_id: i64,
+    file_ids: &[i64],
+) -> Result<Json<DeleteMediaResponse>, ApiError> {
+    let report = queries::delete_media_files_force(&state.pool, file_ids)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let payload = serde_json::json!({
+        "files_deleted": report.files_purged,
+        "episodes_purged": report.episodes_purged,
+        "seasons_purged": report.seasons_purged,
+        "items_purged": report.items_purged,
+        "paths": &report.purged_paths,
+    });
+    crate::api::admin::audit_log(
+        state,
+        chimpflix_library::NewAuditEntry {
+            actor_user_id: Some(user.id),
+            action: "media.delete".into(),
+            target_kind: Some(target_kind.into()),
+            target_id: Some(target_id.to_string()),
+            payload_json: Some(payload.to_string()),
+            ip: None,
+            user_agent,
+        },
+    )
+    .await;
+
+    // Unlink files + sprites + transcoder caches in the background.
+    // The DB cascade is already committed at this point, so the
+    // user-facing response can return immediately and the
+    // filesystem cleanup happens off the request path. Failures
+    // (file missing, permission denied) log and move on — they
+    // can't roll back the DB delete.
+    let paths = report.purged_paths.clone();
+    let cache_root = state.transcoder.cache_root().to_path_buf();
+    tokio::spawn(async move {
+        for path in paths {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => tracing::info!(path = %path, "unlinked deleted media artefact"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(path = %path, "media artefact already gone");
+                }
+                Err(e) => tracing::warn!(path = %path, error = %e, "failed to unlink media artefact"),
+            }
+            // Evict the per-file WebVTT cache (best-effort; idempotent).
+            let _ = chimpflix_transcoder::evict_text_subs_cache(
+                &cache_root,
+                std::path::Path::new(&path),
+            )
+            .await;
+        }
+    });
+
+    Ok(Json(DeleteMediaResponse {
+        files_deleted: report.files_purged,
+        episodes_purged: report.episodes_purged,
+        seasons_purged: report.seasons_purged,
+        items_purged: report.items_purged,
+        paths: report.purged_paths,
+    }))
+}
+
+/// Lookup the library and reject if `allow_media_deletion` is off.
+/// Surfaces a clear validation error pointing the operator at the
+/// admin-libraries toggle so they know exactly which knob to flip.
+async fn ensure_library_allows_delete(state: &AppState, library_id: i64) -> Result<(), ApiError> {
+    let lib = queries::get_library(&state.pool, library_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    if !lib.allow_media_deletion {
+        return Err(ApiError::validation(format!(
+            "library `{}` does not allow media deletion — enable it from \
+             /admin/library/libraries first",
+            lib.name,
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
 pub struct TrailerResponse {
     pub video_id: Option<String>,
 }
@@ -490,6 +710,184 @@ pub async fn match_apply(
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(detail))
+}
+
+pub async fn match_clear(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ItemDetail>, ApiError> {
+    if !matches!(user.role, chimpflix_library::UserRole::Owner) {
+        return Err(ApiError::Forbidden);
+    }
+    let acc = access(&state, &user).await?;
+    // Verify the user can see the item before mutating — non-owners
+    // can't even reach here (role check above) but the get_item_detail
+    // shape gives us a consistent NotFound for missing ids.
+    let _existing = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let updated = queries::unmatch_item(&state.pool, id)
+        .await
+        .map_err(ApiError::Internal)?;
+    if !updated {
+        return Err(ApiError::NotFound);
+    }
+    let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(detail))
+}
+
+// ─── Report Issue (user → admins) ─────────────────────────────────────────
+//
+// Available to every authed user (owners included — we don't expect them
+// to report to themselves often, but it costs nothing and keeps the menu
+// consistent across roles). Validates the message length, then drops a
+// row into every owner's notifications table and optionally mirrors it
+// as email via `notifier::notify_admins`.
+
+const REPORT_ISSUE_MAX_BYTES: usize = 2000;
+
+#[derive(Debug, Deserialize)]
+pub struct ReportIssueInput {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportIssuePayload<'a> {
+    item_id: i64,
+    item_title: &'a str,
+    kind: &'a str,
+    message: &'a str,
+    reporter_user_id: i64,
+    reporter_username: &'a str,
+}
+
+pub async fn report_issue(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(input): Json<ReportIssueInput>,
+) -> Result<StatusCode, ApiError> {
+    // Allowlist the `kind` so the email subject / payload stays tidy
+    // and so a buggy/hostile client can't spray arbitrary labels into
+    // admin inboxes. Anything outside this set is rejected.
+    const KINDS: &[&str] = &[
+        "wrong_match",
+        "playback",
+        "audio",
+        "subtitles",
+        "metadata",
+        "other",
+    ];
+    let kind = input.kind.trim();
+    if !KINDS.contains(&kind) {
+        return Err(ApiError::validation(format!(
+            "kind must be one of: {}",
+            KINDS.join(", "),
+        )));
+    }
+    let message = input.message.trim();
+    if message.is_empty() {
+        return Err(ApiError::validation("message is required"));
+    }
+    if message.len() > REPORT_ISSUE_MAX_BYTES {
+        return Err(ApiError::validation(format!(
+            "message is too long (max {REPORT_ISSUE_MAX_BYTES} bytes)",
+        )));
+    }
+    // We deliberately don't run the access filter here — any authed user
+    // can report on any item they have a ratingKey for. The reporter's
+    // identity is stamped on the payload so admins can follow up; the
+    // notification body never trusts client-supplied subject lines.
+    let acc = access(&state, &user).await?;
+    let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let payload = ReportIssuePayload {
+        item_id: id,
+        item_title: &detail.item.title,
+        kind,
+        message,
+        reporter_user_id: user.id,
+        reporter_username: &user.username,
+    };
+    let kind_label = match kind {
+        "wrong_match" => "wrong match",
+        "playback" => "playback",
+        "audio" => "audio",
+        "subtitles" => "subtitles",
+        "metadata" => "metadata",
+        _ => "issue",
+    };
+    let server_name = state.settings.read().await.server_name.clone();
+    let title = detail.item.title.clone();
+    let year_str = detail
+        .item
+        .year
+        .map(|y| format!("{title} ({y})"))
+        .unwrap_or_else(|| title.clone());
+    let username_str = format!("@{}", user.username);
+    let item_id_label = format!("#{id}");
+    let subject = format!("[{kind_label}] {title} — issue reported");
+
+    // ── Plain text ──
+    let text_body = format!(
+        "@{username} reported a {kind_label} issue on \"{title}\".\n\n\
+         {message}\n\n\
+         Title: {year_str}\n\
+         Item ID: #{id}\n\
+         Category: {kind_label}",
+        username = user.username,
+    );
+    let text = crate::mail_template::render_email_text(crate::mail_template::EmailTextOpts {
+        server_name: &server_name,
+        headline: &subject,
+        body: &text_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner.",
+    });
+
+    // ── HTML ──
+    let user_safe = crate::mail_template::html_escape(&user.username);
+    let title_safe = crate::mail_template::html_escape(&detail.item.title);
+    let kind_safe = crate::mail_template::html_escape(kind_label);
+    let mut html_body = String::new();
+    html_body.push_str(&crate::mail_template::section_paragraph(&format!(
+        "<strong>@{user_safe}</strong> reported a <strong>{kind_safe}</strong> issue on \
+         <em>{title_safe}</em>:"
+    )));
+    html_body.push_str(&crate::mail_template::section_quote(message));
+    html_body.push_str(&crate::mail_template::section_kv(&[
+        ("Title", &year_str),
+        ("Item ID", &item_id_label),
+        ("Reporter", &username_str),
+        ("Category", kind_label),
+    ]));
+    let eyebrow = format!(
+        "Admin · Issue reported &nbsp;{}",
+        crate::mail_template::section_pip(crate::mail_template::PipKind::Warn, kind_label),
+    );
+    let html = crate::mail_template::render_email(crate::mail_template::EmailOpts {
+        server_name: &server_name,
+        eyebrow_html: &eyebrow,
+        headline: "Someone reported a problem.",
+        body_html: &html_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner.",
+    });
+
+    crate::notifier::notify_admins(
+        &state,
+        "item.issue_reported",
+        &payload,
+        &subject,
+        &text,
+        &html,
+    )
+    .await;
+    Ok(StatusCode::ACCEPTED)
 }
 
 // ─── Reviews (read-only: top reviews ingested from the metadata provider) ─

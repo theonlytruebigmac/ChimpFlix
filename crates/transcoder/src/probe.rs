@@ -260,6 +260,89 @@ pub async fn probe(cfg: &FfmpegConfig, path: &Path) -> Result<ProbeResult> {
     })
 }
 
+/// A single chapter entry from container metadata. Most Bluray /
+/// well-mastered MKV releases have chapter markers; many web rips
+/// don't. When present, the title is the operator-curated label
+/// ("Opening Credits", "Episode 1", "End Credits"); the markers
+/// detector uses it as a much more reliable signal than blackdetect.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chapter {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub title: Option<String>,
+}
+
+/// Pull container-embedded chapters out of the file. Returns an empty
+/// vec for files without chapter metadata (most web rips). One
+/// ffprobe spawn (~50ms on a local file); callers needing both
+/// chapters + streams are better off making a single combined probe,
+/// but that conflates two unrelated parsers — kept separate here for
+/// the same reason the GOP probe is its own function.
+pub async fn probe_chapters(cfg: &FfmpegConfig, path: &Path) -> Result<Vec<Chapter>> {
+    let output = Command::new(&cfg.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_chapters",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .with_context(|| format!("spawn ffprobe (chapters) for {}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "ffprobe (chapters) failed for {}: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+    let raw: RawChapters = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse ffprobe chapters JSON for {}", path.display()))?;
+    let chapters = raw
+        .chapters
+        .into_iter()
+        .filter_map(|c| {
+            // ffprobe gives us both `start` (integer in `time_base`
+            // units) and `start_time` (string seconds). Prefer the
+            // string form — same precision the duration field uses
+            // and avoids having to multiply by time_base.
+            let start_s = c.start_time.as_deref()?.parse::<f64>().ok()?;
+            let end_s = c.end_time.as_deref()?.parse::<f64>().ok()?;
+            if end_s <= start_s {
+                return None;
+            }
+            let title = c.tags.and_then(|t| t.title);
+            Some(Chapter {
+                start_ms: (start_s * 1000.0) as i64,
+                end_ms: (end_s * 1000.0) as i64,
+                title,
+            })
+        })
+        .collect();
+    Ok(chapters)
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChapters {
+    #[serde(default)]
+    chapters: Vec<RawChapter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChapter {
+    start_time: Option<String>,
+    end_time: Option<String>,
+    tags: Option<RawChapterTags>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChapterTags {
+    title: Option<String>,
+}
+
 /// Re-probe the file with just enough flags to extract the codec name
 /// of the Nth subtitle stream (0-indexed within subtitle streams,
 /// matching the API's `subtitle_index` semantics).

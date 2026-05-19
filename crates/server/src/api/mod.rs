@@ -1,7 +1,8 @@
 //! Router assembly.
 
-mod admin;
+pub(crate) mod admin;
 mod auth;
+mod chapters;
 mod collections;
 mod cors;
 mod csrf;
@@ -11,7 +12,7 @@ pub mod error;
 mod health;
 mod items;
 mod libraries;
-mod markers;
+pub(crate) mod markers;
 mod my_list;
 mod notifications;
 mod play_state;
@@ -152,11 +153,14 @@ pub fn router(state: AppState) -> Router {
         .route("/items", get(items::list))
         .route("/items/trending", get(items::trending))
         .route("/items/{id}", get(items::get_one).patch(items::patch_item))
+        .route("/items/{id}/media", axum::routing::delete(items::delete_item_media))
         .route("/items/{id}/trailer", get(items::trailer))
         .route("/items/{id}/similar", get(items::similar))
         .route("/items/{id}/refresh", post(items::refresh))
         .route("/items/{id}/match-search", get(items::match_search))
         .route("/items/{id}/match-apply", post(items::match_apply))
+        .route("/items/{id}/match-clear", post(items::match_clear))
+        .route("/items/{id}/report-issue", post(items::report_issue))
         .route("/items/{id}/reviews", get(items::list_reviews))
         .route("/tags", get(tags::list_all))
         .route(
@@ -200,6 +204,11 @@ pub fn router(state: AppState) -> Router {
             get(previews::manifest),
         )
         .route("/media-files/{id}/preview/sprite", get(previews::sprite))
+        .route("/media-files/{id}/chapters", get(chapters::list))
+        .route(
+            "/media-files/{id}/chapters/{index}/thumb",
+            get(chapters::thumb),
+        )
         .route(
             "/items/{id}/credits",
             axum::routing::patch(items::patch_credits),
@@ -215,6 +224,10 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{id}/backdrop/blob", get(items::get_backdrop_blob))
         .route("/seasons/{id}", get(seasons::get_one))
         .route("/episodes/{id}", get(episodes::get_one))
+        .route(
+            "/episodes/{id}/media",
+            axum::routing::delete(items::delete_episode_media),
+        )
         // Streaming
         .route("/stream/{file_id}/direct", get(stream::direct))
         .route("/stream/sessions", post(stream::create_session))
@@ -222,6 +235,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/stream/sessions/{id}",
             axum::routing::delete(stream::delete_session),
+        )
+        // POST alias for the DELETE — exists because navigator.sendBeacon()
+        // only supports POST, and sendBeacon is the most reliable way to
+        // fire a teardown request as the page is being unloaded (PWA
+        // force-close in particular, where fetch+keepalive can be dropped).
+        .route(
+            "/stream/sessions/{id}/close",
+            post(stream::delete_session),
         )
         .route("/stream/sessions/{id}/pause", post(stream::pause_session))
         .route("/stream/sessions/{id}/resume", post(stream::resume_session))
@@ -235,13 +256,71 @@ pub fn router(state: AppState) -> Router {
         )
         // Play state
         .route("/play-state", post(play_state::update))
+        .route("/play-state/config", get(play_state::config))
         .route("/play-state/scrobble", post(play_state::scrobble))
+        .route("/play-state/event", post(play_state::event))
         .route("/play-state/watched", post(play_state::set_watched))
         .route("/play-state/on-deck", get(play_state::on_deck))
         .route("/play-state/history", get(play_state::history))
-        // Collections (movie franchises)
+        // Collections (movie franchises + admin-curated manual collections)
         .route("/collections", get(collections::list))
         .route("/collections/{id}", get(collections::get_one))
+        .route("/collections/{id}/poster/blob", get(admin::collections::get_poster_blob))
+        .route("/collections/{id}/backdrop/blob", get(admin::collections::get_backdrop_blob))
+        // Admin CRUD for manual collections (auto collections are read-only)
+        .route(
+            "/admin/collections",
+            post(admin::collections::create),
+        )
+        .route(
+            "/admin/collections/{id}",
+            axum::routing::patch(admin::collections::update)
+                .delete(admin::collections::delete),
+        )
+        .route(
+            "/admin/collections/{id}/items",
+            post(admin::collections::add_items)
+                .put(admin::collections::reorder),
+        )
+        .route(
+            "/admin/collections/{id}/items/{item_id}",
+            axum::routing::delete(admin::collections::remove_item),
+        )
+        .route(
+            "/admin/collections/{id}/poster",
+            post(admin::collections::upload_poster),
+        )
+        .route(
+            "/admin/collections/{id}/backdrop",
+            post(admin::collections::upload_backdrop),
+        )
+        .route(
+            "/admin/smart-collections",
+            post(admin::collections::create_smart),
+        )
+        .route(
+            "/admin/smart-collections/{id}/rule",
+            axum::routing::put(admin::collections::update_smart_rule),
+        )
+        // Pre-roll video (operator-uploaded; plays before each session)
+        .route(
+            "/admin/preroll",
+            get(admin::preroll::get_status)
+                .post(admin::preroll::upload)
+                .delete(admin::preroll::clear),
+        )
+        .route("/preroll/blob", get(admin::preroll::serve_blob))
+        // Bulk item operations
+        .route(
+            "/admin/items/bulk/refresh-metadata",
+            post(admin::bulk::refresh_metadata),
+        )
+        .route("/admin/items/bulk/add-tag", post(admin::bulk::add_tag))
+        .route("/admin/items/bulk/remove-tag", post(admin::bulk::remove_tag))
+        .route(
+            "/admin/items/bulk/detect-markers",
+            post(admin::bulk::detect_markers),
+        )
         // Notifications (per-user inbox)
         .route("/notifications", get(notifications::list))
         .route("/notifications/unread-count", get(notifications::unread_count))
@@ -267,7 +346,33 @@ pub fn router(state: AppState) -> Router {
         )
         // Admin (owner-only)
         .route("/admin/backup", post(admin::backup::backup))
+        .route("/admin/backups", get(admin::backup::list))
+        .route(
+            "/admin/backups/cancel-restore",
+            post(admin::backup::cancel_restore),
+        )
+        .route(
+            "/admin/backups/{filename}/download",
+            get(admin::backup::download),
+        )
+        .route(
+            "/admin/backups/{filename}",
+            axum::routing::delete(admin::backup::delete),
+        )
+        .route(
+            "/admin/backups/{filename}/stage-restore",
+            post(admin::backup::stage_restore),
+        )
         .route("/admin/dashboard", get(admin::dashboard::get))
+        .route("/admin/stats/overview", get(admin::stats::overview))
+        .route("/admin/stats/activity", get(admin::stats::activity))
+        .route("/admin/stats/top-users", get(admin::stats::top_users))
+        .route("/admin/stats/top-items", get(admin::stats::top_items))
+        .route("/admin/stats/top-platforms", get(admin::stats::top_platforms))
+        .route("/admin/stats/top-libraries", get(admin::stats::top_libraries))
+        .route("/admin/stats/now-playing", get(admin::stats::now_playing))
+        .route("/admin/stats/plays-per-day", get(admin::stats::plays_per_day))
+        .route("/admin/stats/plays-per-hour", get(admin::stats::plays_per_hour))
         .route(
             "/admin/settings",
             get(admin::settings::get).patch(admin::settings::patch),
@@ -287,6 +392,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/audit", get(admin::audit::list))
         .route("/admin/library-health", get(admin::health::get))
+        .route("/admin/library-health/items", get(admin::health::items))
         .route("/admin/agents", get(admin::agents::list_available))
         .route("/admin/secrets", get(admin::secrets::list))
         .route(
@@ -355,6 +461,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/users/{id}/2fa/reset",
             post(admin::users::reset_user_totp),
+        )
+        .route(
+            "/admin/users/{id}/password-reset",
+            post(admin::users::send_password_reset),
         )
         .route(
             "/admin/users/{id}/unlock-attempts",

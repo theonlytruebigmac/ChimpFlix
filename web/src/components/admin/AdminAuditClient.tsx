@@ -98,17 +98,23 @@ export function AdminAuditClient({ initial }: Props) {
 
 function Payload({ raw }: { raw: string | null }) {
   if (!raw) return <span className="text-white/30">—</span>;
-  // Try to pretty-print JSON; fall back to raw text.
+  // Try to pretty-print JSON; fall back to raw text. Parse outside
+  // the JSX construction so a parser error can't be confused for a
+  // render error by react-hooks/error-boundaries.
+  let pretty: string | null = null;
   try {
-    const parsed = JSON.parse(raw);
+    pretty = JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    // Not JSON — render raw.
+  }
+  if (pretty !== null) {
     return (
-      <pre className="max-w-md overflow-x-auto whitespace-pre-wrap break-words font-mono text-white/60">
-        {JSON.stringify(parsed, null, 2)}
+      <pre className="max-w-md overflow-x-auto whitespace-pre-wrap wrap-break-word font-mono text-white/60">
+        {pretty}
       </pre>
     );
-  } catch {
-    return <code className="font-mono text-white/60">{raw}</code>;
   }
+  return <code className="font-mono text-white/60">{raw}</code>;
 }
 
 function formatWhen(epochMs: number): string {

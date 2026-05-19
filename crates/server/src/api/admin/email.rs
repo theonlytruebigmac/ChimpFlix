@@ -198,15 +198,76 @@ pub async fn test(
         if !addr.contains('@') || addr.len() > 320 {
             return Err(ApiError::validation("send_to must look like local@domain"));
         }
+        // Branded payload so the test arrives styled identically to real
+        // delivery — operators can verify the visual look-and-feel and the
+        // pipeline in one round trip.
+        let host_port = format!(
+            "{host}:{port}",
+            host = settings.email_smtp_host.as_deref().unwrap_or("?"),
+            port = settings
+                .email_smtp_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".into()),
+        );
+        let security = settings
+            .email_smtp_security
+            .as_deref()
+            .unwrap_or("?")
+            .to_uppercase();
+        let from = settings
+            .email_from_address
+            .as_deref()
+            .unwrap_or("(unconfigured)");
+        let when = crate::mail_template::format_email_datetime(chimpflix_common::now_ms());
+
+        let test_html = {
+            let mut body = String::new();
+            body.push_str(&crate::mail_template::section_paragraph(
+                "This is a test email from your ChimpFlix server. If you're reading this, the \
+                 credentials and host/port combo under <strong>Settings → Server → Email</strong> \
+                 are valid and outbound mail will reach your users.",
+            ));
+            body.push_str(&crate::mail_template::section_kv(&[
+                ("Server", &host_port),
+                ("Security", &security),
+                ("From", from),
+                ("Sent", &when),
+            ]));
+            body.push_str(&crate::mail_template::section_small(
+                "This message was triggered by the <em>Send test</em> button in the admin panel. \
+                 No user-visible email was queued.",
+            ));
+            crate::mail_template::render_email(crate::mail_template::EmailOpts {
+                server_name: &settings.server_name,
+                eyebrow_html: "SMTP test",
+                headline: "Your SMTP delivery is working.",
+                body_html: &body,
+                footer_note: "You can safely delete this email.",
+            })
+        };
+
+        let test_text = crate::mail_template::render_email_text(crate::mail_template::EmailTextOpts {
+            server_name: &settings.server_name,
+            headline: "SMTP delivery is working",
+            body: &format!(
+                "This is a test email from your ChimpFlix server. If you're reading this, the \
+                 credentials and host/port combo under Settings → Server → Email are valid and \
+                 outbound mail will reach your users.\n\n\
+                 Server: {host_port}\n\
+                 Security: {security}\n\
+                 From: {from}\n\
+                 Sent: {when}",
+            ),
+            footer_note: "You can safely delete this email.",
+        });
+
         mailer
             .send(OutgoingMessage {
                 to_address: addr,
                 to_name: None,
                 subject: "ChimpFlix SMTP test",
-                html: "<p>This is a test email from your ChimpFlix server. \
-                       If you're reading this, SMTP delivery is working.</p>",
-                text: "This is a test email from your ChimpFlix server. \
-                       If you're reading this, SMTP delivery is working.",
+                html: &test_html,
+                text: &test_text,
             })
             .await
             .map_err(|e| ApiError::validation(format!("test email failed: {e}")))?;

@@ -9,7 +9,7 @@ export default async function AdminAccessPage() {
       <AdminPageHeader
         eyebrow="Users"
         title="Access"
-        description="Library × user access matrix. Toggle which non-owner users can browse each library; owners always see everything."
+        description="Library × user access matrix. Toggle the checkboxes to grant or revoke direct access. Access granted via a group (e.g. Friends) shows beneath the cell as “via …” and is managed under Settings → Users → Groups. Owners always see everything."
       />
       <AdminAccessClient initial={initial.entries} />
     </div>

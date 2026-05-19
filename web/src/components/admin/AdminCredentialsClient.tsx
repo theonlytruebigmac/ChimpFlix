@@ -215,7 +215,7 @@ function SlotCard({
             <button
               onClick={save}
               disabled={!draft.trim() || busy !== null}
-              className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
             >
               {busy === "save" ? "Saving…" : "Save"}
             </button>

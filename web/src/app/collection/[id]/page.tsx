@@ -47,7 +47,7 @@ export default async function CollectionPage({
         )}
         <div className="pointer-events-none absolute inset-0 bg-linear-to-r from-black/95 via-black/55 to-transparent" />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-72 bg-linear-to-t from-(--color-background) via-(--color-background)/70 to-transparent" />
-        <div className="relative z-10 flex h-full max-w-2xl flex-col justify-end px-12 pb-12 pt-28">
+        <div className="relative z-10 flex h-full max-w-2xl flex-col justify-end px-4 sm:px-8 md:px-12 pb-12 pt-24 sm:pt-28">
           <div className="mb-2 text-xs font-bold tracking-[0.35em] text-(--color-accent)">
             COLLECTION
           </div>
@@ -65,7 +65,7 @@ export default async function CollectionPage({
         </div>
       </section>
 
-      <div className="relative z-20 px-12 pb-24">
+      <div className="relative z-20 px-4 sm:px-8 md:px-12 pb-24">
         <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {items.map((it) => (
             <li key={it.ratingKey}>

@@ -23,8 +23,30 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::api::error::ApiError;
+use crate::api::rate_limit;
 use crate::auth::AuthUser;
+use crate::net;
 use crate::state::AppState;
+
+/// Classify the request as "remote" (not on the operator-defined LAN)
+/// for the per-user remote-streams cap. When the LAN list is empty or
+/// the request headers don't carry a parseable client IP, we treat the
+/// request as remote — the cap-then-reject path is more conservative
+/// than the cap-bypass path for the cases we can't classify.
+fn is_remote_request(headers: &HeaderMap, lan_raw: &str) -> bool {
+    let trimmed = lan_raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Some(raw_ip) = rate_limit::header_client_ip(headers) else {
+        return true;
+    };
+    let Ok(ip) = raw_ip.parse::<std::net::IpAddr>() else {
+        return true;
+    };
+    let nets = net::parse_cidr_list(trimmed);
+    !net::ip_in_list(ip, &nets)
+}
 
 /// Reject the request if the user can't see the library this file belongs
 /// to. Returns 404 (not 403) so we don't leak that the file exists.
@@ -305,16 +327,74 @@ pub struct SessionInfo {
 pub async fn create_session(
     State(state): State<AppState>,
     user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    create_session_impl(&state, &user, req).await
+    create_session_impl(&state, &user, &headers, req).await
+}
+
+/// Fire-and-forget recorder for the playback `start` event. Failures
+/// are logged but never surfaced — stats are observability and must
+/// not gate playback. Spawned so the user's POST returns immediately;
+/// the insert happens in the background.
+fn record_start_event(
+    state: &AppState,
+    user_id: i64,
+    media_file_id: i64,
+    decision: &'static str,
+    container: Option<String>,
+    duration_ms: Option<i64>,
+    headers: &HeaderMap,
+    session_token: Option<String>,
+) {
+    let pool = state.pool.clone();
+    let ip = rate_limit::header_client_ip(headers);
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    tokio::spawn(async move {
+        // Look up which item/episode owns this file so the aggregator
+        // can roll episodes up to shows. Both columns can be NULL when
+        // the file row has been soft-deleted between session-start and
+        // event-record — recording an orphan event is still useful for
+        // "who watched at this time" but stops short of a parent join.
+        let (item_id, episode_id) =
+            chimpflix_library::queries::media_file_owner(&pool, media_file_id)
+                .await
+                .unwrap_or((None, None));
+        let ev = chimpflix_library::queries::PlaybackEventInput {
+            item_id,
+            episode_id,
+            media_file_id: Some(media_file_id),
+            duration_ms,
+            decision: Some(decision),
+            container: container.as_deref(),
+            ip: ip.as_deref(),
+            user_agent: user_agent.as_deref(),
+            session_token: session_token.as_deref(),
+            ..chimpflix_library::queries::PlaybackEventInput::new(user_id, "start")
+        };
+        if let Err(e) = chimpflix_library::queries::record_playback_event(&pool, ev).await {
+            tracing::warn!(error = %format!("{e:#}"), "record playback start event");
+        }
+    });
 }
 
 async fn create_session_impl(
     state: &AppState,
     user: &AuthUser,
-    req: CreateSessionRequest,
+    headers: &HeaderMap,
+    mut req: CreateSessionRequest,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    // Server-wide default for audio normalization. If the operator
+    // flipped `audio_normalize_enabled` on, every session gets the
+    // loudnorm filter — the player's per-session toggle can still
+    // *opt in*, but cannot opt out of an admin-mandated default.
+    // (Matching Plex's "Volume leveling" server setting.)
+    if state.settings.read().await.audio_normalize_enabled {
+        req.audio_normalize = true;
+    }
     ensure_file_accessible(state, user, req.media_file_id).await?;
     let locator = queries::get_media_file_locator(&state.pool, req.media_file_id)
         .await?
@@ -500,26 +580,41 @@ async fn create_session_impl(
     }
 
     match mode {
-        PlayMode::Direct => Ok((
-            StatusCode::CREATED,
-            Json(CreateSessionResponse {
-                session: SessionInfo {
-                    id: "direct".into(),
-                    mode: "direct",
-                    direct_url: Some(format!("/api/v1/stream/{}/direct", req.media_file_id)),
-                    hls_master_url: None,
-                    media_file_id: req.media_file_id,
-                    start_position_ms: req.start_position_ms,
-                    duration_ms,
-                    resolved_height: None,
-                    resolved_video_bitrate_bps: None,
-                    source_height: source_height.map(|h| h as u32),
-                    encoder: None,
-                    video_treatment: None,
-                    audio_treatment: None,
-                },
-            }),
-        )),
+        PlayMode::Direct => {
+            record_start_event(
+                state,
+                user.id,
+                req.media_file_id,
+                "direct",
+                container.clone(),
+                duration_ms,
+                headers,
+                None,
+            );
+            Ok((
+                StatusCode::CREATED,
+                Json(CreateSessionResponse {
+                    session: SessionInfo {
+                        id: "direct".into(),
+                        mode: "direct",
+                        direct_url: Some(format!(
+                            "/api/v1/stream/{}/direct",
+                            req.media_file_id,
+                        )),
+                        hls_master_url: None,
+                        media_file_id: req.media_file_id,
+                        start_position_ms: req.start_position_ms,
+                        duration_ms,
+                        resolved_height: None,
+                        resolved_video_bitrate_bps: None,
+                        source_height: source_height.map(|h| h as u32),
+                        encoder: None,
+                        video_treatment: None,
+                        audio_treatment: None,
+                    },
+                }),
+            ))
+        }
         PlayMode::Transcode => {
             // Enforce the operator's concurrent-transcode cap. The setting
             // is hot-reloaded, so we re-read it each time rather than
@@ -531,6 +626,32 @@ async fn create_session_impl(
                 return Err(ApiError::TooManyRequests(format!(
                     "transcoder is at capacity ({current}/{max_concurrent} concurrent sessions)"
                 )));
+            }
+
+            // Per-user remote-stream cap. When the operator set
+            // `max_remote_streams_per_user > 0`, requests originating
+            // outside `lan_networks` are rate-limited per-user. LAN
+            // requests bypass — the point of the cap is to keep one
+            // remote user from monopolising the encoder while still
+            // letting trusted local clients play freely. Both
+            // settings are hot-reloaded.
+            let (remote_cap, lan_raw) = {
+                let s = state.settings.read().await;
+                (s.max_remote_streams_per_user, s.lan_networks.clone())
+            };
+            if remote_cap > 0 && is_remote_request(headers, &lan_raw) {
+                let mine = state
+                    .transcoder
+                    .list_sessions()
+                    .iter()
+                    .filter(|s| s.user_id == user.id)
+                    .count() as i64;
+                if mine >= remote_cap {
+                    return Err(ApiError::TooManyRequests(format!(
+                        "you have {mine}/{remote_cap} remote streams in flight; \
+                         close one before starting another",
+                    )));
+                }
             }
 
             // Resolve the codec of the chosen subtitle stream so the
@@ -655,6 +776,28 @@ async fn create_session_impl(
                 &settings_snapshot.transcoder_hw_accel,
                 &state.transcoder_caps,
             );
+            // Per-encoder-type cap: software encodes (libx264 / libx265)
+            // peg N CPU cores each. The overall `transcoder_max_concurrent`
+            // already ran; this second gate kicks in only when the
+            // session would land on the software path. Stops a wave of
+            // fallback-to-software encodes from starving a parallel
+            // GPU session.
+            if matches!(hwaccel, chimpflix_transcoder::HwAccel::None) {
+                let max_cpu_concurrent =
+                    settings_snapshot.transcoder_max_cpu_concurrent;
+                let current_cpu = state
+                    .transcoder
+                    .list_sessions()
+                    .iter()
+                    .filter(|s| s.encoder.starts_with("software"))
+                    .count() as i64;
+                if current_cpu >= max_cpu_concurrent {
+                    return Err(ApiError::TooManyRequests(format!(
+                        "software (CPU) transcode capacity reached \
+                         ({current_cpu}/{max_cpu_concurrent}) — wait for a slot or enable a hardware encoder"
+                    )));
+                }
+            }
             // Operator's speed-vs-quality dial. Default 'balanced'
             // reproduces pre-Phase-18 behavior; 'speed' shaves CPU on
             // overloaded boxes, 'quality' burns more cycles for less
@@ -729,13 +872,23 @@ async fn create_session_impl(
             //   * Only when the primary tier is high enough that a
             //     fallback actually buys something (≥720p; 480p sources
             //     have nothing useful to downgrade to).
-            //   * Skipped for subtitle-burn sessions (the encoder
+            //   * Skipped for subtitle-BURN sessions only (the encoder
             //     branch's filter graph doesn't compose with `split`
             //     yet — the transcoder also enforces this defensively).
+            //     Sidecar/text subtitles don't touch the video graph
+            //     so they compose fine with the ABR split — important
+            //     for mobile clients where cellular bandwidth makes
+            //     the fallback variant the difference between smooth
+            //     playback and a wedged buffer.
             //   * Skipped for explicit quality_target requests (user
             //     pinned a tier; respect that without auto-secondary).
+            let subtitle_would_burn = req.subtitle_index.is_some()
+                && !subtitle_codec
+                    .as_deref()
+                    .map(chimpflix_transcoder::is_text_subtitle_codec)
+                    .unwrap_or(false);
             let fallback_variant = resolved_quality.and_then(|(h, _)| {
-                if req.subtitle_index.is_some() || req.quality_target.is_some() {
+                if subtitle_would_burn || req.quality_target.is_some() {
                     return None;
                 }
                 fallback_for_primary(h)
@@ -846,9 +999,50 @@ async fn create_session_impl(
                     source_video_codec.as_deref(),
                     audio_codec.as_deref(),
                     source_video_pix_fmt.as_deref(),
+                    chimpflix_transcoder::TonemapConfig {
+                        enabled: settings_snapshot.transcoder_hdr_tonemap_enabled,
+                        algorithm: settings_snapshot.transcoder_hdr_tonemap_algo.clone(),
+                    },
+                    pick_target_codec(
+                        &settings_snapshot.transcoder_hevc_encoding_mode,
+                        client_supports_codec(&req.client, "hevc"),
+                        hwaccel,
+                        &state.transcoder.capabilities(),
+                    ),
+                    settings_snapshot.transcoder_gpu_device.as_str(),
+                    // Two-pass loudnorm when the analyze_loudness
+                    // task has stored measurements; falls back to
+                    // single-pass when absent. Always looked up
+                    // (even when normalize is off) because the call
+                    // is cheap (1 row) and centralising the decision
+                    // here keeps Session::start dumb.
+                    if req.audio_normalize {
+                        queries::get_loudness_measurement(&state.pool, req.media_file_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|m| chimpflix_transcoder::LoudnessTarget {
+                                measured_i: m.integrated,
+                                measured_tp: m.true_peak,
+                                measured_lra: m.lra,
+                                measured_thresh: m.threshold,
+                            })
+                    } else {
+                        None
+                    },
                 )
                 .await
                 .map_err(ApiError::Internal)?;
+            record_start_event(
+                state,
+                user.id,
+                req.media_file_id,
+                "transcode",
+                container.clone(),
+                duration_ms,
+                headers,
+                Some(session.id.clone()),
+            );
             let master_url = format!("/api/v1/stream/sessions/{}/master.m3u8", session.id);
             // Mirror the transcoder's outward-facing per-session
             // labels back to the response so the player can display
@@ -894,13 +1088,18 @@ pub async fn delete_session(
     _user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let removed = state.transcoder.delete(&id).await;
-    if removed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        // Idempotent on already-gone sessions.
-        Ok(StatusCode::NO_CONTENT)
+    // `delete_returning` snapshots the session before destroying it
+    // so we can emit a stop event with the final bandwidth count.
+    // Reaper-driven closes go through the same `emit_session_stop_event`
+    // helper via the hook registered in main.rs, so both paths agree.
+    if let Some(snap) = state.transcoder.delete_returning(&id).await {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            crate::emit_session_stop_event(&pool, &snap).await;
+        });
     }
+    // Idempotent on already-gone sessions.
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Player calls this on the HTML5 `pause` event so the ffmpeg child
@@ -942,6 +1141,7 @@ pub async fn master_playlist(
     let session = state.transcoder.get(&id).ok_or(ApiError::NotFound)?;
     session.touch();
     let body = session.master_playlist();
+    session.add_bytes_served(body.len() as u64);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
@@ -1058,6 +1258,11 @@ pub async fn variant_file(
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| ApiError::Internal(anyhow::Error::from(e)))?;
+    // Bandwidth metering: every segment + playlist GET adds to the
+    // per-session counter. Flushed to playback_events at session close
+    // — segment-grained DB writes would dominate the actual segment
+    // serving cost, which is the whole point of HLS.
+    session.add_bytes_served(bytes.len() as u64);
     let content_type = if is_manifest {
         "application/vnd.apple.mpegurl"
     } else if is_init {
@@ -1673,6 +1878,7 @@ async fn resolve_rating_key(
 pub async fn prewarm_session(
     State(state): State<AppState>,
     user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<PrewarmRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let (media_file_id, start_position_ms) = resolve_rating_key(&state, &user, &req.rating_key)
@@ -1690,7 +1896,51 @@ pub async fn prewarm_session(
         audio_normalize: req.audio_normalize,
         subtitle_offset_ms: 0,
     };
-    create_session_impl(&state, &user, inner).await
+    create_session_impl(&state, &user, &headers, inner).await
+}
+
+/// Whether the client's declared capabilities include the given
+/// codec short-name. Case-insensitive; matches both common spellings
+/// ("hevc" / "h265").
+fn client_supports_codec(caps: &ClientCapabilities, codec: &str) -> bool {
+    let want = codec.to_ascii_lowercase();
+    let aliases: &[&str] = match want.as_str() {
+        "hevc" | "h265" => &["hevc", "h265"],
+        "h264" | "avc" => &["h264", "avc"],
+        _ => return caps
+            .supported_video_codecs
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&want)),
+    };
+    caps.supported_video_codecs
+        .iter()
+        .any(|c| aliases.iter().any(|a| c.eq_ignore_ascii_case(a)))
+}
+
+/// Pick the output codec for this session based on the operator's
+/// mode setting, the client's declared HEVC support, and whether the
+/// selected hwaccel actually has an HEVC encoder available. Falls
+/// back to H264 whenever any of those gates fail — never breaks
+/// playback to chase HEVC.
+fn pick_target_codec(
+    mode: &str,
+    client_supports_hevc: bool,
+    hwaccel: chimpflix_transcoder::HwAccel,
+    caps: &chimpflix_transcoder::TranscoderCapabilities,
+) -> chimpflix_transcoder::VideoCodec {
+    use chimpflix_transcoder::VideoCodec;
+    let want_hevc = match mode.to_ascii_lowercase().as_str() {
+        "always" => true,
+        "when_client_supports" => client_supports_hevc,
+        _ => false, // 'off' or anything unknown
+    };
+    if !want_hevc {
+        return VideoCodec::H264;
+    }
+    if !hwaccel.is_available_for(VideoCodec::Hevc, caps) {
+        return VideoCodec::H264;
+    }
+    VideoCodec::Hevc
 }
 
 #[cfg(test)]

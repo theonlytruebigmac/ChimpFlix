@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   items as itemsApi,
   type Credit,
@@ -82,17 +83,34 @@ export function EditMetadataDialog({
     null,
   );
 
+  // Fetch poster candidates the first time the user opens the Posters tab.
+  // Synchronous setState before the await is the standard "show loading
+  // skeleton, then resolve" pattern; the lint rule's preferred alternative
+  // (useEffectEvent or external store) would be heavier than the case warrants.
+  // Cancellation guard prevents setting state after unmount.
   useEffect(() => {
     if (tab !== "posters" || posters !== null || postersLoading) return;
+    let cancelled = false;
+    /* eslint-disable react-hooks/set-state-in-effect */
     setPostersLoading(true);
     setPostersError(null);
+    /* eslint-enable react-hooks/set-state-in-effect */
     itemsApi
       .tmdbPosters(detail.id)
-      .then((r) => setPosters(r.posters))
-      .catch((e) =>
-        setPostersError(e instanceof Error ? e.message : String(e)),
-      )
-      .finally(() => setPostersLoading(false));
+      .then((r) => {
+        if (!cancelled) setPosters(r.posters);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setPostersError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPostersLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [tab, detail.id, posters, postersLoading]);
 
   async function applyTmdbPoster(p: TmdbPoster) {
@@ -250,7 +268,15 @@ export function EditMetadataDialog({
     }
   }
 
-  return (
+  // Portal to document.body so the dialog escapes the TitleModalShell's
+  // `.zf-modal-in` ancestor. That ancestor has a `transform` animation,
+  // which establishes a new containing block for `position: fixed`
+  // descendants — without the portal, this dialog opens "inset-0"
+  // relative to the (possibly-scrolled) modal card, landing wherever
+  // that card happens to be on screen. The portal renders directly
+  // under <body> so `fixed inset-0` is finally viewport-relative.
+  if (typeof document === "undefined") return null;
+  return createPortal(
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 zf-modal-backdrop"
       onClick={onClose}
@@ -462,7 +488,8 @@ export function EditMetadataDialog({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

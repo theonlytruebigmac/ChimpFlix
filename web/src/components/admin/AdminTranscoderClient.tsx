@@ -4,13 +4,61 @@ import { useEffect, useState } from "react";
 import {
   admin as adminApi,
   type DashboardSession,
+  type HevcMode,
   type ServerSettings,
+  type TonemapAlgorithm,
+  type TranscoderBackgroundPreset,
   type TranscoderCapabilities,
   type TranscoderEncoderPreset,
   type TranscoderHwAccel,
   type TranscoderHwStrictness,
   type TranscoderPreset,
 } from "@/lib/chimpflix-api";
+
+const HEVC_MODES: ReadonlyArray<{ value: HevcMode; label: string; hint: string }> = [
+  {
+    value: "off",
+    label: "Off (always H.264)",
+    hint: "Default. Maximum browser compatibility — every client can decode H.264.",
+  },
+  {
+    value: "when_client_supports",
+    label: "When client supports HEVC",
+    hint: "Safe-conservative: HEVC for Safari + some Edge / Chrome builds, H.264 otherwise.",
+  },
+  {
+    value: "always",
+    label: "Always (HEVC)",
+    hint: "Forces HEVC for every transcode. Breaks Firefox + many Chrome builds. Set only on Safari-only deployments.",
+  },
+];
+
+const BACKGROUND_PRESETS: ReadonlyArray<{
+  value: TranscoderBackgroundPreset;
+  label: string;
+}> = [
+  { value: "ultrafast", label: "ultrafast (lowest CPU, largest output)" },
+  { value: "superfast", label: "superfast" },
+  { value: "veryfast", label: "veryfast (default)" },
+  { value: "faster", label: "faster" },
+  { value: "fast", label: "fast" },
+  { value: "medium", label: "medium" },
+  { value: "slow", label: "slow" },
+  { value: "slower", label: "slower (smallest output, slowest)" },
+];
+
+const TONEMAP_ALGOS: ReadonlyArray<{
+  value: TonemapAlgorithm;
+  label: string;
+  hint: string;
+}> = [
+  { value: "hable", label: "Hable", hint: "Filmic curve — default, balanced." },
+  { value: "reinhard", label: "Reinhard", hint: "Classic, slightly washed-out highlights." },
+  { value: "mobius", label: "Mobius", hint: "Preserves bright highlights — good for HDR10." },
+  { value: "bt2390", label: "BT.2390", hint: "ITU reference — broadcast-style." },
+  { value: "clip", label: "Clip", hint: "Hard clip — fastest, blown highlights." },
+  { value: "linear", label: "Linear", hint: "Linear scale — washed-out, debug-only." },
+];
 
 const HW_ACCEL_OPTIONS: ReadonlyArray<{
   value: TranscoderHwAccel;
@@ -31,16 +79,25 @@ const HW_ACCEL_OPTIONS: ReadonlyArray<{
 
 interface Props {
   capabilities: TranscoderCapabilities;
+  cacheRoot: string;
   presets: TranscoderPreset[];
   settings: ServerSettings;
 }
 
-export function AdminTranscoderClient({ capabilities, presets, settings }: Props) {
+export function AdminTranscoderClient({
+  capabilities,
+  cacheRoot,
+  presets,
+  settings,
+}: Props) {
   const [hwAccel, setHwAccel] = useState<TranscoderHwAccel>(
     settings.transcoder_hw_accel,
   );
   const [maxConcurrent, setMaxConcurrent] = useState(
     settings.transcoder_max_concurrent,
+  );
+  const [maxCpuConcurrent, setMaxCpuConcurrent] = useState(
+    settings.transcoder_max_cpu_concurrent,
   );
   const [ceiling, setCeiling] = useState<number | "">(
     settings.transcoder_quality_ceiling_kbps ?? "",
@@ -51,13 +108,35 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
   const [hwStrictness, setHwStrictness] = useState<TranscoderHwStrictness>(
     settings.transcoder_hw_strictness,
   );
+  const [backgroundPreset, setBackgroundPreset] = useState<TranscoderBackgroundPreset>(
+    settings.transcoder_background_preset,
+  );
+  const [maxBackgroundConcurrent, setMaxBackgroundConcurrent] = useState(
+    settings.transcoder_max_background_concurrent,
+  );
+  const [tonemapEnabled, setTonemapEnabled] = useState(
+    settings.transcoder_hdr_tonemap_enabled,
+  );
+  const [tonemapAlgo, setTonemapAlgo] = useState<TonemapAlgorithm>(
+    settings.transcoder_hdr_tonemap_algo,
+  );
+  const [hevcMode, setHevcMode] = useState<HevcMode>(
+    (settings.transcoder_hevc_encoding_mode ?? "off") as HevcMode,
+  );
+  const [gpuDevice, setGpuDevice] = useState<string>(
+    settings.transcoder_gpu_device ?? "auto",
+  );
   const [allPresets, setAllPresets] = useState(presets);
   const [showAdd, setShowAdd] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [active, setActive] = useState<DashboardSession[]>([]);
-  const [nowMs, setNowMs] = useState<number>(Date.now());
+  // Start at 0 — first dashboard response below replaces it with
+  // server.now_ms. Initializing from Date.now() in useState would call
+  // an impure function during render, which React's strict-mode rules
+  // forbid (and which causes non-deterministic re-renders).
+  const [nowMs, setNowMs] = useState<number>(0);
 
   // Active transcodes are pushed live over /api/v1/ws. We also hit the
   // dashboard endpoint once on mount to populate the list before the first
@@ -123,30 +202,39 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
   const dirty =
     hwAccel !== settings.transcoder_hw_accel ||
     maxConcurrent !== settings.transcoder_max_concurrent ||
+    maxCpuConcurrent !== settings.transcoder_max_cpu_concurrent ||
     (ceiling === "" ? null : Number(ceiling)) !==
       settings.transcoder_quality_ceiling_kbps ||
     encoderPreset !== settings.transcoder_encoder_preset ||
-    hwStrictness !== settings.transcoder_hw_strictness;
+    hwStrictness !== settings.transcoder_hw_strictness ||
+    backgroundPreset !== settings.transcoder_background_preset ||
+    maxBackgroundConcurrent !== settings.transcoder_max_background_concurrent ||
+    tonemapEnabled !== settings.transcoder_hdr_tonemap_enabled ||
+    tonemapAlgo !== settings.transcoder_hdr_tonemap_algo ||
+    hevcMode !== (settings.transcoder_hevc_encoding_mode ?? "off") ||
+    gpuDevice !== (settings.transcoder_gpu_device ?? "auto");
 
   async function saveSettings() {
     setBusy(true);
     setError(null);
     setSaved(false);
     try {
-      await adminApi.settings.patch({
+      const patch = {
         transcoder_hw_accel: hwAccel,
         transcoder_max_concurrent: maxConcurrent,
+        transcoder_max_cpu_concurrent: maxCpuConcurrent,
         transcoder_quality_ceiling_kbps: ceiling === "" ? null : Number(ceiling),
         transcoder_encoder_preset: encoderPreset,
         transcoder_hw_strictness: hwStrictness,
-      });
-      Object.assign(settings, {
-        transcoder_hw_accel: hwAccel,
-        transcoder_max_concurrent: maxConcurrent,
-        transcoder_quality_ceiling_kbps: ceiling === "" ? null : Number(ceiling),
-        transcoder_encoder_preset: encoderPreset,
-        transcoder_hw_strictness: hwStrictness,
-      });
+        transcoder_background_preset: backgroundPreset,
+        transcoder_max_background_concurrent: maxBackgroundConcurrent,
+        transcoder_hdr_tonemap_enabled: tonemapEnabled,
+        transcoder_hdr_tonemap_algo: tonemapAlgo,
+        transcoder_hevc_encoding_mode: hevcMode,
+        transcoder_gpu_device: gpuDevice,
+      };
+      await adminApi.settings.patch(patch);
+      Object.assign(settings, patch);
       setSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -227,6 +315,19 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
             />
           </Field>
           <Field
+            label="Max concurrent CPU transcodes"
+            hint="Sub-cap for software (libx264 / libx265) sessions only. A single CPU encode pegs N cores; capping these separately stops a wave of fallback-to-software encodes from starving GPU sessions. Default 1."
+          >
+            <input
+              type="number"
+              min={1}
+              max={16}
+              value={maxCpuConcurrent}
+              onChange={(e) => setMaxCpuConcurrent(Number(e.target.value))}
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            />
+          </Field>
+          <Field
             label="Quality ceiling (kbps)"
             hint="Blank = no cap. Sessions never exceed this bitrate."
           >
@@ -279,7 +380,7 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
           <button
             disabled={!dirty || busy}
             onClick={saveSettings}
-            className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
           >
             {busy ? "Saving…" : "Save engine settings"}
           </button>
@@ -320,7 +421,165 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
             AV1 in VAAPI needs RDNA2+), not the codec list the
             ffmpeg build was compiled with.
           </p>
+          <div className="mt-3 flex flex-wrap items-baseline gap-2 text-[11px] text-white/40">
+            <span className="text-white/55">Transcoder temp directory:</span>
+            <code className="font-mono text-white/70">{cacheRoot}</code>
+            <span className="text-white/40">
+              (set via the <code className="font-mono">TRANSCODER_CACHE_DIR</code> env;
+              requires server restart to change)
+            </span>
+          </div>
         </details>
+      </section>
+
+      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
+        <h2 className="mb-1 text-base font-semibold">Background transcoding</h2>
+        <p className="mb-4 text-xs text-white/55">
+          The <code className="font-mono">optimize_versions</code> scheduled
+          task pre-encodes media into operator-defined presets so weak
+          clients don&apos;t need a live transcode. These dials trade CPU
+          time / output size and protect live playback from background
+          starvation. Always uses libx264 (no GPU).
+        </p>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <Field
+            label="x264 preset"
+            hint="Slower presets produce smaller files at the same quality, but consume more CPU per encode."
+          >
+            <select
+              value={backgroundPreset}
+              onChange={(e) =>
+                setBackgroundPreset(
+                  e.target.value as TranscoderBackgroundPreset,
+                )
+              }
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            >
+              {BACKGROUND_PRESETS.map((p) => (
+                <option key={p.value} value={p.value}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field
+            label="Max concurrent background jobs"
+            hint="Hard cap on how many optimize_versions jobs run per scheduler tick (every 30s)."
+          >
+            <input
+              type="number"
+              min={1}
+              max={16}
+              value={maxBackgroundConcurrent}
+              onChange={(e) =>
+                setMaxBackgroundConcurrent(Number(e.target.value))
+              }
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            />
+          </Field>
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
+        <h2 className="mb-1 text-base font-semibold">HDR tone mapping</h2>
+        <p className="mb-4 text-xs text-white/55">
+          When the source is HDR (HDR10 / HLG / Dolby Vision) and the
+          session is being re-encoded, ffmpeg applies a tonemap filter
+          so the SDR output isn&apos;t washed out. Disabling skips the
+          filter — saves CPU but the picture will look flat on SDR
+          displays.
+        </p>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <Field label="Tone map HDR sources">
+            <label className="flex items-center gap-2 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm">
+              <input
+                type="checkbox"
+                checked={tonemapEnabled}
+                onChange={(e) => setTonemapEnabled(e.target.checked)}
+              />
+              <span>
+                Apply HDR → SDR tonemap during reencode (recommended)
+              </span>
+            </label>
+          </Field>
+          <Field
+            label="Tonemap algorithm"
+            hint={
+              TONEMAP_ALGOS.find((a) => a.value === tonemapAlgo)?.hint ?? ""
+            }
+          >
+            <select
+              value={tonemapAlgo}
+              disabled={!tonemapEnabled}
+              onChange={(e) => setTonemapAlgo(e.target.value as TonemapAlgorithm)}
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30 disabled:opacity-40"
+            >
+              {TONEMAP_ALGOS.map((a) => (
+                <option key={a.value} value={a.value}>
+                  {a.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
+        <h2 className="mb-1 text-base font-semibold">GPU device</h2>
+        <p className="mb-4 text-xs text-white/55">
+          Multi-GPU hosts can pin transcoding to a specific card.
+          Auto lets the driver pick — fine for single-GPU systems
+          (~99% of installs). Bad combinations (e.g. picking a VAAPI
+          render node while NVENC is active) silently fall back to
+          driver default at session-spawn time.
+        </p>
+        <Field
+          label="Transcode device"
+          hint={
+            capabilities.gpu_devices.length === 0
+              ? "No multi-GPU devices detected; the dropdown only shows Auto."
+              : "Pinned to the chosen card for every new session. Restart not required."
+          }
+        >
+          <select
+            value={gpuDevice}
+            onChange={(e) => setGpuDevice(e.target.value)}
+            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+          >
+            <option value="auto">Auto (driver picks)</option>
+            {capabilities.gpu_devices.map((d) => (
+              <option key={d.value} value={d.value}>
+                {d.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </section>
+
+      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
+        <h2 className="mb-1 text-base font-semibold">HEVC output</h2>
+        <p className="mb-4 text-xs text-white/55">
+          HEVC (H.265) produces ~30% smaller files at the same visual
+          quality but isn&apos;t universally browser-supported. Output
+          container is forced to fMP4 when HEVC is selected; the ABR
+          fallback variant is disabled (HEVC ABR is a future expansion).
+        </p>
+        <Field
+          label="HEVC encoding mode"
+          hint={HEVC_MODES.find((m) => m.value === hevcMode)?.hint ?? ""}
+        >
+          <select
+            value={hevcMode}
+            onChange={(e) => setHevcMode(e.target.value as HevcMode)}
+            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+          >
+            {HEVC_MODES.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </Field>
       </section>
 
       <section>
@@ -389,7 +648,7 @@ export function AdminTranscoderClient({ capabilities, presets, settings }: Props
           <h2 className="text-base font-semibold">Quality presets</h2>
           <button
             onClick={() => setShowAdd((v) => !v)}
-            className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600"
+            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
           >
             {showAdd ? "Cancel" : "+ New preset"}
           </button>

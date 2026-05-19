@@ -66,7 +66,7 @@ export function MyListClient() {
   }, []);
 
   return (
-    <div className="px-12 pb-24 pt-28">
+    <div className="px-4 sm:px-8 md:px-12 pb-24 pt-24 sm:pt-28">
       <h1 className="mb-10 text-4xl font-bold tracking-tight">My List</h1>
 
       {items === null ? (

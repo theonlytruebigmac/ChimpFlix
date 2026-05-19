@@ -14,6 +14,7 @@ chimpflix-metadata = { path = "../metadata" }
 chimpflix-transcoder = { path = "../transcoder" }
 
 anyhow = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }

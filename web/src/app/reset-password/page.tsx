@@ -90,7 +90,7 @@ function ResetContent() {
             </div>
             <Link
               href="/login"
-              className="block w-full rounded bg-(--color-accent) px-3 py-2 text-center font-semibold text-white transition hover:opacity-90"
+              className="block w-full rounded bg-(--color-accent) px-3 py-3 text-center text-base font-semibold text-white transition hover:opacity-90"
             >
               Sign in
             </Link>
@@ -108,7 +108,7 @@ function ResetContent() {
                 autoFocus
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
               />
               <span className="mt-1 block text-xs text-white/40">
                 At least 8 characters.
@@ -125,7 +125,7 @@ function ResetContent() {
                 maxLength={1024}
                 value={confirm}
                 onChange={(e) => setConfirm(e.target.value)}
-                className="w-full rounded bg-white/10 px-3 py-2 outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
               />
             </label>
 
@@ -138,7 +138,7 @@ function ResetContent() {
             <button
               type="submit"
               disabled={busy}
-              className="w-full rounded bg-(--color-accent) px-3 py-2 font-semibold text-white transition disabled:opacity-50"
+              className="w-full rounded bg-(--color-accent) px-3 py-3 text-base font-semibold text-white transition disabled:opacity-50"
             >
               {busy ? "…" : "Set new password"}
             </button>

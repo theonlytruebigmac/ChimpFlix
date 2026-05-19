@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   items as itemsApi,
   type ItemDetail,
@@ -82,9 +83,15 @@ export function FixMatchDialog({
     void runSearch(query, Number.isFinite(y) ? (y as number) : undefined);
   }
 
-  return (
+  // Portal to document.body so the dialog escapes the TitleModalShell's
+  // `.zf-modal-in` ancestor (transform animation → new containing
+  // block for fixed descendants → dialog ends up wherever the
+  // possibly-scrolled modal card is, instead of centered in the
+  // viewport).
+  if (typeof document === "undefined") return null;
+  return createPortal(
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 zf-modal-backdrop"
+      className="fixed inset-0 z-60 flex items-center justify-center bg-black/70 p-4 zf-modal-backdrop"
       onClick={onClose}
     >
       <div
@@ -211,6 +218,7 @@ export function FixMatchDialog({
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

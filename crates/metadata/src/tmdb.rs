@@ -17,12 +17,20 @@ const TMDB_IMAGE_BASE: &str = "https://image.tmdb.org/t/p";
 pub struct TmdbClient {
     http: reqwest::Client,
     base_url: String,
+    /// BCP-47 language tag sent on every TMDB request (overview,
+    /// tagline, certain titles, image filtering). Defaults to `en-US`.
+    /// Set via `metadata_language` server setting at startup —
+    /// changes require a server restart since this is a process-wide
+    /// singleton.
+    language: String,
 }
 
 impl TmdbClient {
     /// Build a TmdbClient from the `TMDB_READ_TOKEN` environment variable.
     /// Returns `Ok(None)` if the variable is unset/empty so callers can
-    /// skip metadata enrichment gracefully.
+    /// skip metadata enrichment gracefully. Uses `en-US` for metadata —
+    /// callers needing a different language should construct via
+    /// [`Self::with_language`] after vault retrieval.
     pub fn from_env() -> Result<Option<Self>> {
         match std::env::var("TMDB_READ_TOKEN") {
             Ok(token) if !token.trim().is_empty() => Ok(Some(Self::new(token.trim())?)),
@@ -30,7 +38,19 @@ impl TmdbClient {
         }
     }
 
+    /// Construct with the default `en-US` language. Used by the admin
+    /// credential-test path (where short-lived validation against any
+    /// endpoint suffices) and any consumer that doesn't have the
+    /// operator's preferred language available.
     pub fn new(token: &str) -> Result<Self> {
+        Self::with_language(token, "en-US")
+    }
+
+    /// Construct with an operator-chosen BCP-47 language. Sent on every
+    /// localised endpoint (`/movie/{id}`, `/tv/{id}`, search, season
+    /// detail, etc.). Invalid tags get original-language fallbacks
+    /// from TMDB silently — no error.
+    pub fn with_language(token: &str, language: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let auth = format!("Bearer {token}");
         let mut auth_value =
@@ -49,7 +69,24 @@ impl TmdbClient {
         Ok(Self {
             http,
             base_url: TMDB_BASE_URL.to_string(),
+            language: language.to_string(),
         })
+    }
+
+    /// The active language tag — exposed so callers can decide whether
+    /// to rebuild the client after a settings change.
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// Value for the `include_image_language` query param. We want the
+    /// base language code (`en` from `en-US`, `ja` from `ja-JP`) plus
+    /// `null` so language-less art is always included as a fallback —
+    /// many releases ship a no-language logo that we want as the
+    /// secondary candidate when the localised one is missing.
+    fn image_lang_filter(&self) -> String {
+        let base = self.language.split('-').next().unwrap_or("en");
+        format!("{base},null")
     }
 
     /// Hit a tiny endpoint to confirm the API key is accepted. Used by the
@@ -70,7 +107,7 @@ impl TmdbClient {
     pub async fn lookup_movie(&self, query: &str, year: Option<i32>) -> Result<Option<TmdbMovie>> {
         let mut params: Vec<(&str, String)> = vec![
             ("query", query.to_string()),
-            ("language", "en-US".to_string()),
+            ("language", self.language.clone()),
         ];
         if let Some(y) = year {
             params.push(("year", y.to_string()));
@@ -93,13 +130,13 @@ impl TmdbClient {
             .get(
                 &format!("/movie/{tmdb_id}"),
                 &[
-                    ("language", "en-US".to_string()),
+                    ("language", self.language.clone()),
                     ("append_to_response", "external_ids,images".to_string()),
                     // Restrict the images response to English (or the
                     // language-less art that many releases ship); avoids
                     // pulling logos in 30+ languages for a payload we
                     // only need a single pick from.
-                    ("include_image_language", "en,null".to_string()),
+                    ("include_image_language", self.image_lang_filter()),
                 ],
             )
             .await?;
@@ -113,7 +150,7 @@ impl TmdbClient {
         let raw: RawImagesResponse = self
             .get(
                 &format!("/movie/{tmdb_id}/images"),
-                &[("include_image_language", "en,null".to_string())],
+                &[("include_image_language", self.image_lang_filter())],
             )
             .await?;
         Ok(pick_logo(&raw.logos))
@@ -123,7 +160,7 @@ impl TmdbClient {
     /// we take the first page since the Top 10 rail only needs 10.
     pub async fn trending_movies(&self) -> Result<Vec<TmdbTrendingEntry>> {
         let raw: SearchPage<RawTrendingEntry> = self
-            .get("/trending/movie/week", &[("language", "en-US".to_string())])
+            .get("/trending/movie/week", &[("language", self.language.clone())])
             .await?;
         Ok(raw
             .results
@@ -137,7 +174,7 @@ impl TmdbClient {
     /// `/trending/tv/week` route so the result is homogeneous.
     pub async fn trending_shows(&self) -> Result<Vec<TmdbTrendingEntry>> {
         let raw: SearchPage<RawTrendingEntry> = self
-            .get("/trending/tv/week", &[("language", "en-US".to_string())])
+            .get("/trending/tv/week", &[("language", self.language.clone())])
             .await?;
         Ok(raw
             .results
@@ -149,7 +186,7 @@ impl TmdbClient {
     pub async fn lookup_show(&self, query: &str, year: Option<i32>) -> Result<Option<TmdbShow>> {
         let mut params: Vec<(&str, String)> = vec![
             ("query", query.to_string()),
-            ("language", "en-US".to_string()),
+            ("language", self.language.clone()),
         ];
         if let Some(y) = year {
             params.push(("first_air_date_year", y.to_string()));
@@ -168,9 +205,9 @@ impl TmdbClient {
             .get(
                 &format!("/tv/{tmdb_id}"),
                 &[
-                    ("language", "en-US".to_string()),
+                    ("language", self.language.clone()),
                     ("append_to_response", "external_ids,images".to_string()),
-                    ("include_image_language", "en,null".to_string()),
+                    ("include_image_language", self.image_lang_filter()),
                 ],
             )
             .await?;
@@ -183,7 +220,7 @@ impl TmdbClient {
         let raw: RawImagesResponse = self
             .get(
                 &format!("/tv/{tmdb_id}/images"),
-                &[("include_image_language", "en,null".to_string())],
+                &[("include_image_language", self.image_lang_filter())],
             )
             .await?;
         Ok(pick_logo(&raw.logos))
@@ -201,7 +238,7 @@ impl TmdbClient {
     ) -> Result<Vec<TmdbCandidate>> {
         let mut params: Vec<(&str, String)> = vec![
             ("query", query.to_string()),
-            ("language", "en-US".to_string()),
+            ("language", self.language.clone()),
         ];
         let path = match kind {
             TmdbKind::Movie => {
@@ -240,7 +277,7 @@ impl TmdbClient {
             TmdbKind::Show => format!("/tv/{tmdb_id}/credits"),
         };
         let raw: RawCredits = self
-            .get(&path, &[("language", "en-US".to_string())])
+            .get(&path, &[("language", self.language.clone())])
             .await?;
         let cast: Vec<TmdbCastMember> = raw
             .cast
@@ -281,7 +318,7 @@ impl TmdbClient {
         let raw: RawCollectionDetail = self
             .get(
                 &format!("/collection/{tmdb_id}"),
-                &[("language", "en-US".to_string())],
+                &[("language", self.language.clone())],
             )
             .await?;
         Ok(TmdbCollection {
@@ -316,7 +353,7 @@ impl TmdbClient {
             TmdbKind::Show => format!("/tv/{tmdb_id}/reviews"),
         };
         let raw: RawReviews = self
-            .get(&path, &[("language", "en-US".to_string())])
+            .get(&path, &[("language", self.language.clone())])
             .await?;
         Ok(raw
             .results
@@ -354,7 +391,7 @@ impl TmdbClient {
             TmdbKind::Show => format!("/tv/{tmdb_id}/videos"),
         };
         let raw: RawVideos = self
-            .get(&path, &[("language", "en-US".to_string())])
+            .get(&path, &[("language", self.language.clone())])
             .await?;
         Ok(raw
             .results
@@ -386,7 +423,7 @@ impl TmdbClient {
             format!("/movie/{tmdb_id}/similar")
         };
         let resp: SimilarResults = self
-            .get(&path, &[("language", "en-US".to_string())])
+            .get(&path, &[("language", self.language.clone())])
             .await?;
         Ok(resp.results.into_iter().map(|r| r.id).collect())
     }
@@ -406,7 +443,7 @@ impl TmdbClient {
             format!("/movie/{tmdb_id}/videos")
         };
         let resp: RawVideos = self
-            .get(&path, &[("language", "en-US".to_string())])
+            .get(&path, &[("language", self.language.clone())])
             .await?;
         let mut trailers: Vec<&RawVideo> = resp
             .results
@@ -438,7 +475,7 @@ impl TmdbClient {
             .get(
                 &path,
                 &[
-                    ("include_image_language", "en,null".to_string()),
+                    ("include_image_language", self.image_lang_filter()),
                 ],
             )
             .await?;
@@ -462,7 +499,7 @@ impl TmdbClient {
         let raw: RawSeason = self
             .get(
                 &format!("/tv/{show_id}/season/{season_number}"),
-                &[("language", "en-US".to_string())],
+                &[("language", self.language.clone())],
             )
             .await?;
         Ok(TmdbSeason {

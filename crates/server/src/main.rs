@@ -5,7 +5,9 @@ mod auth;
 mod events;
 mod file_watcher;
 mod log_buffer;
+mod mail_template;
 mod mailer;
+mod net;
 mod notifier;
 mod scheduler;
 mod session_watcher;
@@ -31,7 +33,7 @@ use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer as _, fmt, prelude::*};
 
 use crate::auth::AuthConfig;
 use crate::events::Hub;
@@ -45,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = env::var("DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./data"));
-    let bind_addr: SocketAddr = env::var("BIND_ADDR")
+    let mut bind_addr: SocketAddr = env::var("BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()
         .context("BIND_ADDR is not a valid socket address")?;
@@ -54,7 +56,38 @@ async fn main() -> anyhow::Result<()> {
 
     let vault = Arc::new(load_vault());
 
-    let pool = chimpflix_library::open(&data_dir).await?;
+    // Apply any operator-staged restore before opening the DB. When a
+    // `chimpflix.db.pending-restore` file is present in data_dir, this
+    // moves the current `chimpflix.db` aside to
+    // `chimpflix.db.pre-restore-<stamp>.db` and renames the pending
+    // file into place. Idempotent + no-op when nothing is staged.
+    if let Err(e) = crate::api::admin::backup::apply_pending_restore_if_present(&data_dir).await {
+        warn!(error = %format!("{e:#}"), "pending-restore application failed; booting against current DB");
+    }
+
+    // Two-pass open so the operator-configured `database_cache_size_mb`
+    // is baked into every pooled connection from the start. The probe
+    // pool is opened with SQLite defaults, runs migrations, and reads
+    // the setting; if the operator wants a non-default cache, we close
+    // the probe pool and reopen with the value pinned via
+    // `PRAGMA cache_size`. The double-open cost is microseconds at
+    // boot and is far simpler than juggling per-connection PRAGMA
+    // application against a shared atomic.
+    let probe_pool = chimpflix_library::open(&data_dir).await?;
+    let configured_cache_mb = match queries::get_server_settings(&probe_pool).await {
+        Ok(s) => s.database_cache_size_mb,
+        Err(_) => 0,
+    };
+    let pool = if configured_cache_mb > 0 {
+        probe_pool.close().await;
+        info!(
+            cache_size_mb = configured_cache_mb,
+            "reopening database with operator-configured PRAGMA cache_size",
+        );
+        chimpflix_library::open_with(&data_dir, Some(configured_cache_mb)).await?
+    } else {
+        probe_pool
+    };
     queries::ensure_default_user(&pool).await?;
 
     // Migrate any legacy plaintext webhook secrets into the encrypted
@@ -89,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
         info!(count = expired, "purged expired sessions");
     }
 
-    let ffmpeg = FfmpegConfig::from_env();
+    let mut ffmpeg = FfmpegConfig::from_env();
     maybe_import_tmdb_from_env(&pool, &vault).await?;
     let tmdb = build_tmdb_from_vault(&pool, &vault).await?;
     match &tmdb {
@@ -182,23 +215,72 @@ async fn main() -> anyhow::Result<()> {
         ffmpeg.clone(),
         transcoder_caps.clone(),
     )?;
-    // Reap orphaned sessions: 5-minute idle threshold, polled every 30s.
-    // The client touches the session on every HLS manifest/segment
-    // request, but HLS.js stops polling once its buffer is full — so a
-    // user who pauses for a few minutes goes silent. 20s used to kill
-    // those sessions; raise the floor to comfortably cover a coffee
-    // break. Cost of the higher floor is ~5 minutes of stale ffmpeg
-    // after a lost DELETE, which is acceptable.
-    transcoder.spawn_reaper(300_000, 30);
-
-    let hub = Hub::new(256);
 
     // Hydrate the server settings cache. The migration guarantees a row
     // exists (id = 1) with defaults; a missing row here is a corruption
-    // bug, not a missing-config one.
+    // bug, not a missing-config one. Loading early so the reaper can
+    // honour the operator's configured idle threshold from the first
+    // tick instead of starting at the hard-coded default.
     let initial_settings = queries::get_server_settings(&pool)
         .await
         .context("load server_settings singleton")?;
+    // Wire the scanner nice level into the FfmpegConfig that scheduled
+    // tasks and the file watcher will use. Live transcode sessions
+    // call `Command::new(&cfg.ffmpeg)` directly and bypass the nice
+    // wrapper — so the prior `transcoder.clone()` of `ffmpeg` (which
+    // is what `TranscodeManager` keeps) doesn't pick up the nice
+    // level, which is intentional. The state.ffmpeg used by scanner
+    // and tasks gets the nice level applied here.
+    if (1..=19).contains(&initial_settings.scanner_nice_level) {
+        ffmpeg.background_nice_level = Some(initial_settings.scanner_nice_level as i32);
+        info!(
+            level = initial_settings.scanner_nice_level,
+            "background ffmpeg/ffprobe will run under `nice -n N`"
+        );
+    }
+    // Operator-set bind override takes precedence over the env when
+    // non-empty. Parsed at write-time so a malformed value is rejected
+    // before storage; the parse here is just to surface it; failure
+    // falls back to the env-derived value with a warning.
+    let bi = initial_settings.bind_interface.trim();
+    if !bi.is_empty() {
+        match bi.parse::<SocketAddr>() {
+            Ok(addr) => {
+                info!(env = %bind_addr, override = %addr, "honoring settings bind_interface");
+                bind_addr = addr;
+            }
+            Err(e) => {
+                warn!(value = %bi, error = %e, "ignoring malformed bind_interface, using env");
+            }
+        }
+    }
+    // Reap orphaned sessions on the operator's configured idle window.
+    // The client sends a keepalive ping every 60s (and on every HLS
+    // manifest/segment request), so the default 90s floor catches a
+    // single missed beat plus reaper interval slack. Aggressive cleanup
+    // matters most on mobile, where force-closing the PWA doesn't
+    // reliably fire any unload event the server can observe — the only
+    // signal is the keepalive going silent. The threshold is a startup-
+    // time read (spawn_reaper takes an i64, not a settings handle);
+    // changing it via the admin UI takes effect on next restart.
+    // Reaper with a stats hook: every time the reaper kills an idle
+    // session, fan out a `stop` event to playback_events with the
+    // final cumulative bytes_served. Gives the admin Stats page
+    // per-stream bandwidth without any per-segment DB write.
+    let pool_for_reaper = pool.clone();
+    transcoder.spawn_reaper_with_hook(
+        initial_settings.transcoder_reaper_idle_threshold_ms,
+        15,
+        move |snap| {
+            let pool = pool_for_reaper.clone();
+            tokio::spawn(async move {
+                emit_session_stop_event(&pool, &snap).await;
+            });
+        },
+    );
+
+    let hub = Hub::new(256);
+
     let settings = std::sync::Arc::new(tokio::sync::RwLock::new(initial_settings));
 
     let state = AppState {
@@ -240,7 +322,18 @@ async fn main() -> anyhow::Result<()> {
     scheduler::spawn(state.clone());
     webhooks::spawn(state.clone());
     session_watcher::spawn(state.hub.clone(), state.transcoder.clone());
-    file_watcher::spawn(state.clone());
+    // Filesystem watcher is gated on the operator's `scan_automatically`
+    // setting (default on). Manual scans + scheduled `scan_library`
+    // tasks still work when off — this only controls the
+    // notify-driven real-time path. Read once at startup; toggling
+    // takes effect on next restart so we don't have to tear down +
+    // re-spawn the watcher mid-flight.
+    let settings_now = state.settings.read().await.clone();
+    if settings_now.scan_automatically {
+        file_watcher::spawn(state.clone());
+    } else {
+        info!("scan_automatically = false; file watcher not started");
+    }
 
     let app = api::router(state);
     let listener = TcpListener::bind(bind_addr)
@@ -263,12 +356,26 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(buffer: log_buffer::LogBuffer) {
-    let filter = EnvFilter::try_from_default_env()
+    // Per-layer filters: the stdout fmt layer honors RUST_LOG (so
+    // container/syslog stays tidy), but the in-memory buffer that powers
+    // the admin Logs page captures everything at TRACE-and-above. Without
+    // this split, applying RUST_LOG=info globally meant the buffer never
+    // saw DEBUG/TRACE — and changing the UI's "Min level" dropdown from
+    // INFO down to TRACE looked like a no-op because there was nothing
+    // below INFO to reveal.
+    //
+    // The buffer cap (5k lines in log_buffer.rs) keeps memory bounded
+    // even when a chatty crate spams DEBUG; oldest evicts first.
+    let stdout_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,tower_http=info"));
+    // Buffer captures TRACE+ globally so the UI dropdown is meaningful,
+    // but silences a few notoriously chatty deps (sqlx at the statement
+    // level, the hyper/reqwest HTTP plumbing) to keep the 5k-line ring
+    // useful instead of swamped with one-shot request frames.
+    let buffer_filter = EnvFilter::new("trace,sqlx=info,hyper=info,h2=info,reqwest=info");
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
-        .with(log_buffer::LogBufferLayer::new(buffer))
+        .with(fmt::layer().with_filter(stdout_filter))
+        .with(log_buffer::LogBufferLayer::new(buffer).with_filter(buffer_filter))
         .init();
 }
 
@@ -326,7 +433,18 @@ async fn build_tmdb_from_vault(
     let Some(token) = queries::vault_get(pool, vault, "tmdb").await? else {
         return Ok(None);
     };
-    Ok(Some(TmdbClient::new(&token)?))
+    // Read the operator's preferred metadata language inline rather
+    // than threading it through main()'s startup sequence — the
+    // settings row is tiny and this avoids reordering against the
+    // later `initial_settings` load that several other subsystems
+    // depend on. Settings changes here require a server restart since
+    // TmdbClient is a process-wide singleton consumed by the scanner
+    // and on-demand fix-match path.
+    let language = match queries::get_server_settings(pool).await {
+        Ok(s) => s.metadata_language,
+        Err(_) => "en-US".to_string(),
+    };
+    Ok(Some(TmdbClient::with_language(&token, &language)?))
 }
 
 async fn build_tvdb_from_vault(
@@ -393,4 +511,37 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received");
+}
+
+/// Emit a `stop` event with the closing session's cumulative
+/// bandwidth + final position. Called from both the reaper (via the
+/// hook registered above) and the explicit `DELETE /sessions/{id}`
+/// path so admin Stats reflects every terminated stream. Resolves the
+/// owning item / episode via `media_file_owner` — the same pattern
+/// the start-event recorder uses.
+pub(crate) async fn emit_session_stop_event(
+    pool: &SqlitePool,
+    snap: &chimpflix_transcoder::SessionSnapshot,
+) {
+    let (item_id, episode_id) =
+        chimpflix_library::queries::media_file_owner(pool, snap.media_file_id)
+            .await
+            .unwrap_or((None, None));
+    let ev = chimpflix_library::queries::PlaybackEventInput {
+        item_id,
+        episode_id,
+        media_file_id: Some(snap.media_file_id),
+        duration_ms: snap.duration_ms,
+        decision: Some("transcode"),
+        bytes_sent: Some(snap.bytes_served),
+        session_token: Some(snap.id.as_str()),
+        ..chimpflix_library::queries::PlaybackEventInput::new(snap.user_id, "stop")
+    };
+    if let Err(e) = chimpflix_library::queries::record_playback_event(pool, ev).await {
+        warn!(
+            session_id = %snap.id,
+            error = %format!("{e:#}"),
+            "record playback stop event",
+        );
+    }
 }

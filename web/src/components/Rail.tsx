@@ -34,13 +34,13 @@ export function Rail({
     // Combined with image lazy-loading, a 15-rail home page only spends
     // paint cycles on the 2-3 rails actually visible.
     <section
-      className="zf-rise-in px-12 pb-1 pt-1"
+      className="zf-rise-in px-4 pb-1 pt-1 sm:px-8 md:px-12"
       style={{
         contentVisibility: "auto",
         containIntrinsicSize: "260px",
       }}
     >
-      <h2 className="mb-3 text-[1.4rem] font-semibold tracking-tight">
+      <h2 className="mb-3 text-lg font-semibold tracking-tight sm:text-xl md:text-[1.4rem]">
         {href ? (
           <Link
             href={href}
@@ -78,11 +78,15 @@ export function Rail({
         its origin so the edge cards expand inward instead of being clipped
         by the rail's overflow-x boundary. Middle cards keep origin-center.
       */}
-      <ul className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-12 pt-2 scrollbar-none [&::-webkit-scrollbar]:hidden">
+      {/* `snap-x snap-mandatory` makes touch swipes land on a card
+          rather than mid-card — feels closer to a native carousel.
+          Disabled at md+ where there's no real swipe gesture and snap
+          can interrupt mouse-wheel scrolling. */}
+      <ul className="-mx-1 flex snap-x snap-mandatory gap-1.5 overflow-x-auto px-1 pb-12 pt-2 scrollbar-none md:snap-none [&::-webkit-scrollbar]:hidden">
         {items.map((it) => (
           <li
             key={it.ratingKey}
-            className="flex-none [&:first-child_.card-scaler]:origin-left [&:last-child_.card-scaler]:origin-right"
+            className="snap-start flex-none [&:first-child_.card-scaler]:origin-left [&:last-child_.card-scaler]:origin-right"
           >
             <Card item={it} />
           </li>

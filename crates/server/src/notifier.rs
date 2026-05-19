@@ -11,6 +11,8 @@ use chimpflix_library::{User, queries};
 use serde::Serialize;
 use tracing::warn;
 
+use crate::mail_template;
+use crate::mail_template::{CalloutKind, PipKind};
 use crate::mailer::{Mailer, OutgoingMessage};
 use crate::state::AppState;
 
@@ -120,29 +122,62 @@ async fn send_email_if_opted_in(
 // Pre-baked rendering helpers — keep template knowledge in one place.
 // ---------------------------------------------------------------------------
 
-pub fn render_user_registered(payload: &UserRegisteredPayload<'_>) -> (String, String, String) {
+pub fn render_user_registered(
+    server_name: &str,
+    payload: &UserRegisteredPayload<'_>,
+) -> (String, String, String) {
     let display = payload.display_name.unwrap_or(payload.username);
     let subject = format!("New user joined: {display}");
-    let email_line = payload
-        .email
-        .map(|e| format!(" ({e})"))
-        .unwrap_or_default();
-    let text = format!(
-        "{display} (@{u}){email} just accepted their invite and finished signup.\n\n\
-         Grant library access from Settings → Users → Access.",
-        u = payload.username,
-        email = email_line,
+    // ── Plain text ──
+    let mut text_body = format!("{display} (@{u}) accepted their invite and finished signup.\n",
+        u = payload.username);
+    if let Some(email) = payload.email {
+        text_body.push_str(&format!("Their email is {email}.\n"));
+    }
+    text_body.push_str(
+        "\nThey don't have access to any libraries yet. Grant access from \
+         Settings → Users → Access.",
     );
-    let html = format!(
-        r#"<p><strong>{display_safe}</strong> (@{user_safe}){email_safe} just accepted their invite and finished signup.</p>
-           <p>Grant library access from Settings → Users → Access.</p>"#,
-        display_safe = html_escape(display),
-        user_safe = html_escape(payload.username),
-        email_safe = payload
-            .email
-            .map(|e| format!(" ({})", html_escape(e)))
-            .unwrap_or_default(),
-    );
+    let text = mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name,
+        headline: &format!("{display} just joined your server"),
+        body: &text_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner. \
+                      Admin alerts can be muted per-kind from Settings → Account → Notifications.",
+    });
+    // ── HTML ──
+    let display_safe = mail_template::html_escape(display);
+    let user_safe = mail_template::html_escape(payload.username);
+    let mut html_body = String::new();
+    html_body.push_str(&mail_template::section_paragraph(&format!(
+        "<strong>{display_safe}</strong> (@{user_safe}) accepted their invite and finished signup. \
+         They don't have access to any libraries yet — grant them access from the admin panel."
+    )));
+    let mut rows: Vec<(&str, &str)> = vec![
+        ("Username", payload.username),
+    ];
+    if let Some(email) = payload.email {
+        rows.push(("Email", email));
+    }
+    if let Some(inv) = payload.invite_email {
+        rows.push(("Invited via", inv));
+    }
+    html_body.push_str(&mail_template::section_kv(&rows));
+    html_body.push_str(&mail_template::section_cta_minimal(
+        "Grant library access",
+        "/settings/admin/users/access",
+    ));
+    html_body.push_str(&mail_template::section_small(
+        "Or jump to Settings → Users → Access.",
+    ));
+    let html = mail_template::render_email(mail_template::EmailOpts {
+        server_name,
+        eyebrow_html: "Admin · New signup",
+        headline: &format!("{display} just joined your server."),
+        body_html: &html_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner. \
+                      Admin alerts can be muted per-kind from Settings → Account → Notifications.",
+    });
     (subject, text, html)
 }
 
@@ -154,7 +189,8 @@ pub async fn notify_user_registered(state: &AppState, new_user: &User, invite_em
         email: new_user.email.as_deref(),
         invite_email,
     };
-    let (subject, text, html) = render_user_registered(&payload);
+    let server_name = state.settings.read().await.server_name.clone();
+    let (subject, text, html) = render_user_registered(&server_name, &payload);
     notify_admins(
         state,
         KIND_USER_REGISTERED,
@@ -178,19 +214,58 @@ pub async fn notify_two_factor_disabled(state: &AppState, user: &User) {
         username: &user.username,
     };
     let display = user.display_name.as_deref().unwrap_or(&user.username);
+    let display_safe = mail_template::html_escape(display);
+    let user_safe = mail_template::html_escape(&user.username);
+    let server_name = state.settings.read().await.server_name.clone();
+    let when = mail_template::format_email_datetime(chimpflix_common::now_ms());
+
     let subject = format!("{display} turned off two-factor");
-    let text = format!(
-        "{display} (@{u}) disabled their two-factor authentication.\n\n\
-         If you didn't expect this, reach out — and consider switching\n\
-         the global enforcement to 'required' in Settings → Server → General.",
+
+    let text_body = format!(
+        "{display} (@{u}) disabled their two-factor authentication.\n\
+         When: {when}\n\n\
+         Heads up: their account is now protected by password only. \
+         If this wasn't expected, reach out to confirm — and reset \
+         their password from the admin panel if you suspect compromise.",
         u = user.username,
     );
-    let html = format!(
-        r#"<p><strong>{d_safe}</strong> (@{u_safe}) disabled their two-factor authentication.</p>
-           <p>If you didn't expect this, reach out — and consider switching the global enforcement to 'required' in Settings → Server → General.</p>"#,
-        d_safe = html_escape(display),
-        u_safe = html_escape(&user.username),
+    let text = mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name: &server_name,
+        headline: "Two-factor turned off",
+        body: &text_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner. Security events can't be muted.",
+    });
+
+    let mut html_body = String::new();
+    html_body.push_str(&mail_template::section_paragraph(&format!(
+        "<strong>{display_safe}</strong> (@{user_safe}) disabled two-factor authentication on their account."
+    )));
+    html_body.push_str(&mail_template::section_callout(
+        CalloutKind::Warn,
+        "<strong>Heads up:</strong> their account is now protected by password only. \
+         If this wasn't expected, reach out to confirm — and reset their password from \
+         the admin panel if you suspect compromise.",
+    ));
+    html_body.push_str(&mail_template::section_kv(&[
+        ("When", &when),
+        ("User", display),
+        ("Action", "Disabled their own 2FA"),
+    ]));
+    html_body.push_str(&mail_template::section_cta_minimal(
+        "Review user",
+        "/settings/admin/users/users",
+    ));
+    let eyebrow = format!(
+        "Admin · Security event &nbsp;{}",
+        mail_template::section_pip(PipKind::Warn, "2FA"),
     );
+    let html = mail_template::render_email(mail_template::EmailOpts {
+        server_name: &server_name,
+        eyebrow_html: &eyebrow,
+        headline: "Two-factor turned off.",
+        body_html: &html_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner. Security events can't be muted.",
+    });
     notify_admins(
         state,
         KIND_USER_TWO_FACTOR_DISABLED,
@@ -221,21 +296,60 @@ pub async fn notify_two_factor_reset(state: &AppState, actor: &User, target_user
         .display_name
         .as_deref()
         .unwrap_or(&target_user.username);
+    let ad_safe = mail_template::html_escape(actor_display);
+    let au_safe = mail_template::html_escape(&actor.username);
+    let td_safe = mail_template::html_escape(target_display);
+    let tu_safe = mail_template::html_escape(&target_user.username);
+    let server_name = state.settings.read().await.server_name.clone();
+    let when = mail_template::format_email_datetime(chimpflix_common::now_ms());
+
     let subject = format!("{actor_display} reset 2FA for {target_display}");
-    let text = format!(
-        "{actor_display} (@{au}) reset two-factor for {target_display} (@{tu}).\n\n\
-         The user can now log in with just their password until they re-enroll.",
+
+    let text_body = format!(
+        "{actor_display} (@{au}) reset two-factor for {target_display} (@{tu}).\n\
+         When: {when}\n\n\
+         The target user's account will prompt them to enroll a new TOTP authenticator on \
+         next login. Recovery codes have been invalidated.",
         au = actor.username,
         tu = target_user.username,
     );
-    let html = format!(
-        r#"<p><strong>{ad_safe}</strong> (@{au_safe}) reset two-factor for <strong>{td_safe}</strong> (@{tu_safe}).</p>
-           <p>The user can now log in with just their password until they re-enroll.</p>"#,
-        ad_safe = html_escape(actor_display),
-        au_safe = html_escape(&actor.username),
-        td_safe = html_escape(target_display),
-        tu_safe = html_escape(&target_user.username),
+    let text = mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name: &server_name,
+        headline: "Two-factor reset",
+        body: &text_body,
+        footer_note: "This notification fans out to every server owner so a second admin can \
+                      countersign the action if needed.",
+    });
+
+    let mut html_body = String::new();
+    html_body.push_str(&mail_template::section_paragraph(&format!(
+        "<strong>{ad_safe}</strong> (@{au_safe}) reset two-factor authentication for \
+         <strong>{td_safe}</strong> (@{tu_safe}). Their account will prompt to enroll a new TOTP \
+         authenticator on next login."
+    )));
+    html_body.push_str(&mail_template::section_callout(
+        CalloutKind::Info,
+        "<strong>Recovery codes have been invalidated.</strong> If the user regenerates them \
+         after re-enrollment, they'll get a fresh set.",
+    ));
+    html_body.push_str(&mail_template::section_kv(&[
+        ("When", &when),
+        ("Target user", target_display),
+        ("Acted by", actor_display),
+    ]));
+    let eyebrow = format!(
+        "Admin · Security event &nbsp;{}",
+        mail_template::section_pip(PipKind::Default, "2FA reset"),
     );
+    let html = mail_template::render_email(mail_template::EmailOpts {
+        server_name: &server_name,
+        eyebrow_html: &eyebrow,
+        headline: "Two-factor reset.",
+        body_html: &html_body,
+        footer_note: "This notification fans out to every server owner so a second admin can \
+                      countersign the action if needed.",
+    });
+
     notify_admins(
         state,
         KIND_USER_TWO_FACTOR_RESET,
@@ -247,10 +361,3 @@ pub async fn notify_two_factor_reset(state: &AppState, actor: &User, target_user
     .await;
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}

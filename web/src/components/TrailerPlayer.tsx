@@ -33,7 +33,13 @@ export function TrailerPlayer({
   // proxies like Traefik this is especially likely because the very
   // first iframe load is what YouTube validates.
   const [mounted, setMounted] = useState(false);
+  // SSR-hydration guard: render server-side with a stable placeholder
+  // and flip to the real URL on first client tick. The setState in
+  // effect is intentional — the whole point is "we are now on the
+  // client". eslint-disable rather than refactor since useEffectEvent
+  // is still experimental in our React version.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMounted(true);
   }, []);
 

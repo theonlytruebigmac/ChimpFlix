@@ -16,7 +16,12 @@
 // Types
 // ---------------------------------------------------------------------------
 
-export type UserRole = "owner" | "user";
+/// Three-tier role hierarchy. `Owner > Admin > User` for the purposes
+/// of management actions — owners manage anyone (including each
+/// other), admins manage users + other admins but never owners, users
+/// have no admin powers. At least one owner must always exist; the
+/// backend rejects mutations that would orphan the system.
+export type UserRole = "owner" | "admin" | "user";
 
 export interface User {
   id: number;
@@ -148,6 +153,9 @@ export interface Library {
   episode_naming: EpisodeNaming;
   certification_country: string;
   visibility: LibraryVisibility;
+  /** When true, the item modal exposes a Delete-from-disk button.
+   *  Off by default to protect against accidental loss. */
+  allow_media_deletion: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -167,6 +175,7 @@ export interface LibraryUpdateInput {
   episode_naming?: EpisodeNaming;
   certification_country?: string;
   visibility?: LibraryVisibility;
+  allow_media_deletion?: boolean;
 }
 
 export interface LibraryAgent {
@@ -185,11 +194,31 @@ export interface AgentInfo {
 
 // ─── Scheduled tasks ───────────────────────────────────────────────────────
 
+/** Friendly schedule label. When `custom`, `cron_expr` is the
+ *  source of truth. Otherwise the scheduler computes `next_run_at`
+ *  from `frequency + last_finished_at`. */
+export type TaskFrequency =
+  | "manual"
+  | "hourly"
+  | "every_3_hours"
+  | "every_6_hours"
+  | "every_12_hours"
+  | "daily"
+  | "every_3_days"
+  | "weekly"
+  | "monthly"
+  | "on_change"
+  | "custom";
+
 export interface ScheduledTask {
   id: number;
   kind: string;
   name: string;
   cron_expr: string;
+  frequency: TaskFrequency;
+  /** When true, computed `next_run_at` is snapped forward into the
+   *  next opening of the maintenance window (see ServerSettings). */
+  requires_maintenance_window: boolean;
   params_json: string;
   enabled: boolean;
   last_run_at: number | null;
@@ -204,7 +233,9 @@ export interface ScheduledTask {
 export interface NewScheduledTaskInput {
   kind: string;
   name: string;
-  cron_expr: string;
+  cron_expr?: string;
+  frequency?: TaskFrequency;
+  requires_maintenance_window?: boolean;
   params_json?: string;
   enabled?: boolean;
 }
@@ -212,6 +243,8 @@ export interface NewScheduledTaskInput {
 export interface ScheduledTaskUpdate {
   name?: string;
   cron_expr?: string;
+  frequency?: TaskFrequency;
+  requires_maintenance_window?: boolean;
   params_json?: string;
   enabled?: boolean;
 }
@@ -221,6 +254,10 @@ export interface TaskKindInfo {
   display_name: string;
   description: string;
   params_schema: string;
+  /** Pre-filled when creating a new task of this kind. */
+  default_frequency: TaskFrequency;
+  /** Pre-filled when creating a new task of this kind. */
+  default_requires_maintenance_window: boolean;
 }
 
 export interface TaskRun {
@@ -252,6 +289,16 @@ export interface TranscoderCapabilities {
   /// `pick_video_treatment` to decide whether to emit
   /// `-hwaccel <name>` per session.
   decoders: HwDecoderCapabilities;
+  /// Enumerated GPU devices for the admin Transcoder dropdown.
+  /// Empty on single-GPU boxes (the "auto" sentinel still works);
+  /// populated when multiple cards are present.
+  gpu_devices: GpuDevice[];
+}
+
+export interface GpuDevice {
+  name: string;
+  value: string;
+  backend: string;
 }
 
 export interface HwDecoderCapabilities {
@@ -298,12 +345,33 @@ export interface NetworkSettings {
   public_url: string | null;
   cors_origins: string[];
   secure_connections: SecureConnectionsMode;
+  /** ms a session can go without a keepalive before the reaper kills
+   *  it. Default 90_000. Read at startup — changes take effect on
+   *  next server restart. */
+  transcoder_reaper_idle_threshold_ms: number;
+  /** Cap on concurrent transcode sessions per user when the request
+   *  originates outside `lan_networks`. 0 disables the cap. */
+  max_remote_streams_per_user: number;
+  /** Comma-separated CIDR list. Empty = no LAN inference. */
+  lan_networks: string;
+  /** Comma-separated CIDR list. Matching IPs skip the cookie check
+   *  and run as the server owner. */
+  auth_bypass_cidrs: string;
+  /** Empty = honor BIND_ADDR env (default `0.0.0.0:8080`). Non-empty
+   *  values like `192.168.1.50:8080` pin the listener to a specific
+   *  NIC. Restart required for changes to take effect. */
+  bind_interface: string;
 }
 
 export interface NetworkUpdateInput {
   public_url?: string | null;
   cors_origins?: string[];
   secure_connections?: SecureConnectionsMode;
+  transcoder_reaper_idle_threshold_ms?: number;
+  max_remote_streams_per_user?: number;
+  lan_networks?: string;
+  auth_bypass_cidrs?: string;
+  bind_interface?: string;
 }
 
 export interface ReachabilityResult {
@@ -380,7 +448,16 @@ export interface AccessMatrixEntry {
   username: string;
   library_id: number;
   library_name: string;
+  /// Direct `library_access` row exists. This is the only field the
+  /// matrix checkbox edits.
   allowed: boolean;
+  /// Access-group names that ALSO grant this user this library
+  /// (`access_group_libraries` × `user_access_groups`). These grants
+  /// aren't editable from the matrix — they're managed under Settings
+  /// → Users → Groups — but the UI surfaces them so admins can see
+  /// effective access at a glance instead of mistaking group-only
+  /// access for "locked out".
+  via_groups: string[];
 }
 
 export interface LibraryAccessAssignment {
@@ -458,16 +535,47 @@ export interface Item {
 
 export interface Collection {
   id: number;
-  tmdb_id: number;
+  tmdb_id: number | null;
+  kind: "auto" | "manual" | "smart";
   name: string;
+  sort_title: string | null;
   overview: string | null;
+  description: string | null;
   poster_path: string | null;
   backdrop_path: string | null;
+  created_by_user_id: number | null;
+  rule_json: string | null;
   item_count: number;
 }
 
 export interface CollectionDetail extends Collection {
   items: ListedItem[];
+}
+
+export interface NewManualCollection {
+  name: string;
+  sort_title?: string | null;
+  description?: string | null;
+}
+
+export interface NewSmartCollection {
+  name: string;
+  sort_title?: string | null;
+  description?: string | null;
+  /// Pre-serialised rule JSON. See backend `smart_rule` module for
+  /// the supported field/op vocabulary.
+  rule_json: string;
+}
+
+/// Double-Option mirrors the Rust shape: `undefined` = field omitted (no
+/// change); `null` = explicitly set to NULL. Useful for clearing the
+/// poster_path on a collection without nuking name in the same call.
+export interface ManualCollectionUpdate {
+  name?: string;
+  sort_title?: string | null;
+  description?: string | null;
+  poster_path?: string | null;
+  backdrop_path?: string | null;
 }
 
 export interface PlayStateForItem {
@@ -922,6 +1030,28 @@ export interface ServerSettings {
   transcoder_quality_ceiling_kbps: number | null;
   transcoder_encoder_preset: TranscoderEncoderPreset;
   transcoder_hw_strictness: TranscoderHwStrictness;
+  // ── Transcoder extras (Phase 30) ──
+  /** libx264 preset used by the optimize_versions task. */
+  transcoder_background_preset: TranscoderBackgroundPreset;
+  /** Cap on background optimize-versions concurrency per scheduler tick. */
+  transcoder_max_background_concurrent: number;
+  /** When true (default), HDR sources are tone-mapped to SDR. */
+  transcoder_hdr_tonemap_enabled: boolean;
+  /** Algorithm passed to ffmpeg's tonemap filter. */
+  transcoder_hdr_tonemap_algo: TonemapAlgorithm;
+  /** HEVC output mode. `off` (default): always H.264.
+   *  `when_client_supports`: HEVC for clients that report HEVC decode,
+   *  H.264 otherwise. `always`: force HEVC every session (breaks
+   *  playback on Firefox / older Chrome — only safe on Safari-only
+   *  deployments). */
+  transcoder_hevc_encoding_mode: HevcMode;
+  /** GPU device override: "auto", a numeric NVENC index, or a
+   *  /dev/dri/renderD<N> VAAPI path. */
+  transcoder_gpu_device: string;
+  /** Separate cap for software (libx264/libx265) sessions on top of
+   *  `transcoder_max_concurrent`. Default 1 — keeps CPU encodes from
+   *  starving parallel GPU sessions. */
+  transcoder_max_cpu_concurrent: number;
   // ── Email / SMTP (Phase 21) ──
   email_smtp_host: string | null;
   email_smtp_port: number | null;
@@ -931,6 +1061,67 @@ export interface ServerSettings {
   email_from_name: string | null;
   // ── 2FA (Phase 24) ──
   totp_enforcement: TotpEnforcement;
+  // ── Maintenance window (Phase 29) ──
+  /** HH:MM in server-local time. Start of the window during which
+   *  background tasks marked `requires_maintenance_window` are allowed
+   *  to run. Default 02:00. */
+  maintenance_window_start: string;
+  /** HH:MM in server-local time. End of the maintenance window.
+   *  Default 09:00. If `<= start`, the window wraps midnight. */
+  maintenance_window_end: string;
+  // ── Library (Phase 34) ──
+  /** When true (default), filesystem watcher fires library scans
+   *  on file change. Read once at startup; toggling requires a
+   *  server restart to take effect. */
+  scan_automatically: boolean;
+  /** When ON, completing a scan queues marker detection for every
+   *  new file lacking auto markers. Off by default — blackdetect is
+   *  expensive. Plex calls this "Detect intro/credits when added." */
+  detect_markers_on_add: boolean;
+  /** Server-wide default for ffmpeg loudnorm. When ON, every transcode
+   *  session gets the filter applied (uses stored per-file
+   *  measurements when available, else generic targets). Per-session
+   *  override possible via the player audio menu. */
+  audio_normalize_enabled: boolean;
+  /** `nice -n N` wrapper around ffmpeg in background contexts
+   *  (scheduled tasks, scanner probes). 0 disables. Restart required. */
+  scanner_nice_level: number;
+  /** Filename of the operator-uploaded pre-roll relative to
+   *  `<data_dir>/preroll/`. Null when none configured. */
+  preroll_path: string | null;
+  /** Master switch for pre-roll playback. */
+  preroll_enabled: boolean;
+  // ── Playback / library (Phase 31) ──
+  /** Hard cap on the Continue Watching rail. Default 40. */
+  continue_watching_max_items: number;
+  /** In-progress items last played more than this many weeks ago are
+   *  filtered out of the rail. 0 disables the time-window filter. */
+  continue_watching_max_age_weeks: number;
+  /** When true (default), surfaces S(N+1)E01 of any show the user
+   *  has watched as a Continue Watching tile when a new season
+   *  exists and they haven't started it. Plex parity. */
+  continue_watching_include_premieres: boolean;
+  /** Single threshold (1-99) for "this counts as watched". Used by
+   *  the client to auto-scrobble and by the on-deck query as its
+   *  upper bound. Default 90. */
+  video_played_threshold_pct: number;
+  /** What counts as "watched": pure percentage, the auto-detected
+   *  credits marker, or whichever comes first. Default
+   *  `threshold_pct`. See migration phase 46. */
+  video_completion_behaviour: CompletionBehaviour;
+  /** Megabytes of SQLite page cache per connection. 0 = SQLite
+   *  default (~2 MiB). Applied at next server restart. Default 64. */
+  database_cache_size_mb: number;
+  /** BCP-47 tag (e.g. `en-US`, `ja-JP`) sent to TMDB on every
+   *  metadata fetch. TMDB returns text in this language when
+   *  available; falls back to original language silently when no
+   *  translation exists. Restart required for changes to take effect
+   *  — existing items keep their text until a Refresh metadata. */
+  metadata_language: string;
+  /** Days a freshly-added item stays badged as "Recently Added" on
+   *  Card. 0 disables the badge entirely. Default 14. Takes effect
+   *  on the next config-poll — no rebuild required. */
+  recently_added_days: number;
   /** JSON-encoded object used by later phases for forward-compat fields. */
   extras_json: string;
   updated_at: number;
@@ -956,6 +1147,13 @@ export interface ServerSettingsUpdate {
   transcoder_quality_ceiling_kbps?: number | null;
   transcoder_encoder_preset?: TranscoderEncoderPreset;
   transcoder_hw_strictness?: TranscoderHwStrictness;
+  transcoder_background_preset?: TranscoderBackgroundPreset;
+  transcoder_max_background_concurrent?: number;
+  transcoder_hdr_tonemap_enabled?: boolean;
+  transcoder_hdr_tonemap_algo?: TonemapAlgorithm;
+  transcoder_hevc_encoding_mode?: HevcMode;
+  transcoder_gpu_device?: string;
+  transcoder_max_cpu_concurrent?: number;
   email_smtp_host?: string | null;
   email_smtp_port?: number | null;
   email_smtp_username?: string | null;
@@ -963,6 +1161,21 @@ export interface ServerSettingsUpdate {
   email_from_address?: string | null;
   email_from_name?: string | null;
   totp_enforcement?: TotpEnforcement;
+  maintenance_window_start?: string;
+  maintenance_window_end?: string;
+  scan_automatically?: boolean;
+  detect_markers_on_add?: boolean;
+  audio_normalize_enabled?: boolean;
+  scanner_nice_level?: number;
+  preroll_enabled?: boolean;
+  continue_watching_max_items?: number;
+  continue_watching_max_age_weeks?: number;
+  continue_watching_include_premieres?: boolean;
+  video_played_threshold_pct?: number;
+  video_completion_behaviour?: CompletionBehaviour;
+  database_cache_size_mb?: number;
+  metadata_language?: string;
+  recently_added_days?: number;
   extras_json?: string;
 }
 
@@ -997,6 +1210,33 @@ export type TranscoderEncoderPreset = "speed" | "balanced" | "quality";
  *    Player gets a 409 with the specific reason.
  */
 export type TranscoderHwStrictness = "auto" | "prefer_hw" | "require_hw";
+
+export type HevcMode = "off" | "when_client_supports" | "always";
+
+export type CompletionBehaviour =
+  | "threshold_pct"
+  | "first_credits_marker"
+  | "earliest_of_both";
+
+/** libx264 preset values accepted by the optimize_versions task. */
+export type TranscoderBackgroundPreset =
+  | "ultrafast"
+  | "superfast"
+  | "veryfast"
+  | "faster"
+  | "fast"
+  | "medium"
+  | "slow"
+  | "slower";
+
+/** Algorithms accepted by ffmpeg's `tonemap=tonemap=<algo>` filter. */
+export type TonemapAlgorithm =
+  | "hable"
+  | "reinhard"
+  | "mobius"
+  | "bt2390"
+  | "clip"
+  | "linear";
 
 export interface AuditLogEntry {
   id: number;
@@ -1056,6 +1296,88 @@ export interface PreviewManifest {
 export const previews = {
   manifest: (mediaFileId: number) =>
     apiFetch<PreviewManifest>(`/media-files/${mediaFileId}/preview/manifest`),
+};
+
+// ─── Chapter thumbnails (Phase 38) ─────────────────────────────────────────
+
+export interface ChapterEntry {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  title: string | null;
+  /// Server-relative URL; null when the generate_chapter_thumbs task
+  /// hasn't run for this file yet (or extraction failed).
+  thumb_url: string | null;
+}
+
+export interface ChaptersResponse {
+  chapters: ChapterEntry[];
+  thumbs_ready: boolean;
+}
+
+export const chapters = {
+  list: (mediaFileId: number) =>
+    apiFetch<ChaptersResponse>(`/media-files/${mediaFileId}/chapters`),
+};
+
+// ─── Pre-roll video (Phase 42) ─────────────────────────────────────────────
+
+export interface PrerollStatus {
+  enabled: boolean;
+  configured: boolean;
+  url: string | null;
+  size_bytes: number | null;
+}
+
+// ─── Bulk item operations (Phase 43) ───────────────────────────────────────
+
+export interface BulkReport {
+  ok: number;
+  failed: number;
+  errors: { item_id: number; error: string }[];
+}
+
+export const bulkItems = {
+  refreshMetadata: (item_ids: number[]) =>
+    apiFetch<BulkReport>("/admin/items/bulk/refresh-metadata", {
+      method: "POST",
+      body: { item_ids },
+    }),
+  addTag: (item_ids: number[], tag_name: string) =>
+    apiFetch<BulkReport>("/admin/items/bulk/add-tag", {
+      method: "POST",
+      body: { item_ids, tag_name },
+    }),
+  removeTag: (item_ids: number[], tag_name: string) =>
+    apiFetch<BulkReport>("/admin/items/bulk/remove-tag", {
+      method: "POST",
+      body: { item_ids, tag_name },
+    }),
+  detectMarkers: (item_ids: number[]) =>
+    apiFetch<BulkReport>("/admin/items/bulk/detect-markers", {
+      method: "POST",
+      body: { item_ids },
+    }),
+};
+
+export const preroll = {
+  status: () => apiFetch<PrerollStatus>("/admin/preroll"),
+  clear: () =>
+    apiFetch<void>("/admin/preroll", { method: "DELETE" }),
+  upload: async (file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/api/v1/admin/preroll`, {
+      method: "POST",
+      body: fd,
+      credentials: "include",
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || `pre-roll upload failed: ${res.status}`);
+    }
+    return (await res.json()) as PrerollStatus;
+  },
 };
 
 // ─── Trakt sync + ratings (Phase 15) ───────────────────────────────────────
@@ -1169,6 +1491,35 @@ export interface LibraryHealthResponse {
   orphan_media_files: number;
   missing_files: MissingFileRow[];
   libraries_without_paths: LibraryNoPathRow[];
+}
+
+/// Category keys for the `library-health/items` drill-in. Matches
+/// the server-side allowlist verbatim — anything else returns 400.
+export type LibraryHealthCategory =
+  | "no_files"
+  | "no_metadata"
+  | "no_poster"
+  | "no_backdrop"
+  | "orphan_episodes"
+  | "orphan_media_files";
+
+export interface LibraryHealthItemRow {
+  id: number;
+  kind: "item" | "episode" | "media_file";
+  title: string;
+  subtitle: string | null;
+  library_name: string | null;
+  /// items.id to pass to `?modal=<id>` for click-through. None when
+  /// the row IS an orphan with no parent item to anchor.
+  item_id_for_modal: number | null;
+  /// Full filesystem path — only populated for `media_file` rows.
+  path: string | null;
+}
+
+export interface LibraryHealthItemsResponse {
+  category: LibraryHealthCategory;
+  total: number;
+  rows: LibraryHealthItemRow[];
 }
 
 // ─── Admin: credential vault ───────────────────────────────────────────────
@@ -1366,7 +1717,20 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
     const text = await res.text().catch(() => "");
     throw new ChimpFlixApiError(res.status, text);
   }
-  if (res.status === 204) return undefined as T;
+  // 204 (No Content) and 205 (Reset Content) have no body by spec; 202
+  // (Accepted) — what our async-dispatch endpoints like POST /admin/tasks/{id}/run
+  // return — has an empty body by our convention. Also bail when the
+  // server explicitly says Content-Length: 0, since reading json() on
+  // an empty body throws "unexpected end of data" and surfaces to the
+  // user as a misleading "JSON parse error".
+  if (
+    res.status === 202 ||
+    res.status === 204 ||
+    res.status === 205 ||
+    res.headers.get("content-length") === "0"
+  ) {
+    return undefined as T;
+  }
   return (await res.json()) as T;
 }
 
@@ -1676,6 +2040,13 @@ export const items = {
   // ─── Edit & Fix Match (owner-only on the server) ───────────────────────
   patch: (id: number, edit: ItemEditInput) =>
     apiFetch<ItemDetail>(`/items/${id}`, { method: "PATCH", body: edit }),
+  /// Hard-delete every media file for this item (and its episodes if
+  /// it's a show). Gated by the owning library's
+  /// `allow_media_deletion` flag plus owner role. Returns a small
+  /// summary of what was removed so the UI can decide whether to
+  /// navigate away (item itself was purged) or just close the modal.
+  deleteMedia: (id: number) =>
+    apiFetch<DeleteMediaResponse>(`/items/${id}/media`, { method: "DELETE" }),
   refresh: (id: number) =>
     apiFetch<ItemDetail>(`/items/${id}/refresh`, { method: "POST" }),
   matchSearch: (id: number, q: string, year?: number) =>
@@ -1732,7 +2103,26 @@ export const seasons = {
 
 export const episodes = {
   get: (id: number) => apiFetch<EpisodeDetail>(`/episodes/${id}`),
+  /// Hard-delete this episode's media file. If it was the last
+  /// episode of its season, the season is purged too; if last
+  /// season, the show is purged. Owner-gated + library-gated on the
+  /// server.
+  deleteMedia: (id: number) =>
+    apiFetch<DeleteMediaResponse>(`/episodes/${id}/media`, {
+      method: "DELETE",
+    }),
 };
+
+export interface DeleteMediaResponse {
+  files_deleted: number;
+  episodes_purged: number;
+  seasons_purged: number;
+  items_purged: number;
+  /** Source-file and preview-sprite paths the server is unlinking
+   *  in the background. Surfaced so the operator UI can confirm
+   *  exactly what got removed. */
+  paths: string[];
+}
 
 // ---------------------------------------------------------------------------
 // Stream / play-state
@@ -1777,6 +2167,16 @@ export const stream = {
     `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/master.m3u8`,
 };
 
+export interface PlayStateConfig {
+  /** Threshold (1–99) at which the player auto-scrobbles a session. */
+  played_threshold_pct: number;
+  /** Drives the auto-scrobble decision alongside `played_threshold_pct`. */
+  completion_behaviour: CompletionBehaviour;
+  /** Days an item stays badged as "Recently Added" on Card. 0 = badge
+   *  disabled entirely. Read by `useRecentlyAddedDays()` in Card.tsx. */
+  recently_added_days: number;
+}
+
 export const playState = {
   update: (input: PlayStateUpdateInput) =>
     apiFetch<void>("/play-state", {
@@ -1785,6 +2185,19 @@ export const playState = {
     }),
   scrobble: (input: ScrobbleInput) =>
     apiFetch<void>("/play-state/scrobble", { method: "POST", body: input }),
+  /// Fine-grained playback event (pause / resume) for the admin
+  /// Stats engagement metrics. Fire-and-forget on the server side —
+  /// callers should swallow any error since the player must not be
+  /// blocked by a stats DB write.
+  event: (
+    input: {
+      kind: "pause" | "resume";
+      item_id?: number;
+      episode_id?: number;
+      position_ms?: number;
+    },
+  ) =>
+    apiFetch<void>("/play-state/event", { method: "POST", body: input }),
   setWatched: (
     input: { item_id?: number; episode_id?: number; watched: boolean },
   ) =>
@@ -1794,12 +2207,88 @@ export const playState = {
     apiFetch<{ items: ListedItem[] }>("/play-state/history", {
       query: limit ? { limit } : undefined,
     }),
+  config: () => apiFetch<PlayStateConfig>("/play-state/config"),
 };
 
 export const collections = {
-  list: () =>
-    apiFetch<{ collections: Collection[] }>("/collections"),
+  // `include_auto` defaults to false on the server — TMDB-discovered
+  // franchise rows are excluded unless the caller (typically the admin
+  // panel) explicitly opts in. Keeps the home rail clean on a fresh
+  // server that hasn't been manually curated.
+  list: (opts: { include_auto?: boolean } = {}) =>
+    apiFetch<{ collections: Collection[] }>(
+      opts.include_auto ? "/collections?include_auto=true" : "/collections",
+    ),
   get: (id: number) => apiFetch<CollectionDetail>(`/collections/${id}`),
+  // Admin-only mutations (server enforces OwnerAuth). Auto collections
+  // (tmdb-discovered franchises) reject mutations with a 400 validation
+  // error — only kind = "manual" rows accept these calls.
+  create: (input: NewManualCollection) =>
+    apiFetch<{ id: number }>("/admin/collections", {
+      method: "POST",
+      body: input,
+    }),
+  update: (id: number, patch: ManualCollectionUpdate) =>
+    apiFetch<void>(`/admin/collections/${id}`, {
+      method: "PATCH",
+      body: patch,
+    }),
+  delete: (id: number) =>
+    apiFetch<void>(`/admin/collections/${id}`, { method: "DELETE" }),
+  addItems: (id: number, item_ids: number[]) =>
+    apiFetch<{ inserted: number }>(`/admin/collections/${id}/items`, {
+      method: "POST",
+      body: { item_ids },
+    }),
+  removeItem: (id: number, item_id: number) =>
+    apiFetch<void>(`/admin/collections/${id}/items/${item_id}`, {
+      method: "DELETE",
+    }),
+  reorder: (id: number, item_ids: number[]) =>
+    apiFetch<void>(`/admin/collections/${id}/items`, {
+      method: "PUT",
+      body: { item_ids },
+    }),
+  createSmart: (input: NewSmartCollection) =>
+    apiFetch<{ id: number }>("/admin/smart-collections", {
+      method: "POST",
+      body: input,
+    }),
+  updateSmartRule: (id: number, rule_json: string) =>
+    apiFetch<void>(`/admin/smart-collections/${id}/rule`, {
+      method: "PUT",
+      body: { rule_json },
+    }),
+  /// Multipart upload — mirrors items.uploadPoster pattern. File is
+  /// stored under `<data_dir>/collection_posters/{id}.<ext>` and the
+  /// collection's `poster_path` is set to a versioned `/api/v1/collections/
+  /// {id}/poster/blob?v=<ts>` URL so browser caches refetch on overwrite.
+  uploadPoster: async (id: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/api/v1/admin/collections/${id}/poster`, {
+      method: "POST",
+      body: fd,
+      credentials: "include",
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || `upload failed: ${res.status}`);
+    }
+  },
+  uploadBackdrop: async (id: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/api/v1/admin/collections/${id}/backdrop`, {
+      method: "POST",
+      body: fd,
+      credentials: "include",
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || `upload failed: ${res.status}`);
+    }
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1811,10 +2300,179 @@ export const server = {
   info: () => apiFetch<ServerInfoResponse>("/server-info"),
 };
 
+// ─── Admin Stats (Tautulli-lite) ───────────────────────────────────────────
+
+export interface StatsOverview {
+  total_plays: number;
+  completions: number;
+  direct_plays: number;
+  transcoded_plays: number;
+  unique_users: number;
+}
+
+export interface StatsActivityRow {
+  id: number;
+  occurred_at: number;
+  user_id: number;
+  username: string;
+  event_type: "start" | "progress" | "pause" | "resume" | "complete" | "stop";
+  decision: "direct" | "transcode" | null;
+  video_codec: string | null;
+  audio_codec: string | null;
+  container: string | null;
+  ip: string | null;
+  item_id: number | null;
+  episode_id: number | null;
+  title: string | null;
+}
+
+export interface StatsTopUserRow {
+  user_id: number;
+  username: string;
+  display_name: string | null;
+  play_count: number;
+  completions: number;
+  last_seen_at: number | null;
+}
+
+export interface StatsTopItemRow {
+  item_id: number | null;
+  title: string;
+  kind: string;
+  play_count: number;
+  last_played_at: number | null;
+  year: number | null;
+}
+
+export interface StatsDailyBucket {
+  /// `YYYY-MM-DD` (UTC) — gap-free across the requested window.
+  day: string;
+  starts: number;
+  completions: number;
+}
+
+export interface StatsHourBucket {
+  /// 0..=23 — server local-time hour.
+  hour: number;
+  starts: number;
+}
+
+export interface StatsPlatformBucket {
+  /// Coarse name bucketed server-side from the user_agent string
+  /// (Firefox, Chrome, Android, iOS, LG TV, Roku, …).
+  platform: string;
+  starts: number;
+}
+
+/// Live snapshot from the in-memory TranscodeManager — no DB hop.
+/// Mirrors `chimpflix_transcoder::SessionSnapshot` (only the fields
+/// the Stats UI needs).
+export interface NowPlayingSession {
+  id: string;
+  user_id: number;
+  media_file_id: number;
+  start_position_ms: number;
+  duration_ms: number | null;
+  created_at: number;
+  last_seen_at: number;
+  encoder: string;
+  video_treatment: "copy" | "reencode";
+  audio_treatment: "copy" | "reencode";
+  source_height: number | null;
+  target_height: number;
+  target_video_bitrate_bps: number;
+  encoder_preset: string;
+  /// Cumulative bytes served over HTTP since session start (segment +
+  /// playlist GETs). Flushed to `playback_events.bytes_sent` on close.
+  bytes_served: number;
+}
+
+export interface StatsLibraryBucket {
+  library_id: number;
+  name: string;
+  kind: string;
+  starts: number;
+}
+
 // ─── Admin (owner-only) ────────────────────────────────────────────────────
 
 export const admin = {
   dashboard: () => apiFetch<DashboardResponse>("/admin/dashboard"),
+  stats: {
+    /// Last-N-day counters + the live now-playing count for the hero
+    /// tiles. `days` defaults to 30, clamped to [1, 365] server-side.
+    overview: (days?: number) =>
+      apiFetch<{ days: number; overview: StatsOverview; now_playing_count: number }>(
+        days ? `/admin/stats/overview?days=${days}` : "/admin/stats/overview",
+      ),
+    /// Newest-first event feed. Pass `before` (the smallest id from
+    /// the previous page) to paginate older entries. `user_id` scopes
+    /// to a single user — the per-user drill-in uses this.
+    activity: (opts: { limit?: number; before?: number; user_id?: number } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.limit != null) qs.set("limit", String(opts.limit));
+      if (opts.before != null) qs.set("before", String(opts.before));
+      if (opts.user_id != null) qs.set("user_id", String(opts.user_id));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      return apiFetch<{ events: StatsActivityRow[] }>(`/admin/stats/activity${suffix}`);
+    },
+    /// Daily series for the activity chart — gap-free across the
+    /// requested window so a quiet day shows up as a zero bar
+    /// rather than missing.
+    playsPerDay: (days?: number) =>
+      apiFetch<{ days: number; buckets: StatsDailyBucket[] }>(
+        days ? `/admin/stats/plays-per-day?days=${days}` : "/admin/stats/plays-per-day",
+      ),
+    /// Hour-of-day distribution (24 buckets, server local time).
+    /// Tautulli's most-loved chart — "when does my household watch?"
+    playsPerHour: (days?: number) =>
+      apiFetch<{ days: number; buckets: StatsHourBucket[] }>(
+        days ? `/admin/stats/plays-per-hour?days=${days}` : "/admin/stats/plays-per-hour",
+      ),
+    /// Top libraries by play count. Movies aggregate via
+    /// items.library_id directly; episodes roll up through
+    /// episodes → seasons → items.library_id (parent show).
+    topLibraries: (opts: { days?: number; limit?: number } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.days != null) qs.set("days", String(opts.days));
+      if (opts.limit != null) qs.set("limit", String(opts.limit));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      return apiFetch<{ days: number; libraries: StatsLibraryBucket[] }>(
+        `/admin/stats/top-libraries${suffix}`,
+      );
+    },
+    /// Coarse platform breakdown (Firefox / Chrome / iOS / Roku / …)
+    /// bucketed server-side from the user_agent string.
+    topPlatforms: (opts: { days?: number; limit?: number } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.days != null) qs.set("days", String(opts.days));
+      if (opts.limit != null) qs.set("limit", String(opts.limit));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      return apiFetch<{ days: number; platforms: StatsPlatformBucket[] }>(
+        `/admin/stats/top-platforms${suffix}`,
+      );
+    },
+    topUsers: (opts: { days?: number; limit?: number } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.days != null) qs.set("days", String(opts.days));
+      if (opts.limit != null) qs.set("limit", String(opts.limit));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      return apiFetch<{ days: number; users: StatsTopUserRow[] }>(
+        `/admin/stats/top-users${suffix}`,
+      );
+    },
+    topItems: (opts: { days?: number; limit?: number } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.days != null) qs.set("days", String(opts.days));
+      if (opts.limit != null) qs.set("limit", String(opts.limit));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      return apiFetch<{ days: number; items: StatsTopItemRow[] }>(
+        `/admin/stats/top-items${suffix}`,
+      );
+    },
+    nowPlaying: () =>
+      apiFetch<{ sessions: NowPlayingSession[] }>("/admin/stats/now-playing"),
+  },
   settings: {
     get: () => apiFetch<{ settings: ServerSettings }>("/admin/settings"),
     patch: (patch: ServerSettingsUpdate) =>
@@ -1856,6 +2514,17 @@ export const admin = {
   /// as password-only until the user re-enrolls.
   resetUserTwoFactor: (userId: number) =>
     apiFetch<void>(`/admin/users/${userId}/2fa/reset`, { method: "POST" }),
+  /// Admin: send a password-reset email to another user. Token is
+  /// generated server-side and never exposed to the admin — same
+  /// single-use guarantee as the self-service /auth/password-reset
+  /// path. `ok=false` means the email wasn't delivered (no address on
+  /// file, SMTP not configured, or SMTP send error); the response
+  /// `message` is safe to show as a toast.
+  sendUserPasswordReset: (userId: number) =>
+    apiFetch<{ ok: boolean; message: string }>(
+      `/admin/users/${userId}/password-reset`,
+      { method: "POST" },
+    ),
   /// Named access groups — bulk-assignment of library permissions.
   /// User-side resolution unions direct library_access with group-derived.
   accessGroups: {
@@ -1914,6 +2583,20 @@ export const admin = {
   },
   libraryHealth: () =>
     apiFetch<LibraryHealthResponse>("/admin/library-health"),
+  /// Drill-in for a single Library Health counter — returns the
+  /// actual rows behind the count so admins can act on them. See
+  /// `LibraryHealthCategory` for valid keys.
+  libraryHealthItems: (
+    category: LibraryHealthCategory,
+    opts: { limit?: number; offset?: number } = {},
+  ) => {
+    const qs = new URLSearchParams({ category });
+    if (opts.limit != null) qs.set("limit", String(opts.limit));
+    if (opts.offset != null) qs.set("offset", String(opts.offset));
+    return apiFetch<LibraryHealthItemsResponse>(
+      `/admin/library-health/items?${qs}`,
+    );
+  },
   agents: {
     list: () => apiFetch<{ agents: AgentInfo[] }>("/admin/agents"),
     getForLibrary: (libraryId: number) =>
@@ -2012,7 +2695,7 @@ export const admin = {
   },
   transcoder: {
     capabilities: () =>
-      apiFetch<{ capabilities: TranscoderCapabilities }>(
+      apiFetch<{ capabilities: TranscoderCapabilities; cache_root: string }>(
         "/admin/transcoder/capabilities",
       ),
     listPresets: () =>
@@ -2130,3 +2813,65 @@ export async function downloadBackup(): Promise<void> {
   a.remove();
   URL.revokeObjectURL(url);
 }
+
+// ─── Backup management (auto snapshots) ─────────────────────────────────────
+
+export interface BackupEntry {
+  filename: string;
+  size_bytes: number;
+  /** Last-modified time in milliseconds since epoch. */
+  modified_ms: number;
+}
+
+export interface ListBackupsResponse {
+  backups: BackupEntry[];
+  /** True when a pending-restore is staged and waiting for the
+   *  next server restart to apply. */
+  pending_restore: boolean;
+  total_bytes: number;
+}
+
+export interface StageRestoreResponse {
+  staged: string;
+  message: string;
+}
+
+export const backups = {
+  list: () => apiFetch<ListBackupsResponse>("/admin/backups"),
+
+  /** Trigger the browser download for a specific persisted snapshot. */
+  download: async (filename: string): Promise<void> => {
+    const res = await fetch(
+      `/api/v1/admin/backups/${encodeURIComponent(filename)}/download`,
+      { credentials: "include" },
+    );
+    if (!res.ok) {
+      throw new Error(`download failed: ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  delete: (filename: string) =>
+    apiFetch<void>(`/admin/backups/${encodeURIComponent(filename)}`, {
+      method: "DELETE",
+    }),
+
+  /** Stage a backup as the next-boot database. Server returns plain-
+   *  language instructions; the actual restore happens on restart. */
+  stageRestore: (filename: string) =>
+    apiFetch<StageRestoreResponse>(
+      `/admin/backups/${encodeURIComponent(filename)}/stage-restore`,
+      { method: "POST" },
+    ),
+
+  cancelRestore: () =>
+    apiFetch<void>("/admin/backups/cancel-restore", { method: "POST" }),
+};

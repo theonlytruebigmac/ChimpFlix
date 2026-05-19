@@ -11,15 +11,14 @@ import { openModal } from "@/lib/modal";
 import { prefetchModalData } from "@/lib/modal-cache";
 import { useMyListItem } from "@/lib/my-list";
 import { prefetchPlay } from "@/lib/play-prefetch";
+import { useRecentlyAddedDays } from "@/lib/server-config";
 
-// Items added inside this window get the red "Recently Added" ribbon.
-// Tuned to Netflix's roughly two-week recency where every new arrival
-// stays badged for a fortnight.
-const RECENT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
-
-function recencyBadge(item: MediaItem): string | null {
+function recencyBadge(item: MediaItem, windowDays: number): string | null {
+  // `windowDays = 0` is the explicit "no badge ever" setting.
+  if (windowDays <= 0) return null;
   if (!item.addedAt) return null;
-  if (Date.now() - item.addedAt > RECENT_WINDOW_MS) return null;
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
+  if (Date.now() - item.addedAt > windowMs) return null;
   // For TV shows where we know a new season just landed, surface that
   // over generic "Recently Added". (Season-add tracking lives in
   // `latestSeasonAt` once we wire it; until then any recently-added show
@@ -37,7 +36,8 @@ export function Card({ item }: { item: MediaItem }) {
     item.viewOffset && item.duration
       ? Math.min(100, (item.viewOffset / item.duration) * 100)
       : null;
-  const badge = recencyBadge(item);
+  const recentlyAddedDays = useRecentlyAddedDays();
+  const badge = recencyBadge(item, recentlyAddedDays);
 
   const label = displayTitle(item);
   const modalKey =
@@ -47,7 +47,11 @@ export function Card({ item }: { item: MediaItem }) {
 
   return (
     <div
-      className="group relative w-72 flex-none hover:z-50"
+      // Mobile shows ~2 cards across a 360px viewport; desktop keeps the
+      // original 18rem (288px) sizing. Tailwind's `hover:` variant
+      // already gates on `(hover: hover)` in v4 so the scale-up only
+      // fires on devices with real hover — touch taps won't stick.
+      className="group relative w-44 flex-none sm:w-56 md:w-72 hover:z-50"
       onMouseEnter={() => prefetchModalData(modalKey)}
       onFocus={() => prefetchModalData(modalKey)}
     >

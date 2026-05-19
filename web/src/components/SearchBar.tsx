@@ -15,12 +15,17 @@ export function SearchBar() {
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<number | null>(null);
 
-  // Keep local query in sync when /search?q=... changes (e.g. browser back)
+  // Keep local query in sync when /search?q=... changes (e.g. browser
+  // back). The setState is the "URL is the source of truth, mirror
+  // it into local state" pattern — the documented exception to the
+  // set-state-in-effect rule.
   useEffect(() => {
     if (onSearchPage) {
       const q = searchParams.get("q") ?? "";
+      /* eslint-disable react-hooks/set-state-in-effect */
       setQuery(q);
       setOpen(q.length > 0 || open);
+      /* eslint-enable react-hooks/set-state-in-effect */
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, onSearchPage]);

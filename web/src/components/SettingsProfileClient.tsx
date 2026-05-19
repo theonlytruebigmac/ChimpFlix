@@ -165,7 +165,7 @@ export function SettingsProfileClient({ initial }: Props) {
         <button
           type="submit"
           disabled={busy}
-          className="rounded bg-(--color-accent) px-3 py-2 text-xs font-semibold text-white transition disabled:opacity-50"
+          className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs transition disabled:opacity-50"
         >
           {busy ? "Saving…" : "Save changes"}
         </button>

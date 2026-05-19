@@ -39,8 +39,24 @@ export function SettingsTwoFactorClient() {
     }
   }
 
+  // Mount-time fetch. Async setState landing inside .then() avoids
+  // tripping react-hooks/set-state-in-effect; the cancellation guard
+  // prevents writing after unmount.
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    authApi.twoFactor
+      .status()
+      .then((status) => {
+        if (cancelled) return;
+        setStage({ kind: "idle", status });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(parseError(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function startEnroll() {
@@ -151,7 +167,7 @@ export function SettingsTwoFactorClient() {
             type="button"
             onClick={startEnroll}
             disabled={busy || !password}
-            className="rounded bg-(--color-accent) px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+            className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
           >
             {busy ? "…" : "Begin enrollment"}
           </button>
@@ -210,7 +226,7 @@ export function SettingsTwoFactorClient() {
                 type="button"
                 onClick={verify}
                 disabled={busy || !code}
-                className="rounded bg-(--color-accent) px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
               >
                 {busy ? "…" : "Verify and activate"}
               </button>
@@ -241,7 +257,7 @@ export function SettingsTwoFactorClient() {
               type="button"
               onClick={regenerate}
               disabled={busy || !password}
-              className="rounded border border-white/15 px-3 py-2 text-xs font-medium text-white/80 hover:bg-white/5 disabled:opacity-50"
+              className="rounded border border-white/15 px-3 py-2.5 text-sm font-medium text-white/80 sm:py-2 sm:text-xs hover:bg-white/5 disabled:opacity-50"
             >
               {busy ? "…" : "Regenerate recovery codes"}
             </button>
@@ -250,7 +266,7 @@ export function SettingsTwoFactorClient() {
                 type="button"
                 onClick={disable}
                 disabled={busy || !password}
-                className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-200 hover:bg-red-500/20 disabled:opacity-50"
+                className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2.5 text-sm font-medium text-red-200 sm:py-2 sm:text-xs hover:bg-red-500/20 disabled:opacity-50"
               >
                 {busy ? "…" : "Disable 2FA"}
               </button>

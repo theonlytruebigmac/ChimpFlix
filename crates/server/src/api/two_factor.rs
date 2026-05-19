@@ -460,10 +460,20 @@ async fn issue_session(
     password::fill_random(&mut nonce).map_err(ApiError::Internal)?;
     let expires_at = now_ms() + SESSION_MAX_AGE_S * 1000;
     let user_agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
-    let session_id =
-        queries::create_session(&state.pool, user.id, &nonce, expires_at, user_agent, None)
-            .await
-            .map_err(ApiError::Internal)?;
+    // Mirror the auth.rs fix: capture the client IP at session creation
+    // so the admin Sessions page can show it rather than "unknown IP".
+    // Same proxy-aware extractor the rate-limiter uses.
+    let ip = crate::api::rate_limit::header_client_ip(headers);
+    let session_id = queries::create_session(
+        &state.pool,
+        user.id,
+        &nonce,
+        expires_at,
+        user_agent,
+        ip.as_deref(),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
 
     let value = cookie::build_value(session_id, &nonce, &state.auth.session_secret);
     Ok(cookie::set_cookie_header(

@@ -1,19 +1,113 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   admin as adminApi,
   type ScheduledTask,
+  type ServerSettings,
+  type ServerSettingsUpdate,
+  type TaskFrequency,
   type TaskKindInfo,
   type TaskRun,
   type TasksListResponse,
 } from "@/lib/chimpflix-api";
 
-export function AdminTasksClient({ initial }: { initial: TasksListResponse }) {
+interface Props {
+  initial: TasksListResponse;
+  settings: ServerSettings;
+}
+
+const FREQUENCY_LABELS: Record<TaskFrequency, string> = {
+  manual: "Manually (Run Now only)",
+  hourly: "Every hour",
+  every_3_hours: "Every 3 hours",
+  every_6_hours: "Every 6 hours",
+  every_12_hours: "Every 12 hours",
+  daily: "Daily",
+  every_3_days: "Every 3 days",
+  weekly: "Weekly",
+  monthly: "Monthly",
+  on_change: "When media changes",
+  custom: "Custom (cron)",
+};
+
+const FREQUENCY_OPTIONS: TaskFrequency[] = [
+  "hourly",
+  "every_3_hours",
+  "every_6_hours",
+  "every_12_hours",
+  "daily",
+  "every_3_days",
+  "weekly",
+  "monthly",
+  "manual",
+  "on_change",
+  "custom",
+];
+
+/// Frequency labels rendered as a suffix in the simple-view rows
+/// ("Backup database — daily"). Shorter than the dropdown labels
+/// because the dropdown is hidden in simple mode.
+const FREQUENCY_SHORT_LABELS: Record<TaskFrequency, string> = {
+  manual: "manual",
+  hourly: "hourly",
+  every_3_hours: "every 3h",
+  every_6_hours: "every 6h",
+  every_12_hours: "every 12h",
+  daily: "daily",
+  every_3_days: "every 3 days",
+  weekly: "weekly",
+  monthly: "monthly",
+  on_change: "on change",
+  custom: "custom cron",
+};
+
+/// Kinds that always need a `library_id` parameter and therefore
+/// don't have a meaningful "global" instance to show in the simple
+/// toggle list. Per-library scans are triggered from the library
+/// admin page instead; the simple view shows a footer link there.
+const PER_LIBRARY_KINDS = new Set(["scan_library"]);
+
+/// Find the task row that represents the "global" instance of a
+/// kind in the simple toggle view. A row counts as global when it
+/// either has no `library_id` in its params or has the literal
+/// empty-object params (`{}`). Custom per-library task rows still
+/// show in the advanced view but don't drive the simple toggle.
+function findGlobalTaskFor(kind: string, tasks: ScheduledTask[]): ScheduledTask | null {
+  return (
+    tasks.find((t) => {
+      if (t.kind !== kind) return false;
+      try {
+        const parsed = JSON.parse(t.params_json || "{}");
+        return parsed && typeof parsed === "object" && parsed.library_id == null;
+      } catch {
+        // Garbage params — surface in advanced; never count as global.
+        return false;
+      }
+    }) ?? null
+  );
+}
+
+export function AdminTasksClient({ initial, settings }: Props) {
   const [tasks, setTasks] = useState(initial.tasks);
   const [kinds] = useState(initial.kinds);
+  const [windowStart, setWindowStart] = useState(settings.maintenance_window_start);
+  const [windowEnd, setWindowEnd] = useState(settings.maintenance_window_end);
+  const [savedWindowStart, setSavedWindowStart] = useState(settings.maintenance_window_start);
+  const [savedWindowEnd, setSavedWindowEnd] = useState(settings.maintenance_window_end);
+  const [savingWindow, setSavingWindow] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Plex-style "Hide Advanced" button. Simple mode is a flat
+  // checkbox list of housekeeping tasks with baked-in frequencies;
+  // Advanced mode is the per-card editor that lets an operator
+  // tweak frequency, custom cron, params, etc. Default to simple
+  // because that's the path the user lands on after reading the
+  // admin docs — Advanced is power-user territory.
+  const [advanced, setAdvanced] = useState(false);
+
+  const windowDirty = windowStart !== savedWindowStart || windowEnd !== savedWindowEnd;
+  const windowActiveNow = isWithinWindow(savedWindowStart, savedWindowEnd, new Date());
 
   async function refresh() {
     try {
@@ -21,6 +115,28 @@ export function AdminTasksClient({ initial }: { initial: TasksListResponse }) {
       setTasks(next.tasks);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function saveWindow() {
+    setSavingWindow(true);
+    setError(null);
+    try {
+      const patch: ServerSettingsUpdate = {
+        maintenance_window_start: windowStart,
+        maintenance_window_end: windowEnd,
+      };
+      await adminApi.settings.patch(patch);
+      setSavedWindowStart(windowStart);
+      setSavedWindowEnd(windowEnd);
+      // Window change might shift `next_run_at` for any
+      // window-eligible task — pull fresh so the cards show the
+      // new schedule.
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingWindow(false);
     }
   }
 
@@ -32,46 +148,298 @@ export function AdminTasksClient({ initial }: { initial: TasksListResponse }) {
         </div>
       )}
 
+      <section className="rounded-lg border border-white/10 bg-white/2 p-4 sm:p-5">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div>
+            <h2 className="text-base font-semibold">Maintenance window</h2>
+            <p className="mt-1 max-w-xl text-xs text-white/55">
+              Heavy background tasks (full scans, metadata refresh, backups)
+              run inside this window so they don&apos;t compete with playback.
+              Server-local time. If the end time is earlier than the start
+              the window wraps midnight.
+            </p>
+          </div>
+          <span
+            className={`rounded px-2 py-0.5 text-[11px] uppercase tracking-wider ${
+              windowActiveNow
+                ? "bg-emerald-500/15 text-emerald-300"
+                : "bg-white/10 text-white/60"
+            }`}
+          >
+            {windowActiveNow ? "Active now" : `Next: ${nextWindowDescription(savedWindowStart, savedWindowEnd)}`}
+          </span>
+        </div>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-white/55">From</span>
+            <input
+              type="time"
+              value={windowStart}
+              onChange={(e) => setWindowStart(e.target.value)}
+              className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
+            />
+            <span className="text-white/55">to</span>
+            <input
+              type="time"
+              value={windowEnd}
+              onChange={(e) => setWindowEnd(e.target.value)}
+              className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
+            />
+          </div>
+          <button
+            disabled={!windowDirty || savingWindow}
+            onClick={saveWindow}
+            className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+          >
+            {savingWindow ? "Saving…" : "Save window"}
+          </button>
+        </div>
+      </section>
+
       <div className="flex items-center justify-between">
         <span className="text-sm text-white/60">
-          {tasks.length} task{tasks.length === 1 ? "" : "s"}
+          {advanced
+            ? `${tasks.length} task${tasks.length === 1 ? "" : "s"} configured`
+            : "Toggle a task to enable it. Hidden defaults match what Plex ships."}
         </span>
         <button
-          onClick={() => setShowAdd((v) => !v)}
-          className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600"
+          onClick={() => setAdvanced((v) => !v)}
+          className="rounded border border-white/15 px-3 py-1.5 text-xs text-white/80 hover:bg-white/5"
         >
-          {showAdd ? "Cancel" : "+ New task"}
+          {advanced ? "Hide Advanced" : "Show Advanced"}
         </button>
       </div>
 
-      {showAdd && (
-        <NewTaskForm
+      {!advanced && (
+        <SimpleTaskList
           kinds={kinds}
-          onCreated={async () => {
-            setShowAdd(false);
-            await refresh();
-          }}
+          tasks={tasks}
+          onChanged={refresh}
           onError={setError}
         />
       )}
 
-      <div className="space-y-3">
-        {tasks.length === 0 && !showAdd && (
-          <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-8 text-center text-sm text-white/50">
-            No scheduled tasks. Click &quot;+ New task&quot; to add one.
+      {advanced && (
+        <>
+          <div className="flex items-center justify-end">
+            <button
+              onClick={() => setShowAdd((v) => !v)}
+              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
+            >
+              {showAdd ? "Cancel" : "+ New task"}
+            </button>
           </div>
-        )}
-        {tasks.map((t) => (
-          <TaskRow
-            key={t.id}
-            task={t}
-            kinds={kinds}
-            onChanged={refresh}
-            onError={setError}
+
+          {showAdd && (
+            <NewTaskForm
+              kinds={kinds}
+              onCreated={async () => {
+                setShowAdd(false);
+                await refresh();
+              }}
+              onError={setError}
+            />
+          )}
+
+          <div className="space-y-3">
+            {tasks.length === 0 && !showAdd && (
+              <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-8 text-center text-sm text-white/50">
+                No scheduled tasks. Click &quot;+ New task&quot; to add one.
+              </div>
+            )}
+            {tasks.map((t) => (
+              <TaskRow
+                key={t.id}
+                task={t}
+                kinds={kinds}
+                onChanged={refresh}
+                onError={setError}
+              />
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/// Plex-style flat-list view: one row per registered task kind with a
+/// checkbox + inline status + Run now button. Toggling on creates the
+/// global instance of the task using the registry's recommended
+/// frequency; toggling off disables it (preserves customizations so a
+/// later re-enable doesn't lose the operator's Advanced edits).
+function SimpleTaskList({
+  kinds,
+  tasks,
+  onChanged,
+  onError,
+}: {
+  kinds: TaskKindInfo[];
+  tasks: ScheduledTask[];
+  onChanged: () => Promise<void>;
+  onError: (msg: string | null) => void;
+}) {
+  // Filter to the kinds that have a meaningful global instance.
+  // Per-library tasks (scan, currently only scan_library) are
+  // surfaced from the library admin page instead.
+  const visibleKinds = useMemo(
+    () => kinds.filter((k) => !PER_LIBRARY_KINDS.has(k.kind)),
+    [kinds],
+  );
+
+  return (
+    <section className="rounded-lg border border-white/10 bg-white/2">
+      <ul className="divide-y divide-white/5">
+        {visibleKinds.map((k) => (
+          <SimpleTaskRow
+            key={k.kind}
+            kind={k}
+            existing={findGlobalTaskFor(k.kind, tasks)}
+            onChanged={onChanged}
+            onError={onError}
           />
         ))}
+      </ul>
+      <div className="border-t border-white/10 px-4 py-3 text-xs text-white/45">
+        Per-library scans run automatically via the file watcher. Trigger
+        them by hand from the relevant library card in{" "}
+        <code className="font-mono text-white/55">Library &rsaquo; Libraries</code>.
       </div>
-    </div>
+    </section>
+  );
+}
+
+function SimpleTaskRow({
+  kind,
+  existing,
+  onChanged,
+  onError,
+}: {
+  kind: TaskKindInfo;
+  existing: ScheduledTask | null;
+  onChanged: () => Promise<void>;
+  onError: (msg: string | null) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const enabled = existing?.enabled ?? false;
+  const frequency = (existing?.frequency ?? kind.default_frequency) as TaskFrequency;
+  const requiresWindow =
+    existing?.requires_maintenance_window ?? kind.default_requires_maintenance_window;
+  const freqLabel = FREQUENCY_SHORT_LABELS[frequency] ?? frequency;
+  const scheduleSummary = requiresWindow
+    ? `${freqLabel} · in maintenance window`
+    : freqLabel;
+
+  async function toggle(next: boolean) {
+    setBusy(true);
+    onError(null);
+    try {
+      if (existing) {
+        // Row already in place — flip the enabled flag. We never
+        // delete on disable so an operator's Advanced customisations
+        // (custom cron, non-default params, frequency tweaks) ride
+        // through a later re-enable unchanged.
+        await adminApi.tasks.update(existing.id, { enabled: next });
+      } else if (next) {
+        // First time the operator turns this on — create the row
+        // with the registry's recommended defaults.
+        await adminApi.tasks.create({
+          kind: kind.kind,
+          name: kind.display_name,
+          frequency: kind.default_frequency,
+          requires_maintenance_window: kind.default_requires_maintenance_window,
+          params_json: "{}",
+          enabled: true,
+        });
+      }
+      await onChanged();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runNow() {
+    if (!existing) {
+      // Toggle on first, then trigger — saves the operator one click.
+      await toggle(true);
+      // Find the freshly-created row by re-querying. Cheap: the
+      // toggle already refetched.
+      return;
+    }
+    setBusy(true);
+    onError(null);
+    try {
+      await adminApi.tasks.runNow(existing.id);
+      // Give the runner a beat to start writing history, then refresh.
+      window.setTimeout(() => {
+        void onChanged();
+        setBusy(false);
+      }, 700);
+      return;
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li className="flex flex-wrap items-center gap-3 px-4 py-3 sm:flex-nowrap">
+      <label className="flex flex-1 min-w-0 items-start gap-3">
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(e) => toggle(e.target.checked)}
+          className="mt-1"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-2 text-sm">
+            <span className="font-medium">{kind.display_name}</span>
+            <span className="text-xs text-white/45">— {scheduleSummary}</span>
+            {existing?.last_status === "failed" && (
+              <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
+                Last run failed
+              </span>
+            )}
+            {existing?.last_status === "running" && (
+              <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-blue-300">
+                Running
+              </span>
+            )}
+          </div>
+          <p className="mt-0.5 text-xs text-white/55">{kind.description}</p>
+          <div className="mt-1 text-xs text-white/40">
+            {existing && enabled && (
+              <>
+                Next: {formatWhen(existing.next_run_at)}
+                {existing.last_run_at && (
+                  <> · Last: {formatWhen(existing.last_run_at)}</>
+                )}
+              </>
+            )}
+            {existing && !enabled && <>Disabled — toggle to resume scheduling.</>}
+            {!existing && <>Not yet enabled.</>}
+          </div>
+          {existing?.last_error && (
+            <div className="mt-0.5 truncate text-xs text-red-300" title={existing.last_error}>
+              {existing.last_error}
+            </div>
+          )}
+        </div>
+      </label>
+      {existing && (
+        <button
+          disabled={busy}
+          onClick={runNow}
+          className="rounded border border-white/15 px-2 py-1 text-xs text-white/80 hover:bg-white/5 disabled:opacity-50"
+        >
+          Run now
+        </button>
+      )}
+    </li>
   );
 }
 
@@ -88,6 +456,8 @@ function TaskRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [name, setName] = useState(task.name);
+  const [frequency, setFrequency] = useState<TaskFrequency>(task.frequency);
+  const [requiresWindow, setRequiresWindow] = useState(task.requires_maintenance_window);
   const [cron, setCron] = useState(task.cron_expr);
   const [params, setParams] = useState(task.params_json);
   const [busy, setBusy] = useState(false);
@@ -95,13 +465,26 @@ function TaskRow({
 
   const kindInfo = kinds.find((k) => k.kind === task.kind);
   const dirty =
-    name !== task.name || cron !== task.cron_expr || params !== task.params_json;
+    name !== task.name ||
+    frequency !== task.frequency ||
+    requiresWindow !== task.requires_maintenance_window ||
+    (frequency === "custom" && cron !== task.cron_expr) ||
+    params !== task.params_json;
 
   async function save() {
     setBusy(true);
     onError(null);
     try {
-      await adminApi.tasks.update(task.id, { name, cron_expr: cron, params_json: params });
+      const patch: Parameters<typeof adminApi.tasks.update>[1] = {
+        name,
+        frequency,
+        requires_maintenance_window: requiresWindow,
+        params_json: params,
+      };
+      // Only send cron when the user is in custom mode — otherwise the
+      // existing placeholder is preserved unchanged.
+      if (frequency === "custom") patch.cron_expr = cron;
+      await adminApi.tasks.update(task.id, patch);
       await onChanged();
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
@@ -167,26 +550,48 @@ function TaskRow({
     }
   }
 
+  const scheduleSummary = useMemo(() => {
+    if (task.frequency === "custom") {
+      return `Custom · ${task.cron_expr}`;
+    }
+    const base = FREQUENCY_LABELS[task.frequency];
+    return task.requires_maintenance_window
+      ? `${base} · in maintenance window`
+      : base;
+  }, [task.frequency, task.cron_expr, task.requires_maintenance_window]);
+
+  const neverFires =
+    task.frequency === "manual" || task.frequency === "on_change";
+
   return (
     <div className="rounded-lg border border-white/10 bg-white/2">
-      <div className="flex items-center gap-3 p-3">
+      <div className="flex flex-wrap items-center gap-3 p-3">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
             <span className="font-medium">{task.name}</span>
             <span className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/60">
               {task.kind}
             </span>
             <StatusBadge status={task.last_status} />
+            {!task.enabled && (
+              <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-white/50">
+                Off
+              </span>
+            )}
           </div>
-          <div className="mt-0.5 font-mono text-xs text-white/40">{task.cron_expr}</div>
+          <div className="mt-0.5 text-xs text-white/55">{scheduleSummary}</div>
           <div className="mt-0.5 text-xs text-white/40">
-            Next: {formatWhen(task.next_run_at)}
+            {neverFires ? (
+              <>Runs only when triggered.</>
+            ) : (
+              <>Next: {formatWhen(task.next_run_at)}</>
+            )}
             {task.last_run_at && (
               <>
                 {" · "}Last:{" "}
                 {formatWhen(task.last_run_at)}
                 {task.last_duration_ms != null && (
-                  <> ({task.last_duration_ms}ms)</>
+                  <> ({formatDuration(task.last_duration_ms)})</>
                 )}
               </>
             )}
@@ -223,7 +628,10 @@ function TaskRow({
       </div>
       {expanded && (
         <div className="space-y-4 border-t border-white/10 p-4">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          {kindInfo?.description && (
+            <p className="text-xs text-white/55">{kindInfo.description}</p>
+          )}
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <Field label="Name">
               <input
                 type="text"
@@ -232,8 +640,36 @@ function TaskRow({
                 className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
               />
             </Field>
-            <Field label="Schedule" hint="Pick a preset or use Custom for raw cron.">
-              <CronEditor value={cron} onChange={setCron} />
+            <Field label="Run">
+              <FrequencyPicker value={frequency} onChange={setFrequency} />
+            </Field>
+            {frequency === "custom" && (
+              <Field
+                label="Custom cron"
+                hint="Six fields: sec min hour dom mon dow (UTC). Advanced — most operators should pick a frequency above instead."
+              >
+                <input
+                  type="text"
+                  value={cron}
+                  onChange={(e) => setCron(e.target.value)}
+                  className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+                  placeholder="0 0 3 * * *"
+                />
+              </Field>
+            )}
+            <Field
+              label="Maintenance window"
+              hint="When on, the next scheduled run is deferred to the next opening of the server maintenance window."
+            >
+              <label className="flex items-center gap-2 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={requiresWindow}
+                  disabled={frequency === "manual" || frequency === "on_change"}
+                  onChange={(e) => setRequiresWindow(e.target.checked)}
+                />
+                <span>Only run inside the maintenance window</span>
+              </label>
             </Field>
             <Field label="Params (JSON)" hint={kindInfo?.params_schema}>
               <input
@@ -248,7 +684,7 @@ function TaskRow({
             <button
               disabled={!dirty || busy}
               onClick={save}
-              className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
             >
               Save
             </button>
@@ -291,7 +727,7 @@ function TaskRow({
                         </td>
                         <td className="px-3 py-1.5 tabular-nums text-white/60">
                           {r.finished_at != null
-                            ? `${r.finished_at - r.started_at}ms`
+                            ? formatDuration(r.finished_at - r.started_at)
                             : "—"}
                         </td>
                         <td className="px-3 py-1.5 text-white/70">
@@ -329,11 +765,28 @@ function NewTaskForm({
 }) {
   const [kind, setKind] = useState(kinds[0]?.kind ?? "prune_sessions");
   const [name, setName] = useState("");
-  const [cron, setCron] = useState("0 0 * * * *");
+  const kindInfo = kinds.find((k) => k.kind === kind);
+  // Each kind has a recommended default schedule/window combo from
+  // the registry — we mirror them here so the form is pre-filled
+  // sensibly when the operator switches kind.
+  const [frequency, setFrequency] = useState<TaskFrequency>(
+    kindInfo?.default_frequency ?? "daily",
+  );
+  const [requiresWindow, setRequiresWindow] = useState(
+    kindInfo?.default_requires_maintenance_window ?? false,
+  );
+  const [cron, setCron] = useState("0 0 3 * * *");
   const [params, setParams] = useState("{}");
   const [busy, setBusy] = useState(false);
 
-  const kindInfo = kinds.find((k) => k.kind === kind);
+  function changeKind(nextKind: string) {
+    setKind(nextKind);
+    const info = kinds.find((k) => k.kind === nextKind);
+    if (info) {
+      setFrequency(info.default_frequency);
+      setRequiresWindow(info.default_requires_maintenance_window);
+    }
+  }
 
   async function submit() {
     setBusy(true);
@@ -342,7 +795,9 @@ function NewTaskForm({
       await adminApi.tasks.create({
         kind,
         name: name.trim() || (kindInfo?.display_name ?? kind),
-        cron_expr: cron,
+        frequency,
+        requires_maintenance_window: requiresWindow,
+        cron_expr: frequency === "custom" ? cron : undefined,
         params_json: params,
         enabled: true,
       });
@@ -360,7 +815,7 @@ function NewTaskForm({
         <Field label="Kind" hint={kindInfo?.description}>
           <select
             value={kind}
-            onChange={(e) => setKind(e.target.value)}
+            onChange={(e) => changeKind(e.target.value)}
             className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
           >
             {kinds.map((k) => (
@@ -379,9 +834,30 @@ function NewTaskForm({
             className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
           />
         </Field>
-        <Field label="Schedule">
-          <CronEditor value={cron} onChange={setCron} />
+        <Field label="Run">
+          <FrequencyPicker value={frequency} onChange={setFrequency} />
         </Field>
+        <Field label="Maintenance window">
+          <label className="flex items-center gap-2 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm">
+            <input
+              type="checkbox"
+              checked={requiresWindow}
+              disabled={frequency === "manual" || frequency === "on_change"}
+              onChange={(e) => setRequiresWindow(e.target.checked)}
+            />
+            <span>Only run inside the maintenance window</span>
+          </label>
+        </Field>
+        {frequency === "custom" && (
+          <Field label="Custom cron" hint="Six fields: sec min hour dom mon dow (UTC).">
+            <input
+              type="text"
+              value={cron}
+              onChange={(e) => setCron(e.target.value)}
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+            />
+          </Field>
+        )}
         <Field label="Params (JSON)" hint={kindInfo?.params_schema}>
           <input
             type="text"
@@ -394,7 +870,7 @@ function NewTaskForm({
       <button
         disabled={busy}
         onClick={submit}
-        className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-50"
+        className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:opacity-50"
       >
         {busy ? "Creating…" : "Create"}
       </button>
@@ -402,284 +878,25 @@ function NewTaskForm({
   );
 }
 
-/// Structured editor for our 6-field cron strings
-/// (`sec min hour dom mon dow`). Defaults to the most-common
-/// preset shapes (Hourly / Every N hours / Daily at time / Weekly
-/// on day at time / Custom raw expression). When the value can't
-/// be parsed into a known shape, the mode flips to Custom and the
-/// raw input is the source of truth.
-///
-/// Day-of-week numbering: 0 = Sunday … 6 = Saturday (cron standard).
-function CronEditor({
+function FrequencyPicker({
   value,
   onChange,
 }: {
-  value: string;
-  onChange: (next: string) => void;
-}) {
-  const parsed = parseCron(value);
-  const mode = parsed.mode;
-
-  function setMode(next: CronMode) {
-    if (next === "hourly") {
-      onChange("0 0 * * * *");
-    } else if (next === "every_n_hours") {
-      onChange("0 0 */6 * * *");
-    } else if (next === "daily") {
-      onChange("0 0 3 * * *");
-    } else if (next === "weekly") {
-      onChange("0 0 4 * * 0");
-    } else if (next === "every_n_minutes") {
-      onChange("0 */30 * * * *");
-    } else {
-      // Custom — keep the current cron as-is so the user can edit it.
-    }
-  }
-
-  return (
-    <div className="space-y-2">
-      <select
-        value={mode}
-        onChange={(e) => setMode(e.target.value as CronMode)}
-        className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-      >
-        <option value="every_n_minutes">Every N minutes</option>
-        <option value="hourly">Every hour</option>
-        <option value="every_n_hours">Every N hours</option>
-        <option value="daily">Daily at time</option>
-        <option value="weekly">Weekly on day at time</option>
-        <option value="custom">Custom cron expression</option>
-      </select>
-
-      {mode === "every_n_minutes" && (
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-white/55">Every</span>
-          <NumberInput
-            value={parsed.everyMinutes ?? 30}
-            min={1}
-            max={59}
-            onChange={(n) => onChange(`0 */${n} * * * *`)}
-          />
-          <span className="text-white/55">minutes</span>
-        </div>
-      )}
-
-      {mode === "every_n_hours" && (
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-white/55">Every</span>
-          <NumberInput
-            value={parsed.everyHours ?? 6}
-            min={1}
-            max={23}
-            onChange={(n) => onChange(`0 0 */${n} * * *`)}
-          />
-          <span className="text-white/55">hours</span>
-        </div>
-      )}
-
-      {mode === "daily" && (
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-white/55">At</span>
-          <TimeInput
-            hour={parsed.hour ?? 3}
-            minute={parsed.minute ?? 0}
-            onChange={(h, m) => onChange(`0 ${m} ${h} * * *`)}
-          />
-        </div>
-      )}
-
-      {mode === "weekly" && (
-        <div className="flex flex-wrap items-center gap-2 text-sm">
-          <span className="text-white/55">On</span>
-          <select
-            value={parsed.dayOfWeek ?? 0}
-            onChange={(e) =>
-              onChange(
-                `0 ${parsed.minute ?? 0} ${parsed.hour ?? 4} * * ${e.target.value}`,
-              )
-            }
-            className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm"
-          >
-            {DAYS.map((d, i) => (
-              <option key={i} value={i}>
-                {d}
-              </option>
-            ))}
-          </select>
-          <span className="text-white/55">at</span>
-          <TimeInput
-            hour={parsed.hour ?? 4}
-            minute={parsed.minute ?? 0}
-            onChange={(h, m) =>
-              onChange(`0 ${m} ${h} * * ${parsed.dayOfWeek ?? 0}`)
-            }
-          />
-        </div>
-      )}
-
-      {mode === "custom" && (
-        <input
-          type="text"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-          placeholder="sec min hour day-of-month month day-of-week"
-        />
-      )}
-
-      <div className="font-mono text-[11px] text-white/40">
-        {value}
-        {parsed.summary && (
-          <span className="ml-2 font-sans text-white/55">
-            ({parsed.summary})
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-
-type CronMode =
-  | "every_n_minutes"
-  | "hourly"
-  | "every_n_hours"
-  | "daily"
-  | "weekly"
-  | "custom";
-
-interface ParsedCron {
-  mode: CronMode;
-  everyMinutes?: number;
-  everyHours?: number;
-  hour?: number;
-  minute?: number;
-  dayOfWeek?: number;
-  summary?: string;
-}
-
-/// Detect which of the friendly modes a raw cron string fits into.
-/// Returns `custom` for anything we don't recognise — the editor
-/// then shows the raw input box and the user can write any
-/// expression they like. The summary is a human-friendly description
-/// shown alongside the raw value so the operator can sanity-check
-/// what the cron evaluates to.
-function parseCron(value: string): ParsedCron {
-  const parts = value.trim().split(/\s+/);
-  if (parts.length !== 6) return { mode: "custom" };
-  const [sec, min, hour, dom, mon, dow] = parts;
-  if (sec !== "0" || dom !== "*" || mon !== "*") {
-    return { mode: "custom" };
-  }
-
-  // Every-N-minutes shape: `0 */N * * * *`
-  const minEvery = min.match(/^\*\/(\d+)$/);
-  if (minEvery && hour === "*" && dow === "*") {
-    return {
-      mode: "every_n_minutes",
-      everyMinutes: parseInt(minEvery[1], 10),
-      summary: `Every ${minEvery[1]} minutes`,
-    };
-  }
-
-  // Hourly shape: `0 0 * * * *`
-  if (min === "0" && hour === "*" && dow === "*") {
-    return { mode: "hourly", summary: "Every hour" };
-  }
-
-  // Every-N-hours shape: `0 0 */N * * *`
-  const hourEvery = hour.match(/^\*\/(\d+)$/);
-  if (hourEvery && min === "0" && dow === "*") {
-    return {
-      mode: "every_n_hours",
-      everyHours: parseInt(hourEvery[1], 10),
-      summary: `Every ${hourEvery[1]} hours`,
-    };
-  }
-
-  // Daily shape: `0 MM HH * * *`
-  const m = parseInt(min, 10);
-  const h = parseInt(hour, 10);
-  if (
-    !Number.isNaN(m) && !Number.isNaN(h) && dow === "*"
-    && m >= 0 && m < 60 && h >= 0 && h < 24
-  ) {
-    return {
-      mode: "daily",
-      hour: h,
-      minute: m,
-      summary: `Daily at ${pad2(h)}:${pad2(m)}`,
-    };
-  }
-
-  // Weekly shape: `0 MM HH * * D`
-  const d = parseInt(dow, 10);
-  if (
-    !Number.isNaN(m) && !Number.isNaN(h) && !Number.isNaN(d)
-    && m >= 0 && m < 60 && h >= 0 && h < 24 && d >= 0 && d < 7
-  ) {
-    return {
-      mode: "weekly",
-      hour: h,
-      minute: m,
-      dayOfWeek: d,
-      summary: `Weekly on ${DAYS[d]} at ${pad2(h)}:${pad2(m)}`,
-    };
-  }
-
-  return { mode: "custom" };
-}
-
-function pad2(n: number): string {
-  return n.toString().padStart(2, "0");
-}
-
-function NumberInput({
-  value,
-  min,
-  max,
-  onChange,
-}: {
-  value: number;
-  min: number;
-  max: number;
-  onChange: (n: number) => void;
+  value: TaskFrequency;
+  onChange: (next: TaskFrequency) => void;
 }) {
   return (
-    <input
-      type="number"
+    <select
       value={value}
-      min={min}
-      max={max}
-      onChange={(e) => {
-        const n = parseInt(e.target.value, 10);
-        if (!Number.isNaN(n) && n >= min && n <= max) onChange(n);
-      }}
-      className="w-16 rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
-    />
-  );
-}
-
-function TimeInput({
-  hour,
-  minute,
-  onChange,
-}: {
-  hour: number;
-  minute: number;
-  onChange: (hour: number, minute: number) => void;
-}) {
-  return (
-    <input
-      type="time"
-      value={`${pad2(hour)}:${pad2(minute)}`}
-      onChange={(e) => {
-        const [h, m] = e.target.value.split(":").map((s) => parseInt(s, 10));
-        if (!Number.isNaN(h) && !Number.isNaN(m)) onChange(h, m);
-      }}
-      className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
-    />
+      onChange={(e) => onChange(e.target.value as TaskFrequency)}
+      className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+    >
+      {FREQUENCY_OPTIONS.map((f) => (
+        <option key={f} value={f}>
+          {FREQUENCY_LABELS[f]}
+        </option>
+      ))}
+    </select>
   );
 }
 
@@ -729,5 +946,49 @@ function StatusBadge({ status }: { status: string | null }) {
 }
 
 function formatWhen(epochMs: number): string {
+  // Anything more than 50 years out (the scheduler's "never" sentinel
+  // is year 2100) renders as a friendly placeholder — operators
+  // shouldn't ever see "1/1/2100, 12:00:00 AM" in the UI.
+  if (epochMs > Date.now() + 50 * 365 * 86_400_000) return "never";
   return new Date(epochMs).toLocaleString();
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const mins = Math.floor(ms / 60_000);
+  const secs = Math.floor((ms % 60_000) / 1000);
+  return `${mins}m ${secs}s`;
+}
+
+/// Decide whether the local clock currently falls inside the maintenance
+/// window. Mirrors the server-side `snap_to_maintenance_window` logic
+/// (including midnight-wrap handling) so the "Active now" badge stays
+/// honest. We compute minutes-since-midnight to dodge timezone math.
+function isWithinWindow(start: string, end: string, now: Date): boolean {
+  const s = hhmmToMinutes(start);
+  const e = hhmmToMinutes(end);
+  if (s == null || e == null) return false;
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  if (s === e) return false;
+  if (s < e) return nowMin >= s && nowMin < e;
+  // Wraps midnight.
+  return nowMin >= s || nowMin < e;
+}
+
+function nextWindowDescription(start: string, end: string): string {
+  const s = hhmmToMinutes(start);
+  const e = hhmmToMinutes(end);
+  if (s == null || e == null) return start;
+  return `${start} → ${end}`;
+}
+
+function hhmmToMinutes(hhmm: string): number | null {
+  const parts = hhmm.split(":");
+  if (parts.length !== 2) return null;
+  const h = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  if (h < 0 || h >= 24 || m < 0 || m >= 60) return null;
+  return h * 60 + m;
 }

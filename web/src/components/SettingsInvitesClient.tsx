@@ -53,7 +53,6 @@ export function SettingsInvitesClient() {
       .list()
       .then(({ groups }) => setGroups(groups))
       .catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function refresh() {
@@ -268,7 +267,7 @@ export function SettingsInvitesClient() {
             type="button"
             onClick={create}
             disabled={busy}
-            className="rounded bg-(--color-accent) px-4 py-2 text-xs font-semibold text-white transition disabled:opacity-50"
+            className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:py-2 sm:text-xs transition disabled:opacity-50"
           >
             {busy ? "Creating…" : "Create invite"}
           </button>

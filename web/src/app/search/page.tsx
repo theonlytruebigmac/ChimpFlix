@@ -22,7 +22,7 @@ export default async function SearchPage({
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="px-12 pb-24 pt-28">
+      <div className="px-4 sm:px-8 md:px-12 pb-24 pt-24 sm:pt-28">
         {!query ? (
           <>
             <h1 className="mb-3 text-4xl font-bold tracking-tight">Search</h1>

@@ -13,6 +13,10 @@ interface Props {
 // Build a 2D toggle from the flat user × library matrix. Save commits
 // per-library `set_library_user_ids` calls under a single bulk request.
 export function AdminAccessClient({ initial }: Props) {
+  // Baseline tracked in state (rather than reading `initial` directly)
+  // so a successful save can update the dirty-check anchor without
+  // mutating the prop array, which trips react-hooks/immutability.
+  const [baseline, setBaseline] = useState(initial);
   const [entries, setEntries] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -34,11 +38,9 @@ export function AdminAccessClient({ initial }: Props) {
     );
   }, [entries]);
 
-  function isAllowed(userId: number, libraryId: number) {
-    return (
-      entries.find(
-        (e) => e.user_id === userId && e.library_id === libraryId,
-      )?.allowed ?? false
+  function cellFor(userId: number, libraryId: number) {
+    return entries.find(
+      (e) => e.user_id === userId && e.library_id === libraryId,
     );
   }
 
@@ -54,7 +56,7 @@ export function AdminAccessClient({ initial }: Props) {
 
   const dirty =
     JSON.stringify(entries.map((e) => ({ u: e.user_id, l: e.library_id, a: e.allowed }))) !==
-    JSON.stringify(initial.map((e) => ({ u: e.user_id, l: e.library_id, a: e.allowed })));
+    JSON.stringify(baseline.map((e) => ({ u: e.user_id, l: e.library_id, a: e.allowed })));
 
   async function save() {
     setBusy(true);
@@ -73,10 +75,9 @@ export function AdminAccessClient({ initial }: Props) {
       }));
       const r = await adminApi.access.put(payload);
       setEntries(r.entries);
-      // Refresh the "initial" baseline by mutating in place — keeps the
-      // dirty-check truthful after a save.
-      initial.length = 0;
-      for (const e of r.entries) initial.push(e);
+      // Refresh the baseline so the dirty-check returns false after
+      // the save lands.
+      setBaseline(r.entries);
       setSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -118,16 +119,30 @@ export function AdminAccessClient({ initial }: Props) {
                 <td className="whitespace-nowrap px-4 py-2 font-medium">
                   @{u.username}
                 </td>
-                {libraries.map((l) => (
-                  <td key={l.id} className="px-3 py-2 text-center">
-                    <input
-                      type="checkbox"
-                      checked={isAllowed(u.id, l.id)}
-                      onChange={() => toggle(u.id, l.id)}
-                      className="h-4 w-4"
-                    />
-                  </td>
-                ))}
+                {libraries.map((l) => {
+                  const cell = cellFor(u.id, l.id);
+                  const allowed = cell?.allowed ?? false;
+                  const viaGroups = cell?.via_groups ?? [];
+                  return (
+                    <td key={l.id} className="px-3 py-2 text-center align-top">
+                      <input
+                        type="checkbox"
+                        checked={allowed}
+                        onChange={() => toggle(u.id, l.id)}
+                        className="h-4 w-4"
+                        title="Direct grant — toggle to add/remove"
+                      />
+                      {viaGroups.length > 0 && (
+                        <div
+                          className="mt-1 text-[10px] uppercase tracking-wider text-emerald-300/70"
+                          title={`Also granted via group${viaGroups.length > 1 ? "s" : ""}: ${viaGroups.join(", ")}`}
+                        >
+                          via {viaGroups.join(", ")}
+                        </div>
+                      )}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -137,7 +152,7 @@ export function AdminAccessClient({ initial }: Props) {
         <button
           disabled={!dirty || busy}
           onClick={save}
-          className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
         >
           {busy ? "Saving…" : "Save changes"}
         </button>

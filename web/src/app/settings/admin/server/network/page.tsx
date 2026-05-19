@@ -9,7 +9,7 @@ export default async function AdminNetworkPage() {
       <AdminPageHeader
         eyebrow="Server"
         title="Network"
-        description="Public URL, CORS, and secure-connection policy. Settings apply without restart via the in-memory settings cache."
+        description="Public URL, CORS, LAN policy, and session cleanup. Most settings apply without restart; the reaper threshold is read once at spawn time and flags itself when changed."
       />
       <AdminNetworkClient initial={initial} />
     </div>

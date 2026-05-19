@@ -15,6 +15,13 @@ export function ModalRoot() {
   const [titleId, setTitleId] = useState<string | null>(null);
 
   useEffect(() => {
+    // Read the initial titleId from window.location on first client
+    // mount — readTitleFromLocation can't run during SSR, so this
+    // setState is the synchronization point between URL-as-source-of-
+    // truth and React state. All subsequent setTitleId calls are
+    // event-driven (modal open/close, popstate), which the lint rule
+    // is fine with.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setTitleId(readTitleFromLocation());
 
     function onOpen(e: Event) {

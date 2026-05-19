@@ -37,7 +37,7 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
         </span>
         <button
           onClick={() => setShowAdd((v) => !v)}
-          className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600"
+          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
         >
           {showAdd ? "Cancel" : "+ New webhook"}
         </button>
@@ -277,7 +277,7 @@ function WebhookRow({
             <button
               disabled={!dirty || busy}
               onClick={save}
-              className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
             >
               Save
             </button>
@@ -450,7 +450,7 @@ function NewWebhookForm({
       <button
         disabled={busy || mask.length === 0 || !name.trim() || !url.trim()}
         onClick={submit}
-        className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-50"
+        className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:opacity-50"
       >
         {busy ? "Creating…" : "Create"}
       </button>
