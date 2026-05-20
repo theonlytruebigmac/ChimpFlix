@@ -182,6 +182,21 @@ pub fn router(state: AppState) -> Router {
             "/items/{id}/detect-markers",
             post(markers::detect_for_item),
         )
+        // Per-media-file marker editor (operator-only) — used by the
+        // owner-side marker-correction UI. The player-side surface
+        // gets markers via the item detail response and never edits.
+        .route(
+            "/media-files/{id}/markers",
+            get(markers::list_for_media_file).put(markers::replace_manual),
+        )
+        // Per-show intro fingerprint status + clear. Keyed on the
+        // media file id so the operator editor (which already knows
+        // its file id) can call them without an extra
+        // show-id lookup of its own.
+        .route(
+            "/media-files/{id}/intro-fingerprint",
+            get(markers::fingerprint_status).delete(markers::clear_fingerprint),
+        )
         // Scan jobs
         .route("/scans/{id}", get(scans::get_one))
         // Items / seasons / episodes
@@ -355,6 +370,32 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/items/bulk/detect-markers",
             post(admin::bulk::detect_markers),
+        )
+        // Per-show intro fingerprint maintenance (Owner-only) —
+        // surfaces the inventory under Admin → Maintenance and lets
+        // the operator clear any show's captured signature.
+        .route(
+            "/admin/intro-fingerprints",
+            get(admin::fingerprints::list),
+        )
+        .route(
+            "/admin/intro-fingerprints/{show_id}",
+            axum::routing::delete(admin::fingerprints::delete_for_show),
+        )
+        // Background job queue (Owner-only) — durable pipeline jobs
+        // for marker detection, preview sprites, loudness analysis,
+        // chapter thumbs. The list endpoint also accepts ?kind=...
+        // and ?status=... query params for filtering.
+        .route("/admin/jobs", get(admin::jobs::list))
+        .route("/admin/jobs/summary", get(admin::jobs::summary))
+        .route("/admin/jobs/{id}/requeue", post(admin::jobs::requeue))
+        .route(
+            "/admin/jobs/process-all-pending",
+            post(admin::jobs::process_all_pending),
+        )
+        .route(
+            "/admin/jobs/queued",
+            axum::routing::delete(admin::jobs::wipe_queued),
         )
         // Notifications (per-user inbox)
         .route("/notifications", get(notifications::list))

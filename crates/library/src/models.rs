@@ -894,6 +894,19 @@ pub struct ItemDetail {
     /// /items/:id/reviews to keep ItemDetail bounded.
     #[serde(default)]
     pub reviews: ReviewsSummary,
+    /// Per-user watched stats for shows. None for movies (whose
+    /// watched state lives in `play_state`). Lets the show-level
+    /// Mark-watched toggle decide whether to render "Mark all as
+    /// watched" or "Mark all as unwatched" without the client having
+    /// to fan out a per-season fetch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_stats: Option<ShowWatchStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShowWatchStats {
+    pub total_episodes: i64,
+    pub watched_episodes: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -918,6 +931,13 @@ pub struct Marker {
     pub start_ms: i64,
     pub end_ms: i64,
     pub label: Option<String>,
+    /// `auto` when written by the detect_markers task (chapter probe,
+    /// blackdetect, chromaprint override) or `manual` when the
+    /// operator drew it in the marker editor. The player uses this
+    /// to render auto-detected segments more prominently on the
+    /// timeline so the user can see at a glance which areas were
+    /// machine-found vs hand-curated.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1615,11 +1635,11 @@ pub struct ServerSettings {
     /// a server restart.
     pub scan_automatically: bool,
     /// When true, completing a library scan (via file_watcher) queues
-    /// `detect_markers` for every newly-discovered file that lacks
-    /// auto markers. Off by default — blackdetect is expensive and the
-    /// scheduled `detect_markers` task already covers bulk catch-up.
-    /// Matches Plex's "Detect intro/credits when media is added."
-    pub detect_markers_on_add: bool,
+    // (Removed in the discovery-pipeline migration: the
+    // `detect_markers_on_add` toggle is now effectively always-on
+    // since FileAdded events fan out into per-file detection jobs
+    // unconditionally. The DB column is preserved for migration
+    // compat but no longer consumed.)
     // ---- Playback / library (phase 31) ---------------------------------
     /// Hard cap on the Continue Watching rail. Default 40.
     pub continue_watching_max_items: i64,
@@ -1801,12 +1821,6 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(1)
-                != 0,
-            detect_markers_on_add: row
-                .try_get::<Option<i64>, _>("detect_markers_on_add")
-                .ok()
-                .flatten()
-                .unwrap_or(0)
                 != 0,
             continue_watching_max_items: row
                 .try_get::<Option<i64>, _>("continue_watching_max_items")
@@ -2011,8 +2025,6 @@ pub struct ServerSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_automatically: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detect_markers_on_add: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_watching_max_items: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_watching_max_age_weeks: Option<i64>,
@@ -2185,6 +2197,103 @@ pub struct SecretMetadata {
     pub last4: String,
     pub updated_at: i64,
     pub updated_by: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// Background job queue (jobs table)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle status of a queued background job. See migration
+/// `phase57_jobs_queue.sql` for the persisted column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    /// Last attempt failed; `run_after` is set in the future and the
+    /// row is eligible for re-claim on the next poll cycle that
+    /// crosses that threshold. Transitions back to `Queued` when the
+    /// worker re-claims it.
+    Failed,
+    /// Exhausted `max_attempts`. Manual intervention required (admin
+    /// can re-queue with a fresh attempt counter).
+    Dead,
+}
+
+impl JobStatus {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            JobStatus::Queued => "queued",
+            JobStatus::Running => "running",
+            JobStatus::Succeeded => "succeeded",
+            JobStatus::Failed => "failed",
+            JobStatus::Dead => "dead",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "queued" => JobStatus::Queued,
+            "running" => JobStatus::Running,
+            "succeeded" => JobStatus::Succeeded,
+            "failed" => JobStatus::Failed,
+            "dead" => JobStatus::Dead,
+            other => anyhow::bail!("unknown job status: {other}"),
+        })
+    }
+}
+
+/// One row from the `jobs` table. The payload is kept as a string
+/// here (raw JSON) so the library layer doesn't need to know each
+/// kind's schema — handlers `serde_json::from_str` into their own
+/// typed struct.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobRow {
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    pub status: JobStatus,
+    pub priority: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub run_after: i64,
+    pub locked_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+impl JobRow {
+    pub(crate) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
+        let status_str: String = row.try_get("status")?;
+        Ok(Self {
+            id: row.try_get("id")?,
+            kind: row.try_get("kind")?,
+            payload: row.try_get("payload")?,
+            status: JobStatus::from_db_str(&status_str)?,
+            priority: row.try_get("priority")?,
+            attempts: row.try_get("attempts")?,
+            max_attempts: row.try_get("max_attempts")?,
+            run_after: row.try_get("run_after")?,
+            locked_at: row.try_get("locked_at")?,
+            last_error: row.try_get("last_error")?,
+            created_at: row.try_get("created_at")?,
+            started_at: row.try_get("started_at")?,
+            finished_at: row.try_get("finished_at")?,
+        })
+    }
+}
+
+/// Aggregate counts surfaced on the admin queue dashboard.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JobSummary {
+    pub queued: i64,
+    pub running: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub dead: i64,
 }
 
 /// Sort-friendly form of a title (leading article removed for

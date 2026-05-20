@@ -41,6 +41,9 @@ export async function GET(
           if (ep.play_state && ep.play_state.position_ms > 0) {
             base.viewOffset = ep.play_state.position_ms;
           }
+          if (ep.play_state?.watched) {
+            base.watched = true;
+          }
           return base;
         });
       } catch {

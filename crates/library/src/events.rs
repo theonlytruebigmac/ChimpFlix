@@ -32,6 +32,19 @@ pub enum ScanEvent {
         library_id: i64,
         error: String,
     },
+    /// Fired the moment a new media_files row is created. Consumers
+    /// (the server's scan emitter) use this to enqueue per-file
+    /// discovery-pipeline jobs (detect markers, generate preview,
+    /// analyze loudness, build chapter thumbs) so processing starts
+    /// as soon as the file lands rather than waiting for the next
+    /// scheduled detection / preview tick. Not emitted for
+    /// `Updated` or `Unchanged` outcomes — the pipeline only fires
+    /// on freshly-discovered files.
+    FileAdded {
+        job_id: i64,
+        library_id: i64,
+        media_file_id: i64,
+    },
 }
 
 /// The scanner is event-source-agnostic: it takes a closure and the caller

@@ -14,6 +14,7 @@ import {
   type TranscoderHwStrictness,
   type TranscoderPreset,
 } from "@/lib/chimpflix-api";
+import { Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
 
 const HEVC_MODES: ReadonlyArray<{ value: HevcMode; label: string; hint: string }> = [
   {
@@ -63,9 +64,6 @@ const TONEMAP_ALGOS: ReadonlyArray<{
 const HW_ACCEL_OPTIONS: ReadonlyArray<{
   value: TranscoderHwAccel;
   label: string;
-  /// Name of the encoder ffmpeg must have for this option to be
-  /// usable. `null` for software (always works) and `auto` (picks
-  /// whichever HW encoder is present, falls back to software).
   requires: string | null;
 }> = [
   { value: "auto", label: "Auto (best available)", requires: null },
@@ -83,6 +81,11 @@ interface Props {
   presets: TranscoderPreset[];
   settings: ServerSettings;
 }
+
+const INPUT_CLASS =
+  "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30";
+const INPUT_CHANGED_CLASS =
+  "w-full rounded-md border border-amber-400/40 bg-black/30 px-3 py-2 text-sm outline-none focus:border-amber-300";
 
 export function AdminTranscoderClient({
   capabilities,
@@ -148,9 +151,7 @@ export function AdminTranscoderClient({
   );
   const [allPresets, setAllPresets] = useState(presets);
   const [showAdd, setShowAdd] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
   const [active, setActive] = useState<DashboardSession[]>([]);
   // Start at 0 — first dashboard response below replaces it with
   // server.now_ms. Initializing from Date.now() in useState would call
@@ -219,62 +220,84 @@ export function AdminTranscoderClient({
     }
   }
 
-  const dirty =
-    hwAccel !== baseline.transcoder_hw_accel ||
-    maxConcurrent !== baseline.transcoder_max_concurrent ||
-    maxCpuConcurrent !== baseline.transcoder_max_cpu_concurrent ||
-    (ceiling === "" ? null : Number(ceiling)) !==
-      baseline.transcoder_quality_ceiling_kbps ||
-    encoderPreset !== baseline.transcoder_encoder_preset ||
-    hwStrictness !== baseline.transcoder_hw_strictness ||
-    backgroundPreset !== baseline.transcoder_background_preset ||
-    maxBackgroundConcurrent !== baseline.transcoder_max_background_concurrent ||
-    tonemapEnabled !== baseline.transcoder_hdr_tonemap_enabled ||
-    tonemapAlgo !== baseline.transcoder_hdr_tonemap_algo ||
-    hevcMode !== baseline.transcoder_hevc_encoding_mode ||
-    gpuDevice !== baseline.transcoder_gpu_device;
+  // Per-field dirty flags. Drives the SettingsRow `changed` outline
+  // and the SaveBar `dirtyCount` + summary.
+  const dirtyFields: Record<string, boolean> = {
+    "Hardware acceleration": hwAccel !== baseline.transcoder_hw_accel,
+    "Max concurrent transcodes":
+      maxConcurrent !== baseline.transcoder_max_concurrent,
+    "Max CPU transcodes":
+      maxCpuConcurrent !== baseline.transcoder_max_cpu_concurrent,
+    "Quality ceiling":
+      (ceiling === "" ? null : Number(ceiling)) !==
+      baseline.transcoder_quality_ceiling_kbps,
+    "Encoder preset": encoderPreset !== baseline.transcoder_encoder_preset,
+    "Hardware strictness": hwStrictness !== baseline.transcoder_hw_strictness,
+    "x264 preset":
+      backgroundPreset !== baseline.transcoder_background_preset,
+    "Max background jobs":
+      maxBackgroundConcurrent !==
+      baseline.transcoder_max_background_concurrent,
+    "Tone map HDR sources":
+      tonemapEnabled !== baseline.transcoder_hdr_tonemap_enabled,
+    "Tonemap algorithm":
+      tonemapAlgo !== baseline.transcoder_hdr_tonemap_algo,
+    "Transcode device": gpuDevice !== baseline.transcoder_gpu_device,
+    "HEVC encoding mode":
+      hevcMode !== baseline.transcoder_hevc_encoding_mode,
+  };
+  const dirtyLabels = Object.entries(dirtyFields)
+    .filter(([, isDirty]) => isDirty)
+    .map(([label]) => label);
+  const dirtyCount = dirtyLabels.length;
 
   async function saveSettings() {
-    setBusy(true);
     setError(null);
-    setSaved(false);
-    try {
-      const patch = {
-        transcoder_hw_accel: hwAccel,
-        transcoder_max_concurrent: maxConcurrent,
-        transcoder_max_cpu_concurrent: maxCpuConcurrent,
-        transcoder_quality_ceiling_kbps: ceiling === "" ? null : Number(ceiling),
-        transcoder_encoder_preset: encoderPreset,
-        transcoder_hw_strictness: hwStrictness,
-        transcoder_background_preset: backgroundPreset,
-        transcoder_max_background_concurrent: maxBackgroundConcurrent,
-        transcoder_hdr_tonemap_enabled: tonemapEnabled,
-        transcoder_hdr_tonemap_algo: tonemapAlgo,
-        transcoder_hevc_encoding_mode: hevcMode,
-        transcoder_gpu_device: gpuDevice,
-      };
-      await adminApi.settings.patch(patch);
-      setBaseline({
-        transcoder_hw_accel: hwAccel,
-        transcoder_max_concurrent: maxConcurrent,
-        transcoder_max_cpu_concurrent: maxCpuConcurrent,
-        transcoder_quality_ceiling_kbps:
-          ceiling === "" ? null : Number(ceiling),
-        transcoder_encoder_preset: encoderPreset,
-        transcoder_hw_strictness: hwStrictness,
-        transcoder_background_preset: backgroundPreset,
-        transcoder_max_background_concurrent: maxBackgroundConcurrent,
-        transcoder_hdr_tonemap_enabled: tonemapEnabled,
-        transcoder_hdr_tonemap_algo: tonemapAlgo,
-        transcoder_hevc_encoding_mode: hevcMode,
-        transcoder_gpu_device: gpuDevice,
-      });
-      setSaved(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+    const patch = {
+      transcoder_hw_accel: hwAccel,
+      transcoder_max_concurrent: maxConcurrent,
+      transcoder_max_cpu_concurrent: maxCpuConcurrent,
+      transcoder_quality_ceiling_kbps: ceiling === "" ? null : Number(ceiling),
+      transcoder_encoder_preset: encoderPreset,
+      transcoder_hw_strictness: hwStrictness,
+      transcoder_background_preset: backgroundPreset,
+      transcoder_max_background_concurrent: maxBackgroundConcurrent,
+      transcoder_hdr_tonemap_enabled: tonemapEnabled,
+      transcoder_hdr_tonemap_algo: tonemapAlgo,
+      transcoder_hevc_encoding_mode: hevcMode,
+      transcoder_gpu_device: gpuDevice,
+    };
+    await adminApi.settings.patch(patch);
+    setBaseline({
+      transcoder_hw_accel: hwAccel,
+      transcoder_max_concurrent: maxConcurrent,
+      transcoder_max_cpu_concurrent: maxCpuConcurrent,
+      transcoder_quality_ceiling_kbps:
+        ceiling === "" ? null : Number(ceiling),
+      transcoder_encoder_preset: encoderPreset,
+      transcoder_hw_strictness: hwStrictness,
+      transcoder_background_preset: backgroundPreset,
+      transcoder_max_background_concurrent: maxBackgroundConcurrent,
+      transcoder_hdr_tonemap_enabled: tonemapEnabled,
+      transcoder_hdr_tonemap_algo: tonemapAlgo,
+      transcoder_hevc_encoding_mode: hevcMode,
+      transcoder_gpu_device: gpuDevice,
+    });
+  }
+
+  function discardChanges() {
+    setHwAccel(baseline.transcoder_hw_accel);
+    setMaxConcurrent(baseline.transcoder_max_concurrent);
+    setMaxCpuConcurrent(baseline.transcoder_max_cpu_concurrent);
+    setCeiling(baseline.transcoder_quality_ceiling_kbps ?? "");
+    setEncoderPreset(baseline.transcoder_encoder_preset);
+    setHwStrictness(baseline.transcoder_hw_strictness);
+    setBackgroundPreset(baseline.transcoder_background_preset);
+    setMaxBackgroundConcurrent(baseline.transcoder_max_background_concurrent);
+    setTonemapEnabled(baseline.transcoder_hdr_tonemap_enabled);
+    setTonemapAlgo(baseline.transcoder_hdr_tonemap_algo);
+    setHevcMode(baseline.transcoder_hevc_encoding_mode);
+    setGpuDevice(baseline.transcoder_gpu_device);
   }
 
   async function refreshPresets() {
@@ -282,151 +305,182 @@ export function AdminTranscoderClient({
     setAllPresets(r.presets);
   }
 
+  const tonemapHint =
+    TONEMAP_ALGOS.find((a) => a.value === tonemapAlgo)?.hint ?? "";
+  const hevcHint = HEVC_MODES.find((m) => m.value === hevcMode)?.hint ?? "";
+
   return (
-    <div className="space-y-8">
+    <div>
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
         </div>
       )}
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="mb-4 text-base font-semibold">Engine</h2>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <Field label="Hardware acceleration">
-            <select
-              value={hwAccel}
-              onChange={(e) => setHwAccel(e.target.value as TranscoderHwAccel)}
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            >
-              {HW_ACCEL_OPTIONS.map((opt) => {
-                // Each option requires a SPECIFIC encoder name
-                // (`h264_nvenc`, `h264_qsv`, …) — the hwaccel decoder
-                // list is a different thing and not what we care about
-                // for encoding. Check against the encoder list so the
-                // dropdown only enables options that will actually run.
-                const available =
-                  opt.requires == null ||
-                  capabilities.h264_encoders.includes(opt.requires);
-                return (
-                  <option
-                    key={opt.value}
-                    value={opt.value}
-                    disabled={!available && opt.value !== hwAccel}
-                  >
-                    {opt.label}
-                    {!available && " (not available)"}
-                  </option>
-                );
-              })}
-            </select>
-            <p className="mt-1 text-xs text-white/50">
-              ffmpeg {capabilities.ffmpeg_version ?? "?"} —{" "}
-              {capabilities.h264_encoders.length === 0
-                ? "no h264 encoders detected"
-                : capabilities.h264_encoders.join(", ")}
-            </p>
-            {hwAccel === "auto" && (
-              <p className="mt-1 text-xs text-white/50">
-                Will pick:{" "}
+      {/* ── Engine ────────────────────────────────────────────────── */}
+      <SettingsCard
+        title="Engine"
+        description={
+          <>
+            ffmpeg {capabilities.ffmpeg_version ?? "?"} —{" "}
+            {capabilities.h264_encoders.length === 0
+              ? "no h264 encoders detected"
+              : capabilities.h264_encoders.join(", ")}
+          </>
+        }
+      >
+        <SettingsRow
+          label="Hardware acceleration"
+          help={
+            hwAccel === "auto" ? (
+              <>
+                Auto will pick:{" "}
                 <span className="font-medium text-white/80">
                   {pickAutoLabel(capabilities.h264_encoders)}
                 </span>
-              </p>
-            )}
-          </Field>
-          <Field
-            label="Max concurrent transcodes"
-            hint="Sessions exceeding this limit are rejected with 429."
+              </>
+            ) : (
+              "Specific encoder used for live transcodes. Greys out options the host can't run."
+            )
+          }
+          changed={dirtyFields["Hardware acceleration"]}
+        >
+          <select
+            value={hwAccel}
+            onChange={(e) => setHwAccel(e.target.value as TranscoderHwAccel)}
+            className={
+              dirtyFields["Hardware acceleration"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
-            <input
-              type="number"
-              min={1}
-              max={64}
-              value={maxConcurrent}
-              onChange={(e) => setMaxConcurrent(Number(e.target.value))}
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            />
-          </Field>
-          <Field
-            label="Max concurrent CPU transcodes"
-            hint="Sub-cap for software (libx264 / libx265) sessions only. A single CPU encode pegs N cores; capping these separately stops a wave of fallback-to-software encodes from starving GPU sessions. Default 1."
+            {HW_ACCEL_OPTIONS.map((opt) => {
+              const available =
+                opt.requires == null ||
+                capabilities.h264_encoders.includes(opt.requires);
+              return (
+                <option
+                  key={opt.value}
+                  value={opt.value}
+                  disabled={!available && opt.value !== hwAccel}
+                >
+                  {opt.label}
+                  {!available && " (not available)"}
+                </option>
+              );
+            })}
+          </select>
+        </SettingsRow>
+
+        <SettingsRow
+          label="Max concurrent transcodes"
+          help="Sessions exceeding this limit are rejected with 429."
+          changed={dirtyFields["Max concurrent transcodes"]}
+        >
+          <input
+            type="number"
+            min={1}
+            max={64}
+            value={maxConcurrent}
+            onChange={(e) => setMaxConcurrent(Number(e.target.value))}
+            className={
+              dirtyFields["Max concurrent transcodes"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Max CPU transcodes"
+          help="Sub-cap for software (libx264 / libx265) sessions only. A single CPU encode pegs N cores; capping these separately stops a wave of fallback-to-software encodes from starving GPU sessions. Default 1."
+          changed={dirtyFields["Max CPU transcodes"]}
+        >
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={maxCpuConcurrent}
+            onChange={(e) => setMaxCpuConcurrent(Number(e.target.value))}
+            className={
+              dirtyFields["Max CPU transcodes"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Quality ceiling (kbps)"
+          help="Blank = no cap. Sessions never exceed this bitrate."
+          changed={dirtyFields["Quality ceiling"]}
+        >
+          <input
+            type="number"
+            min={100}
+            max={200_000}
+            value={ceiling}
+            placeholder="Unlimited"
+            onChange={(e) =>
+              setCeiling(e.target.value === "" ? "" : Number(e.target.value))
+            }
+            className={
+              dirtyFields["Quality ceiling"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Encoder preset"
+          help="Speed–quality dial: speed shaves CPU, quality spends more cycles for finer detail. Applied to whichever encoder is active above."
+          changed={dirtyFields["Encoder preset"]}
+        >
+          <select
+            value={encoderPreset}
+            onChange={(e) =>
+              setEncoderPreset(e.target.value as TranscoderEncoderPreset)
+            }
+            className={
+              dirtyFields["Encoder preset"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
-            <input
-              type="number"
-              min={1}
-              max={16}
-              value={maxCpuConcurrent}
-              onChange={(e) => setMaxCpuConcurrent(Number(e.target.value))}
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            />
-          </Field>
-          <Field
-            label="Quality ceiling (kbps)"
-            hint="Blank = no cap. Sessions never exceed this bitrate."
+            <option value="speed">Speed (lowest CPU)</option>
+            <option value="balanced">Balanced (default)</option>
+            <option value="quality">Quality (slower)</option>
+          </select>
+        </SettingsRow>
+
+        <SettingsRow
+          label="Hardware strictness"
+          help="How aggressively to enforce HW use. Require HW refuses sessions that need software fallback for any stage (decode / filter / encode)."
+          changed={dirtyFields["Hardware strictness"]}
+        >
+          <select
+            value={hwStrictness}
+            onChange={(e) =>
+              setHwStrictness(e.target.value as TranscoderHwStrictness)
+            }
+            className={
+              dirtyFields["Hardware strictness"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
-            <input
-              type="number"
-              min={100}
-              max={200_000}
-              value={ceiling}
-              placeholder="Unlimited"
-              onChange={(e) =>
-                setCeiling(e.target.value === "" ? "" : Number(e.target.value))
-              }
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            />
-          </Field>
-          <Field
-            label="Encoder preset"
-            hint="Speed–quality dial: speed shaves CPU, quality spends more cycles for finer detail. Applied to whichever encoder is active above."
-          >
-            <select
-              value={encoderPreset}
-              onChange={(e) =>
-                setEncoderPreset(e.target.value as TranscoderEncoderPreset)
-              }
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            >
-              <option value="speed">Speed (lowest CPU)</option>
-              <option value="balanced">Balanced (default)</option>
-              <option value="quality">Quality (slower)</option>
-            </select>
-          </Field>
-          <Field
-            label="Hardware strictness"
-            hint="How aggressively to enforce HW use. Require HW refuses sessions that need software fallback for any stage (decode / filter / encode)."
-          >
-            <select
-              value={hwStrictness}
-              onChange={(e) =>
-                setHwStrictness(e.target.value as TranscoderHwStrictness)
-              }
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            >
-              <option value="auto">Auto (HW where possible, SW fallback)</option>
-              <option value="prefer_hw">Prefer HW (warn on fallback)</option>
-              <option value="require_hw">Require HW (refuse fallback)</option>
-            </select>
-          </Field>
-        </div>
-        <div className="mt-4 flex items-center gap-3">
-          <button
-            disabled={!dirty || busy}
-            onClick={saveSettings}
-            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-          >
-            {busy ? "Saving…" : "Save engine settings"}
-          </button>
-          {saved && !dirty && (
-            <span className="text-xs text-white/50">Saved.</span>
-          )}
-        </div>
-        <details className="mt-4 text-xs text-white/50">
+            <option value="auto">Auto (HW where possible, SW fallback)</option>
+            <option value="prefer_hw">Prefer HW (warn on fallback)</option>
+            <option value="require_hw">Require HW (refuse fallback)</option>
+          </select>
+        </SettingsRow>
+
+        <details className="border-t border-white/10 px-5 py-3 text-xs text-white/50">
           <summary className="cursor-pointer hover:text-white/70">
             Capability detail (probed at startup)
           </summary>
-          <div className="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
             <div>
               <div className="text-white/40">H.264 hardware encoders</div>
               <div className="mt-0.5 font-mono">
@@ -449,11 +503,9 @@ export function AdminTranscoderClient({
             <DecoderRow label="VideoToolbox decoders" list={capabilities.decoders.videotoolbox} />
           </div>
           <p className="mt-3 text-[11px] text-white/40">
-            Decoder support is probed at server start by running a
-            one-frame test through each hwaccel — so this reflects
-            what your actual card can do (NVDEC AV1 needs Ampere+,
-            AV1 in VAAPI needs RDNA2+), not the codec list the
-            ffmpeg build was compiled with.
+            Decoder support is probed at server start by running a one-frame
+            test through each hwaccel — so this reflects what your actual
+            card can do, not the codec list ffmpeg was compiled with.
           </p>
           <div className="mt-3 flex flex-wrap items-baseline gap-2 text-[11px] text-white/40">
             <span className="text-white/55">Transcoder temp directory:</span>
@@ -464,121 +516,131 @@ export function AdminTranscoderClient({
             </span>
           </div>
         </details>
-      </section>
+      </SettingsCard>
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="mb-1 text-base font-semibold">Background transcoding</h2>
-        <p className="mb-4 text-xs text-white/55">
-          The <code className="font-mono">optimize_versions</code> scheduled
-          task pre-encodes media into operator-defined presets so weak
-          clients don&apos;t need a live transcode. These dials trade CPU
-          time / output size and protect live playback from background
-          starvation. Always uses libx264 (no GPU).
-        </p>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field
-            label="x264 preset"
-            hint="Slower presets produce smaller files at the same quality, but consume more CPU per encode."
-          >
-            <select
-              value={backgroundPreset}
-              onChange={(e) =>
-                setBackgroundPreset(
-                  e.target.value as TranscoderBackgroundPreset,
-                )
-              }
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            >
-              {BACKGROUND_PRESETS.map((p) => (
-                <option key={p.value} value={p.value}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field
-            label="Max concurrent background jobs"
-            hint="Hard cap on how many optimize_versions jobs run per scheduler tick (every 30s)."
-          >
-            <input
-              type="number"
-              min={1}
-              max={16}
-              value={maxBackgroundConcurrent}
-              onChange={(e) =>
-                setMaxBackgroundConcurrent(Number(e.target.value))
-              }
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-            />
-          </Field>
-        </div>
-      </section>
-
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="mb-1 text-base font-semibold">HDR tone mapping</h2>
-        <p className="mb-4 text-xs text-white/55">
-          When the source is HDR (HDR10 / HLG / Dolby Vision) and the
-          session is being re-encoded, ffmpeg applies a tonemap filter
-          so the SDR output isn&apos;t washed out. Disabling skips the
-          filter — saves CPU but the picture will look flat on SDR
-          displays.
-        </p>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Tone map HDR sources">
-            <label className="flex items-center gap-2 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm">
-              <input
-                type="checkbox"
-                checked={tonemapEnabled}
-                onChange={(e) => setTonemapEnabled(e.target.checked)}
-              />
-              <span>
-                Apply HDR → SDR tonemap during reencode (recommended)
-              </span>
-            </label>
-          </Field>
-          <Field
-            label="Tonemap algorithm"
-            hint={
-              TONEMAP_ALGOS.find((a) => a.value === tonemapAlgo)?.hint ?? ""
+      {/* ── Background transcoding ─────────────────────────────────── */}
+      <SettingsCard
+        title="Background transcoding"
+        description={
+          <>
+            The <code className="font-mono">optimize_versions</code> scheduled
+            task pre-encodes media into operator-defined presets so weak
+            clients don&apos;t need a live transcode. These dials trade CPU
+            time vs. output size and protect live playback from background
+            starvation. Always uses libx264 (no GPU).
+          </>
+        }
+      >
+        <SettingsRow
+          label="x264 preset"
+          help="Slower presets produce smaller files at the same quality, but consume more CPU per encode."
+          changed={dirtyFields["x264 preset"]}
+        >
+          <select
+            value={backgroundPreset}
+            onChange={(e) =>
+              setBackgroundPreset(
+                e.target.value as TranscoderBackgroundPreset,
+              )
+            }
+            className={
+              dirtyFields["x264 preset"] ? INPUT_CHANGED_CLASS : INPUT_CLASS
             }
           >
-            <select
-              value={tonemapAlgo}
-              disabled={!tonemapEnabled}
-              onChange={(e) => setTonemapAlgo(e.target.value as TonemapAlgorithm)}
-              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30 disabled:opacity-40"
-            >
-              {TONEMAP_ALGOS.map((a) => (
-                <option key={a.value} value={a.value}>
-                  {a.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-        </div>
-      </section>
+            {BACKGROUND_PRESETS.map((p) => (
+              <option key={p.value} value={p.value}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </SettingsRow>
+        <SettingsRow
+          label="Max background jobs"
+          help="Hard cap on how many optimize_versions jobs run per scheduler tick (every 30s)."
+          changed={dirtyFields["Max background jobs"]}
+        >
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={maxBackgroundConcurrent}
+            onChange={(e) =>
+              setMaxBackgroundConcurrent(Number(e.target.value))
+            }
+            className={
+              dirtyFields["Max background jobs"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
+          />
+        </SettingsRow>
+      </SettingsCard>
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="mb-1 text-base font-semibold">GPU device</h2>
-        <p className="mb-4 text-xs text-white/55">
-          Multi-GPU hosts can pin transcoding to a specific card.
-          Auto lets the driver pick — fine for single-GPU systems
-          (~99% of installs). Bad combinations (e.g. picking a VAAPI
-          render node while NVENC is active) silently fall back to
-          driver default at session-spawn time.
-        </p>
-        <Field
+      {/* ── HDR tone mapping ──────────────────────────────────────── */}
+      <SettingsCard
+        title="HDR tone mapping"
+        description="When the source is HDR (HDR10 / HLG / Dolby Vision) and the session is being re-encoded, ffmpeg applies a tonemap filter so the SDR output isn't washed out. Disabling skips the filter — saves CPU but the picture will look flat on SDR displays."
+      >
+        <SettingsRow
+          label="Tone map HDR sources"
+          help="Recommended unless you only stream to HDR-capable clients."
+          changed={dirtyFields["Tone map HDR sources"]}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={tonemapEnabled}
+              onChange={(e) => setTonemapEnabled(e.target.checked)}
+            />
+            <span>Apply HDR → SDR tonemap during reencode</span>
+          </label>
+        </SettingsRow>
+        <SettingsRow
+          label="Tonemap algorithm"
+          help={tonemapHint}
+          changed={dirtyFields["Tonemap algorithm"]}
+        >
+          <select
+            value={tonemapAlgo}
+            disabled={!tonemapEnabled}
+            onChange={(e) => setTonemapAlgo(e.target.value as TonemapAlgorithm)}
+            className={`${
+              dirtyFields["Tonemap algorithm"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            } disabled:opacity-40`}
+          >
+            {TONEMAP_ALGOS.map((a) => (
+              <option key={a.value} value={a.value}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+        </SettingsRow>
+      </SettingsCard>
+
+      {/* ── GPU device ────────────────────────────────────────────── */}
+      <SettingsCard
+        title="GPU device"
+        description="Multi-GPU hosts can pin transcoding to a specific card. Auto lets the driver pick — fine for single-GPU systems (~99% of installs)."
+      >
+        <SettingsRow
           label="Transcode device"
-          hint={
+          help={
             capabilities.gpu_devices.length === 0
               ? "No multi-GPU devices detected; the dropdown only shows Auto."
               : "Pinned to the chosen card for every new session. Restart not required."
           }
+          changed={dirtyFields["Transcode device"]}
         >
           <select
             value={gpuDevice}
             onChange={(e) => setGpuDevice(e.target.value)}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["Transcode device"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
             <option value="auto">Auto (driver picks)</option>
             {capabilities.gpu_devices.map((d) => (
@@ -587,25 +649,27 @@ export function AdminTranscoderClient({
               </option>
             ))}
           </select>
-        </Field>
-      </section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="mb-1 text-base font-semibold">HEVC output</h2>
-        <p className="mb-4 text-xs text-white/55">
-          HEVC (H.265) produces ~30% smaller files at the same visual
-          quality but isn&apos;t universally browser-supported. Output
-          container is forced to fMP4 when HEVC is selected; the ABR
-          fallback variant is disabled (HEVC ABR is a future expansion).
-        </p>
-        <Field
+      {/* ── HEVC ──────────────────────────────────────────────────── */}
+      <SettingsCard
+        title="HEVC output"
+        description="HEVC (H.265) produces ~30% smaller files at the same visual quality but isn't universally browser-supported. Output container is forced to fMP4 when HEVC is selected; the ABR fallback variant is disabled (HEVC ABR is a future expansion)."
+      >
+        <SettingsRow
           label="HEVC encoding mode"
-          hint={HEVC_MODES.find((m) => m.value === hevcMode)?.hint ?? ""}
+          help={hevcHint}
+          changed={dirtyFields["HEVC encoding mode"]}
         >
           <select
             value={hevcMode}
             onChange={(e) => setHevcMode(e.target.value as HevcMode)}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["HEVC encoding mode"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
             {HEVC_MODES.map((m) => (
               <option key={m.value} value={m.value}>
@@ -613,19 +677,28 @@ export function AdminTranscoderClient({
               </option>
             ))}
           </select>
-        </Field>
-      </section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <section>
-        <h2 className="mb-3 flex items-center gap-2 text-base font-semibold">
-          Active transcodes
+      {/* ── Sticky save bar ───────────────────────────────────────── */}
+      <SaveBar
+        dirtyCount={dirtyCount}
+        summary={dirtyLabels.slice(0, 3).join(", ") +
+          (dirtyLabels.length > 3 ? `, +${dirtyLabels.length - 3} more` : "")}
+        onSave={saveSettings}
+        onDiscard={discardChanges}
+      />
+
+      {/* ── Active transcodes (no save state) ─────────────────────── */}
+      <section className="mt-6">
+        <div className="mb-3 flex items-center gap-2">
+          <h2 className="text-base font-semibold">Active transcodes</h2>
           {active.length > 0 && (
-            <span className="flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">
-              <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+            <Pill tone="ok" dot>
               {active.length} running
-            </span>
+            </Pill>
           )}
-        </h2>
+        </div>
         {active.length === 0 ? (
           <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-6 text-center text-sm text-white/50">
             No transcodes in flight.
@@ -677,12 +750,13 @@ export function AdminTranscoderClient({
         )}
       </section>
 
-      <section>
+      {/* ── Quality presets (CRUD) ────────────────────────────────── */}
+      <section className="mt-6">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-semibold">Quality presets</h2>
           <button
             onClick={() => setShowAdd((v) => !v)}
-            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
+            className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover"
           >
             {showAdd ? "Cancel" : "+ New preset"}
           </button>
@@ -829,40 +903,40 @@ function NewPresetForm({
 
   return (
     <div className="mb-3 grid grid-cols-1 gap-3 rounded-lg border border-white/10 bg-white/2 p-4 md:grid-cols-4">
-      <Field label="Name">
+      <PresetField label="Name">
         <input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="e.g. Mobile 360p"
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+          className={INPUT_CLASS}
         />
-      </Field>
-      <Field label="Max height (px)">
+      </PresetField>
+      <PresetField label="Max height (px)">
         <input
           type="number"
           value={maxHeight}
           min={0}
           max={4320}
           onChange={(e) => setMaxHeight(Number(e.target.value))}
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+          className={INPUT_CLASS}
         />
-      </Field>
-      <Field label="Max bitrate (kbps)">
+      </PresetField>
+      <PresetField label="Max bitrate (kbps)">
         <input
           type="number"
           value={maxBitrate}
           min={0}
           max={200_000}
           onChange={(e) => setMaxBitrate(Number(e.target.value))}
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+          className={INPUT_CLASS}
         />
-      </Field>
+      </PresetField>
       <div className="flex items-end">
         <button
           disabled={busy || !name.trim()}
           onClick={submit}
-          className="w-full rounded-md bg-red-500 px-3 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-50"
+          className="w-full rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-50"
         >
           {busy ? "Creating…" : "Create"}
         </button>
@@ -871,20 +945,17 @@ function NewPresetForm({
   );
 }
 
-function Field({
+function PresetField({
   label,
-  hint,
   children,
 }: {
   label: string;
-  hint?: string;
   children: React.ReactNode;
 }) {
   return (
     <div>
       <label className="mb-1 block text-sm font-medium">{label}</label>
       {children}
-      {hint && <p className="mt-1 text-xs text-white/50">{hint}</p>}
     </div>
   );
 }
@@ -899,11 +970,6 @@ function formatRelative(ms: number): string {
   return m > 0 ? `${h}h ${m}m ago` : `${h}h ago`;
 }
 
-/// One row of the "decoders probed at startup" detail. Empty list
-/// means either the hwaccel isn't present or every codec probe
-/// failed (no driver, no card, missing libavcodec encoder for the
-/// probe's test stream). Either way the user gets a clear "none"
-/// signal.
 function DecoderRow({ label, list }: { label: string; list: string[] }) {
   return (
     <div>
@@ -915,10 +981,6 @@ function DecoderRow({ label, list }: { label: string; list: string[] }) {
   );
 }
 
-/// Mirror of HwAccel::auto_pick in the Rust transcoder — when the
-/// operator sets the dropdown to "Auto", show which concrete encoder
-/// will actually run. Keep priorities in sync if the backend's
-/// `auto_pick` changes.
 function pickAutoLabel(encoders: string[]): string {
   if (encoders.includes("h264_nvenc")) return "NVIDIA NVENC";
   if (encoders.includes("h264_qsv")) return "Intel QuickSync";

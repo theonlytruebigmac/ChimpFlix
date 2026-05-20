@@ -40,8 +40,37 @@ use crate::probe::{Chapter, probe_chapters};
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectedMarker {
     pub kind: MarkerKind,
+    /// Effective range used by the player. For chapter-derived intros
+    /// this is anchored to 0 so the Skip Intro button advances past
+    /// the cold open + title card; the original chapter sub-range
+    /// lives in `signature_range`.
     pub start_ms: i64,
     pub end_ms: i64,
+    /// Which detection strategy produced this marker. Drives the
+    /// fingerprint auto-capture decision — only Chapter-source
+    /// intros are trusted enough to seed a show's canonical theme
+    /// signature without operator review.
+    pub source: MarkerSource,
+    /// Sub-range that contains the content signature (the actual
+    /// intro audio without the cold-open prefix). When `Some`, the
+    /// auto-capture path extracts the fingerprint from this slice
+    /// rather than `[start_ms, end_ms]`; when `None`, the full
+    /// marker range is used. Chapter-derived intros set this so
+    /// the fingerprint is built from just the theme music, not
+    /// the cold open that precedes it.
+    pub signature_range: Option<(i64, i64)>,
+}
+
+/// Which detection strategy produced a `DetectedMarker`. Chapter
+/// detection name-matches against ffprobe's chapter list — narrow
+/// rules, high confidence. Blackdetect spots fade-to-black runs —
+/// works on any source but produces noisier ranges. The distinction
+/// matters for the fingerprint auto-capture path, which only trusts
+/// chapter-derived intros to seed a show's canonical signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerSource {
+    Chapter,
+    BlackDetect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +180,10 @@ pub(crate) fn classify_chapters(
                 // cold open + title card, not just the chapter mark.
                 start_ms: 0,
                 end_ms: ch.end_ms,
+                source: MarkerSource::Chapter,
+                // The chapter's actual range carries just the theme
+                // song, suitable for fingerprint capture.
+                signature_range: Some((ch.start_ms, ch.end_ms)),
             });
         } else if is_credits {
             let end = duration_ms.unwrap_or(ch.end_ms);
@@ -158,6 +191,8 @@ pub(crate) fn classify_chapters(
                 kind: MarkerKind::Credits,
                 start_ms: ch.start_ms,
                 end_ms: end,
+                source: MarkerSource::Chapter,
+                signature_range: None,
             });
         }
     }
@@ -236,6 +271,11 @@ fn classify(runs: Vec<BlackRun>, duration_ms: Option<i64>) -> Vec<DetectedMarker
             kind: MarkerKind::Intro,
             start_ms: 0,
             end_ms: run.end_ms,
+            source: MarkerSource::BlackDetect,
+            // Blackdetect produces a fade range, not the intro audio
+            // itself — signature is unknown, so leave `None` and the
+            // fingerprint auto-capture path skips this marker.
+            signature_range: None,
         });
     }
 
@@ -248,6 +288,8 @@ fn classify(runs: Vec<BlackRun>, duration_ms: Option<i64>) -> Vec<DetectedMarker
                 kind: MarkerKind::Credits,
                 start_ms: run.start_ms,
                 end_ms: dur,
+                source: MarkerSource::BlackDetect,
+                signature_range: None,
             });
         }
     }
@@ -377,16 +419,22 @@ some unrelated log line
             kind: MarkerKind::Intro,
             start_ms: 0,
             end_ms: 90_000,
+            source: MarkerSource::Chapter,
+            signature_range: Some((30_000, 90_000)),
         }];
         let blackdetect = vec![DetectedMarker {
             kind: MarkerKind::Intro,
             start_ms: 0,
             end_ms: 35_000,
+            source: MarkerSource::BlackDetect,
+            signature_range: None,
         }];
         let out = merge_markers(chapter.clone(), blackdetect);
         assert_eq!(out.len(), 1);
         // Chapter-derived value wins.
         assert_eq!(out[0].end_ms, 90_000);
+        assert_eq!(out[0].source, MarkerSource::Chapter);
+        assert_eq!(out[0].signature_range, Some((30_000, 90_000)));
     }
 
     #[test]
@@ -395,16 +443,56 @@ some unrelated log line
             kind: MarkerKind::Intro,
             start_ms: 0,
             end_ms: 90_000,
+            source: MarkerSource::Chapter,
+            signature_range: Some((30_000, 90_000)),
         }];
         let blackdetect = vec![DetectedMarker {
             kind: MarkerKind::Credits,
             start_ms: 1_700_000,
             end_ms: 1_800_000,
+            source: MarkerSource::BlackDetect,
+            signature_range: None,
         }];
         let out = merge_markers(chapter, blackdetect);
         assert_eq!(out.len(), 2);
         // Sorted: credits ("credits" < "intro" alphabetically).
         assert_eq!(out[0].kind, MarkerKind::Credits);
+        assert_eq!(out[0].source, MarkerSource::BlackDetect);
         assert_eq!(out[1].kind, MarkerKind::Intro);
+        assert_eq!(out[1].source, MarkerSource::Chapter);
+    }
+
+    #[test]
+    fn classify_chapters_sets_signature_range_to_chapter_bounds() {
+        let chapters = vec![Chapter {
+            start_ms: 12_000,
+            end_ms: 90_000,
+            title: Some("Opening Credits".into()),
+        }];
+        let out = classify_chapters(&chapters, Some(1_800_000));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, MarkerKind::Intro);
+        // Effective range anchored to 0 (skip button advances past
+        // cold open), but signature range carries the actual theme.
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[0].end_ms, 90_000);
+        assert_eq!(out[0].signature_range, Some((12_000, 90_000)));
+        assert_eq!(out[0].source, MarkerSource::Chapter);
+    }
+
+    #[test]
+    fn blackdetect_intro_leaves_signature_range_unset() {
+        // The blackdetect classifier produces an intro from a black
+        // run, but the actual theme audio isn't bounded by the fade
+        // edges. Signature stays None so the auto-capture path
+        // refuses to seed a fingerprint from it.
+        let runs = vec![BlackRun {
+            start_ms: 60_000,
+            end_ms: 65_000,
+        }];
+        let out = classify(runs, Some(1_800_000));
+        let intro = out.iter().find(|m| m.kind == MarkerKind::Intro).unwrap();
+        assert_eq!(intro.source, MarkerSource::BlackDetect);
+        assert_eq!(intro.signature_range, None);
     }
 }

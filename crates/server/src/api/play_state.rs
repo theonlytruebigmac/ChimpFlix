@@ -43,6 +43,10 @@ pub async fn update(
 pub struct WatchedInput {
     pub item_id: Option<i64>,
     pub episode_id: Option<i64>,
+    /// When set, marks every episode of the given show id. Atomic
+    /// upsert across all `play_state` rows for the show. Mutually
+    /// exclusive with `item_id` / `episode_id`.
+    pub show_id: Option<i64>,
     pub watched: bool,
 }
 
@@ -54,19 +58,41 @@ pub async fn set_watched(
     user: AuthUser,
     Json(req): Json<WatchedInput>,
 ) -> Result<StatusCode, ApiError> {
-    match (req.item_id, req.episode_id) {
-        (Some(_), Some(_)) => {
-            return Err(ApiError::validation(
-                "only one of item_id or episode_id may be set",
-            ));
-        }
-        (None, None) => {
-            return Err(ApiError::validation(
-                "one of item_id or episode_id is required",
-            ));
-        }
-        _ => {}
+    let n_set = [req.item_id, req.episode_id, req.show_id]
+        .iter()
+        .filter(|o| o.is_some())
+        .count();
+    if n_set == 0 {
+        return Err(ApiError::validation(
+            "one of item_id, episode_id, or show_id is required",
+        ));
     }
+    if n_set > 1 {
+        return Err(ApiError::validation(
+            "only one of item_id, episode_id, or show_id may be set",
+        ));
+    }
+
+    if let Some(show_id) = req.show_id {
+        let episode_ids = queries::set_all_episodes_watched_for_show(
+            &state.pool,
+            user.id,
+            show_id,
+            req.watched,
+        )
+        .await?;
+        // Fan out Trakt history pushes — one per episode. Each call
+        // is already fire-and-forget; spawning N concurrent tasks is
+        // fine for typical season/show sizes. Skip on unwatched
+        // (symmetry with the single-item path).
+        if req.watched {
+            for ep_id in episode_ids {
+                push_watched_to_trakt(state.clone(), user.id, None, Some(ep_id));
+            }
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     queries::set_watched(&state.pool, user.id, req.item_id, req.episode_id, req.watched)
         .await?;
     // Fire-and-forget Trakt push when marking watched. Unwatch sync is

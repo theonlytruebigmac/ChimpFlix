@@ -94,7 +94,6 @@ async fn migrations_apply_cleanly_and_settings_round_trip() {
     assert_eq!(s0.transcoder_hevc_encoding_mode, "off");
     assert_eq!(s0.transcoder_gpu_device, "auto");
     assert!(!s0.preroll_enabled);
-    assert!(!s0.detect_markers_on_add);
 
     // ─── Round-trip a setting: patch, reload, verify the change
     //     stuck. Catches the "patch handler missed a recently-added

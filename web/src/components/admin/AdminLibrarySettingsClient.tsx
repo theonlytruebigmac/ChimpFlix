@@ -6,30 +6,25 @@ import {
   type ServerSettings,
   type ServerSettingsUpdate,
 } from "@/lib/chimpflix-api";
+import { Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
 
 interface Props {
   settings: ServerSettings;
 }
 
+const INPUT_CLASS =
+  "rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30";
+const INPUT_CHANGED_CLASS =
+  "rounded-md border border-amber-400/40 bg-black/30 px-3 py-2 text-sm outline-none focus:border-amber-300";
+
 /// Consolidated Library settings — Plex's "Settings → Library" page
-/// shape. One long flat form with grouped sections instead of the
-/// previous per-page split (Phase 3 had Playback alone here; this
-/// folds in the scan toggles, CW dials, completion threshold, and
-/// database cache into a single surface).
-///
-/// All fields hit `/admin/settings` PATCH. Some take effect
-/// immediately (CW dials, threshold), others need a server restart
-/// (scan watcher, DB cache size); those flag a "Restart pending"
-/// badge next to the input so the operator knows.
+/// shape. One stack of SettingsCards over fields that mostly hit
+/// /admin/settings PATCH. Some take effect immediately (CW dials,
+/// threshold), others need a server restart (scan watcher, DB cache);
+/// those show a "Restart pending" pill next to the input.
 export function AdminLibrarySettingsClient({ settings }: Props) {
-  // See AdminGeneralForm for rationale — keep a baseline in state so
-  // dirty-checks compare against a value we control, not the parent's
-  // prop reference. The old `Object.assign(settings, patch)` mutated
-  // the prop in place, which silently shared state with any sibling
-  // also holding that reference.
   const [baseline, setBaseline] = useState({
     scan_automatically: settings.scan_automatically,
-    detect_markers_on_add: settings.detect_markers_on_add,
     audio_normalize_enabled: settings.audio_normalize_enabled,
     scanner_nice_level: settings.scanner_nice_level,
     video_played_threshold_pct: settings.video_played_threshold_pct,
@@ -43,9 +38,6 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     recently_added_days: settings.recently_added_days,
   });
   const [scanAuto, setScanAuto] = useState(baseline.scan_automatically);
-  const [detectMarkersOnAdd, setDetectMarkersOnAdd] = useState(
-    baseline.detect_markers_on_add,
-  );
   const [audioNormalize, setAudioNormalize] = useState(
     baseline.audio_normalize_enabled,
   );
@@ -72,117 +64,120 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const [recentlyAddedDays, setRecentlyAddedDays] = useState(
     baseline.recently_added_days,
   );
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
 
-  const dirty =
-    scanAuto !== baseline.scan_automatically ||
-    detectMarkersOnAdd !== baseline.detect_markers_on_add ||
-    audioNormalize !== baseline.audio_normalize_enabled ||
-    scannerNice !== baseline.scanner_nice_level ||
-    playedThreshold !== baseline.video_played_threshold_pct ||
-    completionBehaviour !== baseline.video_completion_behaviour ||
-    cwMaxItems !== baseline.continue_watching_max_items ||
-    cwMaxAgeWeeks !== baseline.continue_watching_max_age_weeks ||
-    cwIncludePremieres !== baseline.continue_watching_include_premieres ||
-    dbCacheMb !== baseline.database_cache_size_mb ||
-    metadataLanguage !== baseline.metadata_language ||
-    recentlyAddedDays !== baseline.recently_added_days;
+  const dirtyFields: Record<string, boolean> = {
+    "Auto-scan": scanAuto !== baseline.scan_automatically,
+    "Audio normalize": audioNormalize !== baseline.audio_normalize_enabled,
+    "Scanner nice level": scannerNice !== baseline.scanner_nice_level,
+    "Watched threshold":
+      playedThreshold !== baseline.video_played_threshold_pct,
+    "Completion behaviour":
+      completionBehaviour !== baseline.video_completion_behaviour,
+    "CW max items": cwMaxItems !== baseline.continue_watching_max_items,
+    "CW age weeks":
+      cwMaxAgeWeeks !== baseline.continue_watching_max_age_weeks,
+    "CW include premieres":
+      cwIncludePremieres !== baseline.continue_watching_include_premieres,
+    "DB page cache": dbCacheMb !== baseline.database_cache_size_mb,
+    "Metadata language": metadataLanguage !== baseline.metadata_language,
+    "Recently-added window":
+      recentlyAddedDays !== baseline.recently_added_days,
+  };
+  const dirtyLabels = Object.entries(dirtyFields)
+    .filter(([, isDirty]) => isDirty)
+    .map(([label]) => label);
+  const dirtyCount = dirtyLabels.length;
 
-  // Restart-required hints. These are read once at server startup
-  // (file_watcher::spawn, SqliteConnectOptions, TmdbClient::with_language);
-  // we surface a badge so the operator isn't surprised when saving
-  // doesn't immediately change behavior.
-  const scanAutoChanged = scanAuto !== baseline.scan_automatically;
-  const dbCacheChanged = dbCacheMb !== baseline.database_cache_size_mb;
-  const niceChanged = scannerNice !== baseline.scanner_nice_level;
-  const metadataLanguageChanged =
-    metadataLanguage !== baseline.metadata_language;
+  const scanAutoChanged = dirtyFields["Auto-scan"];
+  const dbCacheChanged = dirtyFields["DB page cache"];
+  const niceChanged = dirtyFields["Scanner nice level"];
+  const metadataLanguageChanged = dirtyFields["Metadata language"];
 
   async function save() {
-    setSaving(true);
     setError(null);
-    try {
-      const patch: ServerSettingsUpdate = {
-        scan_automatically: scanAuto,
-        detect_markers_on_add: detectMarkersOnAdd,
-        audio_normalize_enabled: audioNormalize,
-        scanner_nice_level: scannerNice,
-        video_played_threshold_pct: playedThreshold,
-        video_completion_behaviour: completionBehaviour,
-        continue_watching_max_items: cwMaxItems,
-        continue_watching_max_age_weeks: cwMaxAgeWeeks,
-        continue_watching_include_premieres: cwIncludePremieres,
-        database_cache_size_mb: dbCacheMb,
-        metadata_language: metadataLanguage,
-        recently_added_days: recentlyAddedDays,
-      };
-      await adminApi.settings.patch(patch);
-      setBaseline({
-        scan_automatically: scanAuto,
-        detect_markers_on_add: detectMarkersOnAdd,
-        audio_normalize_enabled: audioNormalize,
-        scanner_nice_level: scannerNice,
-        video_played_threshold_pct: playedThreshold,
-        video_completion_behaviour: completionBehaviour,
-        continue_watching_max_items: cwMaxItems,
-        continue_watching_max_age_weeks: cwMaxAgeWeeks,
-        continue_watching_include_premieres: cwIncludePremieres,
-        database_cache_size_mb: dbCacheMb,
-        metadata_language: metadataLanguage,
-        recently_added_days: recentlyAddedDays,
-      });
-      setSavedAt(Date.now());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
+    const patch: ServerSettingsUpdate = {
+      scan_automatically: scanAuto,
+      audio_normalize_enabled: audioNormalize,
+      scanner_nice_level: scannerNice,
+      video_played_threshold_pct: playedThreshold,
+      video_completion_behaviour: completionBehaviour,
+      continue_watching_max_items: cwMaxItems,
+      continue_watching_max_age_weeks: cwMaxAgeWeeks,
+      continue_watching_include_premieres: cwIncludePremieres,
+      database_cache_size_mb: dbCacheMb,
+      metadata_language: metadataLanguage,
+      recently_added_days: recentlyAddedDays,
+    };
+    await adminApi.settings.patch(patch);
+    setBaseline({
+      scan_automatically: scanAuto,
+      audio_normalize_enabled: audioNormalize,
+      scanner_nice_level: scannerNice,
+      video_played_threshold_pct: playedThreshold,
+      video_completion_behaviour: completionBehaviour,
+      continue_watching_max_items: cwMaxItems,
+      continue_watching_max_age_weeks: cwMaxAgeWeeks,
+      continue_watching_include_premieres: cwIncludePremieres,
+      database_cache_size_mb: dbCacheMb,
+      metadata_language: metadataLanguage,
+      recently_added_days: recentlyAddedDays,
+    });
+  }
+
+  function discard() {
+    setScanAuto(baseline.scan_automatically);
+    setAudioNormalize(baseline.audio_normalize_enabled);
+    setScannerNice(baseline.scanner_nice_level);
+    setPlayedThreshold(baseline.video_played_threshold_pct);
+    setCompletionBehaviour(baseline.video_completion_behaviour);
+    setCwMaxItems(baseline.continue_watching_max_items);
+    setCwMaxAgeWeeks(baseline.continue_watching_max_age_weeks);
+    setCwIncludePremieres(baseline.continue_watching_include_premieres);
+    setDbCacheMb(baseline.database_cache_size_mb);
+    setMetadataLanguage(baseline.metadata_language);
+    setRecentlyAddedDays(baseline.recently_added_days);
   }
 
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (dirty && !saving) save();
-      }}
-      className="space-y-6"
-    >
+    <div>
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
         </div>
       )}
 
-      <Section
+      <SettingsCard
         title="Scanning"
         description="How the server keeps the library in sync with files on disk."
       >
-        <Toggle
+        <SettingsRow
           label="Scan my library automatically"
-          hint={
+          help={
             scanAutoChanged
               ? "Server restart required for changes to take effect."
               : "When on, the filesystem watcher fires a library scan within seconds of a file appearing or disappearing. Manual scans and scheduled scan tasks always work, regardless of this toggle."
           }
-          checked={scanAuto}
-          onChange={setScanAuto}
-          restartPending={scanAutoChanged}
-        />
-        <Toggle
-          label="Detect intro / credits when media is added"
-          hint="After each file-watcher scan, queue blackdetect on every new file lacking auto markers. Expensive (~30s/45-min episode) — leave off if your hardware is slow or your library churns a lot. Scheduled `detect_markers` task still runs regardless."
-          checked={detectMarkersOnAdd}
-          onChange={setDetectMarkersOnAdd}
-        />
-        <Field
-          label="Run scanner ffmpeg at lower priority"
-          hint={
+          changed={scanAutoChanged}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={scanAuto}
+              onChange={(e) => setScanAuto(e.target.checked)}
+            />
+            <span>Watch the filesystem and scan on change</span>
+            {scanAutoChanged && <Pill tone="warn">Restart pending</Pill>}
+          </label>
+        </SettingsRow>
+        <SettingsRow
+          label="Scanner ffmpeg priority"
+          help={
             niceChanged
               ? "Server restart required for changes to take effect."
-              : "Wraps background ffmpeg invocations (scanner probes, scheduled tasks: previews, chapter thumbs, loudness, markers) in `nice -n N`. 0 disables. 10–15 is a polite default that yields to live playback. Live transcode sessions always run at normal priority."
+              : "Wraps background ffmpeg invocations (scanner probes + scheduled tasks) in nice -n N. 0 disables. 10–15 yields politely to live playback. Live transcode sessions always run at normal priority."
           }
+          changed={niceChanged}
         >
           <div className="flex items-center gap-2">
             <input
@@ -191,25 +186,24 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               max={19}
               value={scannerNice}
               onChange={(e) => setScannerNice(Number(e.target.value))}
-              className="w-20 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+              className={`w-20 tabular-nums ${
+                niceChanged ? INPUT_CHANGED_CLASS : INPUT_CLASS
+              }`}
             />
             <span className="text-sm text-white/55">nice level</span>
-            {niceChanged && (
-              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                Restart pending
-              </span>
-            )}
+            {niceChanged && <Pill tone="warn">Restart pending</Pill>}
           </div>
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section
+      <SettingsCard
         title="Recently Added badge"
-        description="How long a freshly-added item shows the red “Recently Added” ribbon on its Card."
+        description="How long a freshly-added item shows the red ribbon on its Card."
       >
-        <Field
+        <SettingsRow
           label="Window"
-          hint="Set to 0 to disable the badge entirely. Default 14 days matches Netflix’s recency. Takes effect on the next config-poll — no rebuild needed."
+          help="0 disables the badge entirely. Default 14 days matches Netflix recency. Takes effect on the next config-poll."
+          changed={dirtyFields["Recently-added window"]}
         >
           <div className="flex items-center gap-2">
             <input
@@ -217,10 +211,12 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               min={0}
               max={365}
               value={recentlyAddedDays}
-              onChange={(e) =>
-                setRecentlyAddedDays(Number(e.target.value))
-              }
-              className="w-24 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+              onChange={(e) => setRecentlyAddedDays(Number(e.target.value))}
+              className={`w-24 tabular-nums ${
+                dirtyFields["Recently-added window"]
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }`}
               required
             />
             <span className="text-sm text-white/55">
@@ -231,27 +227,34 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
                   : "days"}
             </span>
           </div>
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section
+      <SettingsCard
         title="Continue Watching"
         description="Caps on the in-progress rail and the threshold for marking items watched."
       >
-        <Field label="Maximum items" hint="Hard cap on the rail. Plex default 40.">
+        <SettingsRow
+          label="Maximum items"
+          help="Hard cap on the rail. Plex default 40."
+          changed={dirtyFields["CW max items"]}
+        >
           <input
             type="number"
             min={1}
             max={200}
             value={cwMaxItems}
             onChange={(e) => setCwMaxItems(Number(e.target.value))}
-            className="w-32 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+            className={`w-32 tabular-nums ${
+              dirtyFields["CW max items"] ? INPUT_CHANGED_CLASS : INPUT_CLASS
+            }`}
             required
           />
-        </Field>
-        <Field
+        </SettingsRow>
+        <SettingsRow
           label="Weeks to consider"
-          hint="In-progress items last played more than this many weeks ago disappear from the rail. Set 0 to disable the time-window filter entirely."
+          help="In-progress items last played more than this many weeks ago disappear. 0 disables the time-window filter."
+          changed={dirtyFields["CW age weeks"]}
         >
           <div className="flex items-center gap-2">
             <input
@@ -260,21 +263,34 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               max={520}
               value={cwMaxAgeWeeks}
               onChange={(e) => setCwMaxAgeWeeks(Number(e.target.value))}
-              className="w-24 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+              className={`w-24 tabular-nums ${
+                dirtyFields["CW age weeks"]
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }`}
               required
             />
             <span className="text-sm text-white/55">weeks</span>
           </div>
-        </Field>
-        <Toggle
-          label="Include season premieres in Continue Watching"
-          hint="When a new season's first episode exists for a show you've watched, surface it on the Continue Watching rail. Off skips premieres entirely (rail shows only in-progress items)."
-          checked={cwIncludePremieres}
-          onChange={setCwIncludePremieres}
-        />
-        <Field
+        </SettingsRow>
+        <SettingsRow
+          label="Include season premieres"
+          help="When a new season's first episode exists for a show you've watched, surface it on Continue Watching."
+          changed={dirtyFields["CW include premieres"]}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={cwIncludePremieres}
+              onChange={(e) => setCwIncludePremieres(e.target.checked)}
+            />
+            <span>Include season premieres alongside in-progress items</span>
+          </label>
+        </SettingsRow>
+        <SettingsRow
           label="Video played threshold"
-          hint="The percentage at which the player auto-scrobbles a session as watched. Same number gates the Continue Watching upper bound so tiles disappear the moment we mark them played."
+          help="Percentage at which the player auto-scrobbles a session as watched. Same number gates the Continue Watching upper bound so tiles disappear when we mark them played."
+          changed={dirtyFields["Watched threshold"]}
         >
           <div className="flex items-center gap-2">
             <input
@@ -283,22 +299,33 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               max={99}
               value={playedThreshold}
               onChange={(e) => setPlayedThreshold(Number(e.target.value))}
-              className="w-24 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+              className={`w-24 tabular-nums ${
+                dirtyFields["Watched threshold"]
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }`}
               required
             />
             <span className="text-sm text-white/55">%</span>
           </div>
-        </Field>
-        <Field
+        </SettingsRow>
+        <SettingsRow
           label="Video play completion"
-          hint="What counts as 'watched'. `first_credits_marker` requires that the `detect_markers` task has found a credits marker for the file; falls back to the percentage threshold when it hasn't. `earliest_of_both` scrobbles at whichever lands first."
+          help="What counts as 'watched'. first_credits_marker requires that the detect_markers task has found one; falls back to the percentage threshold otherwise. earliest_of_both scrobbles at whichever lands first."
+          changed={dirtyFields["Completion behaviour"]}
         >
           <select
             value={completionBehaviour}
             onChange={(e) =>
-              setCompletionBehaviour(e.target.value as typeof completionBehaviour)
+              setCompletionBehaviour(
+                e.target.value as typeof completionBehaviour,
+              )
             }
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={`w-full ${
+              dirtyFields["Completion behaviour"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }`}
           >
             <option value="threshold_pct">Percentage threshold only</option>
             <option value="first_credits_marker">
@@ -308,30 +335,37 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               Earliest of either (recommended once markers are populated)
             </option>
           </select>
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section
+      <SettingsCard
         title="Metadata"
         description="Preferred language for TMDB-sourced descriptions, taglines, and localized titles."
       >
-        <Field
+        <SettingsRow
           label="Metadata language"
-          hint={
+          help={
             metadataLanguageChanged
               ? "Server restart required for changes to take effect. Existing items keep their current text — run Refresh metadata on a library (or per-item) to re-pull in the new language."
-              : "BCP-47 tag (e.g. en-US, ja-JP, de-DE). TMDB returns text in this language when available; for items missing a translation (common for niche anime) it falls back to the original language silently."
+              : "BCP-47 tag (e.g. en-US, ja-JP). TMDB returns text in this language when available; for items missing a translation it falls back to the original language silently."
           }
+          changed={metadataLanguageChanged}
         >
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <select
-              value={METADATA_LANGUAGES.some((l) => l.tag === metadataLanguage) ? metadataLanguage : "__custom"}
+              value={
+                METADATA_LANGUAGES.some((l) => l.tag === metadataLanguage)
+                  ? metadataLanguage
+                  : "__custom"
+              }
               onChange={(e) => {
                 if (e.target.value !== "__custom") {
                   setMetadataLanguage(e.target.value);
                 }
               }}
-              className="rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+              className={
+                metadataLanguageChanged ? INPUT_CHANGED_CLASS : INPUT_CLASS
+              }
             >
               {METADATA_LANGUAGES.map((l) => (
                 <option key={l.tag} value={l.tag}>
@@ -346,40 +380,51 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               onChange={(e) => setMetadataLanguage(e.target.value)}
               placeholder="en-US"
               maxLength={12}
-              className="w-28 rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+              className={`w-28 font-mono ${
+                metadataLanguageChanged
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }`}
             />
             {metadataLanguageChanged && (
-              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                Restart pending
-              </span>
+              <Pill tone="warn">Restart pending</Pill>
             )}
           </div>
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section
+      <SettingsCard
         title="Audio"
         description="EBU R 128 loudness normalization."
       >
-        <Toggle
-          label="Normalize loudness on every transcode session"
-          hint="When on, ffmpeg's loudnorm filter is applied to every session by default — uses stored per-file measurements when the `analyze_loudness` task has run, otherwise generic targets. Users can still toggle off per-session via the player audio menu."
-          checked={audioNormalize}
-          onChange={setAudioNormalize}
-        />
-      </Section>
+        <SettingsRow
+          label="Normalize loudness by default"
+          help="When on, ffmpeg's loudnorm filter is applied to every session — uses stored per-file measurements when the analyze_loudness task has run, otherwise generic targets. Users can still toggle off per-session via the player audio menu."
+          changed={dirtyFields["Audio normalize"]}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={audioNormalize}
+              onChange={(e) => setAudioNormalize(e.target.checked)}
+            />
+            <span>Normalize loudness on every transcode session</span>
+          </label>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section
+      <SettingsCard
         title="Database"
         description="SQLite tuning. Increase the page cache for libraries with tens of thousands of items."
       >
-        <Field
+        <SettingsRow
           label="Page cache size"
-          hint={
+          help={
             dbCacheChanged
               ? "Server restart required for changes to take effect."
               : "0 = SQLite default (~2 MiB). 64 MiB is a sensible baseline for a busy library."
           }
+          changed={dbCacheChanged}
         >
           <div className="flex items-center gap-2">
             <input
@@ -388,107 +433,24 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
               max={4096}
               value={dbCacheMb}
               onChange={(e) => setDbCacheMb(Number(e.target.value))}
-              className="w-24 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+              className={`w-24 tabular-nums ${
+                dbCacheChanged ? INPUT_CHANGED_CLASS : INPUT_CLASS
+              }`}
               required
             />
             <span className="text-sm text-white/55">MiB</span>
-            {dbCacheChanged && (
-              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                Restart pending
-              </span>
-            )}
+            {dbCacheChanged && <Pill tone="warn">Restart pending</Pill>}
           </div>
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <div className="flex items-center gap-3">
-        <button
-          type="submit"
-          disabled={!dirty || saving}
-          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-        >
-          {saving ? "Saving…" : "Save changes"}
-        </button>
-        {savedAt && !dirty && !saving && (
-          <span className="text-xs text-white/50">Saved.</span>
-        )}
-      </div>
-    </form>
-  );
-}
-
-function Section({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-      <h2 className="text-base font-semibold">{title}</h2>
-      {description && (
-        <p className="mt-1 mb-4 max-w-2xl text-xs text-white/55">{description}</p>
-      )}
-      <div className="space-y-4">{children}</div>
-    </section>
-  );
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-sm font-medium">{label}</label>
-      {children}
-      {hint && <p className="mt-1 text-xs text-white/50">{hint}</p>}
-    </div>
-  );
-}
-
-/// Plex-style checkbox toggle: label on the right, optional
-/// "Restart pending" badge for restart-required settings.
-function Toggle({
-  label,
-  hint,
-  checked,
-  onChange,
-  restartPending,
-}: {
-  label: string;
-  hint?: string;
-  checked: boolean;
-  onChange: (next: boolean) => void;
-  restartPending?: boolean;
-}) {
-  return (
-    <div>
-      <label className="flex items-start gap-3 text-sm">
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => onChange(e.target.checked)}
-          className="mt-1"
-        />
-        <div className="flex flex-wrap items-baseline gap-2">
-          <span className="font-medium">{label}</span>
-          {restartPending && (
-            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-              Restart pending
-            </span>
-          )}
-        </div>
-      </label>
-      {hint && <p className="ml-7 mt-1 text-xs text-white/50">{hint}</p>}
+      <SaveBar
+        dirtyCount={dirtyCount}
+        summary={dirtyLabels.slice(0, 3).join(", ") +
+          (dirtyLabels.length > 3 ? `, +${dirtyLabels.length - 3} more` : "")}
+        onSave={save}
+        onDiscard={discard}
+      />
     </div>
   );
 }

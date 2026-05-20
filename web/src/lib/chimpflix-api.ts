@@ -656,6 +656,101 @@ export interface Marker {
   start_ms: number;
   end_ms: number;
   label: string | null;
+  /// `auto` for markers written by the detect_markers task,
+  /// `manual` for ones drawn in the operator editor. The player
+  /// renders auto segments more prominently on the timeline so the
+  /// user can see which areas were machine-detected.
+  source: "auto" | "manual" | string;
+}
+
+/// Full marker row shape including id + source. Returned by the
+/// operator-side marker editor; the player path consumes the slimmer
+/// [`Marker`] above (no id/source) because client code never edits
+/// markers directly.
+export interface MarkerRow {
+  id: number;
+  kind: "intro" | "credits" | "commercial" | string;
+  start_ms: number;
+  end_ms: number;
+  label: string | null;
+  /// `auto` when written by the scheduled detect_markers task,
+  /// `manual` when written by the operator's editor.
+  source: "auto" | "manual" | string;
+}
+
+export interface MediaFileMarkersResponse {
+  media_file_id: number;
+  duration_ms: number | null;
+  markers: MarkerRow[];
+}
+
+export interface ManualMarkerInput {
+  kind: "intro" | "credits" | "commercial";
+  start_ms: number;
+  end_ms: number;
+  label?: string | null;
+}
+
+/// Backing shape for the "Fingerprint captured" badge in the marker
+/// editor. `show_id` is null for movie files (no parent show); the
+/// `captured` flag is true only when a fingerprint actually exists.
+export interface ShowFingerprintStatus {
+  show_id: number | null;
+  captured: boolean;
+  duration_ms: number | null;
+  captured_at: number | null;
+  captured_by: string | null;
+}
+
+/// Joined-with-show row for the Admin → Intro fingerprints listing.
+/// `season_id` is null for the show-wide row (today's only scope);
+/// kept on the wire so future per-season storage rides through
+/// without an API break.
+export interface ShowIntroFingerprintListing {
+  id: number;
+  show_id: number;
+  show_title: string;
+  season_id: number | null;
+  season_number: number | null;
+  duration_ms: number;
+  captured_from_media_file_id: number | null;
+  captured_at: number;
+  captured_by: string;
+}
+
+// ─── Background job queue (admin) ─────────────────────────────────────────
+
+export type JobStatusFilter = "queued" | "running" | "succeeded" | "failed" | "dead";
+
+export interface JobSummary {
+  queued: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  dead: number;
+}
+
+export interface JobRow {
+  id: number;
+  kind: string;
+  payload: string;
+  status: JobStatusFilter;
+  priority: number;
+  attempts: number;
+  max_attempts: number;
+  run_after: number;
+  locked_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export interface JobSweepCounts {
+  markers: number;
+  previews: number;
+  chapter_thumbs: number;
+  loudness: number;
 }
 
 export interface SeasonSummary {
@@ -746,7 +841,15 @@ export type ItemDetail = Item & {
   extras: Extra[];
   reviews: ReviewsSummary;
   locked_fields: string[];
+  /// Per-user watched counts for shows. Absent for movies (whose
+  /// watched state lives in `play_state`).
+  watch_stats?: ShowWatchStats;
 };
+
+export interface ShowWatchStats {
+  total_episodes: number;
+  watched_episodes: number;
+}
 
 export interface Season {
   id: number;
@@ -1074,10 +1177,6 @@ export interface ServerSettings {
    *  on file change. Read once at startup; toggling requires a
    *  server restart to take effect. */
   scan_automatically: boolean;
-  /** When ON, completing a scan queues marker detection for every
-   *  new file lacking auto markers. Off by default — blackdetect is
-   *  expensive. Plex calls this "Detect intro/credits when added." */
-  detect_markers_on_add: boolean;
   /** Server-wide default for ffmpeg loudnorm. When ON, every transcode
    *  session gets the filter applied (uses stored per-file
    *  measurements when available, else generic targets). Per-session
@@ -1166,7 +1265,6 @@ export interface ServerSettingsUpdate {
   maintenance_window_start?: string;
   maintenance_window_end?: string;
   scan_automatically?: boolean;
-  detect_markers_on_add?: boolean;
   audio_normalize_enabled?: boolean;
   scanner_nice_level?: number;
   preroll_enabled?: boolean;
@@ -1799,19 +1897,32 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
     const text = await res.text().catch(() => "");
     throw new ChimpFlixApiError(res.status, text);
   }
-  // 204 (No Content) and 205 (Reset Content) have no body by spec; 202
-  // (Accepted) — what our async-dispatch endpoints like POST /admin/tasks/{id}/run
-  // return — has an empty body by our convention. Also bail when the
-  // server explicitly says Content-Length: 0, since reading json() on
-  // an empty body throws "unexpected end of data" and surfaces to the
-  // user as a misleading "JSON parse error".
+  // 204 (No Content) and 205 (Reset Content) have no body by spec.
+  // Also bail when the server explicitly says Content-Length: 0,
+  // since reading json() on an empty body throws "unexpected end of
+  // data" and surfaces to the user as a misleading "JSON parse error".
   if (
-    res.status === 202 ||
     res.status === 204 ||
     res.status === 205 ||
     res.headers.get("content-length") === "0"
   ) {
     return undefined as T;
+  }
+  // 202 (Accepted) may or may not carry a body — some async-dispatch
+  // endpoints fire-and-forget (no body), others return a queued count
+  // or job descriptor. Read it as text first; if empty, treat as
+  // body-less; otherwise parse JSON. Previously we unconditionally
+  // discarded the body and returned undefined, which broke any
+  // caller that destructured the response (e.g. detect-markers'
+  // `{ queued }`).
+  if (res.status === 202) {
+    const text = await res.text();
+    if (!text) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return undefined as T;
+    }
   }
   return (await res.json()) as T;
 }
@@ -2119,6 +2230,39 @@ export const items = {
     apiFetch<{ queued: number }>(`/items/${id}/detect-markers`, {
       method: "POST",
     }),
+  // ─── Per-media-file marker editor (owner-only) ─────────────────────────
+  /// Read every marker (auto + manual) on a media file. The full row
+  /// shape (with id + source) is used by the operator editor; the
+  /// player path consumes a slimmer Marker via the item detail.
+  listMarkers: (mediaFileId: number) =>
+    apiFetch<MediaFileMarkersResponse>(`/media-files/${mediaFileId}/markers`),
+  /// Replace every manual marker on a media file with `markers`. Auto
+  /// rows are preserved — they're regenerated by the detection task.
+  /// The server-side PUT validates kind / width / duration before the
+  /// transaction lands.
+  replaceManualMarkers: (
+    mediaFileId: number,
+    markers: ManualMarkerInput[],
+  ) =>
+    apiFetch<MediaFileMarkersResponse>(`/media-files/${mediaFileId}/markers`, {
+      method: "PUT",
+      body: { markers },
+    }),
+  /// Per-show intro fingerprint status. Returns `{ captured: false }`
+  /// for movie files and shows whose operator hasn't yet saved a
+  /// manual intro marker that would trigger fingerprint capture.
+  getFingerprintStatus: (mediaFileId: number) =>
+    apiFetch<ShowFingerprintStatus>(
+      `/media-files/${mediaFileId}/intro-fingerprint`,
+    ),
+  /// Wipe the parent show's fingerprint(s). The next detect_markers
+  /// run on the show's episodes falls back to blackdetect until the
+  /// operator saves a new manual intro marker on E01.
+  clearFingerprint: (mediaFileId: number) =>
+    apiFetch<ShowFingerprintStatus>(
+      `/media-files/${mediaFileId}/intro-fingerprint`,
+      { method: "DELETE" },
+    ),
   // ─── Edit & Fix Match (owner-only on the server) ───────────────────────
   patch: (id: number, edit: ItemEditInput) =>
     apiFetch<ItemDetail>(`/items/${id}`, { method: "PATCH", body: edit }),
@@ -2281,7 +2425,15 @@ export const playState = {
   ) =>
     apiFetch<void>("/play-state/event", { method: "POST", body: input }),
   setWatched: (
-    input: { item_id?: number; episode_id?: number; watched: boolean },
+    input: {
+      item_id?: number;
+      episode_id?: number;
+      /// When set, marks every episode of this show id watched
+      /// (or unwatched). Server runs the bulk upsert atomically and
+      /// fans out Trakt history pushes per affected episode.
+      show_id?: number;
+      watched: boolean;
+    },
   ) =>
     apiFetch<void>("/play-state/watched", { method: "POST", body: input }),
   onDeck: () => apiFetch<OnDeckResponse>("/play-state/on-deck"),
@@ -2480,6 +2632,53 @@ export interface StatsLibraryBucket {
 
 export const admin = {
   dashboard: () => apiFetch<DashboardResponse>("/admin/dashboard"),
+  /// Per-show intro fingerprints — listing + per-show clear. Powers
+  /// the Admin → Maintenance → Intro fingerprints page. See
+  /// `crates/server/src/api/admin/fingerprints.rs` for the backend.
+  introFingerprints: {
+    list: () =>
+      apiFetch<{ fingerprints: ShowIntroFingerprintListing[] }>(
+        "/admin/intro-fingerprints",
+      ),
+    deleteForShow: (showId: number) =>
+      apiFetch<{ removed: number }>(
+        `/admin/intro-fingerprints/${showId}`,
+        { method: "DELETE" },
+      ),
+  },
+  /// Background job queue. Powers the Admin → Maintenance → Job
+  /// queue page. See `crates/server/src/api/admin/jobs.rs` for the
+  /// backend.
+  jobs: {
+    summary: () => apiFetch<JobSummary>("/admin/jobs/summary"),
+    list: (opts: { kind?: string; status?: JobStatusFilter; limit?: number } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.kind) qs.set("kind", opts.kind);
+      if (opts.status) qs.set("status", opts.status);
+      if (opts.limit != null) qs.set("limit", String(opts.limit));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      return apiFetch<{ jobs: JobRow[] }>(`/admin/jobs${suffix}`);
+    },
+    requeue: (jobId: number) =>
+      apiFetch<{ requeued: boolean }>(`/admin/jobs/${jobId}/requeue`, {
+        method: "POST",
+      }),
+    /// Sweep every existing file lacking any pipeline artifact and
+    /// enqueue the corresponding jobs. Idempotent (each per-file
+    /// enqueue is deduped); safe to re-run while jobs are in flight.
+    processAllPending: () =>
+      apiFetch<JobSweepCounts>("/admin/jobs/process-all-pending", {
+        method: "POST",
+      }),
+    /// Delete all currently-queued rows. Running jobs are NOT
+    /// killed — they finish their current file and then stop.
+    /// Optionally scope to one kind via `kind` arg.
+    wipeQueued: (kind?: string) =>
+      apiFetch<{ removed: number }>(
+        `/admin/jobs/queued${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`,
+        { method: "DELETE" },
+      ),
+  },
   stats: {
     /// Last-N-day counters + the live now-playing count for the hero
     /// tiles. `days` defaults to 30, clamped to [1, 365] server-side.

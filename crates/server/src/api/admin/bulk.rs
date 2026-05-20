@@ -153,65 +153,74 @@ pub async fn detect_markers(
     Json(req): Json<BulkDetectMarkersRequest>,
 ) -> Result<(StatusCode, Json<BulkReport>), ApiError> {
     cap_check(req.item_ids.len())?;
-    let mut total_files: Vec<(i64, String, Option<i64>)> = Vec::new();
     let mut errors: Vec<BulkError> = Vec::new();
     let mut ok = 0usize;
+    // Fan out per-file (not per-item) so each media_file_id gets its
+    // own queue row with independent retry/dedup. A bulk-detect on
+    // 50 shows ends up as N×episodes jobs rather than 50 — fine for
+    // the queue (SQLite handles tens of thousands of rows trivially)
+    // and gives the worker pool finer interleaving.
     for id in &req.item_ids {
-        match collect_files_for_item(&state, *id, actor.id).await {
-            Ok(files) => {
-                ok += 1;
-                total_files.extend(files);
+        let detail = match queries::get_item_detail(&state.pool, *id, actor.id, None).await {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                errors.push(BulkError {
+                    item_id: *id,
+                    error: "item not found".into(),
+                });
+                continue;
             }
+            Err(e) => {
+                errors.push(BulkError {
+                    item_id: *id,
+                    error: format!("{e:#}"),
+                });
+                continue;
+            }
+        };
+        let file_ids: Vec<i64> = match detail.item.kind {
+            chimpflix_library::ItemKind::Movie => {
+                detail.files.iter().map(|f| f.id).collect()
+            }
+            chimpflix_library::ItemKind::Show => {
+                match sqlx::query_scalar::<_, i64>(
+                    "SELECT mf.id
+                     FROM media_files mf
+                     JOIN episodes e ON e.id = mf.episode_id
+                     JOIN seasons s ON s.id = e.season_id
+                     WHERE s.show_id = ? AND mf.removed_at IS NULL",
+                )
+                .bind(*id)
+                .fetch_all(&state.pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        errors.push(BulkError {
+                            item_id: *id,
+                            error: format!("{e:#}"),
+                        });
+                        continue;
+                    }
+                }
+            }
+        };
+        match crate::jobs::handlers::detect_markers_file::enqueue_for_files(
+            &state.pool,
+            &file_ids,
+        )
+        .await
+        {
+            Ok(_) => ok += 1,
             Err(e) => errors.push(BulkError {
                 item_id: *id,
                 error: format!("{e:#}"),
             }),
         }
     }
-    if !total_files.is_empty() {
-        crate::api::markers::spawn_detection(&state, total_files);
-    }
     let failed = errors.len();
     audit_with(&state, actor.id, &headers, "items.bulk.detect_markers", &req).await;
     Ok((StatusCode::ACCEPTED, Json(BulkReport { ok, failed, errors })))
-}
-
-async fn collect_files_for_item(
-    state: &AppState,
-    item_id: i64,
-    user_id: i64,
-) -> anyhow::Result<Vec<(i64, String, Option<i64>)>> {
-    let detail = queries::get_item_detail(&state.pool, item_id, user_id, None)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("item not found"))?;
-    let mut out: Vec<(i64, String, Option<i64>)> = Vec::new();
-    match detail.item.kind {
-        chimpflix_library::ItemKind::Movie => {
-            for f in &detail.files {
-                let path = sqlx::query_scalar::<_, String>(
-                    "SELECT path FROM media_files WHERE id = ?",
-                )
-                .bind(f.id)
-                .fetch_one(&state.pool)
-                .await?;
-                out.push((f.id, path, f.duration_ms));
-            }
-        }
-        chimpflix_library::ItemKind::Show => {
-            let rows = sqlx::query_as::<_, (i64, String, Option<i64>)>(
-                "SELECT mf.id, mf.path, mf.duration_ms
-                 FROM media_files mf
-                 JOIN episodes e ON e.id = mf.episode_id
-                 JOIN seasons s ON s.id = e.season_id
-                 WHERE s.show_id = ?",
-            )
-            .bind(item_id)
-            .fetch_all(&state.pool)
-            .await?;
-            out.extend(rows);
-        }
-    }
-    Ok(out)
 }
 
 fn cap_check(n: usize) -> Result<(), ApiError> {

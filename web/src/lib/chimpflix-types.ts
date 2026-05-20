@@ -35,6 +35,10 @@ export type MediaItem = {
   year?: number;
   duration?: number;
   viewOffset?: number;
+  /// Set to true once the user (or the auto-scrobble threshold) has
+  /// marked this item watched. Drives the per-episode and per-movie
+  /// watched indicator + the Mark-watched toggle UI.
+  watched?: boolean;
   contentRating?: string;
   rating?: number;
   genres?: string[];

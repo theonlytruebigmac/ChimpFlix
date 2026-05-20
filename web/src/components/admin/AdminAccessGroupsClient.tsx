@@ -109,7 +109,7 @@ export function AdminAccessGroupsClient({
               type="button"
               onClick={create}
               disabled={creating || !newName.trim()}
-              className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
+              className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
             >
               {creating ? "…" : "Add"}
             </button>
@@ -329,7 +329,7 @@ function GroupEditor({
           type="button"
           onClick={saveMeta}
           disabled={!metaDirty || savingMeta}
-          className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
+          className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingMeta ? "…" : "Save details"}
         </button>
@@ -354,7 +354,7 @@ function GroupEditor({
                   className={
                     "rounded-full border px-3 py-1 text-xs transition-colors " +
                     (active
-                      ? "border-(--color-accent) bg-accent/20 text-white"
+                      ? "border-accent bg-accent/20 text-white"
                       : "border-white/15 text-white/70 hover:border-white/30")
                   }
                 >
@@ -368,7 +368,7 @@ function GroupEditor({
           type="button"
           onClick={saveLibs}
           disabled={!libsDirty || savingLibs}
-          className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
+          className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingLibs ? "…" : "Save libraries"}
         </button>
@@ -394,7 +394,7 @@ function GroupEditor({
                     <div className="text-[11px] text-white/50">
                       @{u.username}
                       {u.role === "owner" && (
-                        <span className="ml-1 text-(--color-accent)">· owner</span>
+                        <span className="ml-1 text-accent">· owner</span>
                       )}
                     </div>
                   </div>
@@ -415,7 +415,7 @@ function GroupEditor({
           type="button"
           onClick={saveMembers}
           disabled={!membersDirty || savingMembers}
-          className="rounded bg-(--color-accent) px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
+          className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingMembers ? "…" : "Save members"}
         </button>

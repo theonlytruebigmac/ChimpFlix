@@ -38,6 +38,7 @@ import {
   type User,
 } from "@/lib/chimpflix-api";
 import { EditMetadataDialog } from "./EditMetadataDialog";
+import { MarkerEditor } from "./MarkerEditor";
 import { FixMatchDialog } from "./FixMatchDialog";
 import { prefetchPlay } from "@/lib/play-prefetch";
 import { cancelPrewarm, prewarmFor } from "@/lib/prewarm";
@@ -103,13 +104,21 @@ function useThemeMusic(tvdbId: number | null, enabled: boolean) {
     audio.loop = true;
     audio.volume = 0.35;
     audio.preload = "auto";
+    // Detach the error listener BEFORE clearing src — Firefox fires
+    // a fresh `error` event whenever the media element's src is set
+    // to empty (or removed), which without this would re-enter
+    // `teardown` and create an infinite log flood of
+    // "Invalid URI. Load of media resource failed." messages for any
+    // show whose tvdb_id has no entry on tvthemes.plexapp.com
+    // (common for anime / non-Western titles). Chrome breaks this
+    // loop differently; Firefox does not.
+    const onError = () => teardown();
     const teardown = () => {
+      audio.removeEventListener("error", onError);
       audio.pause();
       audio.src = "";
     };
-    audio.addEventListener("error", () => {
-      teardown();
-    });
+    audio.addEventListener("error", onError);
     audio.play().catch(() => {
       // Autoplay policies; the user can still trigger via interaction.
       teardown();
@@ -176,6 +185,23 @@ function TitleModalView({ data }: { data: ModalData }) {
   const [detail, setDetail] = useState<ItemDetail>(data.detail);
   const { item, seasons, initialEpisodes, similar, credits, extras } = data;
   const isShow = item.type === "show";
+  // Owner-only flag for the SeasonEpisodes per-episode "Edit markers"
+  // button. Sub-components (TagBar, AdminActionsMenu) do their own
+  // owner checks via authApi.me — we need a parallel one here because
+  // SeasonEpisodes lives in this scope, not theirs.
+  const [isOwnerView, setIsOwnerView] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    authApi
+      .me()
+      .then((me) => {
+        if (!cancelled) setIsOwnerView(me?.user.role === "owner");
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const { inList, toggle: toggleMyList } = useMyListItem(item.ratingKey);
   const trailerVideoId = useTrailer(item);
   // Theme music: only attempt for TV shows with a tvdb_id, only when no
@@ -471,6 +497,7 @@ function TitleModalView({ data }: { data: ModalData }) {
           seasons={seasons}
           initialEpisodes={initialEpisodes}
           initialSeasonKey={firstSeason.ratingKey}
+          isOwner={isOwnerView}
         />
       )}
 
@@ -658,6 +685,15 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 // actions row next to Add-to-List. Optimistic: we update local state
 // immediately and refetch the modal data so play_state, the Continue
 // Watching rail, and the resume label reflect the new state.
+//
+// For shows, the action marks every episode watched (the server
+// runs an atomic bulk upsert + fans out Trakt history pushes).
+// Because shows themselves don't have a `play_state` row, we infer
+// the show-level watched state from `view_count > 0` — once any
+// episode is watched the show is "partly watched" and the button
+// flips to "Mark all unwatched". This matches the Plex behaviour
+// where the ✓ on a show tile means "fully watched" but the per-show
+// detail page just offers the bulk toggle.
 function WatchedToggle({
   detail,
   onUpdated,
@@ -665,24 +701,37 @@ function WatchedToggle({
   detail: ItemDetail;
   onUpdated: (next: ItemDetail) => void;
 }) {
-  const watched = detail.play_state?.watched ?? false;
+  const isShow = detail.kind === "show";
   const [busy, setBusy] = useState(false);
 
-  // Shows aren't a single watch target; Plex marks the whole series via
-  // recursive "all episodes" which we don't yet expose. Hide the toggle
-  // for shows for now.
-  if (detail.kind === "show") return null;
+  // Movies use `play_state.watched`; shows derive "fully watched"
+  // from the per-user watch_stats subquery the backend joins on
+  // every ItemDetail fetch. A show with zero episodes counts as
+  // unwatched (no-op toggle target) so the button doesn't claim a
+  // metadata-only placeholder show is fully watched.
+  const watched = isShow
+    ? (detail.watch_stats &&
+        detail.watch_stats.total_episodes > 0 &&
+        detail.watch_stats.watched_episodes >= detail.watch_stats.total_episodes) ?? false
+    : detail.play_state?.watched ?? false;
 
   async function toggle() {
     if (busy) return;
     setBusy(true);
     try {
-      await playStateApi.setWatched({
-        item_id: detail.id,
-        watched: !watched,
-      });
-      // Refetch the detail so position_ms / view_count / watched are in
-      // sync without us having to mirror the server's logic.
+      if (isShow) {
+        await playStateApi.setWatched({
+          show_id: detail.id,
+          watched: !watched,
+        });
+      } else {
+        await playStateApi.setWatched({
+          item_id: detail.id,
+          watched: !watched,
+        });
+      }
+      // Refetch the detail so play_state / watch_stats / view_count
+      // are in sync without us having to mirror the server's logic.
       const next = await itemsApi.get(detail.id);
       onUpdated(next);
     } catch {
@@ -692,13 +741,21 @@ function WatchedToggle({
     }
   }
 
+  const label = isShow
+    ? watched
+      ? "Mark all as unwatched"
+      : "Mark all as watched"
+    : watched
+      ? "Mark as unwatched"
+      : "Mark as watched";
+
   return (
     <button
       type="button"
       onClick={toggle}
       disabled={busy}
-      aria-label={watched ? "Mark as unwatched" : "Mark as watched"}
-      title={watched ? "Mark as unwatched" : "Mark as watched"}
+      aria-label={label}
+      title={label}
       className={`flex h-11 w-11 items-center justify-center rounded-full border-2 transition-colors disabled:opacity-50 ${
         watched
           ? "border-(--color-accent) bg-(--color-accent) text-white"
@@ -1123,6 +1180,11 @@ function AdminActions({
   const [showMatch, setShowMatch] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
   const [showAddToCollection, setShowAddToCollection] = useState(false);
+  // Owner-only marker editor — opens for movies' primary file. Shows
+  // are excluded from this surface because the editor is per-file and
+  // a show has N episodes; we'd need an episode picker before the
+  // editor, which is a future refinement.
+  const [showMarkerEditor, setShowMarkerEditor] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [detectingMarkers, setDetectingMarkers] = useState(false);
   /// Brief one-shot toast for fire-and-forget admin actions
@@ -1310,6 +1372,23 @@ function AdminActions({
             disabled: detectingMarkers,
             onClick: detectMarkers,
           },
+          // Owner-only marker editor. Disabled for shows (the editor
+          // is per-media-file; surfacing it on the show item would
+          // need an episode picker first — future polish). Movies
+          // always have at least one entry in `detail.files`.
+          ...(detail.kind === "movie" && detail.files.length > 0
+            ? ([
+                {
+                  kind: "item" as const,
+                  label: "Edit markers…",
+                  icon: WaveIcon,
+                  onClick: () => {
+                    setOpen(false);
+                    setShowMarkerEditor(true);
+                  },
+                },
+              ] as const)
+            : []),
           {
             kind: "item",
             label: "Add to collection…",
@@ -1362,6 +1441,25 @@ function AdminActions({
           itemId={detail.id}
           itemTitle={detail.title}
           onClose={() => setShowAddToCollection(false)}
+        />
+      )}
+      {showMarkerEditor && detail.files[0] && (
+        <MarkerEditor
+          mediaFileId={detail.files[0].id}
+          fileLabel={detail.title}
+          open={showMarkerEditor}
+          onClose={() => setShowMarkerEditor(false)}
+          onSaved={() => {
+            // Re-fetch the item detail so the new markers ride along
+            // with the next player session. itemsApi.refresh would
+            // also re-query TMDB metadata — that's a heavier path
+            // than we need here; a plain GET picks up the new
+            // markers without touching upstream providers.
+            void itemsApi
+              .get(detail.id)
+              .then(onUpdated)
+              .catch(() => {});
+          }}
         />
       )}
     </>

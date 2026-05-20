@@ -2,6 +2,7 @@
 
 pub mod capabilities;
 pub mod chapter_thumbs;
+pub mod fingerprint;
 pub mod hwaccel;
 pub mod loudness;
 pub mod markers;
@@ -29,7 +30,7 @@ pub fn safe_ffmpeg_input(path: &std::path::Path) -> String {
 
 pub use capabilities::{TranscoderCapabilities, detect_capabilities};
 pub use hwaccel::{EncoderPreset, HwAccel, VideoCodec};
-pub use markers::{DetectedMarker, MarkerKind, detect_markers};
+pub use markers::{DetectedMarker, MarkerKind, MarkerSource, detect_markers};
 pub use previews::{DEFAULT_INTERVAL_S, DEFAULT_TILE_WIDTH, SpriteInfo, generate_sprite};
 pub use probe::{
     Chapter, GopProbe, ProbeResult, ProbeStream, StreamKind, probe, probe_chapters, probe_gop,

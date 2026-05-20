@@ -1999,11 +1999,25 @@ async fn spawn_ffmpeg(
             }
             // Quote the tail of stderr in one line so the operator
             // doesn't have to scroll the Logs page hunting for the
-            // last few warnings before the child died.
+            // last few warnings before the child died. Strip benign
+            // probe noise (MKV attachments, PGS subtitle dimension
+            // probes, "consider increasing analyzeduration") since
+            // the per-line WARN path already drops them — keeping
+            // them in the tail just floods the post-mortem with
+            // boilerplate. If everything in the ring was benign, we
+            // surface that explicitly so the operator can see at a
+            // glance there was nothing actionable in stderr.
+            let filtered: Vec<String> = ring
+                .iter()
+                .filter(|l| !is_benign_ffmpeg_line(l))
+                .cloned()
+                .collect();
             let tail = if ring.is_empty() {
                 "(no stderr output)".to_string()
+            } else if filtered.is_empty() {
+                "(only benign init warnings)".to_string()
             } else {
-                ring.into_iter().collect::<Vec<_>>().join(" | ")
+                filtered.join(" | ")
             };
             // Capture exit status via waitpid(WNOHANG). We don't call
             // tokio's Child::wait anywhere (the Child handle sits in the
@@ -2059,13 +2073,31 @@ async fn spawn_ffmpeg(
             // ffmpeg holding only stdout) while the encoder keeps
             // writing segments to disk just fine. Heartbeat monitor
             // above is authoritative on liveness via kill(pid, 0).
-            warn!(
-                session_id = %session_id_str,
-                pid = ?pid,
-                exit = %exit_detail,
-                stderr_tail = %tail,
-                "ffmpeg stderr drained — liveness now tracked solely by the heartbeat monitor",
-            );
+            //
+            // Severity tiering: if ffmpeg has actually exited (or is
+            // still running but produced something worth surfacing in
+            // the tail) the log stays at WARN. If it's still running
+            // AND the only stderr content was benign init noise, this
+            // is the normal anime-MKV / PGS-subtitle case — log at
+            // INFO so the operator's WARN feed isn't flooded with
+            // non-actionable events.
+            let still_running_clean = exit_detail.starts_with("still running")
+                && filtered.is_empty();
+            if still_running_clean {
+                info!(
+                    session_id = %session_id_str,
+                    pid = ?pid,
+                    "ffmpeg stderr drained after benign init warnings — heartbeat monitor remains authoritative",
+                );
+            } else {
+                warn!(
+                    session_id = %session_id_str,
+                    pid = ?pid,
+                    exit = %exit_detail,
+                    stderr_tail = %tail,
+                    "ffmpeg stderr drained — liveness now tracked solely by the heartbeat monitor",
+                );
+            }
             // Make sure each variant playlist carries `#EXT-X-ENDLIST`.
             // When ffmpeg exits cleanly it adds this itself; when it
             // exits less-cleanly (zombie, kernel-buffer close, signal)

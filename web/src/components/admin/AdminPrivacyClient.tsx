@@ -2,59 +2,55 @@
 
 import { useState } from "react";
 import { admin as adminApi } from "@/lib/chimpflix-api";
+import { SaveBar, SettingsCard, SettingsRow } from "./ui";
 
 export function AdminPrivacyClient({ initial }: { initial: boolean }) {
-  const [optIn, setOptIn] = useState(initial);
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [baseline, setBaseline] = useState(initial);
+  const [optIn, setOptIn] = useState(baseline);
   const [error, setError] = useState<string | null>(null);
 
+  const dirty = optIn !== baseline;
+
   async function save() {
-    setBusy(true);
     setError(null);
-    setSaved(false);
-    try {
-      const r = await adminApi.privacy.patch(optIn);
-      setOptIn(r.telemetry_opt_in);
-      setSaved(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+    const r = await adminApi.privacy.patch(optIn);
+    setBaseline(r.telemetry_opt_in);
+    setOptIn(r.telemetry_opt_in);
   }
 
   return (
-    <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-      <label className="flex items-start gap-3">
-        <input
-          type="checkbox"
-          checked={optIn}
-          onChange={(e) => setOptIn(e.target.checked)}
-          className="mt-1"
-        />
-        <div className="text-sm">
-          <div className="font-medium">Send anonymous usage telemetry</div>
-          <div className="mt-1 text-xs text-white/50">
-            What would be sent: server version, library counts, transcoder
-            settings (no media titles, no user data). Nothing is sent today
-            — this preference is recorded for future versions to honor.
-          </div>
+    <div>
+      {error && (
+        <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+          {error}
         </div>
-      </label>
-      <div className="mt-4 flex items-center gap-3">
-        <button
-          disabled={busy || optIn === initial}
-          onClick={save}
-          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+      )}
+
+      <SettingsCard
+        title="Telemetry"
+        description="Anonymous usage data the server may send to help with future versions."
+      >
+        <SettingsRow
+          label="Anonymous usage telemetry"
+          help="What would be sent: server version, library counts, transcoder settings (no media titles, no user data). Nothing is sent today — this preference is recorded for future versions to honor."
+          changed={dirty}
         >
-          {busy ? "Saving…" : "Save"}
-        </button>
-        {saved && optIn === initial && (
-          <span className="text-xs text-white/50">Saved.</span>
-        )}
-        {error && <span className="text-xs text-red-400">{error}</span>}
-      </div>
-    </section>
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={optIn}
+              onChange={(e) => setOptIn(e.target.checked)}
+            />
+            <span>Send anonymous usage telemetry</span>
+          </label>
+        </SettingsRow>
+      </SettingsCard>
+
+      <SaveBar
+        dirtyCount={dirty ? 1 : 0}
+        onSave={save}
+        onDiscard={() => setOptIn(baseline)}
+      />
+    </div>
   );
 }

@@ -5,6 +5,7 @@ import {
   admin as adminApi,
   type AccessMatrixEntry,
 } from "@/lib/chimpflix-api";
+import { Pill, SaveBar } from "./ui";
 
 interface Props {
   initial: AccessMatrixEntry[];
@@ -18,9 +19,7 @@ export function AdminAccessClient({ initial }: Props) {
   // mutating the prop array, which trips react-hooks/immutability.
   const [baseline, setBaseline] = useState(initial);
   const [entries, setEntries] = useState(initial);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
 
   const users = useMemo(() => {
     const seen = new Map<number, string>();
@@ -59,31 +58,26 @@ export function AdminAccessClient({ initial }: Props) {
     JSON.stringify(baseline.map((e) => ({ u: e.user_id, l: e.library_id, a: e.allowed })));
 
   async function save() {
-    setBusy(true);
     setError(null);
-    setSaved(false);
-    try {
-      // For each library, compute the list of allowed user_ids.
-      const libraries = new Map<number, number[]>();
-      for (const e of entries) {
-        if (!libraries.has(e.library_id)) libraries.set(e.library_id, []);
-        if (e.allowed) libraries.get(e.library_id)!.push(e.user_id);
-      }
-      const payload = Array.from(libraries, ([library_id, user_ids]) => ({
-        library_id,
-        user_ids,
-      }));
-      const r = await adminApi.access.put(payload);
-      setEntries(r.entries);
-      // Refresh the baseline so the dirty-check returns false after
-      // the save lands.
-      setBaseline(r.entries);
-      setSaved(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+    // For each library, compute the list of allowed user_ids.
+    const libraries = new Map<number, number[]>();
+    for (const e of entries) {
+      if (!libraries.has(e.library_id)) libraries.set(e.library_id, []);
+      if (e.allowed) libraries.get(e.library_id)!.push(e.user_id);
     }
+    const payload = Array.from(libraries, ([library_id, user_ids]) => ({
+      library_id,
+      user_ids,
+    }));
+    const r = await adminApi.access.put(payload);
+    setEntries(r.entries);
+    // Refresh the baseline so the dirty-check returns false after
+    // the save lands.
+    setBaseline(r.entries);
+  }
+
+  function discard() {
+    setEntries(baseline);
   }
 
   if (users.length === 0 || libraries.length === 0) {
@@ -134,10 +128,14 @@ export function AdminAccessClient({ initial }: Props) {
                       />
                       {viaGroups.length > 0 && (
                         <div
-                          className="mt-1 text-[10px] uppercase tracking-wider text-emerald-300/70"
+                          className="mt-1 flex flex-wrap justify-center gap-0.5"
                           title={`Also granted via group${viaGroups.length > 1 ? "s" : ""}: ${viaGroups.join(", ")}`}
                         >
-                          via {viaGroups.join(", ")}
+                          {viaGroups.map((g) => (
+                            <Pill key={g} tone="ok">
+                              via {g}
+                            </Pill>
+                          ))}
                         </div>
                       )}
                     </td>
@@ -148,18 +146,12 @@ export function AdminAccessClient({ initial }: Props) {
           </tbody>
         </table>
       </div>
-      <div className="flex items-center gap-3">
-        <button
-          disabled={!dirty || busy}
-          onClick={save}
-          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-        >
-          {busy ? "Saving…" : "Save changes"}
-        </button>
-        {saved && !dirty && (
-          <span className="text-xs text-white/50">Saved.</span>
-        )}
-      </div>
+      <SaveBar
+        dirtyCount={dirty ? 1 : 0}
+        summary="library access grants"
+        onSave={save}
+        onDiscard={discard}
+      />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { AdminMobileNav } from "@/components/admin/AdminMobileNav";
 import { AdminNav } from "@/components/admin/AdminNav";
+import { AdminScrollReset } from "@/components/admin/AdminScrollReset";
 import { requireOwner } from "@/lib/chimpflix-server";
 
 /// Admin shell. The outer /settings layout already provides TopNav and
@@ -19,6 +20,7 @@ export default async function AdminLayout({
 
   return (
     <div className="flex flex-col gap-4 pt-2 md:flex-row md:gap-8">
+      <AdminScrollReset />
       <aside className="sticky top-32 hidden h-fit w-56 shrink-0 md:block">
         <AdminNav />
       </aside>

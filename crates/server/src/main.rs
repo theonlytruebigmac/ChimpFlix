@@ -5,6 +5,7 @@ mod auth;
 mod client_ip;
 mod events;
 mod file_watcher;
+mod jobs;
 mod log_buffer;
 mod mail_template;
 mod mailer;
@@ -14,6 +15,7 @@ mod scheduler;
 mod session_watcher;
 mod ssrf;
 mod state;
+mod subtitles_lookup;
 mod totp;
 mod trakt_sync;
 mod webhooks;
@@ -371,6 +373,13 @@ async fn main() -> anyhow::Result<()> {
         warn!(error = %format!("{e:#}"), "scheduler seed failed; tasks can still be created manually");
     }
     scheduler::spawn(state.clone());
+    // Durable background job queue (see `crates/server/src/jobs/`).
+    // Runs reclaim on startup so anything left as `running` from a
+    // previous crash gets put back in the queue. Two workers lets
+    // two CPU-bound ffmpeg detection passes run in parallel — fine
+    // on any host with 4+ cores; raise to 3 only if the box has
+    // headroom and live transcodes aren't competing.
+    jobs::start(state.clone(), jobs::build_router(), 2).await;
     webhooks::spawn(state.clone());
     session_watcher::spawn(state.hub.clone(), state.transcoder.clone());
     // Filesystem watcher is gated on the operator's `scan_automatically`

@@ -20,7 +20,11 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
   {
     title: "Status",
     items: [
-      { href: "/settings/admin", label: "Dashboard" },
+      // Home replaces the old Dashboard: hero stats, recent activity,
+      // alerts, and quick actions all in one surface. The standalone
+      // Alerts + Stats pages remain as deep-dive views — Home links
+      // into them via the "View all" affordances on each card.
+      { href: "/settings/admin", label: "Home" },
       { href: "/settings/admin/status/alerts", label: "Alerts" },
       { href: "/settings/admin/status/stats", label: "Stats" },
     ],
@@ -72,6 +76,14 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
       { href: "/settings/admin/maintenance/backup", label: "Backup" },
       { href: "/settings/admin/maintenance/logs", label: "Logs" },
       { href: "/settings/admin/maintenance/health", label: "Library Health" },
+      {
+        href: "/settings/admin/maintenance/intro-fingerprints",
+        label: "Intro fingerprints",
+      },
+      {
+        href: "/settings/admin/maintenance/jobs",
+        label: "Job queue",
+      },
     ],
     disabled: [],
   },

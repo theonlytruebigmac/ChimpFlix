@@ -258,12 +258,18 @@ async fn spawn_scan(state: AppState, library_id: i64) {
     let tvmaze = state.tvmaze.clone();
     let hub = state.hub.clone();
     let cache_root = state.transcoder.cache_root().to_path_buf();
-    let state_for_markers = state.clone();
     let state_for_release = state.clone();
     tokio::spawn(async move {
-        let emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
+        let inner_emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
             hub.publish(crate::events::Event::Scan(evt));
         });
+        // Pipeline wrapper: FileAdded fans out into discovery jobs.
+        // Same wrapper used by the manual + scheduled scan paths so
+        // file-watcher-discovered files get the same processing.
+        let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(
+            pool.clone(),
+            inner_emitter,
+        );
         let scan_ok = match chimpflix_library::run_scan(
             pool.clone(),
             ffmpeg,
@@ -285,38 +291,19 @@ async fn spawn_scan(state: AppState, library_id: i64) {
             }
         };
         // Optional post-scan trigger: detect markers for any file the
-        // scan introduced that doesn't have auto markers yet. Off by
-        // default — gated on `detect_markers_on_add` because the
-        // blackdetect pass costs ~30s/45min-episode and not every
-        // operator wants that overhead on every drop.
-        if scan_ok {
-            let on_add = state_for_markers.settings.read().await.detect_markers_on_add;
-            if on_add {
-                // 256 caps a single scan from queueing thousands of jobs at
-                // once — typical drops are 1–20 files; an rsync of a season
-                // pack still fits comfortably. Excess gets picked up by the
-                // next scan or the scheduled `detect_markers` task.
-                match queries::list_media_files_needing_markers(&pool, library_id, 256).await {
-                    Ok(files) if !files.is_empty() => {
-                        info!(
-                            library_id,
-                            count = files.len(),
-                            "file watcher: queueing markers for new files"
-                        );
-                        crate::api::markers::spawn_detection(&state_for_markers, files);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(library_id, error = %format!("{e:#}"), "file watcher: marker query failed");
-                    }
-                }
-            }
-        }
+        // (Previously: a post-scan block enqueued marker detection
+        // for new files, gated on the `detect_markers_on_add`
+        // setting. That's now handled by the discovery pipeline
+        // wrapper around the emitter — every FileAdded event fans
+        // out into detect_markers_file / preview / loudness /
+        // chapter-thumbs jobs automatically. The wrapper's
+        // enqueue_job_unique dedup means re-triggers are no-ops.
+        // Marker `detect_markers_on_add` setting is effectively
+        // always-on with the new pipeline; the knob now affects
+        // only the scheduled safety-net task.)
+        let _ = scan_ok;
         // Release the lock as the final act so a concurrent scheduled
-        // scan or manual trigger can proceed cleanly. The marker
-        // detection above is fire-and-forget (`spawn_detection` spawns
-        // its own task), so we don't need to keep the lock for its
-        // duration — only the scan itself contended for disk.
+        // scan or manual trigger can proceed cleanly.
         state_for_release.release_library_scan(library_id).await;
     });
 }

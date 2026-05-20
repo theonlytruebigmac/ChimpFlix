@@ -26,8 +26,9 @@ use crate::models::{
     MediaFileLocator, MediaFileSummary, MediaStreamSummary, NewAccessGroup, NewAuditEntry,
     NewExternalSubtitle, NewLibrary, NewOptimizedVersion, NewScheduledTask, NewTranscoderPreset,
     NewWebhook, Notification, OnDeckEntry, OnDeckResponse, OptimizedVersion, Person,
-    PlayStateBatch, PlayStateForItem, Review, ReviewsSummary, ScanJob, ScheduledTask,
-    ScheduledTaskUpdate, Season, SeasonDetail, SeasonSummary, SecretMetadata, ServerSettings,
+    JobRow, JobStatus, JobSummary, PlayStateBatch, PlayStateForItem, Review, ReviewsSummary,
+    ScanJob, ScheduledTask, ScheduledTaskUpdate, Season, SeasonDetail, SeasonSummary,
+    SecretMetadata, ServerSettings, ShowWatchStats,
     ServerSettingsUpdate, SessionRow, TaskRun, TranscoderPreset, TranscoderPresetUpdate, User,
     UserRole, UserWithSecret, Webhook, WebhookDelivery, WebhookUpdate, make_sort_title,
 };
@@ -1138,6 +1139,10 @@ pub async fn get_item_detail(
     let reviews = reviews_summary_for_item(pool, id)
         .await
         .unwrap_or_default();
+    let watch_stats = match item.kind {
+        ItemKind::Show => Some(show_watch_stats(pool, id, user_id).await?),
+        ItemKind::Movie => None,
+    };
 
     Ok(Some(ItemDetail {
         item,
@@ -1148,7 +1153,36 @@ pub async fn get_item_detail(
         credits,
         extras,
         reviews,
+        watch_stats,
     }))
+}
+
+/// Returns total + watched episode counts for a show, for the given
+/// user. Used by the show-level Mark-watched toggle to decide which
+/// action label to render.
+async fn show_watch_stats(
+    pool: &SqlitePool,
+    show_id: i64,
+    user_id: i64,
+) -> Result<ShowWatchStats> {
+    let row = sqlx::query(
+        "SELECT
+            COUNT(*) AS total,
+            COUNT(CASE WHEN ps.watched = 1 THEN 1 END) AS watched
+         FROM episodes e
+         JOIN seasons s ON s.id = e.season_id
+         LEFT JOIN play_state ps
+             ON ps.episode_id = e.id AND ps.user_id = ?
+         WHERE s.show_id = ?",
+    )
+    .bind(user_id)
+    .bind(show_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(ShowWatchStats {
+        total_episodes: row.try_get("total")?,
+        watched_episodes: row.try_get("watched")?,
+    })
 }
 
 async fn list_credits_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<Credit>> {
@@ -1472,7 +1506,7 @@ pub async fn list_markers_for_file(
     media_file_id: i64,
 ) -> Result<Vec<Marker>> {
     let rows = sqlx::query(
-        "SELECT kind, start_ms, end_ms, label FROM markers \
+        "SELECT kind, start_ms, end_ms, label, source FROM markers \
          WHERE media_file_id = ? ORDER BY start_ms ASC",
     )
     .bind(media_file_id)
@@ -1485,6 +1519,7 @@ pub async fn list_markers_for_file(
                 start_ms: r.try_get("start_ms")?,
                 end_ms: r.try_get("end_ms")?,
                 label: r.try_get::<Option<String>, _>("label").ok().flatten(),
+                source: r.try_get("source")?,
             })
         })
         .collect()
@@ -1513,6 +1548,348 @@ pub async fn replace_auto_markers(
         .bind(kind)
         .bind(start_ms)
         .bind(end_ms)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Full markers row including id + source. Used by the operator-side
+/// marker editor; the player surface uses the slimmer [`Marker`]
+/// (without id/source) because client code never edits markers.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkerRow {
+    pub id: i64,
+    pub kind: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub label: Option<String>,
+    pub source: String,
+}
+
+/// List every marker on a media file with row ids + source. Sorted by
+/// start_ms so the editor renders them in playback order.
+pub async fn list_markers_full(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Vec<MarkerRow>> {
+    let rows = sqlx::query(
+        "SELECT id, kind, start_ms, end_ms, label, source FROM markers \
+         WHERE media_file_id = ? ORDER BY start_ms",
+    )
+    .bind(media_file_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(MarkerRow {
+                id: r.try_get::<i64, _>("id")?,
+                kind: r.try_get::<String, _>("kind")?,
+                start_ms: r.try_get::<i64, _>("start_ms")?,
+                end_ms: r.try_get::<i64, _>("end_ms")?,
+                label: r.try_get::<Option<String>, _>("label").ok().flatten(),
+                source: r.try_get::<String, _>("source")?,
+            })
+        })
+        .collect()
+}
+
+/// Stored chromaprint fingerprint for a show's intro/theme. Powers
+/// the per-show signature match in the detect_markers pipeline. The
+/// `fingerprint` BLOB is a packed little-endian u32 array — decode
+/// via `chimpflix_transcoder::fingerprint::decode_blob`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShowIntroFingerprint {
+    pub id: i64,
+    pub show_id: i64,
+    pub season_id: Option<i64>,
+    pub fingerprint: Vec<u8>,
+    pub duration_ms: i64,
+    pub captured_from_media_file_id: Option<i64>,
+    pub captured_at: i64,
+    pub captured_by: String,
+}
+
+/// Insert or replace the canonical intro fingerprint for
+/// `(show_id, season_id)`. Pass `season_id = None` for the show-wide
+/// row. A 'manual' row is never silently overwritten by an 'auto'
+/// upsert — the second-to-last `WHERE` clause enforces operator
+/// supremacy.
+pub async fn upsert_show_intro_fingerprint(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_id: Option<i64>,
+    fingerprint: &[u8],
+    duration_ms: i64,
+    captured_from_media_file_id: Option<i64>,
+    captured_by: &str,
+) -> Result<()> {
+    let now = chimpflix_common::now_ms();
+    // SQLite's UPSERT requires the conflict-target columns to match
+    // an actual index. Our unique index keys on `(show_id,
+    // COALESCE(season_id, -1))`, so the ON CONFLICT clause uses the
+    // same expression to nominate the same index. The WHERE guard
+    // blocks an 'auto' write from replacing an existing 'manual' row.
+    sqlx::query(
+        "INSERT INTO show_intro_fingerprints
+            (show_id, season_id, fingerprint, duration_ms,
+             captured_from_media_file_id, captured_at, captured_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (show_id, COALESCE(season_id, -1)) DO UPDATE SET
+            fingerprint = excluded.fingerprint,
+            duration_ms = excluded.duration_ms,
+            captured_from_media_file_id = excluded.captured_from_media_file_id,
+            captured_at = excluded.captured_at,
+            captured_by = excluded.captured_by
+         WHERE captured_by = 'auto' OR excluded.captured_by = 'manual'",
+    )
+    .bind(show_id)
+    .bind(season_id)
+    .bind(fingerprint)
+    .bind(duration_ms)
+    .bind(captured_from_media_file_id)
+    .bind(now)
+    .bind(captured_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Look up the canonical intro fingerprint for the given show (and
+/// optional season). Returns `None` when no fingerprint has been
+/// captured yet — the detect_markers task falls back to blackdetect
+/// in that case.
+pub async fn get_show_intro_fingerprint(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_id: Option<i64>,
+) -> Result<Option<ShowIntroFingerprint>> {
+    // Two-step: prefer a per-season row when one exists; fall back to
+    // the show-wide (season_id IS NULL) row otherwise. We can't do
+    // this in one query without a CTE that's awkward in SQLite, so
+    // we just check season-scope first then show-scope.
+    if let Some(season_id) = season_id
+        && let Some(row) = sqlx::query(
+            "SELECT id, show_id, season_id, fingerprint, duration_ms,
+                    captured_from_media_file_id, captured_at, captured_by
+             FROM show_intro_fingerprints
+             WHERE show_id = ? AND season_id = ?",
+        )
+        .bind(show_id)
+        .bind(season_id)
+        .fetch_optional(pool)
+        .await?
+    {
+        return Ok(Some(ShowIntroFingerprint {
+            id: row.try_get("id")?,
+            show_id: row.try_get("show_id")?,
+            season_id: row.try_get("season_id").ok().flatten(),
+            fingerprint: row.try_get("fingerprint")?,
+            duration_ms: row.try_get("duration_ms")?,
+            captured_from_media_file_id: row
+                .try_get("captured_from_media_file_id")
+                .ok()
+                .flatten(),
+            captured_at: row.try_get("captured_at")?,
+            captured_by: row.try_get("captured_by")?,
+        }));
+    }
+    let row = sqlx::query(
+        "SELECT id, show_id, season_id, fingerprint, duration_ms,
+                captured_from_media_file_id, captured_at, captured_by
+         FROM show_intro_fingerprints
+         WHERE show_id = ? AND season_id IS NULL",
+    )
+    .bind(show_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some(ShowIntroFingerprint {
+        id: row.try_get("id")?,
+        show_id: row.try_get("show_id")?,
+        season_id: row.try_get("season_id").ok().flatten(),
+        fingerprint: row.try_get("fingerprint")?,
+        duration_ms: row.try_get("duration_ms")?,
+        captured_from_media_file_id: row
+            .try_get("captured_from_media_file_id")
+            .ok()
+            .flatten(),
+        captured_at: row.try_get("captured_at")?,
+        captured_by: row.try_get("captured_by")?,
+    }))
+}
+
+/// Resolve the parent show id for a media file. Returns `None` for
+/// files that belong to a movie (no show), or when the file row /
+/// linked episode / season can't be found. Used by the
+/// detect_markers + capture pipelines to scope fingerprints to a
+/// show.
+pub async fn show_id_for_media_file(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Option<i64>> {
+    let row = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT s.show_id
+         FROM media_files mf
+         JOIN episodes e ON e.id = mf.episode_id
+         JOIN seasons s ON s.id = e.season_id
+         WHERE mf.id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.flatten())
+}
+
+/// Resolve `(show_id, season_id)` for a media file. Symmetric to
+/// [`show_id_for_media_file`] but also returns the season — used by
+/// the capture path so per-season fingerprints can be written when
+/// the operator wants seasonal granularity (future polish; the
+/// current capture writes show-wide).
+pub async fn show_and_season_for_media_file(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> Result<Option<(i64, i64)>> {
+    let row = sqlx::query(
+        "SELECT s.show_id, s.id AS season_id
+         FROM media_files mf
+         JOIN episodes e ON e.id = mf.episode_id
+         JOIN seasons s ON s.id = e.season_id
+         WHERE mf.id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some((row.try_get("show_id")?, row.try_get("season_id")?)))
+}
+
+/// Delete the stored fingerprint(s) for a show. Pass `season_id =
+/// Some(_)` to clear just that season's row; `None` clears the
+/// show-wide row only. To wipe everything for a show, call once with
+/// each scope (or use [`delete_all_show_intro_fingerprints`]).
+pub async fn delete_show_intro_fingerprint(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_id: Option<i64>,
+) -> Result<u64> {
+    let result = if let Some(sid) = season_id {
+        sqlx::query(
+            "DELETE FROM show_intro_fingerprints WHERE show_id = ? AND season_id = ?",
+        )
+        .bind(show_id)
+        .bind(sid)
+        .execute(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "DELETE FROM show_intro_fingerprints WHERE show_id = ? AND season_id IS NULL",
+        )
+        .bind(show_id)
+        .execute(pool)
+        .await?
+    };
+    Ok(result.rows_affected())
+}
+
+/// Wipe every fingerprint row attached to a show, across all season
+/// scopes including the show-wide row. Used by the operator's "Clear
+/// fingerprint" UI which is intentionally scope-agnostic.
+pub async fn delete_all_show_intro_fingerprints(
+    pool: &SqlitePool,
+    show_id: i64,
+) -> Result<u64> {
+    let result =
+        sqlx::query("DELETE FROM show_intro_fingerprints WHERE show_id = ?")
+            .bind(show_id)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
+}
+
+/// Joined row used by the admin "Intro fingerprints" listing page —
+/// pairs every fingerprint with the show's display title so the
+/// operator can read "Breaking Bad — captured 2d ago" instead of
+/// "show_id=42 — captured 2d ago". Show + season titles come from
+/// the items table.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShowIntroFingerprintListing {
+    pub id: i64,
+    pub show_id: i64,
+    pub show_title: String,
+    pub season_id: Option<i64>,
+    pub season_number: Option<i64>,
+    pub duration_ms: i64,
+    pub captured_from_media_file_id: Option<i64>,
+    pub captured_at: i64,
+    pub captured_by: String,
+}
+
+/// List every captured fingerprint, joined to the show title for
+/// the admin listing page. Ordered most-recent-first so the page's
+/// default sort matches operator intuition (what did I do last?).
+pub async fn list_all_show_intro_fingerprints(
+    pool: &SqlitePool,
+) -> Result<Vec<ShowIntroFingerprintListing>> {
+    let rows = sqlx::query(
+        "SELECT f.id, f.show_id, i.title AS show_title,
+                f.season_id, s.season_number,
+                f.duration_ms, f.captured_from_media_file_id,
+                f.captured_at, f.captured_by
+         FROM show_intro_fingerprints f
+         JOIN items i ON i.id = f.show_id
+         LEFT JOIN seasons s ON s.id = f.season_id
+         ORDER BY f.captured_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(ShowIntroFingerprintListing {
+                id: r.try_get("id")?,
+                show_id: r.try_get("show_id")?,
+                show_title: r.try_get("show_title")?,
+                season_id: r.try_get("season_id").ok().flatten(),
+                season_number: r.try_get("season_number").ok().flatten(),
+                duration_ms: r.try_get("duration_ms")?,
+                captured_from_media_file_id: r
+                    .try_get("captured_from_media_file_id")
+                    .ok()
+                    .flatten(),
+                captured_at: r.try_get("captured_at")?,
+                captured_by: r.try_get("captured_by")?,
+            })
+        })
+        .collect()
+}
+
+/// Replace every manual marker on a media file with `new_markers`.
+/// Auto-detected rows (source='auto') are preserved so a re-run of
+/// the detection task overlaps cleanly with the operator's edits.
+/// Symmetric to [`replace_auto_markers`].
+pub async fn replace_manual_markers(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    new_markers: &[(String, i64, i64, Option<String>)],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM markers WHERE media_file_id = ? AND source = 'manual'",
+    )
+    .bind(media_file_id)
+    .execute(&mut *tx)
+    .await?;
+    for (kind, start_ms, end_ms, label) in new_markers {
+        sqlx::query(
+            "INSERT INTO markers (media_file_id, kind, start_ms, end_ms, label, source) \
+             VALUES (?, ?, ?, ?, ?, 'manual')",
+        )
+        .bind(media_file_id)
+        .bind(kind)
+        .bind(start_ms)
+        .bind(end_ms)
+        .bind(label.as_deref())
         .execute(&mut *tx)
         .await?;
     }
@@ -5990,6 +6367,552 @@ pub async fn set_watched(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Background job queue
+// ---------------------------------------------------------------------------
+
+/// Input for `enqueue_job`. Defaults: priority 0, max_attempts 3,
+/// run_after = now (immediately eligible).
+#[derive(Debug, Clone)]
+pub struct JobInput {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub priority: i64,
+    pub max_attempts: i64,
+    pub run_after: Option<i64>,
+}
+
+impl JobInput {
+    pub fn new(kind: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            kind: kind.into(),
+            payload,
+            priority: 0,
+            max_attempts: 3,
+            run_after: None,
+        }
+    }
+
+    pub fn with_priority(mut self, p: i64) -> Self {
+        self.priority = p;
+        self
+    }
+
+    pub fn with_max_attempts(mut self, n: i64) -> Self {
+        self.max_attempts = n;
+        self
+    }
+}
+
+/// Insert a new job. Returns the row id so the caller can correlate
+/// (e.g. surface a "view job" link in the UI response).
+pub async fn enqueue_job(pool: &SqlitePool, input: JobInput) -> Result<i64> {
+    let now = now_ms();
+    let run_after = input.run_after.unwrap_or(now);
+    let payload = serde_json::to_string(&input.payload)?;
+    let res = sqlx::query(
+        "INSERT INTO jobs
+            (kind, payload, status, priority, attempts, max_attempts, run_after, created_at)
+         VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+    )
+    .bind(&input.kind)
+    .bind(payload)
+    .bind(input.priority)
+    .bind(input.max_attempts)
+    .bind(run_after)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
+/// Enqueue with per-target dedup. Skips if a non-terminal job
+/// (queued / running / failed-pending) already exists with the same
+/// `kind` AND payload-extracted `dedup_key`. Returns `Some(new_id)`
+/// when inserted, `None` when a duplicate was found.
+///
+/// `dedup_key` should be a string drawn from the payload (e.g.
+/// `format!("file:{file_id}")` or `format!("item:{item_id}")`) — we
+/// match against `json_extract(payload, '$.<field>')` via a literal
+/// `payload LIKE` to avoid the json1 dependency. The payload must
+/// include a top-level field matching `dedup_field`.
+pub async fn enqueue_job_unique(
+    pool: &SqlitePool,
+    input: JobInput,
+    dedup_field: &str,
+    dedup_value: i64,
+) -> Result<Option<i64>> {
+    let mut tx = pool.begin().await?;
+    let inserted = enqueue_job_unique_tx(&mut tx, input, dedup_field, dedup_value).await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Transactional variant — call within an existing transaction
+/// when enqueuing multiple jobs as a group (e.g. the discovery
+/// pipeline's four-kind fan-out per FileAdded). One tx = one fsync
+/// instead of one per kind.
+pub async fn enqueue_job_unique_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
+    input: JobInput,
+    dedup_field: &str,
+    dedup_value: i64,
+) -> Result<Option<i64>> {
+    // Switched from a LIKE-on-payload pattern to `json_extract` —
+    // SQLite ships with json1 enabled by default, and pulling the
+    // field out structurally eliminates the prefix-collision class
+    // of bug entirely (no need to reason about `,`/`}` delimiters
+    // in the pattern). Cheap: json1 functions are O(payload size)
+    // and our payloads are tiny.
+    let key = format!("$.{dedup_field}");
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM jobs
+         WHERE kind = ?
+           AND status IN ('queued', 'running', 'failed')
+           AND json_extract(payload, ?) = ?
+         LIMIT 1",
+    )
+    .bind(&input.kind)
+    .bind(&key)
+    .bind(dedup_value)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if existing.is_some() {
+        return Ok(None);
+    }
+    let id = enqueue_job_tx(tx, input).await?;
+    Ok(Some(id))
+}
+
+/// Transactional variant of `enqueue_job` — pairs with
+/// `enqueue_job_unique_tx` for the batched-pipeline path.
+pub async fn enqueue_job_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
+    input: JobInput,
+) -> Result<i64> {
+    let now = now_ms();
+    let run_after = input.run_after.unwrap_or(now);
+    let payload = serde_json::to_string(&input.payload)?;
+    let res = sqlx::query(
+        "INSERT INTO jobs
+            (kind, payload, status, priority, attempts, max_attempts, run_after, created_at)
+         VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+    )
+    .bind(&input.kind)
+    .bind(payload)
+    .bind(input.priority)
+    .bind(input.max_attempts)
+    .bind(run_after)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
+/// Atomically claim the next eligible job. Uses an UPDATE…RETURNING
+/// on a SELECT subquery so two concurrent workers can't race onto
+/// the same row. SQLite serializes writes, so the UPDATE wins
+/// exactly once.
+///
+/// Eligibility filter:
+///   - status = 'queued' OR (status = 'failed' AND run_after <= now)
+///   - run_after <= now
+///
+/// Order: priority DESC, id ASC (FIFO at the same priority).
+pub async fn claim_next_job(pool: &SqlitePool) -> Result<Option<JobRow>> {
+    let now = now_ms();
+    let row = sqlx::query(
+        "UPDATE jobs
+         SET status     = 'running',
+             attempts   = attempts + 1,
+             locked_at  = ?,
+             started_at = COALESCE(started_at, ?)
+         WHERE id = (
+             SELECT id FROM jobs
+             WHERE (status = 'queued' OR status = 'failed')
+               AND run_after <= ?
+             ORDER BY priority DESC, id ASC
+             LIMIT 1
+         )
+         RETURNING *",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| JobRow::from_row(&r)).transpose()
+}
+
+/// Force a job into terminal `dead` state without consulting
+/// `attempts`/`max_attempts`. Used by the worker when no handler
+/// is registered for a job's kind — there's no point in burning
+/// retries against an impossible-to-process row.
+pub async fn mark_job_dead(pool: &SqlitePool, job_id: i64, error: &str) -> Result<()> {
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE jobs
+         SET status      = 'dead',
+             locked_at   = NULL,
+             finished_at = ?,
+             last_error  = ?
+         WHERE id = ?",
+    )
+    .bind(now)
+    .bind(error)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Heartbeat for a long-running job — refreshes `locked_at` to
+/// `now()` so the orphan-reclaim sweep doesn't grab a row out
+/// from under a still-alive worker. Cheap (one UPDATE).
+pub async fn touch_job_lease(pool: &SqlitePool, job_id: i64) -> Result<()> {
+    sqlx::query("UPDATE jobs SET locked_at = ? WHERE id = ? AND status = 'running'")
+        .bind(now_ms())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Saturation-aware variant of `claim_next_job` — skips any kind
+/// listed in `exclude_kinds`. The worker passes the set of kinds
+/// whose in-process semaphore is currently full so we never claim
+/// a row we'd then have to roll back. Without this, a saturated
+/// kind sitting at the head of the queue (lots of pending
+/// `detect_markers_file` after a bulk backfill) would starve all
+/// other kinds because every poll would re-claim and roll back the
+/// same row.
+pub async fn claim_next_job_excluding_kinds(
+    pool: &SqlitePool,
+    exclude_kinds: &[String],
+) -> Result<Option<JobRow>> {
+    if exclude_kinds.is_empty() {
+        return claim_next_job(pool).await;
+    }
+    let now = now_ms();
+    // Build the IN-list of placeholders dynamically. `exclude_kinds`
+    // is small (≤ number of registered job kinds) so the SQL stays
+    // short. Bind each kind separately so sqlx escapes correctly.
+    let placeholders = std::iter::repeat("?")
+        .take(exclude_kinds.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "UPDATE jobs
+         SET status     = 'running',
+             attempts   = attempts + 1,
+             locked_at  = ?,
+             started_at = COALESCE(started_at, ?)
+         WHERE id = (
+             SELECT id FROM jobs
+             WHERE (status = 'queued' OR status = 'failed')
+               AND run_after <= ?
+               AND kind NOT IN ({placeholders})
+             ORDER BY priority DESC, id ASC
+             LIMIT 1
+         )
+         RETURNING *",
+    );
+    let mut q = sqlx::query(&sql).bind(now).bind(now).bind(now);
+    for k in exclude_kinds {
+        q = q.bind(k);
+    }
+    let row = q.fetch_optional(pool).await?;
+    row.map(|r| JobRow::from_row(&r)).transpose()
+}
+
+/// Terminal success state.
+pub async fn mark_job_succeeded(pool: &SqlitePool, job_id: i64) -> Result<()> {
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE jobs
+         SET status       = 'succeeded',
+             locked_at    = NULL,
+             finished_at  = ?,
+             last_error   = NULL
+         WHERE id = ?",
+    )
+    .bind(now)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark the current attempt as failed. If `attempts < max_attempts`,
+/// bump `run_after = now + backoff_ms` and set status back to
+/// `failed` (eligible for re-claim later); otherwise transition to
+/// `dead` (terminal — admin must re-queue manually).
+pub async fn mark_job_failed(
+    pool: &SqlitePool,
+    job_id: i64,
+    error: &str,
+    backoff_ms: i64,
+) -> Result<()> {
+    let now = now_ms();
+    let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await?;
+    let attempts: i64 = row.try_get("attempts")?;
+    let max_attempts: i64 = row.try_get("max_attempts")?;
+    if attempts >= max_attempts {
+        sqlx::query(
+            "UPDATE jobs
+             SET status      = 'dead',
+                 locked_at   = NULL,
+                 finished_at = ?,
+                 last_error  = ?
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(error)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE jobs
+             SET status     = 'failed',
+                 locked_at  = NULL,
+                 run_after  = ?,
+                 last_error = ?
+             WHERE id = ?",
+        )
+        .bind(now + backoff_ms)
+        .bind(error)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// On startup: any row left as `running` whose `locked_at` is older
+/// than the lease ttl is treated as orphaned (worker died) and
+/// flipped back to `queued`. `attempts` is preserved — the
+/// next worker that picks it up will see attempts already bumped
+/// from the previous claim, so a job that keeps crashing the worker
+/// still hits `max_attempts` instead of looping forever.
+///
+/// Returns the count of reclaimed rows for logging.
+pub async fn reclaim_orphan_jobs(pool: &SqlitePool, lease_ttl_ms: i64) -> Result<u64> {
+    let cutoff = now_ms() - lease_ttl_ms;
+    let res = sqlx::query(
+        "UPDATE jobs
+         SET status    = 'queued',
+             locked_at = NULL
+         WHERE status = 'running'
+           AND (locked_at IS NULL OR locked_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Aggregate counts by status — backs the admin queue dashboard.
+pub async fn job_summary(pool: &SqlitePool) -> Result<JobSummary> {
+    let row = sqlx::query(
+        "SELECT
+            SUM(CASE WHEN status = 'queued'    THEN 1 ELSE 0 END) AS queued,
+            SUM(CASE WHEN status = 'running'   THEN 1 ELSE 0 END) AS running,
+            SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,
+            SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN status = 'dead'      THEN 1 ELSE 0 END) AS dead
+         FROM jobs",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(JobSummary {
+        queued: row.try_get::<Option<i64>, _>("queued")?.unwrap_or(0),
+        running: row.try_get::<Option<i64>, _>("running")?.unwrap_or(0),
+        succeeded: row.try_get::<Option<i64>, _>("succeeded")?.unwrap_or(0),
+        failed: row.try_get::<Option<i64>, _>("failed")?.unwrap_or(0),
+        dead: row.try_get::<Option<i64>, _>("dead")?.unwrap_or(0),
+    })
+}
+
+/// List recent jobs for the admin queue page. `kind_filter` narrows
+/// to one kind; `status_filter` narrows to one status. `limit`
+/// defaults to 100 and is clamped to 500.
+pub async fn list_jobs(
+    pool: &SqlitePool,
+    kind_filter: Option<&str>,
+    status_filter: Option<JobStatus>,
+    limit: i64,
+) -> Result<Vec<JobRow>> {
+    let limit = limit.clamp(1, 500);
+    let mut sql = String::from("SELECT * FROM jobs WHERE 1 = 1");
+    if kind_filter.is_some() {
+        sql.push_str(" AND kind = ?");
+    }
+    if status_filter.is_some() {
+        sql.push_str(" AND status = ?");
+    }
+    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    let mut q = sqlx::query(&sql);
+    if let Some(k) = kind_filter {
+        q = q.bind(k);
+    }
+    if let Some(s) = status_filter {
+        q = q.bind(s.as_db_str());
+    }
+    q = q.bind(limit);
+    let rows = q.fetch_all(pool).await?;
+    rows.iter().map(JobRow::from_row).collect()
+}
+
+/// Periodic cleanup that bounds the `jobs` table size. Without
+/// this, succeeded rows accumulate forever — a single library
+/// backfill produces tens of thousands of succeeded rows, and a
+/// year of daily subtitle sweeps adds more on top.
+///
+/// Default retention:
+///   - `succeeded` rows older than `succeeded_ttl_ms` → DELETE
+///   - `dead` rows older than `dead_ttl_ms` → DELETE
+///
+/// Returns `(succeeded_removed, dead_removed)` for the operator's
+/// task log.
+pub async fn cleanup_old_jobs(
+    pool: &SqlitePool,
+    succeeded_ttl_ms: i64,
+    dead_ttl_ms: i64,
+) -> Result<(u64, u64)> {
+    let now = now_ms();
+    let succ = sqlx::query(
+        "DELETE FROM jobs
+         WHERE status = 'succeeded'
+           AND finished_at IS NOT NULL
+           AND finished_at < ?",
+    )
+    .bind(now - succeeded_ttl_ms)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let dead = sqlx::query(
+        "DELETE FROM jobs
+         WHERE status = 'dead'
+           AND finished_at IS NOT NULL
+           AND finished_at < ?",
+    )
+    .bind(now - dead_ttl_ms)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok((succ, dead))
+}
+
+/// Bulk delete queued jobs — admin "wipe queue" affordance for the
+/// case where the operator clicked Process all by mistake on a
+/// huge library and wants to bail out. Only `queued` rows are
+/// removed; `running` jobs are mid-work and `failed` rows are in
+/// retry-backoff so the operator is presumed to want those kept.
+/// Returns the count of rows deleted.
+///
+/// Optional `kind_filter`: when set, only wipes that kind. Useful
+/// when the operator regrets only one type of pending work (e.g.
+/// "cancel all queued loudness jobs but keep the markers ones").
+pub async fn wipe_queued_jobs(
+    pool: &SqlitePool,
+    kind_filter: Option<&str>,
+) -> Result<u64> {
+    let res = if let Some(k) = kind_filter {
+        sqlx::query("DELETE FROM jobs WHERE status = 'queued' AND kind = ?")
+            .bind(k)
+            .execute(pool)
+            .await?
+    } else {
+        sqlx::query("DELETE FROM jobs WHERE status = 'queued'")
+            .execute(pool)
+            .await?
+    };
+    Ok(res.rows_affected())
+}
+
+/// Admin "retry" — push a dead/failed row back into the queue with
+/// a fresh attempt counter. No-op on terminal succeeded rows.
+pub async fn requeue_job(pool: &SqlitePool, job_id: i64) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE jobs
+         SET status      = 'queued',
+             attempts    = 0,
+             run_after   = ?,
+             locked_at   = NULL,
+             started_at  = NULL,
+             finished_at = NULL,
+             last_error  = NULL
+         WHERE id = ?
+           AND status IN ('failed', 'dead')",
+    )
+    .bind(now_ms())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Bulk variant of `set_watched` for whole shows. Marks every
+/// episode of `show_id` as watched/unwatched in one transaction and
+/// returns the affected episode_ids so the caller can fan out the
+/// Trakt history push. Position is set to each episode's own
+/// duration_ms (so the resume rail reflects the full progress bar).
+pub async fn set_all_episodes_watched_for_show(
+    pool: &SqlitePool,
+    user_id: i64,
+    show_id: i64,
+    watched: bool,
+) -> Result<Vec<i64>> {
+    let now = now_ms();
+    let view_count_delta: i64 = if watched { 1 } else { 0 };
+
+    let episode_rows = sqlx::query(
+        "SELECT e.id, e.duration_ms
+         FROM episodes e
+         JOIN seasons s ON s.id = e.season_id
+         WHERE s.show_id = ?",
+    )
+    .bind(show_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut episode_ids = Vec::with_capacity(episode_rows.len());
+    let mut tx = pool.begin().await?;
+    for r in &episode_rows {
+        let id: i64 = r.try_get("id")?;
+        let duration_ms: Option<i64> = r.try_get("duration_ms").ok().flatten();
+        let position_ms = if watched { duration_ms.unwrap_or(0) } else { 0 };
+        sqlx::query(
+            "INSERT INTO play_state
+                (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
+                position_ms = excluded.position_ms,
+                duration_ms = COALESCE(excluded.duration_ms, play_state.duration_ms),
+                watched = excluded.watched,
+                view_count = play_state.view_count + ?,
+                last_played_at = excluded.last_played_at",
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(position_ms)
+        .bind(duration_ms)
+        .bind(watched as i64)
+        .bind(view_count_delta)
+        .bind(now)
+        .bind(view_count_delta)
+        .execute(&mut *tx)
+        .await?;
+        episode_ids.push(id);
+    }
+    tx.commit().await?;
+    Ok(episode_ids)
+}
+
 pub async fn list_reviews_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<Review>> {
     let rows = sqlx::query(
         "SELECT id, item_id, source, author, author_url, avatar_url,
@@ -6475,12 +7398,6 @@ pub async fn update_server_settings(
     }
     if let Some(v) = patch.scan_automatically {
         sqlx::query("UPDATE server_settings SET scan_automatically = ? WHERE id = 1")
-            .bind(i64::from(v))
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = patch.detect_markers_on_add {
-        sqlx::query("UPDATE server_settings SET detect_markers_on_add = ? WHERE id = 1")
             .bind(i64::from(v))
             .execute(&mut *tx)
             .await?;
@@ -9242,6 +10159,203 @@ pub async fn top_platforms(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn job_queue_full_lifecycle() {
+        let pool = test_pool().await;
+        // Enqueue two jobs at the same priority and verify FIFO claim
+        // by id (priority DESC, id ASC).
+        let a = enqueue_job(
+            &pool,
+            JobInput::new("test_kind", serde_json::json!({"n": 1})),
+        )
+        .await
+        .unwrap();
+        let b = enqueue_job(
+            &pool,
+            JobInput::new("test_kind", serde_json::json!({"n": 2})),
+        )
+        .await
+        .unwrap();
+
+        // First claim returns `a` (lower id at same priority).
+        let claimed = claim_next_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, a);
+        assert_eq!(claimed.status, JobStatus::Running);
+        assert!(claimed.locked_at.is_some());
+        assert_eq!(claimed.attempts, 1);
+
+        // Second claim returns `b`.
+        let claimed = claim_next_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, b);
+
+        // No more queued rows.
+        assert!(claim_next_job(&pool).await.unwrap().is_none());
+
+        // Mark `a` succeeded, `b` failed with a retry.
+        mark_job_succeeded(&pool, a).await.unwrap();
+        mark_job_failed(&pool, b, "boom", 1000).await.unwrap();
+
+        // `b` should be `failed` with run_after in the future.
+        let row =
+            sqlx::query("SELECT status, run_after FROM jobs WHERE id = ?")
+                .bind(b)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let status: String = row.try_get("status").unwrap();
+        assert_eq!(status, "failed");
+        let run_after: i64 = row.try_get("run_after").unwrap();
+        assert!(run_after > now_ms());
+
+        // Manually rewind run_after so the next claim returns b.
+        sqlx::query("UPDATE jobs SET run_after = 0 WHERE id = ?")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = claim_next_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, b);
+        assert_eq!(claimed.attempts, 2);
+
+        // Fail it past max_attempts (default 3) to drive it to dead.
+        mark_job_failed(&pool, b, "boom2", 1000).await.unwrap();
+        sqlx::query("UPDATE jobs SET run_after = 0 WHERE id = ?")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = claim_next_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.attempts, 3);
+        mark_job_failed(&pool, b, "boom3", 1000).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+                .bind(b)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "dead");
+    }
+
+    #[tokio::test]
+    async fn job_queue_reclaim_orphans() {
+        let pool = test_pool().await;
+        let id = enqueue_job(
+            &pool,
+            JobInput::new("test_kind", serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        let _ = claim_next_job(&pool).await.unwrap().unwrap();
+        // Backdate the lock so reclaim treats it as orphaned.
+        sqlx::query("UPDATE jobs SET locked_at = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let n = reclaim_orphan_jobs(&pool, 60_000).await.unwrap();
+        assert_eq!(n, 1);
+        let claimed = claim_next_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        // attempts counter should NOT reset across reclaim — the
+        // first run already consumed one attempt.
+        assert_eq!(claimed.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn dedup_does_not_prefix_collide() {
+        // file_id=42 already queued; enqueueing file_id=421 must NOT
+        // be treated as a duplicate. The original LIKE pattern
+        // `%"file_id":42%` matched both because 42 is a prefix of
+        // 421. The fix anchors the pattern with the JSON-value
+        // terminator (`,` or `}`).
+        let pool = test_pool().await;
+        let _id_42 = enqueue_job_unique(
+            &pool,
+            JobInput::new("test_kind", serde_json::json!({ "file_id": 42 })),
+            "file_id",
+            42,
+        )
+        .await
+        .unwrap()
+        .expect("first enqueue should insert");
+        let id_421 = enqueue_job_unique(
+            &pool,
+            JobInput::new("test_kind", serde_json::json!({ "file_id": 421 })),
+            "file_id",
+            421,
+        )
+        .await
+        .unwrap()
+        .expect("file_id 421 must not be deduped against file_id 42");
+        // And re-enqueueing 42 should still dedup correctly.
+        let id_42_again = enqueue_job_unique(
+            &pool,
+            JobInput::new("test_kind", serde_json::json!({ "file_id": 42 })),
+            "file_id",
+            42,
+        )
+        .await
+        .unwrap();
+        assert!(id_42_again.is_none(), "re-enqueue of 42 should be a no-op");
+        // Multi-field payloads (subtitle handler shape) also dedup
+        // correctly on the targeted field.
+        let _ = enqueue_job_unique(
+            &pool,
+            JobInput::new(
+                "subs_kind",
+                serde_json::json!({ "item_id": 99, "languages": ["en"] }),
+            ),
+            "item_id",
+            99,
+        )
+        .await
+        .unwrap()
+        .expect("first subs enqueue should insert");
+        let dup = enqueue_job_unique(
+            &pool,
+            JobInput::new(
+                "subs_kind",
+                serde_json::json!({ "item_id": 99, "languages": ["es"] }),
+            ),
+            "item_id",
+            99,
+        )
+        .await
+        .unwrap();
+        assert!(dup.is_none(), "second subs enqueue for same item should dedup");
+        assert!(id_421 > 0);
+    }
+
+    async fn test_pool() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                priority INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                run_after INTEGER NOT NULL DEFAULT 0,
+                locked_at INTEGER,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
 
     #[test]
     fn air_date_epoch() {

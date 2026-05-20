@@ -7,6 +7,7 @@ import {
   type WebhookDelivery,
   type WebhooksListResponse,
 } from "@/lib/chimpflix-api";
+import { Pill } from "./ui";
 
 export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse }) {
   const [webhooks, setWebhooks] = useState(initial.webhooks);
@@ -37,7 +38,7 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
         </span>
         <button
           onClick={() => setShowAdd((v) => !v)}
-          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
+          className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover"
         >
           {showAdd ? "Cancel" : "+ New webhook"}
         </button>
@@ -292,7 +293,7 @@ function WebhookRow({
             <button
               disabled={!dirty || busy}
               onClick={save}
-              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+              className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
             >
               Save
             </button>
@@ -339,17 +340,15 @@ function WebhookRow({
                           </td>
                           <td className="px-3 py-1.5">
                             {ok ? (
-                              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">
+                              <Pill tone="ok">
                                 Delivered{code != null ? ` ${code}` : ""}
-                              </span>
+                              </Pill>
                             ) : d.attempts >= 3 ? (
-                              <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
+                              <Pill tone="bad">
                                 Failed{code != null ? ` ${code}` : ""}
-                              </span>
+                              </Pill>
                             ) : (
-                              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                                Pending
-                              </span>
+                              <Pill tone="warn">Pending</Pill>
                             )}
                           </td>
                           <td className="px-3 py-1.5 tabular-nums text-white/60">
@@ -465,7 +464,7 @@ function NewWebhookForm({
       <button
         disabled={busy || mask.length === 0 || !name.trim() || !url.trim()}
         onClick={submit}
-        className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:opacity-50"
+        className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover disabled:opacity-50"
       >
         {busy ? "Creating…" : "Create"}
       </button>

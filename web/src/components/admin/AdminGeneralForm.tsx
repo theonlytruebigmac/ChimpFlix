@@ -7,15 +7,20 @@ import {
   type ServerSettingsUpdate,
   type TotpEnforcement,
 } from "@/lib/chimpflix-api";
+import { SaveBar, SettingsCard, SettingsRow } from "./ui";
 
 interface Props {
   initial: ServerSettings;
 }
 
-// Server-wide identity (server_name), public URL, and telemetry toggle.
-// Detailed transcoder / network / webhook controls live in their own pages
-// once those phases land; this form intentionally only exposes the values
-// that are useful to set in isolation today.
+const INPUT_CLASS =
+  "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30";
+const INPUT_CHANGED_CLASS =
+  "w-full rounded-md border border-amber-400/40 bg-black/30 px-3 py-2 text-sm outline-none focus:border-amber-300";
+
+// Server-wide identity (server_name), public URL, security floor, and
+// telemetry toggle. Detailed transcoder / network / webhook controls
+// live in their own pages.
 export function AdminGeneralForm({ initial }: Props) {
   // Baseline state — initialized from the `initial` prop and updated
   // on save success. Mutating `initial` directly (the previous
@@ -35,163 +40,156 @@ export function AdminGeneralForm({ initial }: Props) {
   const [totpEnforcement, setTotpEnforcement] = useState<TotpEnforcement>(
     baseline.totp_enforcement,
   );
-  const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const dirty =
-    serverName !== baseline.server_name ||
-    (publicUrl || null) !== baseline.public_url ||
-    telemetry !== baseline.telemetry_opt_in ||
-    totpEnforcement !== baseline.totp_enforcement;
+  const dirtyFields: Record<string, boolean> = {
+    "Server name": serverName !== baseline.server_name,
+    "Public URL": (publicUrl || null) !== baseline.public_url,
+    "Two-factor enforcement": totpEnforcement !== baseline.totp_enforcement,
+    "Anonymous telemetry": telemetry !== baseline.telemetry_opt_in,
+  };
+  const dirtyLabels = Object.entries(dirtyFields)
+    .filter(([, isDirty]) => isDirty)
+    .map(([label]) => label);
+  const dirtyCount = dirtyLabels.length;
 
   async function save() {
-    setSaving(true);
     setError(null);
-    try {
-      const patch: ServerSettingsUpdate = {};
-      if (serverName !== baseline.server_name) patch.server_name = serverName.trim();
-      if ((publicUrl || null) !== baseline.public_url) {
-        patch.public_url = publicUrl.trim() || null;
-      }
-      if (telemetry !== baseline.telemetry_opt_in) {
-        patch.telemetry_opt_in = telemetry;
-      }
-      if (totpEnforcement !== baseline.totp_enforcement) {
-        patch.totp_enforcement = totpEnforcement;
-      }
-      await adminApi.settings.patch(patch);
-      setSavedAt(Date.now());
-      setBaseline({
-        server_name: serverName,
-        public_url: publicUrl.trim() || null,
-        telemetry_opt_in: telemetry,
-        totp_enforcement: totpEnforcement,
-      });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
+    const patch: ServerSettingsUpdate = {};
+    if (serverName !== baseline.server_name) patch.server_name = serverName.trim();
+    if ((publicUrl || null) !== baseline.public_url) {
+      patch.public_url = publicUrl.trim() || null;
     }
+    if (telemetry !== baseline.telemetry_opt_in) {
+      patch.telemetry_opt_in = telemetry;
+    }
+    if (totpEnforcement !== baseline.totp_enforcement) {
+      patch.totp_enforcement = totpEnforcement;
+    }
+    await adminApi.settings.patch(patch);
+    setBaseline({
+      server_name: serverName,
+      public_url: publicUrl.trim() || null,
+      telemetry_opt_in: telemetry,
+      totp_enforcement: totpEnforcement,
+    });
+  }
+
+  function discard() {
+    setServerName(baseline.server_name);
+    setPublicUrl(baseline.public_url ?? "");
+    setTelemetry(baseline.telemetry_opt_in);
+    setTotpEnforcement(baseline.totp_enforcement);
   }
 
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (dirty && !saving) save();
-      }}
-      className="space-y-6"
-    >
-      <Section title="Identity">
-        <Field label="Server name" hint="Shown in the top nav and on share metadata.">
+    <div>
+      {error && (
+        <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+          {error}
+        </div>
+      )}
+
+      <SettingsCard
+        title="Identity"
+        description="How the server identifies itself to clients, webhooks, and share links."
+      >
+        <SettingsRow
+          label="Server name"
+          help="Shown in the top nav and on share metadata."
+          changed={dirtyFields["Server name"]}
+        >
           <input
             type="text"
             value={serverName}
             onChange={(e) => setServerName(e.target.value)}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["Server name"] ? INPUT_CHANGED_CLASS : INPUT_CLASS
+            }
             maxLength={100}
             required
           />
-        </Field>
-        <Field
+        </SettingsRow>
+        <SettingsRow
           label="Public URL"
-          hint="Used to generate absolute URLs for webhooks and share links. Leave blank when serving only on a LAN."
+          help="Used to generate absolute URLs for webhooks and share links. Leave blank when serving only on a LAN."
+          changed={dirtyFields["Public URL"]}
         >
           <input
             type="url"
             value={publicUrl}
             onChange={(e) => setPublicUrl(e.target.value)}
             placeholder="https://chimpflix.example.com"
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["Public URL"] ? INPUT_CHANGED_CLASS : INPUT_CLASS
+            }
           />
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section title="Security">
-        <Field
+      <SettingsCard
+        title="Security"
+        description="Account-level enforcement that applies to every user."
+      >
+        <SettingsRow
           label="Two-factor enforcement"
-          hint="`required` forces every account to enroll TOTP before login completes. `optional` lets users enroll themselves. `disabled` blocks new enrollments — existing 2FA stays active until the user disables it."
+          help={
+            <>
+              <code className="font-mono">required</code> forces every account
+              to enroll TOTP before login completes.{" "}
+              <code className="font-mono">optional</code> lets users enroll
+              themselves. <code className="font-mono">disabled</code> blocks
+              new enrollments — existing 2FA stays active until the user
+              disables it.
+            </>
+          }
+          changed={dirtyFields["Two-factor enforcement"]}
         >
           <select
             value={totpEnforcement}
             onChange={(e) =>
               setTotpEnforcement(e.target.value as TotpEnforcement)
             }
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["Two-factor enforcement"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
             <option value="optional">Optional (default)</option>
             <option value="required">Required for all users</option>
             <option value="disabled">Disabled — block new enrollments</option>
           </select>
-        </Field>
-      </Section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <Section title="Privacy">
-        <label className="flex items-start gap-3">
-          <input
-            type="checkbox"
-            checked={telemetry}
-            onChange={(e) => setTelemetry(e.target.checked)}
-            className="mt-1"
-          />
-          <div className="text-sm">
-            <div className="font-medium">Send anonymous usage telemetry</div>
-            <div className="mt-0.5 text-white/50">
-              Off by default. ChimpFlix does not collect any telemetry today
-              — toggling this on records the preference so future versions
-              can honor it.
-            </div>
-          </div>
-        </label>
-      </Section>
-
-      <div className="flex items-center gap-3">
-        <button
-          type="submit"
-          disabled={!dirty || saving}
-          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+      <SettingsCard
+        title="Privacy"
+        description="Controls what (if anything) leaves the server about how it's used."
+      >
+        <SettingsRow
+          label="Anonymous telemetry"
+          help="Off by default. ChimpFlix does not collect any telemetry today — toggling this on records the preference so future versions can honor it."
+          changed={dirtyFields["Anonymous telemetry"]}
         >
-          {saving ? "Saving…" : "Save changes"}
-        </button>
-        {savedAt && !dirty && !saving && (
-          <span className="text-xs text-white/50">Saved.</span>
-        )}
-        {error && <span className="text-xs text-red-400">{error}</span>}
-      </div>
-    </form>
-  );
-}
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={telemetry}
+              onChange={(e) => setTelemetry(e.target.checked)}
+            />
+            <span>Send anonymous usage telemetry</span>
+          </label>
+        </SettingsRow>
+      </SettingsCard>
 
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-      <h2 className="mb-4 text-base font-semibold">{title}</h2>
-      <div className="space-y-4">{children}</div>
-    </section>
-  );
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-sm font-medium">{label}</label>
-      {children}
-      {hint && <p className="mt-1 text-xs text-white/50">{hint}</p>}
+      <SaveBar
+        dirtyCount={dirtyCount}
+        summary={dirtyLabels.slice(0, 3).join(", ") +
+          (dirtyLabels.length > 3 ? `, +${dirtyLabels.length - 3} more` : "")}
+        onSave={save}
+        onDiscard={discard}
+      />
     </div>
   );
 }

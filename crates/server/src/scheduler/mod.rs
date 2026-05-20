@@ -21,11 +21,9 @@ use anyhow::{Context, Result, bail};
 use chimpflix_common::now_ms;
 use chimpflix_library::queries;
 use chimpflix_library::scanner;
-use chimpflix_library::{NewExternalSubtitle, NewScheduledTask, ScheduledTask};
-use chimpflix_metadata::{OpenSubtitlesClient, SearchParams};
+use chimpflix_library::{NewScheduledTask, ScheduledTask};
 use chrono::{Local, NaiveTime, TimeZone, Utc};
 use cron::Schedule;
-use sqlx::Row;
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
@@ -315,6 +313,23 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{\"retention_days\":90}",
             cron_placeholder: "0 30 4 * * *",
         },
+        Seed {
+            kind: "cleanup_jobs",
+            name: "Trim job queue history",
+            // Daily is plenty for queue cleanup — `succeeded` rows
+            // accumulate steadily during a backfill and then the
+            // table stays mostly flat. Window-gated because it can
+            // delete tens of thousands of rows in one shot when
+            // a fresh backfill ages out.
+            frequency: "daily",
+            requires_window: true,
+            // Defaults: keep succeeded for 7 days (long enough to
+            // diagnose a recent regression), dead for 30 days (long
+            // enough for an operator to notice and decide whether
+            // to requeue).
+            params_json: "{\"succeeded_retention_days\":7,\"dead_retention_days\":30}",
+            cron_placeholder: "0 30 4 * * *",
+        },
     ];
     // Window snap requires the actual operator-configured window which
     // lives on the (yet-to-be-populated) settings cache. At seed time
@@ -504,6 +519,38 @@ async fn dispatch(
             append_log(log, format!("pruned {removed} expired sessions"));
             Ok(())
         }
+        "cleanup_jobs" => {
+            // Trim succeeded + dead rows from the `jobs` table.
+            // params.succeeded_retention_days / dead_retention_days
+            // override the defaults (7 / 30).
+            let params: serde_json::Value =
+                serde_json::from_str(&task.params_json).unwrap_or_default();
+            let succ_days = params
+                .get("succeeded_retention_days")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(7)
+                .clamp(1, 3650);
+            let dead_days = params
+                .get("dead_retention_days")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(30)
+                .clamp(1, 3650);
+            let day_ms: i64 = 24 * 60 * 60 * 1000;
+            let (succ_removed, dead_removed) = queries::cleanup_old_jobs(
+                &state.pool,
+                succ_days * day_ms,
+                dead_days * day_ms,
+            )
+            .await?;
+            append_log(
+                log,
+                format!(
+                    "trimmed {succ_removed} succeeded rows (>{succ_days}d), \
+                     {dead_removed} dead rows (>{dead_days}d)"
+                ),
+            );
+            Ok(())
+        }
         "cleanup_audit_log" => {
             // Retention is configurable via params_json.retention_days
             // (default 90). The audit log is append-only and grows
@@ -617,9 +664,14 @@ async fn dispatch(
                     }
                 }
                 let _guard = ScanLockGuard { state: release_state, library_id };
-                let emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
-                    hub.publish(crate::events::Event::Scan(evt));
-                });
+                let inner_emitter: chimpflix_library::ScanEmitter =
+                    Arc::new(move |evt| {
+                        hub.publish(crate::events::Event::Scan(evt));
+                    });
+                let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(
+                    pool.clone(),
+                    inner_emitter,
+                );
                 if let Err(e) = scanner::run_scan(
                     pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job_id,
                     Some(cache_root),
@@ -681,49 +733,25 @@ async fn dispatch(
             Ok(())
         }
         "detect_markers" => {
-            // Walk every media file in the library that doesn't yet
-            // have auto-detected markers, run chapter+blackdetect on
-            // each, and persist results. Idempotent across runs: the
-            // query filters out files that already have an `auto`
-            // marker, so re-running only processes newcomers (typical
-            // case after a new episode lands).
+            // Safety-net sweep: finds files whose discovery-pipeline
+            // job never ran (server was down during scan, or row
+            // pre-dates the pipeline migration) and enqueues
+            // `detect_markers_file` jobs for them. The job queue
+            // worker pool does the actual ffmpeg work — this task
+            // no longer runs detection inline.
             //
-            // Per-file failures (corrupt file, ffprobe couldn't seek)
-            // log + count toward `err` but don't fail the task —
-            // they'd otherwise poison the whole batch and block all
-            // remaining files. Operators re-trigger from the item
-            // modal if they want to force a retry on a specific file.
-            //
-            // Batch caps the per-tick work so the scheduler doesn't
-            // freeze for an hour on a fresh library; subsequent ticks
-            // pick up the remainder.
-            // params.library_id is optional: scoped to one library
-            // when present, all libraries when omitted. The Plex-style
-            // simple-view toggle creates this task with `{}` params
-            // (meaning "all"); operators who want a per-library
-            // schedule create a separate task row via Advanced.
+            // Per-library cap protects the queue from a fresh
+            // 10k-file library piling up everything in one tick.
+            // Subsequent ticks drain whatever the queue worker
+            // hasn't picked up yet.
             let params: serde_json::Value =
                 serde_json::from_str(&task.params_json).unwrap_or_default();
             let scoped_library_id = params.get("library_id").and_then(|v| v.as_i64());
-            let param_batch = params
+            let per_library_cap = params
                 .get("batch_size")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(32);
-            // Cap per-tick batch by the operator's background-concurrency
-            // setting (same pattern as optimize_versions / analyze_loudness).
-            // detect_markers runs ffmpeg serially per file, but a tick that
-            // chews through 32 × N files still occupies the encoder for
-            // 15-30 minutes; with the cap an operator who set
-            // `transcoder_max_background_concurrent = 1` actually gets the
-            // "background work yields to live playback" guarantee they
-            // configured. Bigger batches still possible via the setting.
-            let settings_cap = state
-                .settings
-                .read()
-                .await
-                .transcoder_max_background_concurrent
+                .unwrap_or(500)
                 .max(1);
-            let batch = param_batch.min(settings_cap);
 
             let library_ids: Vec<i64> = match scoped_library_id {
                 Some(lid) => vec![lid],
@@ -734,76 +762,29 @@ async fn dispatch(
                     .collect(),
             };
 
-            // Walk every library (or the one requested), draining up
-            // to `batch` files per library per tick. Hard per-tick
-            // ceiling = batch * library_count; subsequent ticks pick
-            // up remaining files. Per-file failures log + count toward
-            // `err` but don't fail the task — they'd otherwise poison
-            // the whole batch and block remaining files. Operators
-            // re-trigger from the item modal if they want to force a
-            // retry on a specific file.
-            let mut ok = 0usize;
-            let mut empty = 0usize;
-            let mut err = 0usize;
-            let mut total_pending = 0usize;
+            let mut total_enqueued = 0usize;
             for lib_id in &library_ids {
                 let pending = queries::list_media_files_needing_markers(
                     &state.pool,
                     *lib_id,
-                    batch,
+                    per_library_cap,
                 )
                 .await?;
-                total_pending += pending.len();
-                for (file_id, path, duration_ms) in &pending {
-                    match chimpflix_transcoder::detect_markers(
-                        &state.ffmpeg,
-                        std::path::Path::new(path),
-                        *duration_ms,
-                    )
-                    .await
-                    {
-                        Ok(detected) => {
-                            if detected.is_empty() {
-                                empty += 1;
-                            }
-                            let tuples: Vec<(String, i64, i64)> = detected
-                                .into_iter()
-                                .map(|m| (m.kind.as_str().to_string(), m.start_ms, m.end_ms))
-                                .collect();
-                            if let Err(e) =
-                                queries::replace_auto_markers(&state.pool, *file_id, &tuples)
-                                    .await
-                            {
-                                err += 1;
-                                warn!(
-                                    file_id,
-                                    error = %format!("{e:#}"),
-                                    "detect_markers: persist failed"
-                                );
-                            } else {
-                                ok += 1;
-                            }
-                        }
-                        Err(e) => {
-                            err += 1;
-                            warn!(
-                                file_id,
-                                path = %path,
-                                error = %format!("{e:#}"),
-                                "detect_markers: ffmpeg/probe failed"
-                            );
-                        }
-                    }
-                }
+                let file_ids: Vec<i64> = pending.iter().map(|(id, _, _)| *id).collect();
+                let n = crate::jobs::handlers::detect_markers_file::enqueue_for_files(
+                    &state.pool,
+                    &file_ids,
+                )
+                .await?;
+                total_enqueued += n;
             }
-            if total_pending == 0 {
-                append_log(log, "all files already have auto markers");
+            if total_enqueued == 0 {
+                append_log(log, "no files needing markers — queue is the active path");
             } else {
                 append_log(
                     log,
                     format!(
-                        "processed {total_pending} files across {} libraries: \
-                         {ok} markered, {empty} no-markers, {err} failed",
+                        "enqueued {total_enqueued} detect_markers_file jobs across {} libraries",
                         library_ids.len()
                     ),
                 );
@@ -1188,9 +1169,11 @@ pub struct TaskKindInfo {
 /// search OpenSubtitles by tmdb/imdb id (+ season/episode for shows),
 /// and download the top hit. Best-effort; per-item failures do not fail
 /// the whole task.
-/// Iterate up to `batch_size` media files without a preview sprite and
-/// generate one for each. Best-effort: per-file failures log and move on
-/// so a single corrupt file doesn't poison the batch.
+/// Safety-net sweep that enqueues `generate_preview_sprite` jobs
+/// for files lacking a sprite. The actual ffmpeg work happens in
+/// the queue worker, not inline here. This catches files that
+/// either pre-date the discovery-pipeline migration or whose
+/// on-discovery job failed past max_attempts.
 async fn generate_previews_task(
     state: &AppState,
     task: &ScheduledTask,
@@ -1199,84 +1182,38 @@ async fn generate_previews_task(
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let param_batch = params
+    let per_library_cap = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
-        .unwrap_or(4)
+        .unwrap_or(500)
         .max(1);
-    // Honor the background-concurrency setting; same rationale as
-    // detect_markers / analyze_loudness — sprite generation runs an
-    // ffmpeg per file and an unrestrained batch will compete with
-    // live transcodes for CPU/GPU.
-    let settings_cap = state
-        .settings
-        .read()
-        .await
-        .transcoder_max_background_concurrent
-        .max(1);
-    let batch = param_batch.min(settings_cap);
-    let interval_s = params
-        .get("interval_s")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as u32)
-        .unwrap_or(chimpflix_transcoder::DEFAULT_INTERVAL_S);
 
-    let candidates =
-        queries::list_media_files_needing_previews(&state.pool, library_id, batch).await?;
+    let candidates = queries::list_media_files_needing_previews(
+        &state.pool,
+        library_id,
+        per_library_cap,
+    )
+    .await?;
     if candidates.is_empty() {
-        append_log(log, "no media files need previews");
+        append_log(log, "no files need previews — queue is the active path");
         return Ok(());
     }
-
-    let dir = state.data_dir.join("previews");
-    tokio::fs::create_dir_all(&dir).await?;
-
-    let mut ok = 0usize;
-    let mut err = 0usize;
-    for cand in &candidates {
-        let duration = cand.duration_ms.unwrap_or(0);
-        let output = dir.join(format!("{}.jpg", cand.id));
-        let result = chimpflix_transcoder::generate_sprite(
-            &state.ffmpeg,
-            std::path::Path::new(&cand.path),
-            &output,
-            duration,
-            interval_s,
-            chimpflix_transcoder::DEFAULT_TILE_WIDTH,
-        )
-        .await;
-        match result {
-            Ok(info) => {
-                if let Err(e) = queries::record_preview_sprite(
-                    &state.pool,
-                    queries::PreviewSpriteRecord {
-                        media_file_id: cand.id,
-                        path: info.path.to_string_lossy().into_owned(),
-                        interval_ms: info.interval_ms,
-                        tile_width: i64::from(info.tile_width),
-                        tile_height: i64::from(info.tile_height),
-                        tile_cols: i64::from(info.tile_cols),
-                        tile_count: i64::from(info.tile_count),
-                    },
-                )
-                .await
-                {
-                    err += 1;
-                    warn!(file_id = cand.id, error = %format!("{e:#}"), "record preview failed");
-                } else {
-                    ok += 1;
-                }
-            }
-            Err(e) => {
-                err += 1;
-                warn!(file_id = cand.id, error = %format!("{e:#}"), "preview generation failed");
-            }
-        }
-    }
-    append_log(log, format!("generated {ok} sprites, {err} failed"));
+    let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+    let enqueued = crate::jobs::handlers::generate_preview_sprite::enqueue_for_files(
+        &state.pool,
+        &file_ids,
+    )
+    .await?;
+    append_log(
+        log,
+        format!("enqueued {enqueued} generate_preview_sprite jobs"),
+    );
     Ok(())
 }
 
+/// Safety-net sweep that enqueues `build_chapter_thumbs` jobs for
+/// files that haven't been chapter-probed yet. Same shape as
+/// generate_previews_task — the queue worker does the work.
 async fn generate_chapter_thumbs_task(
     state: &AppState,
     task: &ScheduledTask,
@@ -1285,109 +1222,38 @@ async fn generate_chapter_thumbs_task(
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let param_batch = params
+    let per_library_cap = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
-        .unwrap_or(8)
+        .unwrap_or(500)
         .max(1);
-    // Honor the background-concurrency setting; same rationale as
-    // detect_markers / generate_previews / analyze_loudness.
-    let settings_cap = state
-        .settings
-        .read()
-        .await
-        .transcoder_max_background_concurrent
-        .max(1);
-    let batch = param_batch.min(settings_cap);
 
     let candidates = queries::list_media_files_needing_chapter_thumbs(
         &state.pool,
         library_id,
-        batch,
+        per_library_cap,
     )
     .await?;
     if candidates.is_empty() {
-        append_log(log, "no media files need chapter thumbs");
+        append_log(log, "no files need chapter thumbs — queue is the active path");
         return Ok(());
     }
-
-    let root = state.data_dir.join("chapter_thumbs");
-    let mut total_chapters = 0usize;
-    let mut files_with_chapters = 0usize;
-    let mut files_without_chapters = 0usize;
-    let mut err = 0usize;
-
-    for cand in &candidates {
-        let path = std::path::Path::new(&cand.path);
-        // Probe chapters for this file. ffprobe failures are treated
-        // as "no chapters" rather than a hard error — many containers
-        // don't expose chapter metadata, and the task should keep
-        // making progress through the batch.
-        let chapters = match chimpflix_transcoder::probe_chapters(&state.ffmpeg, path).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(file_id = cand.id, error = %format!("{e:#}"), "chapter probe failed");
-                Vec::new()
-            }
-        };
-        if chapters.is_empty() {
-            // Still stamp the file as processed so we don't keep
-            // re-probing it. chapter_count = 0 is the "checked, none"
-            // marker; a future re-scan can clear it explicitly.
-            if let Err(e) = queries::record_chapter_thumbs_generated(&state.pool, cand.id, 0).await {
-                warn!(file_id = cand.id, error = %format!("{e:#}"), "stamp no-chapters failed");
-                err += 1;
-            } else {
-                files_without_chapters += 1;
-            }
-            continue;
-        }
-        let mut produced = 0usize;
-        for (idx, ch) in chapters.iter().enumerate() {
-            let output = chimpflix_transcoder::chapter_thumbs::thumb_path(
-                &root,
-                cand.id,
-                idx as u32,
-            );
-            match chimpflix_transcoder::chapter_thumbs::extract_chapter_thumb(
-                &state.ffmpeg,
-                path,
-                &output,
-                ch,
-                chimpflix_transcoder::chapter_thumbs::DEFAULT_WIDTH,
-            )
-            .await
-            {
-                Ok(()) => produced += 1,
-                Err(e) => {
-                    warn!(file_id = cand.id, chapter = idx, error = %format!("{e:#}"), "chapter thumb extraction failed");
-                }
-            }
-        }
-        if let Err(e) = queries::record_chapter_thumbs_generated(
-            &state.pool,
-            cand.id,
-            chapters.len() as i64,
-        )
-        .await
-        {
-            warn!(file_id = cand.id, error = %format!("{e:#}"), "stamp chapter-thumbs failed");
-            err += 1;
-        }
-        total_chapters += produced;
-        files_with_chapters += 1;
-    }
+    let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+    let enqueued = crate::jobs::handlers::build_chapter_thumbs::enqueue_for_files(
+        &state.pool,
+        &file_ids,
+    )
+    .await?;
     append_log(
         log,
-        format!(
-            "processed {} files: {files_with_chapters} with chapters ({total_chapters} thumbs), \
-             {files_without_chapters} without, {err} errored",
-            candidates.len()
-        ),
+        format!("enqueued {enqueued} build_chapter_thumbs jobs"),
     );
     Ok(())
 }
 
+/// Safety-net sweep that enqueues `analyze_loudness` jobs for
+/// files whose audio hasn't been measured yet. The queue worker
+/// does the ffmpeg loudnorm pass.
 async fn analyze_loudness_task(
     state: &AppState,
     task: &ScheduledTask,
@@ -1396,91 +1262,29 @@ async fn analyze_loudness_task(
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let param_batch = params
+    let per_library_cap = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
-        .unwrap_or(4)
+        .unwrap_or(500)
         .max(1);
-    // Honor the operator's `transcoder_max_background_concurrent`
-    // ceiling — same pattern `optimize_versions` uses. Loudness
-    // analysis spawns an ffmpeg per file; without the cap, a default
-    // batch_size of 4 plus two live streams can put 6 ffmpeg
-    // processes on a 4-core box and make playback stutter. Take the
-    // tighter of the two settings: the explicit param wins when set
-    // smaller, but the operator's global cap is the upper bound.
-    let settings_cap = state
-        .settings
-        .read()
-        .await
-        .transcoder_max_background_concurrent
-        .max(1);
-    let batch = param_batch.min(settings_cap);
 
     let candidates = queries::list_media_files_needing_loudness(
         &state.pool,
         library_id,
-        batch,
+        per_library_cap,
     )
     .await?;
     if candidates.is_empty() {
-        append_log(log, "no media files need loudness analysis");
+        append_log(log, "no files need loudness — queue is the active path");
         return Ok(());
     }
-
-    let mut measured = 0usize;
-    let mut silent = 0usize;
-    let mut err = 0usize;
-    for cand in &candidates {
-        let path = std::path::Path::new(&cand.path);
-        let result = chimpflix_transcoder::loudness::measure(&state.ffmpeg, path).await;
-        match result {
-            Ok(Some(m)) => {
-                if let Err(e) = queries::record_loudness_measurement(
-                    &state.pool,
-                    cand.id,
-                    Some(queries::LoudnessMeasurement {
-                        integrated: m.integrated,
-                        true_peak: m.true_peak,
-                        lra: m.lra,
-                        threshold: m.threshold,
-                    }),
-                )
-                .await
-                {
-                    err += 1;
-                    warn!(file_id = cand.id, error = %format!("{e:#}"), "record loudness failed");
-                } else {
-                    measured += 1;
-                }
-            }
-            Ok(None) => {
-                // No audio / silent — still stamp so we don't re-probe.
-                if let Err(e) = queries::record_loudness_measurement(
-                    &state.pool,
-                    cand.id,
-                    None,
-                )
-                .await
-                {
-                    err += 1;
-                    warn!(file_id = cand.id, error = %format!("{e:#}"), "record null loudness failed");
-                } else {
-                    silent += 1;
-                }
-            }
-            Err(e) => {
-                err += 1;
-                warn!(file_id = cand.id, error = %format!("{e:#}"), "loudness analysis failed");
-            }
-        }
-    }
-    append_log(
-        log,
-        format!(
-            "analyzed {}: {measured} measured, {silent} silent / no-audio, {err} errored",
-            candidates.len()
-        ),
-    );
+    let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+    let enqueued = crate::jobs::handlers::analyze_loudness::enqueue_for_files(
+        &state.pool,
+        &file_ids,
+    )
+    .await?;
+    append_log(log, format!("enqueued {enqueued} analyze_loudness jobs"));
     Ok(())
 }
 
@@ -1889,12 +1693,20 @@ async fn trakt_pull_task(
     Ok(())
 }
 
+/// Safety-net sweep: finds every item that lacks a subtitle row
+/// for any configured language and enqueues one
+/// `fetch_subtitles_item` job per item. The job queue worker does
+/// the OpenSubtitles call.
+///
+/// Per-item dedup means re-running while jobs are in flight is a
+/// no-op. The actual hit/miss/error counting happens inside the
+/// handler; this task just reports how many jobs it queued.
 async fn fetch_subtitles_task(
     state: &AppState,
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let Some(client) = state.opensubtitles_snapshot().await else {
+    if state.opensubtitles_snapshot().await.is_none() {
         append_log(log, "OpenSubtitles disabled — set credentials in /admin/server/credentials");
         return Ok(());
     };
@@ -1911,154 +1723,49 @@ async fn fetch_subtitles_task(
         })
         .unwrap_or_else(|| vec!["en".to_string()]);
 
-    let dir = state.data_dir.join("subtitles");
-    tokio::fs::create_dir_all(&dir).await?;
-
-    let item_rows = if let Some(lid) = library_id {
-        sqlx::query("SELECT id, kind, tmdb_id, imdb_id FROM items WHERE library_id = ?")
-            .bind(lid)
-            .fetch_all(&state.pool)
-            .await?
+    // Item ids with at least one external metadata id — those are the
+    // only ones the provider can look up. The handler does its own
+    // existing-subtitle check per (target, language) so we don't need
+    // to filter on that here.
+    let item_ids: Vec<i64> = if let Some(lid) = library_id {
+        sqlx::query_scalar(
+            "SELECT id FROM items
+             WHERE library_id = ?
+               AND (tmdb_id IS NOT NULL OR imdb_id IS NOT NULL)",
+        )
+        .bind(lid)
+        .fetch_all(&state.pool)
+        .await?
     } else {
-        sqlx::query("SELECT id, kind, tmdb_id, imdb_id FROM items")
-            .fetch_all(&state.pool)
-            .await?
+        sqlx::query_scalar(
+            "SELECT id FROM items
+             WHERE tmdb_id IS NOT NULL OR imdb_id IS NOT NULL",
+        )
+        .fetch_all(&state.pool)
+        .await?
     };
 
-    let mut hits = 0usize;
-    let mut misses = 0usize;
-    let mut errors = 0usize;
-
-    for row in &item_rows {
-        let item_id: i64 = row.try_get("id").unwrap_or(0);
-        let kind: String = row.try_get("kind").unwrap_or_default();
-        let tmdb_id: Option<i64> = row.try_get("tmdb_id").ok().flatten();
-        let imdb_id: Option<String> = row.try_get("imdb_id").ok().flatten();
-        if tmdb_id.is_none() && imdb_id.is_none() {
-            continue;
-        }
-
-        if kind == "movie" {
-            for lang in &languages {
-                match fetch_one_for_item(state, &client, item_id, tmdb_id, imdb_id.as_deref(), lang, &dir).await {
-                    Ok(true) => hits += 1,
-                    Ok(false) => misses += 1,
-                    Err(e) => {
-                        errors += 1;
-                        warn!(item_id, lang, error = %format!("{e:#}"), "fetch_subtitles failed for movie");
-                    }
-                }
-            }
-        } else {
-            // shows: walk episodes
-            let eps = sqlx::query(
-                "SELECT e.id AS id, s.season_number AS season, e.episode_number AS episode
-                 FROM episodes e
-                 JOIN seasons s ON s.id = e.season_id
-                 WHERE s.show_id = ?",
-            )
-            .bind(item_id)
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default();
-            for ep in &eps {
-                let episode_id: i64 = ep.try_get("id").unwrap_or(0);
-                let season: i32 = ep.try_get("season").unwrap_or(0);
-                let episode: i32 = ep.try_get("episode").unwrap_or(0);
-                for lang in &languages {
-                    match fetch_one_for_episode(
-                        state,
-                        &client,
-                        episode_id,
-                        tmdb_id,
-                        imdb_id.as_deref(),
-                        season,
-                        episode,
-                        lang,
-                        &dir,
-                    )
-                    .await
-                    {
-                        Ok(true) => hits += 1,
-                        Ok(false) => misses += 1,
-                        Err(e) => {
-                            errors += 1;
-                            warn!(
-                                episode_id,
-                                lang,
-                                error = %format!("{e:#}"),
-                                "fetch_subtitles failed for episode"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    let enqueued = crate::jobs::handlers::fetch_subtitles_item::enqueue_for_items(
+        &state.pool,
+        &item_ids,
+        &languages,
+    )
+    .await?;
     append_log(
         log,
         format!(
-            "fetched {hits} subtitles, {misses} not found, {errors} errored across {} items",
-            item_rows.len()
+            "enqueued {enqueued} fetch_subtitles_item jobs across {} items",
+            item_ids.len()
         ),
     );
     Ok(())
 }
 
-async fn fetch_one_for_item(
-    state: &AppState,
-    client: &OpenSubtitlesClient,
-    item_id: i64,
-    tmdb_id: Option<i64>,
-    imdb_id: Option<&str>,
-    language: &str,
-    base_dir: &std::path::Path,
-) -> Result<bool> {
-    // Skip if we already have any external subtitle for this item+language.
-    let existing = sqlx::query(
-        "SELECT 1 FROM external_subtitles WHERE item_id = ? AND language = ? LIMIT 1",
-    )
-    .bind(item_id)
-    .bind(language)
-    .fetch_optional(&state.pool)
-    .await?;
-    if existing.is_some() {
-        return Ok(false);
-    }
-
-    let langs = [language.to_string()];
-    let hits = client
-        .search_for_movie(SearchParams {
-            tmdb_id,
-            imdb_id,
-            languages: &langs,
-        })
-        .await?;
-    let Some(hit) = hits.into_iter().next() else {
-        return Ok(false);
-    };
-    let bytes = client.download(hit.file_id).await?;
-    let item_dir = base_dir.join(format!("item-{item_id}"));
-    tokio::fs::create_dir_all(&item_dir).await?;
-    let path = item_dir.join(format!("{language}-{}.srt", hit.file_id));
-    tokio::fs::write(&path, &bytes).await?;
-    queries::insert_external_subtitle(
-        &state.pool,
-        NewExternalSubtitle {
-            item_id: Some(item_id),
-            episode_id: None,
-            language: hit.language,
-            source: "opensubtitles".into(),
-            source_file_id: Some(hit.file_id.to_string()),
-            file_path: path.to_string_lossy().into_owned(),
-            forced: hit.forced,
-            sdh: hit.hearing_impaired,
-        },
-    )
-    .await?;
-    Ok(true)
-}
+// Inline `fetch_one_for_item` / `fetch_one_for_episode` helpers
+// moved to `crate::subtitles_lookup` as part of the subtitle job
+// migration. The handler in `crate::jobs::handlers::fetch_subtitles_item`
+// is the active caller; the safety-net scheduled task above just
+// enqueues per-item jobs.
 
 #[cfg(test)]
 mod tests {
@@ -2180,62 +1887,3 @@ mod tests {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch_one_for_episode(
-    state: &AppState,
-    client: &OpenSubtitlesClient,
-    episode_id: i64,
-    tmdb_id: Option<i64>,
-    imdb_id: Option<&str>,
-    season: i32,
-    episode: i32,
-    language: &str,
-    base_dir: &std::path::Path,
-) -> Result<bool> {
-    let existing = sqlx::query(
-        "SELECT 1 FROM external_subtitles WHERE episode_id = ? AND language = ? LIMIT 1",
-    )
-    .bind(episode_id)
-    .bind(language)
-    .fetch_optional(&state.pool)
-    .await?;
-    if existing.is_some() {
-        return Ok(false);
-    }
-
-    let langs = [language.to_string()];
-    let hits = client
-        .search_for_episode(
-            SearchParams {
-                tmdb_id,
-                imdb_id,
-                languages: &langs,
-            },
-            season,
-            episode,
-        )
-        .await?;
-    let Some(hit) = hits.into_iter().next() else {
-        return Ok(false);
-    };
-    let bytes = client.download(hit.file_id).await?;
-    let ep_dir = base_dir.join(format!("episode-{episode_id}"));
-    tokio::fs::create_dir_all(&ep_dir).await?;
-    let path = ep_dir.join(format!("{language}-{}.srt", hit.file_id));
-    tokio::fs::write(&path, &bytes).await?;
-    queries::insert_external_subtitle(
-        &state.pool,
-        NewExternalSubtitle {
-            item_id: None,
-            episode_id: Some(episode_id),
-            language: hit.language,
-            source: "opensubtitles".into(),
-            source_file_id: Some(hit.file_id.to_string()),
-            file_path: path.to_string_lossy().into_owned(),
-            forced: hit.forced,
-            sdh: hit.hearing_impaired,
-        },
-    )
-    .await?;
-    Ok(true)
-}

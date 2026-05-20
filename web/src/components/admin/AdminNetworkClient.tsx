@@ -7,6 +7,12 @@ import {
   type ReachabilityResult,
   type SecureConnectionsMode,
 } from "@/lib/chimpflix-api";
+import { Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
+
+const INPUT_CLASS =
+  "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30";
+const INPUT_CHANGED_CLASS =
+  "w-full rounded-md border border-amber-400/40 bg-black/30 px-3 py-2 text-sm outline-none focus:border-amber-300";
 
 export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
   // See AdminGeneralForm for rationale. Track the dirty-check
@@ -35,9 +41,7 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
   const [lanNetworks, setLanNetworks] = useState(baseline.lan_networks);
   const [bypassCidrs, setBypassCidrs] = useState(baseline.auth_bypass_cidrs);
   const [bindInterface, setBindInterface] = useState(baseline.bind_interface);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
   const [check, setCheck] = useState<ReachabilityResult | null>(null);
   const [checking, setChecking] = useState(false);
 
@@ -46,56 +50,64 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 
-  const dirty =
-    (publicUrl || null) !== baseline.public_url ||
-    JSON.stringify(originsParsed) !== JSON.stringify(baseline.cors_origins) ||
-    secure !== baseline.secure_connections ||
-    reaperMs !== baseline.transcoder_reaper_idle_threshold_ms ||
-    remoteCap !== baseline.max_remote_streams_per_user ||
-    lanNetworks !== baseline.lan_networks ||
-    bypassCidrs !== baseline.auth_bypass_cidrs ||
-    bindInterface !== baseline.bind_interface;
+  const dirtyFields: Record<string, boolean> = {
+    "Public URL": (publicUrl || null) !== baseline.public_url,
+    "CORS allowlist":
+      JSON.stringify(originsParsed) !== JSON.stringify(baseline.cors_origins),
+    "Secure connections": secure !== baseline.secure_connections,
+    "Reap idle sessions":
+      reaperMs !== baseline.transcoder_reaper_idle_threshold_ms,
+    "Max remote streams": remoteCap !== baseline.max_remote_streams_per_user,
+    "LAN networks": lanNetworks !== baseline.lan_networks,
+    "Allow without auth": bypassCidrs !== baseline.auth_bypass_cidrs,
+    "Bind interface": bindInterface !== baseline.bind_interface,
+  };
+  const dirtyLabels = Object.entries(dirtyFields)
+    .filter(([, isDirty]) => isDirty)
+    .map(([label]) => label);
+  const dirtyCount = dirtyLabels.length;
 
-  // The reaper threshold is consumed at spawn time and not hot-reloaded
-  // (spawn_reaper takes an i64, not a settings handle). Surface this to
-  // the operator so they know why their change doesn't kick in.
-  const reaperChanged =
-    reaperMs !== baseline.transcoder_reaper_idle_threshold_ms;
-  const bindChanged = bindInterface !== baseline.bind_interface;
+  // The reaper threshold and bind_interface are consumed at process
+  // start and not hot-reloaded. Flag visibly so the operator knows why
+  // their change doesn't kick in until restart.
+  const reaperChanged = dirtyFields["Reap idle sessions"];
+  const bindChanged = dirtyFields["Bind interface"];
 
   async function save() {
-    setBusy(true);
     setError(null);
-    setSaved(false);
-    try {
-      const patch = {
-        public_url: publicUrl.trim() || null,
-        cors_origins: originsParsed,
-        secure_connections: secure,
-        transcoder_reaper_idle_threshold_ms: reaperMs,
-        max_remote_streams_per_user: remoteCap,
-        lan_networks: lanNetworks.trim(),
-        auth_bypass_cidrs: bypassCidrs.trim(),
-        bind_interface: bindInterface.trim(),
-      };
-      await adminApi.network.patch(patch);
-      setBaseline({
-        public_url: patch.public_url,
-        cors_origins: patch.cors_origins,
-        secure_connections: patch.secure_connections,
-        transcoder_reaper_idle_threshold_ms:
-          patch.transcoder_reaper_idle_threshold_ms,
-        max_remote_streams_per_user: patch.max_remote_streams_per_user,
-        lan_networks: patch.lan_networks,
-        auth_bypass_cidrs: patch.auth_bypass_cidrs,
-        bind_interface: patch.bind_interface,
-      });
-      setSaved(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+    const patch = {
+      public_url: publicUrl.trim() || null,
+      cors_origins: originsParsed,
+      secure_connections: secure,
+      transcoder_reaper_idle_threshold_ms: reaperMs,
+      max_remote_streams_per_user: remoteCap,
+      lan_networks: lanNetworks.trim(),
+      auth_bypass_cidrs: bypassCidrs.trim(),
+      bind_interface: bindInterface.trim(),
+    };
+    await adminApi.network.patch(patch);
+    setBaseline({
+      public_url: patch.public_url,
+      cors_origins: patch.cors_origins,
+      secure_connections: patch.secure_connections,
+      transcoder_reaper_idle_threshold_ms:
+        patch.transcoder_reaper_idle_threshold_ms,
+      max_remote_streams_per_user: patch.max_remote_streams_per_user,
+      lan_networks: patch.lan_networks,
+      auth_bypass_cidrs: patch.auth_bypass_cidrs,
+      bind_interface: patch.bind_interface,
+    });
+  }
+
+  function discard() {
+    setPublicUrl(baseline.public_url ?? "");
+    setOrigins(baseline.cors_origins.join("\n"));
+    setSecure(baseline.secure_connections);
+    setReaperMs(baseline.transcoder_reaper_idle_threshold_ms);
+    setRemoteCap(baseline.max_remote_streams_per_user);
+    setLanNetworks(baseline.lan_networks);
+    setBypassCidrs(baseline.auth_bypass_cidrs);
+    setBindInterface(baseline.bind_interface);
   }
 
   async function runCheck() {
@@ -112,18 +124,21 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
   }
 
   return (
-    <div className="space-y-6">
+    <div>
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
         </div>
       )}
 
-      <section className="space-y-4 rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="text-base font-semibold">Public access</h2>
-        <Field
+      <SettingsCard
+        title="Public access"
+        description="Origin used to build absolute URLs for webhooks, share links, and emails. Adjacent settings cover the bind socket and HTTPS policy."
+      >
+        <SettingsRow
           label="Public URL"
-          hint="Origin (no path) used to build absolute URLs for webhooks and share links."
+          help="Origin (no path) used to build absolute URLs for webhooks and share links."
+          changed={dirtyFields["Public URL"]}
         >
           <div className="flex items-center gap-2">
             <input
@@ -131,9 +146,14 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
               value={publicUrl}
               onChange={(e) => setPublicUrl(e.target.value)}
               placeholder="https://chimpflix.example.com"
-              className="flex-1 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+              className={
+                dirtyFields["Public URL"]
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }
             />
             <button
+              type="button"
               disabled={checking || !publicUrl}
               onClick={runCheck}
               className="rounded border border-white/15 px-3 py-2 text-sm text-white/80 hover:bg-white/5 disabled:opacity-50"
@@ -150,27 +170,34 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
                 : `Not reachable: ${check.error ?? "unknown error"}${check.latency_ms != null ? ` (after ${check.latency_ms} ms)` : ""}.`}
             </div>
           )}
-        </Field>
+        </SettingsRow>
 
-        <Field
+        <SettingsRow
           label="Additional server URLs (CORS allowlist)"
-          hint="One origin per line. Each is trusted for cross-origin browser requests AND for CSRF origin validation, so multi-URL deployments (LAN URL + WAN URL, staging + prod, etc.) work without bypassing security. The canonical Public URL above is used for outgoing email/share links; this list adds extras."
+          help="One origin per line. Each is trusted for cross-origin browser requests AND for CSRF origin validation, so multi-URL deployments (LAN URL + WAN URL, staging + prod, etc.) work without bypassing security."
+          changed={dirtyFields["CORS allowlist"]}
         >
           <textarea
             value={origins}
             onChange={(e) => setOrigins(e.target.value)}
             rows={5}
             placeholder={"https://lan.example.com\nhttps://app.example.com"}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["CORS allowlist"]
+                ? `${INPUT_CHANGED_CLASS} font-mono`
+                : `${INPUT_CLASS} font-mono`
+            }
           />
-        </Field>
-        <Field
+        </SettingsRow>
+
+        <SettingsRow
           label="Bind interface"
-          hint={
+          help={
             bindChanged
               ? "Server restart required for changes to take effect."
-              : "Empty (default) honors the BIND_ADDR env (binds all interfaces). Set a specific socket address like `192.168.1.50:8080` or `[::1]:8080` to pin the listener to one NIC. Multi-NIC niche; most operators leave this empty."
+              : "Empty (default) honors the BIND_ADDR env. Set a specific socket address like 192.168.1.50:8080 or [::1]:8080 to pin the listener to one NIC."
           }
+          changed={dirtyFields["Bind interface"]}
         >
           <div className="flex items-center gap-2">
             <input
@@ -178,58 +205,70 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
               value={bindInterface}
               onChange={(e) => setBindInterface(e.target.value)}
               placeholder="0.0.0.0:8080 (or empty)"
-              className="flex-1 rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+              className={
+                dirtyFields["Bind interface"]
+                  ? `${INPUT_CHANGED_CLASS} font-mono`
+                  : `${INPUT_CLASS} font-mono`
+              }
             />
-            {bindChanged && (
-              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                Restart pending
-              </span>
-            )}
+            {bindChanged && <Pill tone="warn">Restart pending</Pill>}
           </div>
-        </Field>
+        </SettingsRow>
 
-        <Field
+        <SettingsRow
           label="Secure connections"
-          hint="`required` rejects plain-HTTP; `preferred` allows but warns; `disabled` permits everything."
+          help={
+            <>
+              <code className="font-mono">required</code> rejects plain-HTTP;{" "}
+              <code className="font-mono">preferred</code> allows but warns;{" "}
+              <code className="font-mono">disabled</code> permits everything.
+            </>
+          }
+          changed={dirtyFields["Secure connections"]}
         >
           <select
             value={secure}
             onChange={(e) =>
               setSecure(e.target.value as SecureConnectionsMode)
             }
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["Secure connections"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
           >
             <option value="required">Required</option>
             <option value="preferred">Preferred</option>
             <option value="disabled">Disabled</option>
           </select>
-        </Field>
-      </section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <section className="space-y-4 rounded-lg border border-white/10 bg-white/2 p-6">
-        <div>
-          <h2 className="text-base font-semibold">LAN policy</h2>
-          <p className="mt-1 max-w-2xl text-xs text-white/55">
-            Define which client IPs count as &ldquo;local&rdquo;. Used by the
-            per-user remote stream cap below and by the auth bypass list. Use
-            commas to separate; empty disables the feature.
-          </p>
-        </div>
-        <Field
+      <SettingsCard
+        title="LAN policy"
+        description="Define which client IPs count as “local”. Used by the per-user remote stream cap and by the auth bypass list. Empty disables the feature."
+      >
+        <SettingsRow
           label="LAN networks"
-          hint="Comma-separated CIDR list, e.g. 192.168.0.0/16, 10.0.0.0/8."
+          help="Comma-separated CIDR list, e.g. 192.168.0.0/16, 10.0.0.0/8."
+          changed={dirtyFields["LAN networks"]}
         >
           <input
             type="text"
             value={lanNetworks}
             onChange={(e) => setLanNetworks(e.target.value)}
             placeholder="192.168.0.0/16, 10.0.0.0/8"
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["LAN networks"]
+                ? `${INPUT_CHANGED_CLASS} font-mono`
+                : `${INPUT_CLASS} font-mono`
+            }
           />
-        </Field>
-        <Field
+        </SettingsRow>
+        <SettingsRow
           label="Max remote streams per user"
-          hint="0 = unlimited. When >0, only requests from outside `LAN networks` are counted."
+          help="0 = unlimited. When >0, only requests from outside `LAN networks` are counted."
+          changed={dirtyFields["Max remote streams"]}
         >
           <input
             type="number"
@@ -237,32 +276,44 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
             max={64}
             value={remoteCap}
             onChange={(e) => setRemoteCap(Number(e.target.value))}
-            className="w-32 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+            className={`w-32 tabular-nums ${
+              dirtyFields["Max remote streams"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }`}
           />
-        </Field>
-        <Field
+        </SettingsRow>
+        <SettingsRow
           label="Allow without auth"
-          hint="Comma-separated CIDR list. Matching IPs skip the cookie check entirely and run as the server owner. Use sparingly — only for trusted LAN automation."
+          help="Comma-separated CIDR list. Matching IPs skip the cookie check entirely and run as the server owner. Use sparingly — only for trusted LAN automation."
+          changed={dirtyFields["Allow without auth"]}
         >
           <input
             type="text"
             value={bypassCidrs}
             onChange={(e) => setBypassCidrs(e.target.value)}
             placeholder="192.168.1.50/32"
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+            className={
+              dirtyFields["Allow without auth"]
+                ? `${INPUT_CHANGED_CLASS} font-mono`
+                : `${INPUT_CLASS} font-mono`
+            }
           />
-        </Field>
-      </section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <section className="space-y-4 rounded-lg border border-white/10 bg-white/2 p-6">
-        <h2 className="text-base font-semibold">Session cleanup</h2>
-        <Field
+      <SettingsCard
+        title="Session cleanup"
+        description="How aggressively the transcoder reaper kills idle sessions."
+      >
+        <SettingsRow
           label="Reap idle sessions after"
-          hint={
+          help={
             reaperChanged
               ? "Server restart required for changes to take effect."
               : "ms a transcode session can go without a keepalive ping before the reaper kills it. Default 90000 (90s)."
           }
+          changed={dirtyFields["Reap idle sessions"]}
         >
           <div className="flex items-center gap-2">
             <input
@@ -272,48 +323,25 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
               step={1000}
               value={reaperMs}
               onChange={(e) => setReaperMs(Number(e.target.value))}
-              className="w-32 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm tabular-nums outline-none focus:border-white/30"
+              className={`w-32 tabular-nums ${
+                dirtyFields["Reap idle sessions"]
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }`}
             />
             <span className="text-sm text-white/55">ms</span>
-            {reaperChanged && (
-              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                Restart pending
-              </span>
-            )}
+            {reaperChanged && <Pill tone="warn">Restart pending</Pill>}
           </div>
-        </Field>
-      </section>
+        </SettingsRow>
+      </SettingsCard>
 
-      <div className="flex items-center gap-3">
-        <button
-          disabled={!dirty || busy}
-          onClick={save}
-          className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:py-2 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-        >
-          {busy ? "Saving…" : "Save network settings"}
-        </button>
-        {saved && !dirty && (
-          <span className="text-xs text-white/50">Saved.</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-sm font-medium">{label}</label>
-      {children}
-      {hint && <p className="mt-1 text-xs text-white/50">{hint}</p>}
+      <SaveBar
+        dirtyCount={dirtyCount}
+        summary={dirtyLabels.slice(0, 3).join(", ") +
+          (dirtyLabels.length > 3 ? `, +${dirtyLabels.length - 3} more` : "")}
+        onSave={save}
+        onDiscard={discard}
+      />
     </div>
   );
 }

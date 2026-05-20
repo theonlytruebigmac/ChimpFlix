@@ -46,7 +46,7 @@ function roleLabel(role: UserRole): string {
 function roleColor(role: UserRole): string {
   switch (role) {
     case "owner":
-      return "text-(--color-accent)";
+      return "text-accent";
     case "admin":
       return "text-amber-300";
     case "user":

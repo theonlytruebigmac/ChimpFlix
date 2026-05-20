@@ -217,9 +217,29 @@ async fn scan_inner(
         )
         .await
         {
-            Ok(queries::FileOutcome::Added) => counters.files_added += 1,
-            Ok(queries::FileOutcome::Updated) => counters.files_updated += 1,
-            Ok(queries::FileOutcome::Unchanged) => {}
+            Ok((queries::FileOutcome::Added, Some(media_file_id))) => {
+                counters.files_added += 1;
+                // Hand the new file off to the discovery pipeline.
+                // The consumer (server-side scan emitter) enqueues
+                // detect_markers / preview / loudness / chapter
+                // thumbs jobs against this id so processing starts
+                // as soon as the row lands rather than waiting for
+                // the next scheduled safety-net tick.
+                emitter(ScanEvent::FileAdded {
+                    job_id,
+                    library_id,
+                    media_file_id,
+                });
+            }
+            Ok((queries::FileOutcome::Added, None)) => {
+                // Outcome=Added implies file_id was created. This
+                // arm should be unreachable; treat as Added without
+                // an event rather than panicking on a future
+                // refactor that returns Added with None.
+                counters.files_added += 1;
+            }
+            Ok((queries::FileOutcome::Updated, _)) => counters.files_updated += 1,
+            Ok((queries::FileOutcome::Unchanged, _)) => {}
             Err(e) => warn!(?path, error = %format!("{e:#}"), "failed to process file"),
         }
         since_progress += 1;
@@ -317,7 +337,7 @@ async fn process_file(
     root: &Path,
     path: &Path,
     cache_root: Option<&Path>,
-) -> Result<queries::FileOutcome> {
+) -> Result<(queries::FileOutcome, Option<i64>)> {
     // Non-UTF8 paths used to fail silently up the error chain with
     // only the generic "non-UTF8 path" message in the scan job log.
     // Operators reported files disappearing from the library without
@@ -353,7 +373,7 @@ async fn process_file(
     // Fast-path: file is in the DB and mtime hasn't changed → skip the
     // expensive ffprobe + TMDB calls.
     if existing_mtime == Some(mtime_ms) {
-        return Ok(queries::FileOutcome::Unchanged);
+        return Ok((queries::FileOutcome::Unchanged, None));
     }
 
     let classification = match parser::classify(path, root, library_kind) {
@@ -370,7 +390,7 @@ async fn process_file(
                 library_kind = ?library_kind,
                 "scanner: skipping file — classifier couldn't extract season/episode/title; rename to match an SxxExx pattern or move into a typed folder"
             );
-            return Ok(queries::FileOutcome::Unchanged);
+            return Ok((queries::FileOutcome::Unchanged, None));
         }
     };
 
@@ -539,7 +559,14 @@ async fn process_file(
         tmdb_apply_show(pool, tmdb, tvdb, tvmaze, &hint).await;
     }
 
-    Ok(outcome)
+    // Return the file_id so the caller can emit a FileAdded event
+    // for the discovery pipeline. Only Added carries it; Updated /
+    // Unchanged stay None (the pipeline only fires on first sight).
+    let added_file_id = match outcome {
+        queries::FileOutcome::Added => Some(file_id),
+        _ => None,
+    };
+    Ok((outcome, added_file_id))
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,13 @@ authors = ["ChimpFlix contributors"]
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.5"
+# Pure-Rust port of the chromaprint audio-fingerprint algorithm. Used
+# by the intro detector to anchor a show's intro start/end across
+# episodes — far more reliable than blackdetect alone, which only
+# catches cold-open → theme fades. We picked the pure-Rust port over
+# the C-FFI `chromaprint` crate to avoid a runtime dep on
+# libchromaprint inside the Docker image.
+rusty-chromaprint = "0.3"
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 base64 = "0.22"
 chacha20poly1305 = "0.10"

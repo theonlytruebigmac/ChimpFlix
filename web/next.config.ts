@@ -21,14 +21,20 @@ function csp(): string {
     "frame-src https://www.youtube-nocookie.com https://www.youtube.com",
     "frame-ancestors 'none'",
     // Inline styles + scripts: Next App Router emits inline bootstrap.
-    // `unsafe-eval` was removed in round-3 (2026-05-19) — production
-    // builds don't use eval/new Function; HMR (which does) only runs
-    // in `next dev` and the dev server bypasses these headers.
-    "script-src 'self' 'unsafe-inline'",
+    // `'unsafe-eval'` is still required: Next.js's dev mode honors
+    // these headers (contrary to a prior assumption) and uses eval for
+    // fast refresh; React 19 Server Component hydration also relies on
+    // Function() in some paths. Round-3 tried to drop it and broke
+    // client hydration in dev (Suspense fallbacks never resolved).
+    // Re-evaluate when we move to nonce-based CSP.
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
     "style-src 'self' 'unsafe-inline'",
     // Posters / backdrops served from same origin; trailer thumbnails
-    // come from i.ytimg.com.
-    "img-src 'self' data: blob: https://i.ytimg.com https://image.tmdb.org",
+    // come from i.ytimg.com. The metadata enrichment pipeline can also
+    // hit TVMaze (fallback show provider), TheTVDB (anime / fallback),
+    // and AniList (anime primary) — their image CDNs need to be in
+    // img-src or browsers block the poster/backdrop loads.
+    "img-src 'self' data: blob: https://i.ytimg.com https://image.tmdb.org https://static.tvmaze.com https://artworks.thetvdb.com https://s4.anilist.co",
     "font-src 'self' data:",
     // Plex's CDN for show theme songs played on the title modal.
     // Same source the official Plex web app uses; first-party MP3.

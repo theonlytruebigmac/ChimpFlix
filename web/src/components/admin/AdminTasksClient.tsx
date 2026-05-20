@@ -11,6 +11,7 @@ import {
   type TaskRun,
   type TasksListResponse,
 } from "@/lib/chimpflix-api";
+import { FilterChip, Pill, SettingsCard, SettingsRow } from "./ui";
 
 interface Props {
   initial: TasksListResponse;
@@ -68,6 +69,25 @@ const FREQUENCY_SHORT_LABELS: Record<TaskFrequency, string> = {
 /// admin page instead; the simple view shows a footer link there.
 const PER_LIBRARY_KINDS = new Set(["scan_library"]);
 
+/// Category tabs shown above the Simple task list. Mapping is by
+/// kind so a re-categorization here doesn't require any backend
+/// change — the simple view filters whatever the server returns.
+type TaskCategory = "library" | "transcoder" | "integrations" | "maintenance";
+const CATEGORY_LABEL: Record<TaskCategory, string> = {
+  library: "Library",
+  transcoder: "Transcoder",
+  integrations: "Integrations",
+  maintenance: "Maintenance",
+};
+function categoryOf(kind: string): TaskCategory {
+  if (kind === "optimize_versions") return "transcoder";
+  if (kind === "trakt_pull" || kind === "opensubtitles_fetch") return "integrations";
+  if (kind === "backup" || kind === "verify_backup" || kind === "reap_orphaned") {
+    return "maintenance";
+  }
+  return "library";
+}
+
 /// Find the task row that represents the "global" instance of a
 /// kind in the simple toggle view. A row counts as global when it
 /// either has no `library_id` in its params or has the literal
@@ -105,6 +125,10 @@ export function AdminTasksClient({ initial, settings }: Props) {
   // because that's the path the user lands on after reading the
   // admin docs — Advanced is power-user territory.
   const [advanced, setAdvanced] = useState(false);
+  // Category filter for the simple view. "all" shows every visible
+  // kind; the rest narrow to one category. Stored in component state
+  // so switching tabs doesn't lose your scroll position.
+  const [category, setCategory] = useState<TaskCategory | "all">("all");
 
   const windowDirty = windowStart !== savedWindowStart || windowEnd !== savedWindowEnd;
   const windowActiveNow = isWithinWindow(savedWindowStart, savedWindowEnd, new Date());
@@ -148,53 +172,49 @@ export function AdminTasksClient({ initial, settings }: Props) {
         </div>
       )}
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-4 sm:p-5">
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <div>
-            <h2 className="text-base font-semibold">Maintenance window</h2>
-            <p className="mt-1 max-w-xl text-xs text-white/55">
-              Heavy background tasks (full scans, metadata refresh, backups)
-              run inside this window so they don&apos;t compete with playback.
-              Server-local time. If the end time is earlier than the start
-              the window wraps midnight.
-            </p>
+      <SettingsCard
+        title="Maintenance window"
+        description="Heavy background tasks (full scans, metadata refresh, backups) run inside this window so they don't compete with playback. Server-local time. If the end time is earlier than the start the window wraps midnight."
+        aside={
+          windowActiveNow ? (
+            <Pill tone="ok" dot>
+              Active now
+            </Pill>
+          ) : (
+            <Pill tone="muted">
+              Next: {nextWindowDescription(savedWindowStart, savedWindowEnd)}
+            </Pill>
+          )
+        }
+      >
+        <SettingsRow label="Window" changed={windowDirty}>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-white/55">From</span>
+              <input
+                type="time"
+                value={windowStart}
+                onChange={(e) => setWindowStart(e.target.value)}
+                className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
+              />
+              <span className="text-white/55">to</span>
+              <input
+                type="time"
+                value={windowEnd}
+                onChange={(e) => setWindowEnd(e.target.value)}
+                className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
+              />
+            </div>
+            <button
+              disabled={!windowDirty || savingWindow}
+              onClick={saveWindow}
+              className="rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+            >
+              {savingWindow ? "Saving…" : "Save window"}
+            </button>
           </div>
-          <span
-            className={`rounded px-2 py-0.5 text-[11px] uppercase tracking-wider ${
-              windowActiveNow
-                ? "bg-emerald-500/15 text-emerald-300"
-                : "bg-white/10 text-white/60"
-            }`}
-          >
-            {windowActiveNow ? "Active now" : `Next: ${nextWindowDescription(savedWindowStart, savedWindowEnd)}`}
-          </span>
-        </div>
-        <div className="mt-4 flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-white/55">From</span>
-            <input
-              type="time"
-              value={windowStart}
-              onChange={(e) => setWindowStart(e.target.value)}
-              className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
-            />
-            <span className="text-white/55">to</span>
-            <input
-              type="time"
-              value={windowEnd}
-              onChange={(e) => setWindowEnd(e.target.value)}
-              className="rounded border border-white/10 bg-black/30 px-2 py-1 text-sm tabular-nums"
-            />
-          </div>
-          <button
-            disabled={!windowDirty || savingWindow}
-            onClick={saveWindow}
-            className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-          >
-            {savingWindow ? "Saving…" : "Save window"}
-          </button>
-        </div>
-      </section>
+        </SettingsRow>
+      </SettingsCard>
 
       <div className="flex items-center justify-between">
         <span className="text-sm text-white/60">
@@ -211,12 +231,20 @@ export function AdminTasksClient({ initial, settings }: Props) {
       </div>
 
       {!advanced && (
-        <SimpleTaskList
-          kinds={kinds}
-          tasks={tasks}
-          onChanged={refresh}
-          onError={setError}
-        />
+        <>
+          <CategoryTabs
+            kinds={kinds}
+            active={category}
+            onSelect={setCategory}
+          />
+          <SimpleTaskList
+            kinds={kinds}
+            tasks={tasks}
+            category={category}
+            onChanged={refresh}
+            onError={setError}
+          />
+        </>
       )}
 
       {advanced && (
@@ -224,7 +252,7 @@ export function AdminTasksClient({ initial, settings }: Props) {
           <div className="flex items-center justify-end">
             <button
               onClick={() => setShowAdd((v) => !v)}
-              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
+              className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover"
             >
               {showAdd ? "Cancel" : "+ New task"}
             </button>
@@ -271,11 +299,13 @@ export function AdminTasksClient({ initial, settings }: Props) {
 function SimpleTaskList({
   kinds,
   tasks,
+  category,
   onChanged,
   onError,
 }: {
   kinds: TaskKindInfo[];
   tasks: ScheduledTask[];
+  category: TaskCategory | "all";
   onChanged: () => Promise<void>;
   onError: (msg: string | null) => void;
 }) {
@@ -283,29 +313,82 @@ function SimpleTaskList({
   // Per-library tasks (scan, currently only scan_library) are
   // surfaced from the library admin page instead.
   const visibleKinds = useMemo(
-    () => kinds.filter((k) => !PER_LIBRARY_KINDS.has(k.kind)),
-    [kinds],
+    () =>
+      kinds
+        .filter((k) => !PER_LIBRARY_KINDS.has(k.kind))
+        .filter((k) => category === "all" || categoryOf(k.kind) === category),
+    [kinds, category],
   );
 
   return (
     <section className="rounded-lg border border-white/10 bg-white/2">
-      <ul className="divide-y divide-white/5">
-        {visibleKinds.map((k) => (
-          <SimpleTaskRow
-            key={k.kind}
-            kind={k}
-            existing={findGlobalTaskFor(k.kind, tasks)}
-            onChanged={onChanged}
-            onError={onError}
-          />
-        ))}
-      </ul>
+      {visibleKinds.length === 0 ? (
+        <div className="px-4 py-6 text-center text-sm text-white/45">
+          No tasks in this category.
+        </div>
+      ) : (
+        <ul className="divide-y divide-white/5">
+          {visibleKinds.map((k) => (
+            <SimpleTaskRow
+              key={k.kind}
+              kind={k}
+              existing={findGlobalTaskFor(k.kind, tasks)}
+              onChanged={onChanged}
+              onError={onError}
+            />
+          ))}
+        </ul>
+      )}
       <div className="border-t border-white/10 px-4 py-3 text-xs text-white/45">
         Per-library scans run automatically via the file watcher. Trigger
         them by hand from the relevant library card in{" "}
         <code className="font-mono text-white/55">Library &rsaquo; Libraries</code>.
       </div>
     </section>
+  );
+}
+
+/// Plex-style category strip above the simple task list. Counts come
+/// from the kind registry (visible, non per-library kinds) so an
+/// operator sees at a glance which group is empty without scrolling.
+function CategoryTabs({
+  kinds,
+  active,
+  onSelect,
+}: {
+  kinds: TaskKindInfo[];
+  active: TaskCategory | "all";
+  onSelect: (next: TaskCategory | "all") => void;
+}) {
+  const visible = kinds.filter((k) => !PER_LIBRARY_KINDS.has(k.kind));
+  const counts: Record<TaskCategory | "all", number> = {
+    all: visible.length,
+    library: 0,
+    transcoder: 0,
+    integrations: 0,
+    maintenance: 0,
+  };
+  for (const k of visible) counts[categoryOf(k.kind)] += 1;
+  const cats: Array<TaskCategory | "all"> = [
+    "all",
+    "library",
+    "transcoder",
+    "integrations",
+    "maintenance",
+  ];
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {cats.map((c) => (
+        <FilterChip
+          key={c}
+          active={active === c}
+          count={counts[c]}
+          onClick={() => onSelect(c)}
+        >
+          {c === "all" ? "All" : CATEGORY_LABEL[c]}
+        </FilterChip>
+      ))}
+    </div>
   );
 }
 
@@ -415,14 +498,12 @@ function SimpleTaskRow({
             <span className="font-medium">{kind.display_name}</span>
             <span className="text-xs text-white/45">— {scheduleSummary}</span>
             {existing?.last_status === "failed" && (
-              <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
-                Last run failed
-              </span>
+              <Pill tone="bad">Last run failed</Pill>
             )}
             {existing?.last_status === "running" && (
-              <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-blue-300">
+              <Pill tone="info" dot>
                 Running
-              </span>
+              </Pill>
             )}
           </div>
           <p className="mt-0.5 text-xs text-white/55">{kind.description}</p>
@@ -713,7 +794,7 @@ function TaskRow({
             <button
               disabled={!dirty || busy}
               onClick={save}
-              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+              className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
             >
               Save
             </button>
@@ -902,7 +983,7 @@ function NewTaskForm({
       <button
         disabled={busy}
         onClick={submit}
-        className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:opacity-50"
+        className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover disabled:opacity-50"
       >
         {busy ? "Creating…" : "Create"}
       </button>
@@ -953,28 +1034,21 @@ function Field({
 }
 
 function StatusBadge({ status }: { status: string | null }) {
-  if (status == null) {
-    return (
-      <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-white/50">
-        New
-      </span>
-    );
+  if (status == null) return <Pill tone="muted">New</Pill>;
+  switch (status) {
+    case "success":
+      return <Pill tone="ok">{status}</Pill>;
+    case "running":
+      return (
+        <Pill tone="info" dot>
+          {status}
+        </Pill>
+      );
+    case "failed":
+      return <Pill tone="bad">{status}</Pill>;
+    default:
+      return <Pill tone="muted">{status}</Pill>;
   }
-  const cls =
-    status === "success"
-      ? "bg-emerald-500/15 text-emerald-300"
-      : status === "running"
-        ? "bg-blue-500/15 text-blue-300"
-        : status === "failed"
-          ? "bg-red-500/15 text-red-300"
-          : "bg-white/10 text-white/60";
-  return (
-    <span
-      className={`rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider ${cls}`}
-    >
-      {status}
-    </span>
-  );
 }
 
 function formatWhen(epochMs: number): string {

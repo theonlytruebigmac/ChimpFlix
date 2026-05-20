@@ -145,6 +145,11 @@ export interface PlayerMarker {
   kind: "intro" | "credits" | string;
   start_ms: number;
   end_ms: number;
+  /// `auto` (detect_markers task) or `manual` (operator editor).
+  /// Drives a more prominent timeline tint for auto markers so the
+  /// user can see detected segments at a glance vs hand-curated
+  /// ones. Optional so older API consumers (and tests) don't break.
+  source?: "auto" | "manual" | string;
 }
 
 export type EpisodeSibling = {
@@ -281,6 +286,54 @@ function markerLabel(m: PlayerMarker): string {
   if (m.kind === "credits") return "Skip Credits";
   if (m.kind === "commercial") return "Skip Ad";
   return "Skip Intro";
+}
+
+/// Skip-marker pill with a live countdown so the operator sees how
+/// long they have to act. The countdown updates from a local rAF tick
+/// rather than re-rendering the whole player every 250ms — keeps the
+/// price of this affordance tiny.
+function SkipMarkerButton({
+  marker,
+  currentMs,
+  onSkip,
+}: {
+  marker: PlayerMarker;
+  currentMs: number;
+  onSkip: (m: PlayerMarker) => void;
+}) {
+  const remaining = Math.max(0, Math.ceil((marker.end_ms - currentMs) / 1000));
+  // Fade-in once on mount so the pill animates in rather than popping.
+  // `appear` flips true after the first paint — Tailwind's transition
+  // then animates the opacity + translate from the initial values.
+  const [appear, setAppear] = useState(false);
+  useEffect(() => {
+    // Use rAF so the initial paint sees `appear=false`, and the next
+    // frame sees `appear=true` — the transition lerps between them.
+    const id = requestAnimationFrame(() => setAppear(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+  return (
+    <button
+      type="button"
+      onClick={() => onSkip(marker)}
+      // Sits just above the control bar; on mobile we keep it closer
+      // to the right edge but reachable (smaller padding, 12rem from
+      // bottom to clear the wider mobile control row).
+      className={`pointer-events-auto absolute bottom-28 right-3 z-30 inline-flex items-center gap-2 rounded-md border border-white/30 bg-white/95 px-4 py-2 text-sm font-semibold text-black shadow-2xl transition-all duration-200 hover:scale-[1.03] hover:bg-white sm:bottom-32 sm:right-8 sm:px-6 sm:py-2.5 ${
+        appear ? "opacity-100 translate-y-0" : "opacity-0 translate-y-2"
+      }`}
+    >
+      <span>{markerLabel(marker)}</span>
+      {remaining > 0 && (
+        <span
+          aria-hidden
+          className="tabular-nums text-[0.78em] text-black/55"
+        >
+          {remaining}s
+        </span>
+      )}
+    </button>
+  );
 }
 
 export function ChimpFlixPlayer({
@@ -1186,16 +1239,26 @@ export function ChimpFlixPlayer({
                 hls.subtitleTrack = 0;
                 hls.subtitleDisplay = true;
               }
-              // Pre-roll warmup: wait until the player has a small
-              // forward buffer (~3s, roughly half a segment) before
-              // calling .play(). Without this, the video element will
-              // happily start playing on the first appended frame and
-              // immediately stutter when ffmpeg hasn't finished the
-              // next segment. The wait is bounded by a 4s safety
-              // timeout so a stalled session still surfaces the
-              // existing error path instead of looking frozen.
-              const WARMUP_TARGET_SEC = 3;
-              const WARMUP_TIMEOUT_MS = 4000;
+              // Pre-roll warmup: wait until the player has a full
+              // segment (~6s) of forward buffer before calling
+              // .play(). The earlier 3s threshold meant playback
+              // started right at the edge of running out — the first
+              // ffmpeg segment is slow to produce (encoder warm-up,
+              // initial GOP), so the next segment often hadn't
+              // arrived by the time the 3s drained. That manifested
+              // as a quick stutter ~3s into a fresh session, followed
+              // by the buffer bar "jumping" forward as the queued
+              // segments arrived in a burst. Bumped to 6s for a full
+              // segment of headroom; the safety timeout is 8s so a
+              // genuinely stuck session still falls through to the
+              // existing error path within a reasonable window.
+              //
+              // We also gate on `video.readyState >= HAVE_FUTURE_DATA`
+              // — the browser's own "ready to play through" signal —
+              // because `buffered.end` can lag the decoder for a few
+              // hundred ms after `FRAG_BUFFERED` fires.
+              const WARMUP_TARGET_SEC = 6;
+              const WARMUP_TIMEOUT_MS = 8000;
               let started = false;
               const start = () => {
                 if (started) return;
@@ -1210,7 +1273,12 @@ export function ChimpFlixPlayer({
               const onFrag = () => {
                 if (video.buffered.length === 0) return;
                 const ahead = video.buffered.end(0) - video.currentTime;
-                if (ahead >= WARMUP_TARGET_SEC) start();
+                if (
+                  ahead >= WARMUP_TARGET_SEC &&
+                  video.readyState >= 3 /* HAVE_FUTURE_DATA */
+                ) {
+                  start();
+                }
               };
               hls.on(HlsModule.Events.FRAG_BUFFERED, onFrag);
               warmupSafetyTimer = window.setTimeout(start, WARMUP_TIMEOUT_MS);
@@ -2664,16 +2732,13 @@ export function ChimpFlixPlayer({
       )}
 
       {activeMarkerOverlay && (
-        <button
-          type="button"
-          onClick={() => seekTo(activeMarkerOverlay.end_ms / 1000)}
-          // Sits just above the control bar; on mobile we keep it
-          // closer to the right edge but reachable (smaller padding,
-          // 12rem from bottom to clear the wider mobile control row).
-          className="pointer-events-auto absolute bottom-28 right-3 z-30 rounded-md border border-white/30 bg-white/95 px-4 py-2 text-sm font-semibold text-black shadow-2xl transition-all hover:scale-[1.03] hover:bg-white sm:bottom-32 sm:right-8 sm:px-6 sm:py-2.5"
-        >
-          {markerLabel(activeMarkerOverlay)}
-        </button>
+        <SkipMarkerButton
+          marker={activeMarkerOverlay}
+          currentMs={currentTime * 1000}
+          onSkip={(m) => {
+            seekTo(m.end_ms / 1000);
+          }}
+        />
       )}
 
       {nextHref &&
@@ -4660,28 +4725,45 @@ function ProgressBar({
           Marker overlays sit BEHIND the progress fill so the played
           portion still reads as the accent color, but the unplayed
           portion shows tinted segments where intros / credits live.
-          Color picked per kind: intro is teal-ish (skip-affordance
-          familiar from Netflix), credits is amber, anything else
-          neutral. Pointer events disabled so they don't intercept
-          scrubs.
+          Color picked per kind: intro = teal (skip-affordance
+          familiar from Netflix), credits = amber, anything else
+          neutral. Auto-detected segments (source=auto) get a
+          stronger fill + a 1px top accent stripe so the user can
+          see at a glance which ranges were machine-found; manual
+          ones stay subdued so they don't visually compete with the
+          buffer / playhead. Pointer events disabled so they don't
+          intercept scrubs.
         */}
         {markers && duration > 0 && markers.map((m, i) => {
           const startPct = Math.max(0, Math.min(100, (m.start_ms / 1000 / duration) * 100));
           const endPct = Math.max(0, Math.min(100, (m.end_ms / 1000 / duration) * 100));
           const widthPct = Math.max(0, endPct - startPct);
           if (widthPct < 0.1) return null;
-          const cls = m.kind === "credits"
-            ? "bg-amber-400/35"
+          const isAuto = m.source === "auto";
+          const fillCls = m.kind === "credits"
+            ? isAuto ? "bg-amber-400/70" : "bg-amber-400/30"
             : m.kind === "intro"
-              ? "bg-sky-400/35"
-              : "bg-white/20";
+              ? isAuto ? "bg-sky-400/70" : "bg-sky-400/30"
+              : isAuto ? "bg-white/40" : "bg-white/20";
+          const stripeCls = isAuto
+            ? m.kind === "credits"
+              ? "bg-amber-300"
+              : m.kind === "intro"
+                ? "bg-sky-300"
+                : "bg-white"
+            : null;
           return (
             <div
               key={`${m.kind}-${m.start_ms}-${i}`}
               aria-hidden
-              className={`pointer-events-none absolute inset-y-0 ${cls}`}
+              className="pointer-events-none absolute inset-y-0"
               style={{ left: `${startPct}%`, width: `${widthPct}%` }}
-            />
+            >
+              <div className={`absolute inset-0 ${fillCls}`} />
+              {stripeCls && (
+                <div className={`absolute inset-x-0 top-0 h-px ${stripeCls}`} />
+              )}
+            </div>
           );
         })}
         {/*
