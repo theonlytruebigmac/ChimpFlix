@@ -703,6 +703,12 @@ pub struct Item {
     /// Local id of the collection (franchise) this item belongs to.
     /// Movies only; shows leave this NULL.
     pub collection_id: Option<i64>,
+    /// True when the parser pulled a clean title (and optional year)
+    /// out of the path; false when the scanner inserted a stub
+    /// because the filename didn't match any known pattern. Drives
+    /// the "Unmatched files" admin surface so an operator can
+    /// fix-match without having to rename on disk first.
+    pub auto_matched: bool,
 }
 
 impl Item {
@@ -750,6 +756,13 @@ impl Item {
                 .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
                 .unwrap_or_default(),
             collection_id: row.try_get::<Option<i64>, _>("collection_id").ok().flatten(),
+            // Tolerant fallback for pre-migration rows: missing
+            // column reads as true (legacy behaviour — every item
+            // before phase 68 was auto-matched).
+            auto_matched: row
+                .try_get::<i64, _>("auto_matched")
+                .map(|v| v != 0)
+                .unwrap_or(true),
         })
     }
 }
@@ -802,6 +815,12 @@ pub struct ItemFilter {
     pub sort: Option<ItemSort>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
+    /// When set, restrict results to items whose `auto_matched` flag
+    /// matches. Drives the "Unmatched files" admin surface so the
+    /// operator can find the stub rows the scanner created when it
+    /// couldn't fingerprint the filename. Omit for "all items
+    /// regardless of match status."
+    pub auto_matched: Option<bool>,
 }
 
 /// Serde deserializer for `?key=1,2,3` query-string fields. Empty string
@@ -1564,6 +1583,13 @@ pub struct ServerSettings {
     /// One of: "required" | "preferred" | "disabled".
     pub secure_connections: String,
     pub telemetry_opt_in: bool,
+    /// True once the operator has finished (or explicitly skipped)
+    /// the first-run onboarding wizard at `/onboarding`. The login
+    /// flow auto-redirects owners to the wizard when this is false;
+    /// once flipped the home page renders normally. Resettable from
+    /// Admin → Server → General if the operator wants to re-run the
+    /// tour later.
+    pub setup_completed: bool,
     pub transcoder_max_concurrent: i64,
     /// One of: "none" | "vaapi" | "nvenc" | "qsv" | "videotoolbox".
     pub transcoder_hw_accel: String,
@@ -1589,6 +1615,13 @@ pub struct ServerSettings {
     /// per tick. Default 1 — background work shouldn't starve live
     /// transcodes on a small machine.
     pub transcoder_max_background_concurrent: i64,
+    /// Number of background-job worker tasks spawned at startup.
+    /// Default 2; valid range [1, 16]. Each worker can claim any
+    /// kind subject to per-kind permits (see KIND_LIMITS), so raising
+    /// this is the lever to run more pipeline kinds in parallel when
+    /// you have CPU headroom. Read once at startup — changes require
+    /// a server restart, surfaced via the "restart pending" badge.
+    pub job_workers: i64,
     // ---- HDR tone mapping (phase 30) -----------------------------------
     /// When true (default), HDR sources are tone-mapped to SDR via
     /// zscale + tonemap. When false the filter is skipped — saves
@@ -1733,6 +1766,33 @@ pub struct ServerSettings {
     /// 0 disables the badge entirely; 14 is the default and matches
     /// the original hardcoded window from the Card component.
     pub recently_added_days: i64,
+    // ---- Task gating (phase 59) ----------------------------------------
+    /// Master toggle for the per-file chapter-thumbnail handler. When
+    /// false, neither the on-add discovery pipeline nor the weekly
+    /// safety-net sweep enqueues `build_chapter_thumbs` jobs. Off by
+    /// default — chapter thumbs are nice-to-have but add ffmpeg load on
+    /// every file, so we let the operator opt in.
+    pub chapter_thumbs_enabled: bool,
+    /// Master toggle for per-file EBU R 128 loudness analysis. Off by
+    /// default. Gates both pipeline entry points for `analyze_loudness`.
+    pub loudness_analysis_enabled: bool,
+    /// Master toggle for fetching external subtitles via OpenSubtitles.
+    /// Off by default. Gates both pipeline entry points for
+    /// `fetch_subtitles_item`. The OpenSubtitles credential vault entry
+    /// is still required separately.
+    pub subtitle_fetch_enabled: bool,
+    /// Master toggle for extracting subtitle streams from media
+    /// containers into `.vtt` sidecars. Off by default. Separate
+    /// switch from `subtitle_fetch_enabled` because the operations
+    /// have different costs: extract is free (ffmpeg only), external
+    /// fetch costs network + rate limits. Operators may want one but
+    /// not the other.
+    pub embedded_subs_extract_enabled: bool,
+    /// Master toggle for fetching external ratings (OMDb / Rotten
+    /// Tomatoes / MPAA). Off by default. Requires an OMDb API key
+    /// stored in the credential vault. Rate-limited externally; the
+    /// per-item handler backs off on 429.
+    pub external_ratings_enabled: bool,
     /// JSON-encoded escape-hatch storage for fields added by later phases
     /// without their own migration.
     pub extras_json: String,
@@ -1748,6 +1808,13 @@ impl ServerSettings {
             cors_origins: row.try_get("cors_origins")?,
             secure_connections: row.try_get("secure_connections")?,
             telemetry_opt_in: row.try_get::<i64, _>("telemetry_opt_in")? != 0,
+            setup_completed: row
+                .try_get::<i64, _>("setup_completed")
+                .map(|v| v != 0)
+                // Tolerant of pre-migration rows: defaults to "needs setup"
+                // so a misconfigured row triggers the wizard rather than
+                // silently skipping it.
+                .unwrap_or(false),
             transcoder_max_concurrent: row.try_get("transcoder_max_concurrent")?,
             transcoder_hw_accel: row.try_get("transcoder_hw_accel")?,
             transcoder_quality_ceiling_kbps: row
@@ -1766,6 +1833,11 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(1),
+            job_workers: row
+                .try_get::<Option<i64>, _>("job_workers")
+                .ok()
+                .flatten()
+                .unwrap_or(2),
             transcoder_hdr_tonemap_enabled: row
                 .try_get::<Option<i64>, _>("transcoder_hdr_tonemap_enabled")
                 .ok()
@@ -1930,6 +2002,36 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(14),
+            chapter_thumbs_enabled: row
+                .try_get::<Option<i64>, _>("chapter_thumbs_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            loudness_analysis_enabled: row
+                .try_get::<Option<i64>, _>("loudness_analysis_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            subtitle_fetch_enabled: row
+                .try_get::<Option<i64>, _>("subtitle_fetch_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            embedded_subs_extract_enabled: row
+                .try_get::<Option<i64>, _>("embedded_subs_extract_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            external_ratings_enabled: row
+                .try_get::<Option<i64>, _>("external_ratings_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
             extras_json: row.try_get("extras_json")?,
             updated_at: row.try_get("updated_at")?,
             updated_by: row.try_get::<Option<i64>, _>("updated_by").ok().flatten(),
@@ -1957,6 +2059,8 @@ pub struct ServerSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_opt_in: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_max_concurrent: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hw_accel: Option<String>,
@@ -1974,6 +2078,8 @@ pub struct ServerSettingsUpdate {
     pub transcoder_background_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_max_background_concurrent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_workers: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hdr_tonemap_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2068,6 +2174,16 @@ pub struct ServerSettingsUpdate {
     pub metadata_language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recently_added_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapter_thumbs_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loudness_analysis_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_fetch_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_subs_extract_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ratings_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras_json: Option<String>,
 }

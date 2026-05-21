@@ -7,6 +7,7 @@ import {
   type TotpEnrollResponse,
   type TotpStatusResponse,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 type Stage =
   | { kind: "loading" }
@@ -29,6 +30,8 @@ export function SettingsTwoFactorClient() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [askDisable, setAskDisable] = useState(false);
+  const [askRegenerate, setAskRegenerate] = useState(false);
   // See SettingsProfileClient for rationale — track the auto-clear
   // timer so it can be cancelled on unmount.
   const messageTimerRef = useRef<number | null>(null);
@@ -101,8 +104,7 @@ export function SettingsTwoFactorClient() {
   }
 
   async function disable() {
-    if (!window.confirm("Disable two-factor authentication? Your existing recovery codes will be invalidated."))
-      return;
+    setAskDisable(false);
     setError(null);
     setBusy(true);
     try {
@@ -125,12 +127,7 @@ export function SettingsTwoFactorClient() {
   }
 
   async function regenerate() {
-    if (
-      !window.confirm(
-        "Generate new recovery codes? Any unused old codes will stop working immediately.",
-      )
-    )
-      return;
+    setAskRegenerate(false);
     setError(null);
     setBusy(true);
     try {
@@ -272,7 +269,7 @@ export function SettingsTwoFactorClient() {
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
-              onClick={regenerate}
+              onClick={() => setAskRegenerate(true)}
               disabled={busy || !password}
               className="rounded border border-white/15 px-3 py-2.5 text-sm font-medium text-white/80 sm:py-2 sm:text-xs hover:bg-white/5 disabled:opacity-50"
             >
@@ -281,7 +278,7 @@ export function SettingsTwoFactorClient() {
             {!enforcementRequired && (
               <button
                 type="button"
-                onClick={disable}
+                onClick={() => setAskDisable(true)}
                 disabled={busy || !password}
                 className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2.5 text-sm font-medium text-red-200 sm:py-2 sm:text-xs hover:bg-red-500/20 disabled:opacity-50"
               >
@@ -290,6 +287,28 @@ export function SettingsTwoFactorClient() {
             )}
           </div>
         </div>
+      )}
+      {askDisable && (
+        <ConfirmDialog
+          title="Disable two-factor authentication?"
+          body="Your existing recovery codes will be invalidated. You'll need to re-enroll to turn 2FA back on."
+          confirmLabel="Disable 2FA"
+          destructive
+          busy={busy}
+          onConfirm={() => void disable()}
+          onCancel={() => setAskDisable(false)}
+        />
+      )}
+      {askRegenerate && (
+        <ConfirmDialog
+          title="Generate new recovery codes?"
+          body="Any unused old codes stop working immediately. Save the new codes before closing the dialog they appear in."
+          confirmLabel="Regenerate"
+          destructive
+          busy={busy}
+          onConfirm={() => void regenerate()}
+          onCancel={() => setAskRegenerate(false)}
+        />
       )}
     </div>
   );

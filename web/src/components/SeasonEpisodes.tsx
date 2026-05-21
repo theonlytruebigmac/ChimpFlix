@@ -20,10 +20,9 @@ export function SeasonEpisodes({
   initialEpisodes: MediaItem[];
   initialSeasonKey: string;
   /// When true, render a small "Edit markers" button on each episode
-  /// row. The owner-only feature exists to feed the per-show intro
-  /// fingerprint capture: marking the intro on episode 1 makes future
-  /// detect_markers runs find that intro signature in every other
-  /// episode of the show.
+  /// row. Owner-only because the underlying PUT replaces every
+  /// manual marker on the file; misuse is destructive enough that
+  /// it shouldn't be a co-editing surface.
   isOwner?: boolean;
 }) {
   const [selectedKey, setSelectedKey] = useState(initialSeasonKey);

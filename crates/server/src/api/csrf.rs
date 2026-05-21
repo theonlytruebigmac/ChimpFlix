@@ -34,6 +34,7 @@ use serde_json::json;
 
 use crate::auth::{CSRF_HEADER_NAME, cookie_name, csrf_cookie_name};
 use crate::state::AppState;
+use chimpflix_library::queries;
 
 /// Path prefixes / suffixes of mutating routes that must NEVER bypass
 /// CSRF — even when no session cookie is present. These are the
@@ -211,6 +212,30 @@ pub async fn layer(
         }
         return next.run(req).await;
     };
+
+    // Setup-mode escape hatch: when the server has no owner account
+    // yet, `public_url` is NULL and `cors_origins` is `[]`, so the
+    // origin check below rejects every request — including the very
+    // setup POST that's supposed to bootstrap the system. Letting the
+    // setup endpoint through (Origin/Referer still required, just
+    // not value-validated) breaks that chicken-and-egg. The setup
+    // handler then persists the request's origin as `public_url` so
+    // subsequent strict routes pass without manual config.
+    //
+    // Limited to `/api/v1/auth/setup` and only while
+    // `is_in_setup_mode()` is true; the moment the owner account is
+    // created the bypass closes for everyone. The remaining attack
+    // surface — a third party reaching an un-setup server before the
+    // operator does — is the same surface as exposing any un-setup
+    // admin tool to the public network.
+    if path == "/api/v1/auth/setup" {
+        let in_setup = queries::is_in_setup_mode(&state.pool)
+            .await
+            .unwrap_or(false);
+        if in_setup {
+            return next.run(req).await;
+        }
+    }
 
     if !origin_permitted(&state, &candidate).await {
         return reject().into_response();

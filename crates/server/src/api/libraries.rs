@@ -154,7 +154,7 @@ pub async fn trigger_scan(
     // discovery pipeline (detect_markers / preview / loudness /
     // chapter thumbs jobs per new file). The inner emitter still
     // gets every event for hub + webhook delivery.
-    let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(pool.clone(), emitter);
+    let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(state.clone(), emitter);
     tokio::spawn(async move {
         if let Err(e) = chimpflix_library::run_scan(
             pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job_id,

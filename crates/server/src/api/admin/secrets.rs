@@ -83,6 +83,15 @@ const KNOWN_SLOTS: &[SlotSpec] = &[
         managed: false,
     },
     SlotSpec {
+        name: "omdb",
+        display_name: "OMDb",
+        description: "OMDb API key — fuels the external ratings handler \
+                      (IMDb, Rotten Tomatoes, Metacritic, MPAA). Get a \
+                      free key at omdbapi.com (1,000 requests/day) or \
+                      a paid Patreon key for higher quotas.",
+        managed: false,
+    },
+    SlotSpec {
         name: "session_hmac",
         display_name: "Session HMAC",
         description: "Signs your session cookies. System-managed — \
@@ -367,6 +376,32 @@ pub async fn test(
                 detail: format!("Trakt credentials not usable: {e:#}"),
             })),
         },
+        "omdb" => {
+            // We don't ship a dedicated /validate endpoint for OMDb —
+            // a basic "construct the client and try a known lookup"
+            // proves the key works. Use a stable IMDb id (Citizen
+            // Kane) since OMDb's archive is unlikely to lose it.
+            match chimpflix_metadata::OmdbClient::new(value.clone()) {
+                Ok(client) => match client.fetch_ratings("tt0033467").await {
+                    Ok(Some(_)) => Ok(Json(TestResponse {
+                        ok: true,
+                        detail: "OMDb accepted the key".into(),
+                    })),
+                    Ok(None) => Ok(Json(TestResponse {
+                        ok: false,
+                        detail: "OMDb returned a 'not found' for the test lookup".into(),
+                    })),
+                    Err(e) => Ok(Json(TestResponse {
+                        ok: false,
+                        detail: format!("OMDb rejected: {e:#}"),
+                    })),
+                },
+                Err(e) => Ok(Json(TestResponse {
+                    ok: false,
+                    detail: format!("OMDb key not usable: {e:#}"),
+                })),
+            }
+        }
         "session_hmac" => Ok(Json(TestResponse {
             ok: true,
             detail: "session HMAC is internal; no external test applies".into(),
@@ -434,6 +469,16 @@ async fn refresh_runtime_client(
                 None => None,
             };
             state.set_trakt(client).await;
+            Ok(())
+        }
+        "omdb" => {
+            let client = match new_value {
+                Some(v) => Some(
+                    chimpflix_metadata::OmdbClient::new(v).map_err(ApiError::Internal)?,
+                ),
+                None => None,
+            };
+            state.set_omdb(client).await;
             Ok(())
         }
         // session_hmac is rejected upstream so we never get here for it.

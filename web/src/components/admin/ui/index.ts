@@ -17,3 +17,5 @@ export {
 } from "./Drawer";
 export { HeroCard } from "./HeroCard";
 export { FilterChip } from "./FilterChip";
+export { AdminTabBar, type AdminTab } from "./TabBar";
+export { Pagination, DEFAULT_PAGE_SIZE } from "./Pagination";

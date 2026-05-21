@@ -5,82 +5,9 @@ import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import {
   ChimpFlixApiError,
-  auth as authApi,
   libraries as librariesApi,
   prefs as prefsApi,
-  type UserRole,
 } from "@/lib/chimpflix-api";
-
-// Cache the current user's role in sessionStorage so the "Stats"
-// admin nav link doesn't pop in on every navigation. 5 min TTL is
-// short enough that a role change (promotion / demotion) becomes
-// visible quickly.
-const NAV_ROLE_KEY = "cf_nav_role_v1";
-const NAV_ROLE_TTL_MS = 5 * 60_000;
-
-function readCachedRole(): UserRole | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.sessionStorage.getItem(NAV_ROLE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as { v: UserRole; t: number };
-    if (Date.now() - parsed.t > NAV_ROLE_TTL_MS) return null;
-    return parsed.v;
-  } catch {
-    return null;
-  }
-}
-
-function writeCachedRole(value: UserRole | null): void {
-  if (typeof window === "undefined") return;
-  try {
-    if (value) {
-      window.sessionStorage.setItem(
-        NAV_ROLE_KEY,
-        JSON.stringify({ v: value, t: Date.now() }),
-      );
-    } else {
-      window.sessionStorage.removeItem(NAV_ROLE_KEY);
-    }
-  } catch {
-    // sessionStorage can throw under privacy modes — fall back to fetch.
-  }
-}
-
-function useCurrentUserRole(): UserRole | null {
-  // MUST start `null` for SSR + first client render to agree. Reading
-  // the sessionStorage cache in the `useState` initializer used to flip
-  // the role between server (`null`) and client (cached value) on
-  // hydration — a textual mismatch in the admin-only nav items that
-  // triggered React error #418 and crashed mobile Chrome's renderer
-  // with "Aw, snap". The cached value is populated in the effect below
-  // so the admin items still appear without a network round-trip; they
-  // just appear in the *second* client render instead of fighting
-  // hydration on the first.
-  const [role, setRole] = useState<UserRole | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    const cached = readCachedRole();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (cached) setRole(cached);
-    authApi
-      .me()
-      .then(({ user }) => {
-        if (cancelled) return;
-        setRole(user.role);
-        writeCachedRole(user.role);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        // 401/403: pretend logged-out so admin items stay hidden.
-        writeCachedRole(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return role;
-}
 
 interface NavLibrary {
   id: number;
@@ -182,7 +109,6 @@ function useNavLibraries(): NavLibrary[] {
 
 function navItems(
   libraries: NavLibrary[],
-  role: UserRole | null,
   includeOverflow: boolean,
 ): {
   primary: NavItem[];
@@ -206,17 +132,6 @@ function navItems(
       match: (p) => p === "/my-list" || p.startsWith("/my-list/"),
     },
   ];
-  // Admin / owner shortcut to the playback dashboard. Drops in
-  // right after My List so the section reads "library nav · admin
-  // nav" — keeps the admin link visible without burying it under
-  // the profile menu.
-  if (role === "admin" || role === "owner") {
-    trailing.push({
-      href: "/settings/admin/status/stats",
-      label: "Stats",
-      match: (p) => p.startsWith("/settings/admin/status/stats"),
-    });
-  }
 
   if (includeOverflow) {
     // Mobile drawer renders everything inline — no overflow split.
@@ -231,8 +146,7 @@ function navItems(
 export function NavLinks() {
   const pathname = usePathname() ?? "";
   const libraries = useNavLibraries();
-  const role = useCurrentUserRole();
-  const { primary, overflow } = navItems(libraries, role, false);
+  const { primary, overflow } = navItems(libraries, false);
 
   return (
     <nav className="hidden items-center gap-5 text-sm md:flex">
@@ -253,8 +167,7 @@ export function NavLinks() {
 export function MobileNavTrigger() {
   const pathname = usePathname() ?? "";
   const libraries = useNavLibraries();
-  const role = useCurrentUserRole();
-  const { primary } = navItems(libraries, role, true);
+  const { primary } = navItems(libraries, true);
   const [open, setOpen] = useState(false);
 
   // Close on navigation. usePathname changes when the user taps a

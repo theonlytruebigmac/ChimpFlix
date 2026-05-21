@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
   admin as adminApi,
   auth as authApi,
@@ -42,6 +43,8 @@ export function SettingsInvitesClient() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [issued, setIssued] = useState<CreatedInvite | null>(null);
+  const [askRevokeId, setAskRevokeId] = useState<number | null>(null);
+  const [revokeBusy, setRevokeBusy] = useState(false);
 
   // Tracks the "Copied to clipboard" toast timer so an unmount mid-
   // toast doesn't fire `setMessage` against a torn-down component.
@@ -117,13 +120,21 @@ export function SettingsInvitesClient() {
     }
   }
 
-  async function revoke(id: number) {
-    if (!window.confirm("Revoke this invite?")) return;
+  function revoke(id: number) {
+    setAskRevokeId(id);
+  }
+
+  async function confirmRevoke() {
+    if (askRevokeId == null) return;
+    setRevokeBusy(true);
     try {
-      await authApi.revokeInvite(id);
+      await authApi.revokeInvite(askRevokeId);
       await refresh();
+      setAskRevokeId(null);
     } catch {
       setError("Failed to revoke.");
+    } finally {
+      setRevokeBusy(false);
     }
   }
 
@@ -396,6 +407,17 @@ export function SettingsInvitesClient() {
             ))}
           </ul>
         </div>
+      )}
+      {askRevokeId != null && (
+        <ConfirmDialog
+          title="Revoke this invite?"
+          body="The invite link / code will stop working. Anyone who already accepted keeps their account."
+          confirmLabel="Revoke"
+          destructive
+          busy={revokeBusy}
+          onConfirm={() => void confirmRevoke()}
+          onCancel={() => setAskRevokeId(null)}
+        />
       )}
     </div>
   );

@@ -6,6 +6,7 @@ import {
   preroll as prerollApi,
   type PrerollStatus,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   initialStatus: PrerollStatus;
@@ -27,6 +28,7 @@ export function AdminPrerollClient({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [askClear, setAskClear] = useState(false);
   const previewRef = useRef<HTMLVideoElement | null>(null);
   // Set false on unmount so the debounced volume PATCH below doesn't
   // call setState against a torn-down component.
@@ -46,7 +48,7 @@ export function AdminPrerollClient({
   }
 
   async function clear() {
-    if (!window.confirm("Remove the current pre-roll? Disables pre-roll playback.")) return;
+    setAskClear(false);
     setBusy("clear");
     setError(null);
     try {
@@ -161,7 +163,7 @@ export function AdminPrerollClient({
               </label>
               <button
                 type="button"
-                onClick={clear}
+                onClick={() => setAskClear(true)}
                 disabled={busy === "clear"}
                 className="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-50"
               >
@@ -247,6 +249,17 @@ export function AdminPrerollClient({
           <div className="text-xs text-white/50">Saved.</div>
         )}
       </section>
+      {askClear && (
+        <ConfirmDialog
+          title="Remove the current pre-roll?"
+          body="The uploaded file will be deleted and pre-roll playback will be disabled until a new file is uploaded."
+          confirmLabel="Remove"
+          destructive
+          busy={busy === "clear"}
+          onConfirm={() => void clear()}
+          onCancel={() => setAskClear(false)}
+        />
+      )}
     </div>
   );
 }

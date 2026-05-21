@@ -139,6 +139,35 @@ pub async fn setup(
     .await
     .map_err(ApiError::Internal)?;
 
+    // Seed `public_url` from the setup request's Origin/Referer when
+    // it isn't already configured. The CSRF middleware enforces the
+    // origin check against this value on every subsequent strict
+    // auth route — without seeding it, the operator's next login
+    // would 403 with the same chicken-and-egg the setup endpoint
+    // hits on a fresh DB. Operator can override later via admin →
+    // Server → General.
+    if let Some(origin) = setup_origin_from_headers(&headers) {
+        let current = state.settings.read().await;
+        let already_set = current
+            .public_url
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        drop(current);
+        if !already_set {
+            let patch = chimpflix_library::ServerSettingsUpdate {
+                public_url: Some(Some(origin.clone())),
+                ..Default::default()
+            };
+            let updated =
+                queries::update_server_settings(&state.pool, Some(user.id), patch)
+                    .await
+                    .map_err(ApiError::Internal)?;
+            *state.settings.write().await = updated;
+            info!(public_url = %origin, "seeded public_url from setup request origin");
+        }
+    }
+
     let cookies = issue_session(&state, &user, &headers, Some(ip)).await?;
     info!(user_id = user.id, "setup complete");
     Ok(authed_response(
@@ -1671,6 +1700,24 @@ pub async fn update_user(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract a `scheme://host[:port]` origin from the setup request's
+/// `Origin` header, falling back to the `Referer` (path stripped).
+/// Used to seed `public_url` so the CSRF middleware accepts the same
+/// browser on subsequent requests without manual config.
+fn setup_origin_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() && trimmed != "null" {
+            return Some(trimmed.to_string());
+        }
+    }
+    let referer = headers.get(axum::http::header::REFERER).and_then(|v| v.to_str().ok())?;
+    let after_scheme = referer.find("://")?;
+    let rest = &referer[after_scheme + 3..];
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    Some(format!("{}{}", &referer[..after_scheme + 3], &rest[..host_end]))
+}
 
 fn validate_username(name: &str) -> Result<(), ApiError> {
     let trimmed = name.trim();

@@ -17,6 +17,12 @@ chimpflix-common = { path = "../common" }
 chimpflix-library = { path = "../library" }
 chimpflix-metadata = { path = "../metadata" }
 chimpflix-transcoder = { path = "../transcoder" }
+tacet-core = { workspace = true }
+# bincode is used to serialize tacet's ReferenceFingerprint values into
+# the `show_season_intro_refs` table. Schema-versioned by tacet itself
+# (its Config + Fingerprint structs are #[serde(default)] for new
+# fields), so a tacet upgrade that adds a field still loads old refs.
+bincode = "1.3"
 
 anyhow = { workspace = true }
 argon2 = { workspace = true }

@@ -2,7 +2,6 @@
 
 pub mod capabilities;
 pub mod chapter_thumbs;
-pub mod fingerprint;
 pub mod hwaccel;
 pub mod loudness;
 pub mod markers;

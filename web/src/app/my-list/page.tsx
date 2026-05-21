@@ -1,6 +1,5 @@
 import { ModalRoot } from "@/components/ModalRoot";
 import { MyListClient } from "@/components/MyListClient";
-import { TopNav } from "@/components/TopNav";
 import { requireUser } from "@/lib/chimpflix-server";
 
 export default async function MyListPage() {
@@ -8,7 +7,6 @@ export default async function MyListPage() {
 
   return (
     <main className="relative min-h-screen bg-background">
-      <TopNav />
       <MyListClient />
       <ModalRoot />
     </main>

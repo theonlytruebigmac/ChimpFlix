@@ -1,8 +1,10 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import {
   admin as adminApi,
+  friendlyErrorMessage,
   type ServerSettings,
   type ServerSettingsUpdate,
   type TotpEnforcement,
@@ -41,6 +43,8 @@ export function AdminGeneralForm({ initial }: Props) {
     baseline.totp_enforcement,
   );
   const [error, setError] = useState<string | null>(null);
+  const [rerunBusy, setRerunBusy] = useState(false);
+  const router = useRouter();
 
   const dirtyFields: Record<string, boolean> = {
     "Server name": serverName !== baseline.server_name,
@@ -80,6 +84,22 @@ export function AdminGeneralForm({ initial }: Props) {
     setPublicUrl(baseline.public_url ?? "");
     setTelemetry(baseline.telemetry_opt_in);
     setTotpEnforcement(baseline.totp_enforcement);
+  }
+
+  async function rerunWizard() {
+    setError(null);
+    setRerunBusy(true);
+    try {
+      // Flipping the flag back to false makes the next `/` load
+      // bounce into `/onboarding`. We also push there directly so
+      // the operator doesn't have to click home themselves.
+      await adminApi.settings.patch({ setup_completed: false });
+      router.push("/onboarding");
+    } catch (e) {
+      setError(friendlyErrorMessage(e));
+    } finally {
+      setRerunBusy(false);
+    }
   }
 
   return (
@@ -180,6 +200,25 @@ export function AdminGeneralForm({ initial }: Props) {
             />
             <span>Send anonymous usage telemetry</span>
           </label>
+        </SettingsRow>
+      </SettingsCard>
+
+      <SettingsCard
+        title="First-run wizard"
+        description="The onboarding tour shown on a fresh install. Replay it any time to add another library or change your metadata source."
+      >
+        <SettingsRow
+          label="Replay onboarding"
+          help="Resets the 'setup completed' flag and drops you back into the wizard. Existing libraries, secrets, and settings are not touched."
+        >
+          <button
+            type="button"
+            onClick={rerunWizard}
+            disabled={rerunBusy}
+            className="rounded-md border border-white/20 bg-white/5 px-3 py-1.5 text-sm font-medium text-white hover:border-white/40 hover:bg-white/10 disabled:opacity-50"
+          >
+            {rerunBusy ? "Opening…" : "Re-run setup wizard"}
+          </button>
         </SettingsRow>
       </SettingsCard>
 

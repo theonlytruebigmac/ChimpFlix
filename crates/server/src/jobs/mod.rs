@@ -31,28 +31,30 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use chimpflix_library::queries::{
-    claim_next_job_excluding_kinds, mark_job_dead, mark_job_failed, mark_job_succeeded,
-    reclaim_orphan_jobs, touch_job_lease,
+    claim_next_job_excluding_kinds, mark_job_dead, mark_job_failed_with_class,
+    mark_job_succeeded, reclaim_orphan_jobs, touch_job_lease,
 };
+
+use self::error_class::{backoff_for_class, classify};
 use serde_json::Value;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::{error, info, warn};
 
 use crate::state::AppState;
 
+pub mod error_class;
 pub mod handlers;
 pub mod pipeline;
 
-/// Default lease ttl. A job whose worker hasn't updated `locked_at`
-/// in this long is treated as orphaned on the next startup reclaim.
-/// Long enough to cover the worst-case ffmpeg detect_markers run on
-/// a multi-hour bluray rip; short enough that a real crash is
-/// recovered within an hour of the next start.
-pub const DEFAULT_LEASE_TTL_MS: i64 = 60 * 60 * 1000;
+// Note: the old DEFAULT_LEASE_TTL_MS constant was removed when boot
+// reclaim moved to `lease_ttl=0` (every `running` row at boot is by
+// definition orphaned). The lease-touch heartbeat below uses its own
+// fixed cadence and doesn't need a shared TTL constant.
 
 /// How long the worker sleeps between empty-poll cycles. Short
 /// enough that an enqueue feels responsive; long enough that an
@@ -67,51 +69,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// worker.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// Per-kind concurrency limits. The worker pool's global limit
-/// (number of tokio worker tasks) caps total concurrency, but
-/// these per-kind caps prevent CPU-bound kinds from monopolizing
-/// the pool when a backlog of one kind sits at the head of the
-/// queue.
+/// Build the per-kind semaphore map from the tasks registry.
+/// Unknown kinds (not in the registry) get a permit count equal to
+/// `default_limit` at acquire-time — see [`KindLimiter::acquire`].
 ///
-/// Rationale per kind:
-///   - `detect_markers_file` (CPU/ffmpeg-bound, slow ~30-60s)
-///     → 1: one blackdetect at a time avoids encoder thrash with
-///     live transcodes.
-///   - `generate_preview_sprite` (CPU/ffmpeg-bound, slow)
-///     → 1: same.
-///   - `build_chapter_thumbs` (CPU/ffmpeg-bound, medium)
-///     → 1: same.
-///   - `analyze_loudness` (CPU/ffmpeg-bound, fast ~5-10s)
-///     → 1: same; loudnorm can spike CPU briefly but is short.
-///   - `fetch_subtitles_item` (network-bound, latency-dominated)
-///     → 4: parallelizes fine; OpenSubtitles rate limit is generous.
-///
-/// With 2 workers + these limits, a typical backlog scenario where
-/// the queue has 1000 detect_markers + 500 subtitle jobs ends up
-/// running 1 detect + N subtitles concurrently (instead of 2
-/// detects competing for ffmpeg). New kinds default to 1 unless
-/// added here.
-const KIND_LIMITS: &[(&str, usize)] = &[
-    (handlers::detect_markers_file::KIND, 1),
-    (handlers::generate_preview_sprite::KIND, 1),
-    (handlers::build_chapter_thumbs::KIND, 1),
-    (handlers::analyze_loudness::KIND, 1),
-    (handlers::fetch_subtitles_item::KIND, 4),
-];
-
-/// Build the per-kind semaphore map. Unknown kinds (not listed in
-/// `KIND_LIMITS`) get a permit count equal to `default_limit` —
-/// effectively unbounded by default so future kinds work without
-/// touching this file.
-fn build_kind_semaphores(default_limit: usize) -> HashMap<String, Arc<Semaphore>> {
+/// Single source of truth is now [`crate::tasks::registry`]; adding
+/// a new kind there picks up the cap here automatically. With 2
+/// workers + per-kind caps a typical backlog like 1000 marker jobs
+/// + 500 subtitle jobs ends up running 1 marker + 4 subtitles in
+/// flight instead of dogpiling either kind.
+fn build_kind_semaphores(_default_limit: usize) -> HashMap<String, Arc<Semaphore>> {
     let mut map = HashMap::new();
-    for (kind, limit) in KIND_LIMITS {
-        map.insert((*kind).to_string(), Arc::new(Semaphore::new(*limit)));
+    for k in crate::tasks::registry::all_kinds() {
+        map.insert(
+            k.job_kind.to_string(),
+            Arc::new(Semaphore::new(k.concurrency as usize)),
+        );
     }
-    // A wildcard fallback isn't possible (we don't know future
-    // kinds in advance), so unknown kinds will use `default_limit`
-    // via the get-or-insert path at claim time.
-    let _ = default_limit;
     map
 }
 
@@ -249,32 +223,133 @@ pub fn build_router() -> JobRouter {
         .register(handlers::fetch_subtitles_item::KIND, |s, p| {
             handlers::fetch_subtitles_item::run(s, p)
         })
+        .register(handlers::refresh_logos_item::KIND, |s, p| {
+            handlers::refresh_logos_item::run(s, p)
+        })
+        .register(handlers::detect_extras_item::KIND, |s, p| {
+            handlers::detect_extras_item::run(s, p)
+        })
+        .register(handlers::extract_embedded_subs::KIND, |s, p| {
+            handlers::extract_embedded_subs::run(s, p)
+        })
+        .register(handlers::fetch_external_ratings::KIND, |s, p| {
+            handlers::fetch_external_ratings::run(s, p)
+        })
+        .register(handlers::bootstrap_season_refs::KIND, |s, p| {
+            handlers::bootstrap_season_refs::run(s, p)
+        })
         .build()
 }
 
-/// Reclaim orphans, then spawn `n_workers` polling loops. Workers
-/// run for the process lifetime — there's no explicit shutdown hook
-/// since process exit drops the tokio runtime which cancels them.
-pub async fn start(state: AppState, router: JobRouter, n_workers: usize) {
-    match reclaim_orphan_jobs(&state.pool, DEFAULT_LEASE_TTL_MS).await {
+/// Resizeable handle into the worker pool. Each worker carries a
+/// unique `id` and reads the desired pool size from `count_tx`; on
+/// each iteration it exits if `id >= desired`, so shrinking the
+/// pool drains naturally once each worker finishes its current
+/// claim. Growing spawns fresh workers starting at the next id.
+///
+/// Lives in [`crate::state::AppState`] so the admin settings PATCH
+/// handler can call [`Self::resize`] when the operator changes
+/// `job_workers` — no restart required.
+#[derive(Clone)]
+pub struct WorkerPoolHandle {
+    state: AppState,
+    router: JobRouter,
+    limiter: KindLimiter,
+    count_tx: watch::Sender<usize>,
+    /// Monotonic id allocator. We never reuse worker ids because a
+    /// resize-down followed by resize-up shouldn't accidentally
+    /// re-launch a worker with an id that an in-flight (draining)
+    /// worker is still using.
+    next_id: Arc<AtomicUsize>,
+}
+
+impl WorkerPoolHandle {
+    /// Live desired worker count. Each worker's loop self-exits when
+    /// its id moves outside this window. Clamped to [1, 32] to match
+    /// the admin UI's slider range; 0 would mean "process no jobs",
+    /// which is a footgun more easily expressed as "disable the
+    /// kinds" via the gates.
+    pub fn resize(&self, target: usize) {
+        let clamped = target.clamp(1, 32);
+        let current = *self.count_tx.borrow();
+        if clamped == current {
+            return;
+        }
+        // Publish the new desired count first. Workers above the
+        // threshold notice on their next poll-or-changed wakeup and
+        // bow out gracefully.
+        let _ = self.count_tx.send(clamped);
+        if clamped > current {
+            // Growing: spawn (target - current) new workers. The id
+            // allocator guarantees they get fresh ids past anything
+            // already running, even if a previous shrink hasn't
+            // finished draining yet.
+            for _ in current..clamped {
+                self.spawn_worker();
+            }
+        }
+        info!(
+            from = current,
+            to = clamped,
+            "job worker pool resized",
+        );
+    }
+
+    fn spawn_worker(&self) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let state = self.state.clone();
+        let router = self.router.clone();
+        let limiter = self.limiter.clone();
+        let count_rx = self.count_tx.subscribe();
+        tokio::spawn(async move {
+            worker_loop(id, state, router, limiter, count_rx).await;
+        });
+    }
+}
+
+/// Reclaim orphans, then spawn `n_workers` polling loops. Returns a
+/// [`WorkerPoolHandle`] that can resize the pool live without a
+/// process restart.
+pub async fn start(
+    state: AppState,
+    router: JobRouter,
+    n_workers: usize,
+) -> WorkerPoolHandle {
+    // Boot-time reclaim: any row left in `status='running'` is by
+    // definition orphaned — the worker that claimed it lived in a
+    // previous process that no longer exists. Passing `lease_ttl=0`
+    // makes every `running` row qualify regardless of how recent
+    // its `locked_at` is. The previous 1h TTL only caught long-dead
+    // jobs and let zombie rows from a recent restart sit "running"
+    // for an hour, double-counting against the worker-count math
+    // on the admin dashboard.
+    match reclaim_orphan_jobs(&state.pool, 0).await {
         Ok(0) => {}
         Ok(n) => info!(count = n, "reclaimed orphan jobs from previous run"),
         Err(e) => warn!(error = %format!("{e:#}"), "reclaim_orphan_jobs failed"),
     }
     let n = n_workers.max(1);
     // Limiter is shared across workers so a permit acquired by one
-    // worker blocks others from claiming the same kind. Unknown
-    // kinds default to `n_workers` permits — effectively unbounded
-    // among the running workers — so adding a new kind doesn't
-    // require touching `KIND_LIMITS`.
+    // worker blocks others from claiming the same kind. The default
+    // permit count for unknown kinds is intentionally fixed at the
+    // initial worker count — it caps cross-worker concurrency for
+    // operator-defined custom kinds, and changing it at runtime
+    // doesn't matter because known (registry) kinds carry their own
+    // explicit caps that don't scale with the worker count.
     let limiter = KindLimiter::new(n.max(1));
-    for worker_id in 0..n {
-        let state = state.clone();
-        let router = router.clone();
-        let limiter = limiter.clone();
-        tokio::spawn(async move { worker_loop(worker_id, state, router, limiter).await });
+    let (count_tx, _) = watch::channel(n);
+    let handle = WorkerPoolHandle {
+        state,
+        router,
+        limiter,
+        count_tx,
+        next_id: Arc::new(AtomicUsize::new(0)),
+    };
+    for _ in 0..n {
+        handle.spawn_worker();
     }
     info!(workers = n, "job queue workers spawned");
+    handle
 }
 
 async fn worker_loop(
@@ -282,8 +357,19 @@ async fn worker_loop(
     state: AppState,
     router: JobRouter,
     limiter: KindLimiter,
+    mut count_rx: watch::Receiver<usize>,
 ) {
     loop {
+        // Self-exit check. Each worker's id is monotonic; the
+        // resize handler bumps the desired count and any worker
+        // whose id is now out of range bows out as soon as it
+        // notices. We re-check here (top of the loop) AND between
+        // empty-poll sleeps, so a shrink doesn't have to wait for
+        // the next claim to take effect.
+        if worker_id >= *count_rx.borrow() {
+            info!(worker = worker_id, "job worker draining (pool shrunk)");
+            return;
+        }
         let saturated = limiter.saturated_kinds().await;
         let claim = claim_next_job_excluding_kinds(&state.pool, &saturated).await;
         match claim {
@@ -322,6 +408,17 @@ async fn worker_loop(
                 // — short-lived contention, no starvation.
                 let _kind_permit = limiter.acquire(&kind).await;
 
+                // Bump the live in-flight counter; the guard
+                // decrements on drop (after the handler returns
+                // or panics). For kinds the registry doesn't know
+                // about (operator-custom schedules), we skip
+                // metrics — they aren't surfaced in the admin
+                // activity screen anyway.
+                let metric_kind: Option<&'static str> =
+                    crate::tasks::registry::find_kind(&kind).map(|k| k.job_kind);
+                let _live_guard = metric_kind.map(|k| state.task_metrics.enter(k));
+                let started_at = chimpflix_common::now_ms();
+
                 // Spawn a heartbeat task that refreshes `locked_at`
                 // while the handler runs. Without this, a handler
                 // that takes longer than the lease TTL would be
@@ -348,8 +445,21 @@ async fn worker_loop(
                 });
                 let result = handler(state.clone(), payload).await;
                 heartbeat.abort();
+                let finished_at = chimpflix_common::now_ms();
+                let duration_ms = finished_at.saturating_sub(started_at);
                 match result {
                     Ok(()) => {
+                        if let Some(k) = metric_kind {
+                            state.task_metrics.record(
+                                k,
+                                crate::tasks::metrics::RunRecord {
+                                    finished_at_ms: finished_at,
+                                    duration_ms,
+                                    success: true,
+                                    error_class: None,
+                                },
+                            );
+                        }
                         if let Err(e) =
                             mark_job_succeeded(&state.pool, job.id).await
                         {
@@ -363,19 +473,56 @@ async fn worker_loop(
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        let backoff = backoff_ms(job.attempts);
+                        // Classify before computing backoff: rate-
+                        // limited / auth / permanent / timeout each
+                        // get their own retry curve from
+                        // [`error_class::backoff_for_class`]. Falling
+                        // back to the legacy exponential schedule
+                        // when the class wants a normal retry but
+                        // the curve doesn't have one (covered by
+                        // `Transient`).
+                        let class = classify(&e);
+                        if let Some(k) = metric_kind {
+                            state.task_metrics.record(
+                                k,
+                                crate::tasks::metrics::RunRecord {
+                                    finished_at_ms: finished_at,
+                                    duration_ms,
+                                    success: false,
+                                    error_class: Some(class.as_str()),
+                                },
+                            );
+                        }
+                        let class_backoff = backoff_for_class(class, job.attempts);
+                        // For terminal classes `class_backoff` is
+                        // None and the computed `backoff` value
+                        // doesn't matter — `mark_job_failed_with_class`
+                        // flips to `dead` and ignores backoff
+                        // entirely. We still compute the legacy
+                        // exponential curve as a fallback for the
+                        // non-terminal-but-uncovered case (defensive),
+                        // and so the log line below shows a useful
+                        // number.
+                        let backoff = class_backoff
+                            .unwrap_or_else(|| backoff_ms(job.attempts));
                         warn!(
                             worker = worker_id,
                             job_id = job.id,
                             kind = %kind,
                             attempts = job.attempts,
+                            error_class = class.as_str(),
                             backoff_ms = backoff,
                             error = %msg,
                             "job handler returned error",
                         );
-                        if let Err(e) =
-                            mark_job_failed(&state.pool, job.id, &msg, backoff)
-                                .await
+                        if let Err(e) = mark_job_failed_with_class(
+                            &state.pool,
+                            job.id,
+                            &msg,
+                            backoff,
+                            Some(class.as_str()),
+                        )
+                        .await
                         {
                             error!(
                                 worker = worker_id,
@@ -388,7 +535,14 @@ async fn worker_loop(
                 }
             }
             Ok(None) => {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                // Race the empty-poll sleep against a count-change
+                // notification so a shrink is observed promptly
+                // instead of waiting up to POLL_INTERVAL for the
+                // next loop iteration.
+                tokio::select! {
+                    _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                    _ = count_rx.changed() => {}
+                }
             }
             Err(e) => {
                 warn!(
@@ -396,7 +550,10 @@ async fn worker_loop(
                     error = %format!("{e:#}"),
                     "claim_next_job failed; backing off",
                 );
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = count_rx.changed() => {}
+                }
             }
         }
     }

@@ -37,6 +37,16 @@ use tracing::debug;
 use crate::FfmpegConfig;
 use crate::probe::{Chapter, probe_chapters};
 
+/// blackdetect scan window per side (head + tail). The intro
+/// classifier only considers runs within the first 10 minutes and
+/// credits only within the last 10 minutes of the file, so decoding
+/// the middle is pure waste. On a 2-hour movie this cuts the
+/// blackdetect pass from ~120 minutes of decode work to ~20 — a 6×
+/// speed-up. Files shorter than 2× this window get a single full-
+/// file pass because head and tail would overlap anyway.
+const SCAN_WINDOW_SECS: u64 = 600;
+const SCAN_WINDOW_MS: i64 = (SCAN_WINDOW_SECS as i64) * 1000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectedMarker {
     pub kind: MarkerKind,
@@ -114,23 +124,7 @@ pub async fn detect_markers(
         }
     };
 
-    debug!(path = %path.display(), "blackdetect start");
-    let output = cfg
-        .background_ffmpeg()
-        .args(["-hide_banner", "-nostats", "-loglevel", "info"])
-        .arg("-i")
-        // file: prefix prevents a filename starting with `-` from being
-        // parsed as a flag (see crate::safe_ffmpeg_input).
-        .arg(crate::safe_ffmpeg_input(path))
-        // d=1 → minimum 1s of black; pix_th low so fades are picked up.
-        .args(["-vf", "blackdetect=d=1:pix_th=0.10"])
-        .args(["-an", "-sn", "-f", "null"])
-        .arg("-")
-        .output()
-        .await
-        .with_context(|| format!("spawn ffmpeg blackdetect for {}", path.display()))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let runs = parse_black_runs(&stderr);
+    let runs = scan_blackdetect(cfg, path, duration_ms).await?;
     debug!(
         path = %path.display(),
         runs = runs.len(),
@@ -139,6 +133,89 @@ pub async fn detect_markers(
     let blackdetect_markers = classify(runs, duration_ms);
 
     Ok(merge_markers(chapter_markers, blackdetect_markers))
+}
+
+/// Run the blackdetect ffmpeg pass(es) and return the merged black
+/// runs in absolute file timestamps. Long files get a head-only +
+/// tail-only split so we don't decode the middle that the classifier
+/// would discard anyway; short/unknown-duration files fall back to a
+/// single full-file pass.
+async fn scan_blackdetect(
+    cfg: &FfmpegConfig,
+    path: &Path,
+    duration_ms: Option<i64>,
+) -> Result<Vec<BlackRun>> {
+    match duration_ms {
+        Some(dur) if dur > 2 * SCAN_WINDOW_MS => {
+            // Head: decode first 10 minutes from the start.
+            let head = scan_blackdetect_range(cfg, path, 0, Some(SCAN_WINDOW_SECS)).await?;
+            // Tail: seek to (duration - 10 min) and decode 10 minutes.
+            // `-ss` before `-i` is a fast (keyframe) seek — the resulting
+            // blackdetect timestamps are relative to the seek point,
+            // so we add the offset to convert back to absolute file
+            // time before merging.
+            let tail_offset_secs = ((dur - SCAN_WINDOW_MS) / 1000).max(0) as u64;
+            let mut tail =
+                scan_blackdetect_range(cfg, path, tail_offset_secs, Some(SCAN_WINDOW_SECS))
+                    .await?;
+            let offset_ms = (tail_offset_secs as i64) * 1000;
+            for r in tail.iter_mut() {
+                r.start_ms += offset_ms;
+                r.end_ms += offset_ms;
+            }
+            let mut runs = head;
+            runs.extend(tail);
+            Ok(runs)
+        }
+        _ => {
+            // Single pass for short/unknown-duration files. Head + tail
+            // would overlap anyway and the extra fork would only save
+            // milliseconds.
+            scan_blackdetect_range(cfg, path, 0, None).await
+        }
+    }
+}
+
+/// Invoke ffmpeg's blackdetect filter over a single range and parse
+/// its stderr. `start_secs` becomes `-ss <N>` before `-i` (fast,
+/// keyframe-accurate seek); `duration_secs` becomes `-t <N>` (decode
+/// at most N seconds). When both are None/0 the whole file is
+/// scanned. Returned timestamps are relative to `start_secs` — the
+/// caller is responsible for translating them to absolute file time.
+async fn scan_blackdetect_range(
+    cfg: &FfmpegConfig,
+    path: &Path,
+    start_secs: u64,
+    duration_secs: Option<u64>,
+) -> Result<Vec<BlackRun>> {
+    debug!(
+        path = %path.display(),
+        start_secs,
+        duration_secs = ?duration_secs,
+        "blackdetect start"
+    );
+    let mut cmd = cfg.background_ffmpeg();
+    cmd.args(["-hide_banner", "-nostats", "-loglevel", "info"]);
+    if start_secs > 0 {
+        cmd.args(["-ss", &start_secs.to_string()]);
+    }
+    cmd.arg("-i")
+        // file: prefix prevents a filename starting with `-` from being
+        // parsed as a flag (see crate::safe_ffmpeg_input).
+        .arg(crate::safe_ffmpeg_input(path));
+    if let Some(d) = duration_secs {
+        cmd.args(["-t", &d.to_string()]);
+    }
+    let output = cmd
+        // d=1 → minimum 1s of black; pix_th low so fades are picked up.
+        .args(["-vf", "blackdetect=d=1:pix_th=0.10"])
+        .args(["-an", "-sn", "-f", "null"])
+        .arg("-")
+        .output()
+        .await
+        .with_context(|| format!("spawn ffmpeg blackdetect for {}", path.display()))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(parse_black_runs(&stderr))
 }
 
 /// Map chapter entries onto intro/credits markers via case-insensitive

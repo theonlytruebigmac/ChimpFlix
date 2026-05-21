@@ -130,6 +130,7 @@ async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
     let anilist_configured = state.anilist.read().await.is_some();
     let opensubtitles_configured = state.opensubtitles.read().await.is_some();
     let trakt_configured = state.trakt.read().await.is_some();
+    let omdb_configured = state.omdb.read().await.is_some();
     vec![
         AgentInfo {
             name: "tmdb".into(),
@@ -176,6 +177,18 @@ async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
             // individually from /settings/integrations.
             supported_kinds: vec!["movie".into(), "show".into()],
             configured: trakt_configured,
+        },
+        AgentInfo {
+            name: "omdb".into(),
+            display_name: "OMDb".into(),
+            // External-ratings supplement — IMDb/Rotten Tomatoes/
+            // Metacritic/MPAA. Read by the `fetch_external_ratings`
+            // per-item handler; not a primary metadata source so it
+            // doesn't need to be in the per-library priority list,
+            // but listing it here keeps the configured-status badge
+            // visible next to the other providers.
+            supported_kinds: vec!["movie".into(), "show".into()],
+            configured: omdb_configured,
         },
     ]
 }

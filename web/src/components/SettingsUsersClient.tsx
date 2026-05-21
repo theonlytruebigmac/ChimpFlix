@@ -8,6 +8,7 @@ import {
   type User,
   type UserRole,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface Props {
   currentUserId: number;
@@ -61,6 +62,11 @@ export function SettingsUsersClient({
   const [users, setUsers] = useState<User[] | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // One slot per confirmation flow. Each tracks (id, label) so the
+  // dialog can name the target user.
+  const [askResetTwoFactor, setAskResetTwoFactor] = useState<{ id: number; label: string } | null>(null);
+  const [askSendPasswordReset, setAskSendPasswordReset] = useState<{ id: number; label: string } | null>(null);
+  const [askRemove, setAskRemove] = useState<{ id: number; label: string } | null>(null);
 
   useEffect(() => {
     refresh();
@@ -102,14 +108,14 @@ export function SettingsUsersClient({
     }
   }
 
-  async function resetTwoFactor(id: number, label: string) {
-    if (
-      !window.confirm(
-        `Reset 2FA for "${label}"? They'll be able to log in with just their password until they re-enroll.`,
-      )
-    ) {
-      return;
-    }
+  function resetTwoFactor(id: number, label: string) {
+    setAskResetTwoFactor({ id, label });
+  }
+
+  async function confirmResetTwoFactor() {
+    if (!askResetTwoFactor) return;
+    const { id, label } = askResetTwoFactor;
+    setAskResetTwoFactor(null);
     setBusy(id);
     setMessage(null);
     try {
@@ -137,14 +143,14 @@ export function SettingsUsersClient({
     }
   }
 
-  async function sendPasswordReset(id: number, label: string) {
-    if (
-      !window.confirm(
-        `Send a password reset email to "${label}"? The link expires in 1 hour and can only be used once.`,
-      )
-    ) {
-      return;
-    }
+  function sendPasswordReset(id: number, label: string) {
+    setAskSendPasswordReset({ id, label });
+  }
+
+  async function confirmSendPasswordReset() {
+    if (!askSendPasswordReset) return;
+    const { id } = askSendPasswordReset;
+    setAskSendPasswordReset(null);
     setBusy(id);
     setMessage(null);
     try {
@@ -170,14 +176,14 @@ export function SettingsUsersClient({
     }
   }
 
-  async function remove(id: number, label: string) {
-    if (
-      !window.confirm(
-        `Delete user "${label}"? Their sessions and watch state will be removed.`,
-      )
-    ) {
-      return;
-    }
+  function remove(id: number, label: string) {
+    setAskRemove({ id, label });
+  }
+
+  async function confirmRemove() {
+    if (!askRemove) return;
+    const { id, label } = askRemove;
+    setAskRemove(null);
     setBusy(id);
     setMessage(null);
     try {
@@ -328,6 +334,38 @@ export function SettingsUsersClient({
         ))}
       </ul>
       {message && <p className="mt-3 text-xs text-white/70">{message}</p>}
+      {askResetTwoFactor && (
+        <ConfirmDialog
+          title={`Reset 2FA for "${askResetTwoFactor.label}"?`}
+          body="They'll be able to log in with just their password until they re-enroll. Existing recovery codes are invalidated."
+          confirmLabel="Reset 2FA"
+          destructive
+          busy={busy === askResetTwoFactor.id}
+          onConfirm={() => void confirmResetTwoFactor()}
+          onCancel={() => setAskResetTwoFactor(null)}
+        />
+      )}
+      {askSendPasswordReset && (
+        <ConfirmDialog
+          title={`Send password reset to "${askSendPasswordReset.label}"?`}
+          body="A reset link is emailed to the address on file. The link expires in 1 hour and can only be used once."
+          confirmLabel="Send"
+          busy={busy === askSendPasswordReset.id}
+          onConfirm={() => void confirmSendPasswordReset()}
+          onCancel={() => setAskSendPasswordReset(null)}
+        />
+      )}
+      {askRemove && (
+        <ConfirmDialog
+          title={`Delete user "${askRemove.label}"?`}
+          body="Their sessions, watch state, and personal lists will be removed. Library files on disk are untouched."
+          confirmLabel="Delete user"
+          destructive
+          busy={busy === askRemove.id}
+          onConfirm={() => void confirmRemove()}
+          onCancel={() => setAskRemove(null)}
+        />
+      )}
     </div>
   );
 }

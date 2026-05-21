@@ -39,9 +39,7 @@ services:
       - "/etc/timezone:/etc/timezone:ro"
       - ./data:/data
       # Mount your media here (read-only is recommended).
-      - /mnt/archive/movies:/media/movies:ro
-      - /mnt/archive/tv:/media/shows:ro
-      - /mnt/archive/anime:/media/anime:ro
+      - /mnt/archive:/media
     # IMPORTANT — choose the right bind for your topology:
     #
     #   * Same-host Traefik (shared docker network): remove the `ports:`
@@ -70,7 +68,18 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 512
+    # Process/thread ceiling. Bumped from 512 → 4096 because the
+    # media workload is fundamentally thread-heavy: each ffmpeg
+    # invocation spawns a stderr-capture thread, tacet's rayon
+    # pool defaults to `num_cpus`, and 4 concurrent job workers
+    # each running `detect_markers_file` + an in-flight
+    # `bootstrap_season_refs` (which decodes every episode of a
+    # season in parallel) easily blow through 512 — surfacing as
+    # "task panicked: failed to spawn thread: Resource temporarily
+    # unavailable (os error 11 / EAGAIN)" in the job queue. 4096
+    # still bounds fork-bomb risk but matches the real workload's
+    # peak demand on a 4–8 core host.
+    pids_limit: 4096
     # Disable kernel-mediated mount/CHROOT etc. Apparmor profile
     # `docker-default` is implicit on Ubuntu/Debian hosts.
     # GPU passthrough. Pick one (or both — different runtime keys,

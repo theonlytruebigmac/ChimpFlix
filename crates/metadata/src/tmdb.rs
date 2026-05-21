@@ -13,6 +13,17 @@ use tracing::{debug, warn};
 const TMDB_BASE_URL: &str = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE: &str = "https://image.tmdb.org/t/p";
 
+/// Returned (wrapped in `anyhow::Error`) when TMDB responds with a 2xx
+/// status but a body we can't deserialize — empty body, Cloudflare
+/// challenge HTML, malformed JSON, etc. Callers downcast to map this
+/// to a 502 "TMDB unavailable" instead of a generic 500.
+#[derive(Debug, thiserror::Error)]
+#[error("TMDB upstream returned unparseable body from {url}: {snippet}")]
+pub struct TmdbUpstreamError {
+    pub url: String,
+    pub snippet: String,
+}
+
 #[derive(Clone)]
 pub struct TmdbClient {
     http: reqwest::Client,
@@ -525,24 +536,87 @@ impl TmdbClient {
         params: &[(&str, String)],
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
+        // One retry on transient failures (network error, 5xx, or
+        // 2xx with unparseable body). TMDB's CDN occasionally returns
+        // empty 200s under load; a single short retry recovers without
+        // hammering the API. We don't loop more than once because the
+        // caller (scanner, Fix Match) wraps this in a higher-level
+        // surface that the operator can re-trigger.
+        match self.get_once(&url, params).await {
+            Ok(v) => Ok(v),
+            Err(first) if is_retryable(&first) => {
+                warn!(
+                    %url,
+                    error = %format!("{first:#}"),
+                    "TMDB request failed, retrying once in 250ms",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                self.get_once(&url, params).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn get_once<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: &str,
+        params: &[(&str, String)],
+    ) -> Result<T> {
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .query(params)
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
 
         let status = resp.status();
+        // Buffer the body once — needed for both error logging and
+        // (on success) JSON parsing. `resp.json()` consumes the body
+        // and gives no visibility into what TMDB actually sent when
+        // parsing fails, which is exactly the case we need to debug.
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("read TMDB body from {url}"))?;
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %url, body = %body.chars().take(200).collect::<String>(), "TMDB error");
+            let snippet: String = body.chars().take(200).collect();
+            warn!(%status, %url, body = %snippet, "TMDB error");
             anyhow::bail!("TMDB {url} returned {status}");
         }
-        resp.json::<T>()
-            .await
-            .with_context(|| format!("parse TMDB JSON from {url}"))
+        match serde_json::from_str::<T>(&body) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let snippet: String = body.chars().take(200).collect();
+                warn!(
+                    %url,
+                    body_len = body.len(),
+                    body = %snippet,
+                    error = %e,
+                    "TMDB returned 2xx but body is not the expected JSON shape",
+                );
+                Err(anyhow::Error::new(TmdbUpstreamError {
+                    url: url.to_string(),
+                    snippet,
+                }))
+            }
+        }
     }
+}
+
+/// Network errors and unparseable upstream bodies are worth a single
+/// retry. Non-2xx statuses are NOT retried because (a) 4xx is the
+/// caller's fault (bad query, bad id) and (b) repeat 5xx in quick
+/// succession would amplify load when TMDB is already struggling.
+fn is_retryable(err: &anyhow::Error) -> bool {
+    if err.is::<TmdbUpstreamError>() {
+        return true;
+    }
+    if let Some(re) = err.downcast_ref::<reqwest::Error>() {
+        return re.is_timeout() || re.is_connect() || re.is_request();
+    }
+    false
 }
 
 /// Build a TMDB image URL. Common sizes: `w92`, `w154`, `w185`, `w300`,

@@ -50,6 +50,16 @@ pub async fn patch(
         *guard = updated.clone();
     }
 
+    // Hot-apply settings whose runtime effect isn't just "next time
+    // someone reads the cache." Right now that's only the job
+    // worker pool size — `transcoder_max_background_concurrent` is
+    // already hot because the scheduler reads it fresh every tick.
+    if let Some(target) = input.job_workers {
+        if let Some(handle) = state.worker_pool.read().await.clone() {
+            handle.resize(target.max(1) as usize);
+        }
+    }
+
     let user_agent = headers
         .get(USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -155,6 +165,13 @@ pub fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
         if !(1..=16).contains(&n) {
             return Err(ApiError::validation(
                 "transcoder_max_background_concurrent must be between 1 and 16",
+            ));
+        }
+    }
+    if let Some(n) = patch.job_workers {
+        if !(1..=16).contains(&n) {
+            return Err(ApiError::validation(
+                "job_workers must be between 1 and 16",
             ));
         }
     }

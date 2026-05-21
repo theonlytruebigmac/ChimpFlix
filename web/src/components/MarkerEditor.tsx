@@ -6,7 +6,6 @@ import {
   type ManualMarkerInput,
   type MarkerRow,
   type MediaFileMarkersResponse,
-  type ShowFingerprintStatus,
 } from "@/lib/chimpflix-api";
 
 interface Props {
@@ -62,20 +61,6 @@ export function MarkerEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
-  // Per-show intro fingerprint status — drives the "Fingerprint
-  // captured" badge in the header and the Clear button. Null until
-  // the first GET resolves; remains null for movie files (no parent
-  // show) where the badge is hidden entirely.
-  //
-  // We also snapshot wall-clock time at fetch so the badge can show
-  // a stable "2h ago" without calling Date.now() during render
-  // (which trips react-hooks/purity).
-  const [fingerprint, setFingerprint] = useState<{
-    status: ShowFingerprintStatus;
-    nowMs: number;
-  } | null>(null);
-  const [clearingFp, setClearingFp] = useState(false);
-
   // Fetch on open. The parent unmounts us between sessions (via the
   // `open` gate at the top of the render), so this only fires once
   // per editor invocation — no need to reset loaded/error here.
@@ -93,38 +78,10 @@ export function MarkerEditor({
         if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
       });
-    // Parallel fetch — fingerprint status is independent of marker
-    // CRUD. Silently swallow failures (e.g. movie file with no
-    // parent show) so the badge just stays hidden.
-    itemsApi
-      .getFingerprintStatus(mediaFileId)
-      .then((fp) => {
-        if (!cancelled) setFingerprint({ status: fp, nowMs: Date.now() });
-      })
-      .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [open, mediaFileId]);
-
-  async function clearFingerprint() {
-    if (
-      !window.confirm(
-        "Clear the intro fingerprint for this show? Future detect-markers runs will fall back to blackdetect until you save a new manual intro marker on an episode.",
-      )
-    ) {
-      return;
-    }
-    setClearingFp(true);
-    try {
-      const next = await itemsApi.clearFingerprint(mediaFileId);
-      setFingerprint({ status: next, nowMs: Date.now() });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingFp(false);
-    }
-  }
 
   const autoRows = useMemo(
     () => (loaded ? loaded.markers.filter((m) => m.source === "auto") : []),
@@ -209,14 +166,6 @@ export function MarkerEditor({
                 <span> · {formatSeconds(loaded.duration_ms / 1000)}</span>
               )}
             </p>
-            {fingerprint && fingerprint.status.show_id !== null && (
-              <FingerprintBadge
-                status={fingerprint.status}
-                nowMs={fingerprint.nowMs}
-                onClear={clearFingerprint}
-                clearing={clearingFp}
-              />
-            )}
           </div>
           <button
             type="button"
@@ -428,75 +377,3 @@ function formatSeconds(s: number): string {
   return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
-/// Status badge for the show's intro audio fingerprint. Renders one
-/// of three states:
-///   * captured + manual — operator's marker drove the capture
-///   * captured + auto — future state (auto-capture from a
-///     high-confidence detection); kept distinct so the operator can
-///     see which source they're trusting
-///   * not captured — explains how to seed one (mark an intro on
-///     E01, save)
-///
-/// Sits inside the editor header. The Clear button is only rendered
-/// when something is captured.
-function FingerprintBadge({
-  status,
-  nowMs,
-  onClear,
-  clearing,
-}: {
-  status: ShowFingerprintStatus;
-  /// Wall-clock at fetch time, used to render a stable "2h ago"
-  /// without calling Date.now() during render.
-  nowMs: number;
-  onClear: () => void;
-  clearing: boolean;
-}) {
-  if (!status.captured) {
-    return (
-      <div className="mt-2 inline-flex items-center gap-2 rounded-md border border-white/10 bg-white/2 px-2 py-1 text-[11px] text-white/55">
-        <span aria-hidden className="inline-block h-1.5 w-1.5 rounded-full bg-white/30" />
-        No intro fingerprint yet. Save a manual{" "}
-        <code className="font-mono text-white/70">intro</code> marker to seed
-        one — future episodes auto-detect via audio match.
-      </div>
-    );
-  }
-  const sourceTone =
-    status.captured_by === "manual"
-      ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
-      : "border-sky-400/30 bg-sky-500/10 text-sky-200";
-  const since =
-    status.captured_at != null
-      ? relativeSince(status.captured_at, nowMs)
-      : "recently";
-  return (
-    <div
-      className={`mt-2 inline-flex items-center gap-2 rounded-md border px-2 py-1 text-[11px] ${sourceTone}`}
-    >
-      <span aria-hidden className="inline-block h-1.5 w-1.5 rounded-full bg-current" />
-      Intro fingerprint captured {since}
-      {status.duration_ms != null && (
-        <span className="text-white/55">
-          · {formatSeconds(status.duration_ms / 1000)} sample
-        </span>
-      )}
-      <button
-        type="button"
-        onClick={onClear}
-        disabled={clearing}
-        className="ml-1 rounded border border-white/15 px-1.5 py-0 text-[10px] text-white/75 hover:bg-white/5 disabled:opacity-50"
-      >
-        {clearing ? "Clearing…" : "Clear"}
-      </button>
-    </div>
-  );
-}
-
-function relativeSince(epochMs: number, nowMs: number): string {
-  const diff = nowMs - epochMs;
-  if (diff < 60_000) return "just now";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
-}

@@ -327,7 +327,7 @@ export function AdminDashboardClient({ initial }: Props) {
           }
         />
         <QuickAction
-          href="/settings/admin/maintenance/audit"
+          href="/settings/admin/maintenance/logs/audit"
           title="Audit log"
           subtitle="Recent admin actions"
           icon={

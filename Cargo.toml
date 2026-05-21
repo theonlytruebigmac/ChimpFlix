@@ -5,6 +5,7 @@ members = [
     "crates/library",
     "crates/metadata",
     "crates/server",
+    "crates/tacet-core",
     "crates/transcoder",
 ]
 
@@ -19,12 +20,20 @@ authors = ["ChimpFlix contributors"]
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.5"
-# Pure-Rust port of the chromaprint audio-fingerprint algorithm. Used
-# by the intro detector to anchor a show's intro start/end across
-# episodes — far more reliable than blackdetect alone, which only
-# catches cold-open → theme fades. We picked the pure-Rust port over
-# the C-FFI `chromaprint` crate to avoid a runtime dep on
-# libchromaprint inside the Docker image.
+# tacet — pure-Rust intro/credits detection engine. Reference-based
+# audio fingerprinting (constellation-hash) with a blackframe
+# fallback for live-action shows. Vendored at crates/tacet-core via
+# `git subtree add` from theonlytruebigmac/tacet so we can land
+# ChimpFlix-specific changes locally; push back upstream with
+# `git subtree push --prefix=crates/tacet-core <remote> <branch>`.
+# Default features are off so we don't pull tacet's bundled rusqlite
+# (ChimpFlix has its own SQLite via sqlx).
+tacet-core = { path = "crates/tacet-core", default-features = false }
+# Pure-Rust port of the chromaprint audio-fingerprint algorithm. Was
+# used by the legacy intro detector to anchor a show's intro across
+# episodes via operator-tagged chapter regions. Superseded by tacet's
+# reference-based matching, kept here only for the storage layer that
+# still surfaces older fingerprints (see queries::show_intro_fingerprints).
 rusty-chromaprint = "0.3"
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 base64 = "0.22"
@@ -55,7 +64,7 @@ libc = "0.2"
 notify = "6"
 rand_core = { version = "0.6", features = ["getrandom"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

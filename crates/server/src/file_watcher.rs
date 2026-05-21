@@ -78,10 +78,22 @@ async fn run(state: AppState) -> Result<()> {
         // Either drain a batch of events or wake every second to check
         // pending buckets + whether it's time to re-poll the libraries
         // table for new/removed paths.
+        // Live-read `scan_automatically` once per iteration. When
+        // the operator flips it off in admin, the watcher keeps
+        // running but stops queueing scans — `pending` gets cleared
+        // and incoming events are dropped on the floor. inotify
+        // still delivers events into the channel (zero idle cost
+        // at the kernel layer), they just don't go anywhere.
+        // Toggling back on resumes within the next select iteration.
+        let auto_scan = state.settings.read().await.scan_automatically;
+
         tokio::select! {
             event = rx.recv() => {
                 match event {
                     Some(Ok(ev)) => {
+                        if !auto_scan {
+                            continue;
+                        }
                         if !is_interesting(&ev.kind) {
                             continue;
                         }
@@ -99,6 +111,18 @@ async fn run(state: AppState) -> Result<()> {
             }
             _ = sleep(Duration::from_secs(1)) => {
                 let now = Instant::now();
+                // While paused, drain pending so we don't queue a
+                // burst when the operator re-enables. The next
+                // events after toggle-on rebuild the pending set
+                // from scratch — same semantic as a cold start.
+                if !auto_scan {
+                    pending.clear();
+                    if now.duration_since(last_resync) >= RESYNC_INTERVAL {
+                        last_resync = now;
+                        sync_watched(&state, &mut watcher, &mut watched).await;
+                    }
+                    continue;
+                }
                 // Channel-overflow recovery: notify dropped at least
                 // one event since we last looked, so the incremental
                 // pending-buckets set is incomplete. Force-queue a
@@ -267,7 +291,7 @@ async fn spawn_scan(state: AppState, library_id: i64) {
         // Same wrapper used by the manual + scheduled scan paths so
         // file-watcher-discovered files get the same processing.
         let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(
-            pool.clone(),
+            state_for_release.clone(),
             inner_emitter,
         );
         let scan_ok = match chimpflix_library::run_scan(

@@ -18,16 +18,24 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
   // See AdminGeneralForm for rationale. Track the dirty-check
   // baseline in local state so save success doesn't have to mutate
   // the `initial` prop in place.
+  // Defensive `?? ""` on every string field — earlier the backend
+  // NetworkResponse forgot to include `bind_interface`, the field
+  // arrived as `undefined`, and the next `bindInterface.trim()` on
+  // save threw "cannot access property 'trim' of undefined" — which
+  // surfaced as "Save failed: can't access property trim, k is
+  // undefined" in the UI when adjusting the CORS allowlist. Backend
+  // now ships the field, but defaulting to "" here means any future
+  // schema drift can't crash this form again.
   const [baseline, setBaseline] = useState({
     public_url: initial.public_url ?? null,
-    cors_origins: initial.cors_origins,
+    cors_origins: initial.cors_origins ?? [],
     secure_connections: initial.secure_connections,
     transcoder_reaper_idle_threshold_ms:
       initial.transcoder_reaper_idle_threshold_ms,
     max_remote_streams_per_user: initial.max_remote_streams_per_user,
-    lan_networks: initial.lan_networks,
-    auth_bypass_cidrs: initial.auth_bypass_cidrs,
-    bind_interface: initial.bind_interface,
+    lan_networks: initial.lan_networks ?? "",
+    auth_bypass_cidrs: initial.auth_bypass_cidrs ?? "",
+    bind_interface: initial.bind_interface ?? "",
   });
   const [publicUrl, setPublicUrl] = useState(baseline.public_url ?? "");
   const [origins, setOrigins] = useState(baseline.cors_origins.join("\n"));

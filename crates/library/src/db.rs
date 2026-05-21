@@ -122,10 +122,18 @@ pub async fn open_with(
     migrate_pool.close().await;
 
     // ── App pool: full concurrency, FK on ──────────────────────────
+    // `busy_timeout` lets SQLite poll for up to 5s before returning
+    // SQLITE_BUSY when another connection holds the write lock — the
+    // default of 0 surfaces as "database is locked" 500s on any
+    // mid-transaction collision (e.g. the merge endpoint racing a
+    // scanner upsert on a parallel connection). Five seconds is
+    // generous for the kinds of short writes we run; nothing in the
+    // app should legitimately hold the lock longer than that.
     let mut opts = SqliteConnectOptions::from_str(&url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5))
         .foreign_keys(true);
     if let Some(mb) = cache_size_mb.filter(|n| *n > 0) {
         // Negative N = "N KiB of cache"; positive N = "N pages". We

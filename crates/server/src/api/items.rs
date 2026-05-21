@@ -10,7 +10,7 @@ use chimpflix_library::scanner;
 use chimpflix_library::{
     CreditsEditInput, ItemDetail, ItemEdit, ItemFilter, ItemKind, ItemPage, ListedItem, Review,
 };
-use chimpflix_metadata::{TmdbCandidate, TmdbKind, TmdbPoster};
+use chimpflix_metadata::{TmdbCandidate, TmdbKind, TmdbPoster, TmdbUpstreamError};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -650,7 +650,7 @@ pub async fn refresh(
         None,
     )
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_tmdb_error)?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -692,8 +692,22 @@ pub async fn match_search(
     let candidates = tmdb
         .search_candidates(kind, q.q.trim(), q.year)
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_tmdb_error)?;
     Ok(Json(MatchSearchResponse { candidates }))
+}
+
+/// Convert TMDB errors to a friendly `ApiError`. An unparseable
+/// upstream body (Cloudflare challenge HTML, empty 200, etc.) becomes
+/// a 502 the UI can display as "TMDB unavailable — try again." instead
+/// of a generic 500 banner. Other errors stay as Internal so they keep
+/// their backtrace in the server log.
+fn map_tmdb_error(err: anyhow::Error) -> ApiError {
+    if err.is::<TmdbUpstreamError>() {
+        return ApiError::BadGateway(
+            "TMDB is currently unavailable. Try again in a moment.".to_string(),
+        );
+    }
+    ApiError::Internal(err)
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,11 +739,71 @@ pub async fn match_apply(
         Some(input.tmdb_id),
     )
     .await
-    .map_err(ApiError::Internal)?;
+    .map_err(map_tmdb_error)?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(detail))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeIntoInput {
+    pub target_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MergeIntoResponse {
+    pub report: chimpflix_library::queries::MergeReport,
+    pub target: ItemDetail,
+}
+
+/// Owner-only: re-point every media file (or episode-attached file)
+/// from `id` onto `target_id`, then delete the source. Used to clean
+/// up duplicate items — typically caused by TMDB enrichment renaming
+/// a show after initial scan, which broke the sort_title-based dedup
+/// before the 2026-05-20 fix.
+pub async fn merge_into(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(input): Json<MergeIntoInput>,
+) -> Result<Json<MergeIntoResponse>, ApiError> {
+    if !matches!(user.role, chimpflix_library::UserRole::Owner) {
+        return Err(ApiError::Forbidden);
+    }
+    if id == input.target_id {
+        return Err(ApiError::validation("cannot merge an item into itself"));
+    }
+    let report = queries::merge_items(&state.pool, id, input.target_id)
+        .await
+        .map_err(|e| {
+            // Pre-flight validation errors (different libraries, mismatched
+            // kinds, episode-level file conflicts) are user-facing — surface
+            // as 400 with the underlying message rather than a generic 500.
+            let msg = format!("{e:#}");
+            if msg.contains("merge refused")
+                || msg.contains("different libraries")
+                || msg.contains("kind mismatch")
+                || msg.contains("source and target are the same")
+            {
+                ApiError::Conflict(msg)
+            } else if msg.contains("database is locked") || msg.contains("code: 517") {
+                // Even with busy_timeout, a long-running writer can
+                // exhaust the wait. Surface as 503 with a retry hint
+                // instead of a confusing "internal error".
+                ApiError::TooManyRequests(
+                    "Database was busy. Another writer was running — try again in a moment."
+                        .to_string(),
+                )
+            } else {
+                ApiError::Internal(e)
+            }
+        })?;
+    let acc = access(&state, &user).await?;
+    let target = queries::get_item_detail(&state.pool, input.target_id, user.id, acc.as_deref())
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(MergeIntoResponse { report, target }))
 }
 
 pub async fn match_clear(

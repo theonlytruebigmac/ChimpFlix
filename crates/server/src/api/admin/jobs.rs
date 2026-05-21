@@ -43,11 +43,18 @@ pub struct ListQuery {
     pub kind: Option<String>,
     pub status: Option<String>,
     pub limit: Option<i64>,
+    /// 0-based row offset for paged reads. The admin UI sends
+    /// `offset = (page - 1) * limit`; old callers that only sent
+    /// `limit` continue to work (no offset = first page).
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
     pub jobs: Vec<JobRow>,
+    /// Total rows matching the kind/status filter — drives the
+    /// pagination footer's "X–Y of Z" summary and last-page button.
+    pub total: i64,
 }
 
 pub async fn list(
@@ -61,10 +68,13 @@ pub async fn list(
         None
     };
     let limit = q.limit.unwrap_or(100);
-    let jobs = queries::list_jobs(&state.pool, q.kind.as_deref(), status, limit)
-        .await
-        .map_err(ApiError::Internal)?;
-    Ok(Json(ListResponse { jobs }))
+    let offset = q.offset.unwrap_or(0);
+    let (jobs, total) = tokio::try_join!(
+        queries::list_jobs(&state.pool, q.kind.as_deref(), status, limit, offset),
+        queries::count_jobs(&state.pool, q.kind.as_deref(), status),
+    )
+    .map_err(ApiError::Internal)?;
+    Ok(Json(ListResponse { jobs, total }))
 }
 
 #[derive(Debug, Serialize)]
@@ -95,7 +105,7 @@ pub async fn process_all_pending(
     State(state): State<AppState>,
     _owner: OwnerAuth,
 ) -> Result<(StatusCode, Json<crate::jobs::pipeline::SweepCounts>), ApiError> {
-    let counts = crate::jobs::pipeline::enqueue_full_sweep(&state.pool)
+    let counts = crate::jobs::pipeline::enqueue_full_sweep(&state)
         .await
         .map_err(ApiError::Internal)?;
     Ok((StatusCode::ACCEPTED, Json(counts)))
@@ -123,6 +133,20 @@ pub async fn wipe_queued(
     Query(q): Query<WipeQuery>,
 ) -> Result<Json<WipeResponse>, ApiError> {
     let removed = queries::wipe_queued_jobs(&state.pool, q.kind.as_deref())
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(WipeResponse { removed }))
+}
+
+/// Delete every `dead` row regardless of finished_at. Backs the admin
+/// "Clear dead" button — used after a renamed/removed job kind leaves
+/// orphaned rows that no handler will ever process (cleanup_old_jobs
+/// still respects the TTL, so those rows would otherwise linger).
+pub async fn clear_dead(
+    State(state): State<AppState>,
+    _owner: OwnerAuth,
+) -> Result<Json<WipeResponse>, ApiError> {
+    let removed = queries::clear_dead_jobs(&state.pool)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(WipeResponse { removed }))

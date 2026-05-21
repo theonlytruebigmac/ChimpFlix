@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
 import { NavPrefetch } from "@/components/NavPrefetch";
 import { ServiceWorker } from "@/components/ServiceWorker";
+import { TopNavGate } from "@/components/TopNavGate";
 import { brandName } from "@/lib/env";
 import "./globals.css";
 
@@ -66,6 +67,7 @@ export default async function RootLayout({
       <body className="min-h-full bg-background text-white font-sans">
         <ServiceWorker />
         <NavPrefetch />
+        <TopNavGate />
         {children}
       </body>
     </html>

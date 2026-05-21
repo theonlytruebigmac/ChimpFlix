@@ -1,10 +1,14 @@
 [package]
 name = "tacet-core"
 description = "Ultra-fast audio fingerprinting + blackframe credits detection — library API"
+# Version + edition inherited from ChimpFlix's workspace. License and
+# upstream repository are pinned explicitly so the vendored subtree
+# keeps tacet's original attribution (MIT, originating repo) rather
+# than silently relabeling under ChimpFlix's Apache-2.0.
 version.workspace = true
 edition.workspace = true
-license.workspace = true
-repository.workspace = true
+license = "MIT"
+repository = "https://github.com/theonlytruebigmac/tacet"
 
 [lib]
 name = "tacet"

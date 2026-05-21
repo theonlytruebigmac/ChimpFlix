@@ -275,6 +275,148 @@ export interface TasksListResponse {
   kinds: TaskKindInfo[];
 }
 
+// ─── Registry-driven overview ────────────────────────────────────────────
+//
+// Shapes mirror the Rust types in `crates/server/src/api/admin/tasks_overview.rs`.
+// One overview fetch = one round-trip; the page renders without further
+// data joins on the client.
+
+export type TaskMode = "automatic" | "gated" | "periodic";
+export type TaskScope = "per_file" | "per_item" | "global";
+export type LastStatus = "ok" | "warn" | "bad";
+
+export interface OverviewGateInfo {
+  enabled: boolean;
+  /// True when the kind has no admin-flippable switch (Automatic mode).
+  locked: boolean;
+  /// `*_enabled` setting key. Null for Automatic kinds.
+  setting_key: string | null;
+}
+
+export interface OverviewScheduleInfo {
+  /// `scheduled_tasks.requires_maintenance_window` — whether the
+  /// next_run_at gets snapped forward into the operator's
+  /// configured low-traffic window. Round-tripped so the detail
+  /// page's editable card can render the current value instead of
+  /// guessing a default.
+  requires_maintenance_window: boolean;
+  frequency: string;
+  enabled: boolean;
+  next_at: number;
+  last_at: number | null;
+  last_status: LastStatus;
+}
+
+export interface OverviewLiveInfo {
+  in_flight: number;
+  queued: number;
+  last_success_at_ms: number | null;
+}
+
+export interface OverviewKindCard {
+  name: string;
+  display_name: string;
+  mode: TaskMode;
+  scope: TaskScope;
+  gate: OverviewGateInfo;
+  schedule: OverviewScheduleInfo | null;
+  live: OverviewLiveInfo;
+}
+
+export interface OverviewKindSection {
+  /// Machine-stable identifier — e.g. "automatic", "gated",
+  /// "all". Clients filter on this; `label` is only for display.
+  id: string;
+  label: string;
+  kinds: OverviewKindCard[];
+}
+
+export interface OverviewKindGroup {
+  /// Machine-stable identifier — "media_ingest", "watch_state",
+  /// "system". Clients filter on this; `name` is only for display.
+  id: string;
+  name: string;
+  sections: OverviewKindSection[];
+}
+
+export interface TasksOverviewResponse {
+  groups: OverviewKindGroup[];
+}
+
+export interface TasksSummaryResponse {
+  running: number;
+  queued: number;
+  succeeded_24h: number;
+  failed_24h: number;
+  /// Epoch ms of next maintenance-window open. Null when the
+  /// window is currently open.
+  next_maintenance_window_ms: number | null;
+}
+
+export interface ActivityKindHealth {
+  kind: string;
+  display_name: string;
+  queue_depth: number;
+  in_flight: number;
+  jobs_per_minute: number;
+  p95_duration_ms: number | null;
+  recent_errors: number;
+}
+
+export interface ActivityRecentRun {
+  kind: string;
+  finished_at_ms: number;
+  duration_ms: number;
+  success: boolean;
+  error_class: string | null;
+}
+
+export interface ActivityFailedJob {
+  id: number;
+  kind: string;
+  last_error: string | null;
+  error_class: string | null;
+  finished_at_ms: number | null;
+}
+
+export interface TasksActivityResponse {
+  per_kind: ActivityKindHealth[];
+  recent_runs: ActivityRecentRun[];
+  failed: ActivityFailedJob[];
+}
+
+export interface KindDetailDailyMetrics {
+  day_ms: number;
+  success_count: number;
+  failure_count: number;
+  p50_duration_ms: number | null;
+  p95_duration_ms: number | null;
+  targets_processed: number;
+}
+
+export interface KindDetailResponse {
+  name: string;
+  display_name: string;
+  mode: TaskMode;
+  scope: TaskScope;
+  gate: OverviewGateInfo;
+  schedule: OverviewScheduleInfo | null;
+  live: OverviewLiveInfo;
+  p95_duration_ms: number | null;
+  recent_runs: ActivityRecentRun[];
+  history: KindDetailDailyMetrics[];
+}
+
+/// PATCH body for the rebuilt detail page's editable Schedule card.
+/// All fields are independently optional — passing just
+/// `{ frequency: "daily" }` leaves enabled, window, params alone.
+export interface KindScheduleUpdate {
+  frequency?: TaskFrequency;
+  enabled?: boolean;
+  requires_maintenance_window?: boolean;
+  params_json?: string;
+}
+
 // ─── Transcoder ────────────────────────────────────────────────────────────
 
 export interface TranscoderCapabilities {
@@ -499,10 +641,6 @@ export interface AlertsResponse {
   audit: AuditLogEntry[];
 }
 
-export interface PrivacyResponse {
-  telemetry_opt_in: boolean;
-}
-
 export type ItemKind = "movie" | "show";
 
 export interface Item {
@@ -619,6 +757,11 @@ export interface ItemFilter {
   sort?: ItemSort;
   page?: number;
   page_size?: number;
+  /** Filter by parser confidence. `true` = clean metadata,
+   *  `false` = stubs the scanner created when it couldn't
+   *  fingerprint the filename. Omit for all items. Drives the
+   *  "Unmatched files" admin surface. */
+  auto_matched?: boolean;
 }
 
 export interface MediaStreamSummary {
@@ -689,33 +832,6 @@ export interface ManualMarkerInput {
   start_ms: number;
   end_ms: number;
   label?: string | null;
-}
-
-/// Backing shape for the "Fingerprint captured" badge in the marker
-/// editor. `show_id` is null for movie files (no parent show); the
-/// `captured` flag is true only when a fingerprint actually exists.
-export interface ShowFingerprintStatus {
-  show_id: number | null;
-  captured: boolean;
-  duration_ms: number | null;
-  captured_at: number | null;
-  captured_by: string | null;
-}
-
-/// Joined-with-show row for the Admin → Intro fingerprints listing.
-/// `season_id` is null for the show-wide row (today's only scope);
-/// kept on the wire so future per-season storage rides through
-/// without an API break.
-export interface ShowIntroFingerprintListing {
-  id: number;
-  show_id: number;
-  show_title: string;
-  season_id: number | null;
-  season_number: number | null;
-  duration_ms: number;
-  captured_from_media_file_id: number | null;
-  captured_at: number;
-  captured_by: string;
 }
 
 // ─── Background job queue (admin) ─────────────────────────────────────────
@@ -1128,6 +1244,10 @@ export interface ServerSettings {
   cors_origins: string;
   secure_connections: SecureConnectionsMode;
   telemetry_opt_in: boolean;
+  /** True once the first-run onboarding wizard has been completed
+   *  or explicitly skipped. Drives the post-login redirect to
+   *  `/onboarding` for owners on a fresh install. */
+  setup_completed: boolean;
   transcoder_max_concurrent: number;
   transcoder_hw_accel: TranscoderHwAccel;
   transcoder_quality_ceiling_kbps: number | null;
@@ -1138,6 +1258,8 @@ export interface ServerSettings {
   transcoder_background_preset: TranscoderBackgroundPreset;
   /** Cap on background optimize-versions concurrency per scheduler tick. */
   transcoder_max_background_concurrent: number;
+  /** Worker count for the durable job queue (markers/sprites/thumbs/loudness). */
+  job_workers: number;
   /** When true (default), HDR sources are tone-mapped to SDR. */
   transcoder_hdr_tonemap_enabled: boolean;
   /** Algorithm passed to ffmpeg's tonemap filter. */
@@ -1243,6 +1365,7 @@ export interface ServerSettingsUpdate {
   cors_origins?: string;
   secure_connections?: SecureConnectionsMode;
   telemetry_opt_in?: boolean;
+  setup_completed?: boolean;
   transcoder_max_concurrent?: number;
   transcoder_hw_accel?: TranscoderHwAccel;
   transcoder_quality_ceiling_kbps?: number | null;
@@ -1250,6 +1373,7 @@ export interface ServerSettingsUpdate {
   transcoder_hw_strictness?: TranscoderHwStrictness;
   transcoder_background_preset?: TranscoderBackgroundPreset;
   transcoder_max_background_concurrent?: number;
+  job_workers?: number;
   transcoder_hdr_tonemap_enabled?: boolean;
   transcoder_hdr_tonemap_algo?: TonemapAlgorithm;
   transcoder_hevc_encoding_mode?: HevcMode;
@@ -1354,6 +1478,9 @@ export interface AuditLogEntry {
 export interface AuditListResponse {
   entries: AuditLogEntry[];
   next_before: number | null;
+  /** Total rows in audit_log — drives the paginated admin UI's
+   *  "X–Y of Z" footer and jump-to-page buttons. */
+  total: number;
 }
 
 // ─── External subtitles (Phase 12a — OpenSubtitles agent) ─────────────────
@@ -1471,10 +1598,24 @@ export const preroll = {
   upload: async (file: File) => {
     const fd = new FormData();
     fd.append("file", file);
+    // Mirror the CSRF + cookie handling that `apiFetch` does for
+    // every other mutating call. We bypass `apiFetch` here because
+    // it forces a JSON body, but the double-submit CSRF middleware
+    // still requires the `X-CSRF-Token` header to match the
+    // `cf_csrf` cookie — without it the server returns
+    // `csrf_token_missing` and the upload 403s. Don't set
+    // Content-Type explicitly so the browser injects the
+    // multipart boundary.
+    const headers: Record<string, string> = {};
+    if (typeof document !== "undefined") {
+      const csrf = csrfFromCookieString(document.cookie);
+      if (csrf) headers["X-CSRF-Token"] = csrf;
+    }
     const res = await fetch(`/api/v1/admin/preroll`, {
       method: "POST",
       body: fd,
       credentials: "include",
+      headers,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -1749,6 +1890,44 @@ export class ChimpFlixApiError extends Error {
     super(`chimpflix api ${status}: ${body || "(empty body)"}`);
     this.name = "ChimpFlixApiError";
   }
+
+  /// Returns the user-facing `.error.message` from the JSON body when
+  /// present, otherwise null. Callers that want a clean modal banner
+  /// should prefer this over `.message` (which is the raw debug form
+  /// used for unrecognised error shapes).
+  get friendlyMessage(): string | null {
+    if (!this.body) return null;
+    try {
+      const parsed = JSON.parse(this.body) as unknown;
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "error" in parsed &&
+        parsed.error &&
+        typeof parsed.error === "object" &&
+        "message" in parsed.error &&
+        typeof (parsed.error as { message: unknown }).message === "string"
+      ) {
+        return (parsed.error as { message: string }).message;
+      }
+    } catch {
+      // Body wasn't JSON — fall through to null.
+    }
+    return null;
+  }
+}
+
+/// Pull the friendliest message out of any unknown error — prefers the
+/// server-supplied `.error.message`, falls back to `.message`, then
+/// `String(e)`. Used by every catch path that surfaces an error to the
+/// UI without needing to know whether it's an API error or something
+/// else.
+export function friendlyErrorMessage(e: unknown): string {
+  if (e instanceof ChimpFlixApiError) {
+    return e.friendlyMessage ?? e.message;
+  }
+  if (e instanceof Error) return e.message;
+  return String(e);
 }
 
 type QueryValue =
@@ -2111,11 +2290,17 @@ export const prefs = {
 
 export const libraries = {
   list: () => apiFetch<{ libraries: Library[] }>("/libraries"),
+  // Server returns the Library directly, NOT `{ library: ... }`.
+  // The previous wrapped types let `const { library } = await
+  // create(...)` silently destructure `undefined` from the real
+  // (unwrapped) response, which then crashed any downstream
+  // `library.id` access. Types now mirror the backend's
+  // `Json<Library>` return.
   create: (input: NewLibraryInput) =>
-    apiFetch<{ library: Library }>("/libraries", { method: "POST", body: input }),
-  get: (id: number) => apiFetch<{ library: Library }>(`/libraries/${id}`),
+    apiFetch<Library>("/libraries", { method: "POST", body: input }),
+  get: (id: number) => apiFetch<Library>(`/libraries/${id}`),
   update: (id: number, input: LibraryUpdateInput) =>
-    apiFetch<{ library: Library }>(`/libraries/${id}`, {
+    apiFetch<Library>(`/libraries/${id}`, {
       method: "PATCH",
       body: input,
     }),
@@ -2248,21 +2433,6 @@ export const items = {
       method: "PUT",
       body: { markers },
     }),
-  /// Per-show intro fingerprint status. Returns `{ captured: false }`
-  /// for movie files and shows whose operator hasn't yet saved a
-  /// manual intro marker that would trigger fingerprint capture.
-  getFingerprintStatus: (mediaFileId: number) =>
-    apiFetch<ShowFingerprintStatus>(
-      `/media-files/${mediaFileId}/intro-fingerprint`,
-    ),
-  /// Wipe the parent show's fingerprint(s). The next detect_markers
-  /// run on the show's episodes falls back to blackdetect until the
-  /// operator saves a new manual intro marker on E01.
-  clearFingerprint: (mediaFileId: number) =>
-    apiFetch<ShowFingerprintStatus>(
-      `/media-files/${mediaFileId}/intro-fingerprint`,
-      { method: "DELETE" },
-    ),
   // ─── Edit & Fix Match (owner-only on the server) ───────────────────────
   patch: (id: number, edit: ItemEditInput) =>
     apiFetch<ItemDetail>(`/items/${id}`, { method: "PATCH", body: edit }),
@@ -2283,6 +2453,22 @@ export const items = {
     apiFetch<ItemDetail>(`/items/${id}/match-apply`, {
       method: "POST",
       body: { tmdb_id },
+    }),
+  /// Owner-only: merge this item INTO target_id. All media files (or
+  /// per-episode files, for shows) get re-pointed onto the target,
+  /// then the source item row is deleted. Returns the merge report
+  /// plus the target's refreshed detail.
+  mergeInto: (id: number, target_id: number) =>
+    apiFetch<{
+      report: {
+        moved_files: number;
+        created_seasons: number;
+        created_episodes: number;
+      };
+      target: ItemDetail;
+    }>(`/items/${id}/merge-into`, {
+      method: "POST",
+      body: { target_id },
     }),
   // ─── Reviews (read-only: top reviews from the metadata provider) ───────
   listReviews: (id: number) =>
@@ -2632,32 +2818,28 @@ export interface StatsLibraryBucket {
 
 export const admin = {
   dashboard: () => apiFetch<DashboardResponse>("/admin/dashboard"),
-  /// Per-show intro fingerprints — listing + per-show clear. Powers
-  /// the Admin → Maintenance → Intro fingerprints page. See
-  /// `crates/server/src/api/admin/fingerprints.rs` for the backend.
-  introFingerprints: {
-    list: () =>
-      apiFetch<{ fingerprints: ShowIntroFingerprintListing[] }>(
-        "/admin/intro-fingerprints",
-      ),
-    deleteForShow: (showId: number) =>
-      apiFetch<{ removed: number }>(
-        `/admin/intro-fingerprints/${showId}`,
-        { method: "DELETE" },
-      ),
-  },
   /// Background job queue. Powers the Admin → Maintenance → Job
   /// queue page. See `crates/server/src/api/admin/jobs.rs` for the
   /// backend.
   jobs: {
     summary: () => apiFetch<JobSummary>("/admin/jobs/summary"),
-    list: (opts: { kind?: string; status?: JobStatusFilter; limit?: number } = {}) => {
+    list: (
+      opts: {
+        kind?: string;
+        status?: JobStatusFilter;
+        limit?: number;
+        offset?: number;
+      } = {},
+    ) => {
       const qs = new URLSearchParams();
       if (opts.kind) qs.set("kind", opts.kind);
       if (opts.status) qs.set("status", opts.status);
       if (opts.limit != null) qs.set("limit", String(opts.limit));
+      if (opts.offset != null) qs.set("offset", String(opts.offset));
       const suffix = qs.toString() ? `?${qs}` : "";
-      return apiFetch<{ jobs: JobRow[] }>(`/admin/jobs${suffix}`);
+      return apiFetch<{ jobs: JobRow[]; total: number }>(
+        `/admin/jobs${suffix}`,
+      );
     },
     requeue: (jobId: number) =>
       apiFetch<{ requeued: boolean }>(`/admin/jobs/${jobId}/requeue`, {
@@ -2678,6 +2860,10 @@ export const admin = {
         `/admin/jobs/queued${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`,
         { method: "DELETE" },
       ),
+    /// Delete every `dead` row. Useful after a renamed/removed kind
+    /// leaves orphan rows that no handler will ever pick up.
+    clearDead: () =>
+      apiFetch<{ removed: number }>("/admin/jobs/dead", { method: "DELETE" }),
   },
   stats: {
     /// Last-N-day counters + the live now-playing count for the hero
@@ -2778,11 +2964,14 @@ export const admin = {
       }),
   },
   audit: {
-    list: (params: { before?: number; limit?: number } = {}) =>
+    list: (
+      params: { before?: number; limit?: number; offset?: number } = {},
+    ) =>
       apiFetch<AuditListResponse>("/admin/audit", {
         query: {
           before: params.before,
           limit: params.limit,
+          offset: params.offset,
         },
       }),
   },
@@ -2898,14 +3087,6 @@ export const admin = {
     apiFetch<AlertsResponse>("/admin/alerts", {
       query: params as Record<string, string | number | undefined>,
     }),
-  privacy: {
-    get: () => apiFetch<PrivacyResponse>("/admin/privacy"),
-    patch: (telemetry_opt_in: boolean) =>
-      apiFetch<PrivacyResponse>("/admin/privacy", {
-        method: "PATCH",
-        body: { telemetry_opt_in },
-      }),
-  },
   optimized: {
     list: () =>
       apiFetch<{ versions: OptimizedVersion[] }>("/admin/optimized"),
@@ -3013,6 +3194,45 @@ export const admin = {
     listRuns: (id: number, limit?: number) =>
       apiFetch<{ runs: TaskRun[] }>(`/admin/tasks/${id}/runs`, {
         query: limit ? { limit } : undefined,
+      }),
+    /// Registry-driven views backing the rebuilt tasks UI. Sibling to
+    /// the row-based CRUD above (which still drives the legacy
+    /// advanced editor at /admin/tasks).
+    overview: () =>
+      apiFetch<TasksOverviewResponse>("/admin/tasks/overview"),
+    summary: () =>
+      apiFetch<TasksSummaryResponse>("/admin/tasks/summary"),
+    activity: () =>
+      apiFetch<TasksActivityResponse>("/admin/tasks/activity"),
+    /// Detail payload for one kind — schedule + gate + live counters
+    /// + ring buffer of recent runs + 30-day history rollup. Powers
+    /// the per-task drill-in page.
+    detail: (kind: string) =>
+      apiFetch<KindDetailResponse>(
+        `/admin/tasks/kind/${encodeURIComponent(kind)}`,
+      ),
+    /// Toggle the gate setting for one task kind. Returns 204 on
+    /// success; client refetches `overview` to reflect the new state.
+    setGate: (kind: string, enabled: boolean) =>
+      apiFetch<void>(`/admin/tasks/kind/${encodeURIComponent(kind)}/gate`, {
+        method: "PATCH",
+        body: { enabled },
+      }),
+    /// Edit the `scheduled_tasks` row backing a kind: frequency,
+    /// enabled flag, maintenance-window snap, params. Returns the
+    /// refreshed detail payload so the client can reuse it as the
+    /// new render state without a separate refetch.
+    updateKindSchedule: (kind: string, patch: KindScheduleUpdate) =>
+      apiFetch<KindDetailResponse>(
+        `/admin/tasks/kind/${encodeURIComponent(kind)}`,
+        { method: "PATCH", body: patch },
+      ),
+    /// Dispatch the kind once via the scheduler. Returns 202; the
+    /// caller is expected to poll the detail endpoint for live
+    /// counters/status updates.
+    runKindNow: (kind: string) =>
+      apiFetch<void>(`/admin/tasks/kind/${encodeURIComponent(kind)}/run`, {
+        method: "POST",
       }),
   },
   /// One-click instance-wide maintenance actions. Paired with the

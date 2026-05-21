@@ -189,14 +189,6 @@ pub fn router(state: AppState) -> Router {
             "/media-files/{id}/markers",
             get(markers::list_for_media_file).put(markers::replace_manual),
         )
-        // Per-show intro fingerprint status + clear. Keyed on the
-        // media file id so the operator editor (which already knows
-        // its file id) can call them without an extra
-        // show-id lookup of its own.
-        .route(
-            "/media-files/{id}/intro-fingerprint",
-            get(markers::fingerprint_status).delete(markers::clear_fingerprint),
-        )
         // Scan jobs
         .route("/scans/{id}", get(scans::get_one))
         // Items / seasons / episodes
@@ -210,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{id}/match-search", get(items::match_search))
         .route("/items/{id}/match-apply", post(items::match_apply))
         .route("/items/{id}/match-clear", post(items::match_clear))
+        .route("/items/{id}/merge-into", post(items::merge_into))
         .route("/items/{id}/report-issue", post(items::report_issue))
         .route("/items/{id}/reviews", get(items::list_reviews))
         .route("/tags", get(tags::list_all))
@@ -371,17 +364,6 @@ pub fn router(state: AppState) -> Router {
             "/admin/items/bulk/detect-markers",
             post(admin::bulk::detect_markers),
         )
-        // Per-show intro fingerprint maintenance (Owner-only) —
-        // surfaces the inventory under Admin → Maintenance and lets
-        // the operator clear any show's captured signature.
-        .route(
-            "/admin/intro-fingerprints",
-            get(admin::fingerprints::list),
-        )
-        .route(
-            "/admin/intro-fingerprints/{show_id}",
-            axum::routing::delete(admin::fingerprints::delete_for_show),
-        )
         // Background job queue (Owner-only) — durable pipeline jobs
         // for marker detection, preview sprites, loudness analysis,
         // chapter thumbs. The list endpoint also accepts ?kind=...
@@ -396,6 +378,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/jobs/queued",
             axum::routing::delete(admin::jobs::wipe_queued),
+        )
+        .route(
+            "/admin/jobs/dead",
+            axum::routing::delete(admin::jobs::clear_dead),
         )
         // Notifications (per-user inbox)
         .route("/notifications", get(notifications::list))
@@ -490,6 +476,25 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/tasks/{id}/run", post(admin::tasks::run_now))
         .route("/admin/tasks/{id}/runs", get(admin::tasks::list_runs))
+        // Registry-driven overview (new admin UI in Phase 7). Sibling
+        // to the legacy `/admin/tasks` CRUD surface; the existing
+        // advanced-editor view still uses the row-based endpoints.
+        .route("/admin/tasks/overview", get(admin::tasks_overview::overview))
+        .route("/admin/tasks/summary", get(admin::tasks_overview::summary))
+        .route("/admin/tasks/activity", get(admin::tasks_overview::activity))
+        .route(
+            "/admin/tasks/kind/{kind}",
+            get(admin::tasks_overview::kind_detail)
+                .patch(admin::tasks_overview::update_kind_schedule),
+        )
+        .route(
+            "/admin/tasks/kind/{kind}/gate",
+            axum::routing::patch(admin::tasks_overview::update_gate),
+        )
+        .route(
+            "/admin/tasks/kind/{kind}/run",
+            post(admin::tasks_overview::run_kind_now),
+        )
         .route(
             "/admin/transcoder/capabilities",
             get(admin::transcoder::capabilities),

@@ -1,7 +1,6 @@
 import { notFound } from "next/navigation";
 import { Card } from "@/components/Card";
 import { ModalRoot } from "@/components/ModalRoot";
-import { TopNav } from "@/components/TopNav";
 import {
   ChimpFlixApiError,
   collections as collectionsApi,
@@ -32,7 +31,6 @@ export default async function CollectionPage({
 
   return (
     <main className="relative min-h-screen bg-background">
-      <TopNav />
 
       {/* Header banner with backdrop, name, and overview. Mirrors the
           modal hero treatment but at page scale. */}

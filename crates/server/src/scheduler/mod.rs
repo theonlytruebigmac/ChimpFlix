@@ -313,6 +313,27 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{\"retention_days\":90}",
             cron_placeholder: "0 30 4 * * *",
         },
+        // Seed order matters: rollup must come before cleanup_jobs.
+        // When two daily+requires_window tasks land in the same
+        // maintenance window, the scheduler picks them in
+        // (next_run_at ASC, id ASC) order — and the id falls back
+        // to insertion order on a tie. Putting rollup first means
+        // it processes yesterday's `succeeded` / `dead` rows before
+        // cleanup_jobs trims them. With the default retention (7d)
+        // there's a comfortable margin anyway; only an operator who
+        // tightens succeeded_retention_days to <2 risks losing a
+        // day's rollup. Documented at
+        // [docs/pipelines/backend-plan.md] §6.
+        Seed {
+            kind: "rollup_task_metrics",
+            name: "Daily metrics rollup",
+            // Cheap (aggregates < 100k rows in milliseconds for
+            // any realistic backlog) — runs first in the window.
+            frequency: "daily",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 0 2 * * *",
+        },
         Seed {
             kind: "cleanup_jobs",
             name: "Trim job queue history",
@@ -324,9 +345,10 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             frequency: "daily",
             requires_window: true,
             // Defaults: keep succeeded for 7 days (long enough to
-            // diagnose a recent regression), dead for 30 days (long
-            // enough for an operator to notice and decide whether
-            // to requeue).
+            // diagnose a recent regression and to give the daily
+            // rollup a comfortable read window), dead for 30 days
+            // (long enough for an operator to notice and decide
+            // whether to requeue).
             params_json: "{\"succeeded_retention_days\":7,\"dead_retention_days\":30}",
             cron_placeholder: "0 30 4 * * *",
         },
@@ -513,6 +535,21 @@ async fn dispatch(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
+    // Gate check — runs before any kind-specific work. If admin has
+    // turned the gate off (e.g. chapter thumbs), the sweep is a no-op:
+    // we log a one-liner so the run is visible in history with "skipped
+    // — gated off" rather than vanishing silently. Unknown kinds fall
+    // through to the legacy dispatch below — they pre-date the
+    // registry, so we don't gatekeep them yet.
+    let gate = crate::tasks::is_kind_allowed(state, &task.kind).await;
+    if matches!(gate, crate::tasks::GateState::DisabledByAdmin) {
+        append_log(
+            log,
+            format!("skipped: kind `{}` is gated off in server settings", task.kind),
+        );
+        return Ok(());
+    }
+
     match task.kind.as_str() {
         "prune_sessions" => {
             let removed = queries::cleanup_expired_sessions(&state.pool).await?;
@@ -642,6 +679,7 @@ async fn dispatch(
             let hub = state.hub.clone();
             let cache_root = state.transcoder.cache_root().to_path_buf();
             let release_state = state.clone();
+            let pipeline_state = state.clone();
             tokio::spawn(async move {
                 // RAII guard: release the scan lock on every exit path
                 // including a panic inside `run_scan`. Without it, a
@@ -669,7 +707,7 @@ async fn dispatch(
                         hub.publish(crate::events::Event::Scan(evt));
                     });
                 let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(
-                    pool.clone(),
+                    pipeline_state,
                     inner_emitter,
                 );
                 if let Err(e) = scanner::run_scan(
@@ -799,6 +837,10 @@ async fn dispatch(
         "trakt_pull" => trakt_pull_task(state, log).await,
         "refresh_trending" => refresh_trending_task(state, log).await,
         "refresh_logos" => refresh_logos_task(state, task, log).await,
+        "scan_extras" => scan_extras_task(state, task, log).await,
+        "extract_subs_sweep" => extract_subs_sweep_task(state, task, log).await,
+        "refresh_ratings" => refresh_ratings_task(state, task, log).await,
+        "rollup_task_metrics" => rollup_task_metrics_task(state, log).await,
         "verify_libraries" => verify_libraries_task(state, task, log).await,
         "purge_removed_files" => purge_removed_files_task(state, task, log).await,
         "optimize_versions" => {
@@ -1575,15 +1617,201 @@ async fn purge_removed_files_task(
 /// items that already have a `logo_path`. Caps per-run at `batch_size`
 /// so a fresh server with thousands of items doesn't hammer TMDB in
 /// one go — operators can re-run until the backlog drains.
-async fn refresh_logos_task(
+/// Daily rollup: bucket the previous UTC day's finished jobs by
+/// kind, compute success/failure counts + p50/p95 duration, upsert
+/// into `task_kind_metrics_daily`.
+///
+/// Reads from `jobs`, so this must run *before* `cleanup_jobs`
+/// trims old terminal rows — otherwise yesterday's succeeded jobs
+/// would already be gone (cleanup defaults: succeeded 7d, dead 30d,
+/// which gives the rollup plenty of overlap, but the ordering is
+/// still worth respecting via maintenance-window slot allocation).
+async fn rollup_task_metrics_task(
+    state: &AppState,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    // Yesterday's UTC midnight bounds, computed from now() truncated
+    // to the day. `chrono` is already in the workspace.
+    let now = chimpflix_common::now_ms();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let today_midnight = (now / day_ms) * day_ms;
+    let yesterday_midnight = today_midnight - day_ms;
+    let day_key = yesterday_midnight; // store epoch-ms of the day's UTC start
+
+    let rows = queries::list_finished_jobs_in_window(
+        &state.pool,
+        yesterday_midnight,
+        today_midnight,
+    )
+    .await?;
+
+    // Bucket per kind, accumulating durations + status counts.
+    struct Bucket {
+        success: i64,
+        failure: i64,
+        durations: Vec<i64>,
+    }
+    let mut buckets: HashMap<String, Bucket> = HashMap::new();
+    for r in &rows {
+        let entry = buckets.entry(r.kind.clone()).or_insert(Bucket {
+            success: 0,
+            failure: 0,
+            durations: Vec::new(),
+        });
+        match r.status.as_str() {
+            "succeeded" => entry.success += 1,
+            "dead" => entry.failure += 1,
+            _ => continue,
+        }
+        if let (Some(start), Some(finish)) = (r.started_at, r.finished_at) {
+            let d = finish.saturating_sub(start);
+            if d >= 0 {
+                entry.durations.push(d);
+            }
+        }
+    }
+
+    let mut wrote = 0usize;
+    for (kind, mut b) in buckets {
+        b.durations.sort_unstable();
+        let p50 = pct(&b.durations, 0.50);
+        let p95 = pct(&b.durations, 0.95);
+        let targets = b.success + b.failure;
+        queries::upsert_task_metrics_daily(
+            &state.pool,
+            day_key,
+            &kind,
+            b.success,
+            b.failure,
+            p50,
+            p95,
+            targets,
+        )
+        .await?;
+        wrote += 1;
+    }
+    append_log(
+        log,
+        format!(
+            "rolled up {wrote} kinds for {} (window {} → {})",
+            yesterday_midnight, yesterday_midnight, today_midnight,
+        ),
+    );
+    Ok(())
+}
+
+/// Index a sorted slice at the given percentile in [0.0, 1.0].
+/// Returns None for an empty slice. Uses the simple nearest-rank
+/// method which is exact for any percentile.
+fn pct(sorted: &[i64], q: f64) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+    sorted.get(idx).copied()
+}
+
+/// Sweep: enqueue one `fetch_external_ratings` job per item whose
+/// ratings are missing or stale (>30 days). The per-item handler
+/// dedups against the same staleness window, so re-enqueueing a
+/// fresh item is a no-op.
+async fn refresh_ratings_task(
     state: &AppState,
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let Some(tmdb) = state.tmdb_snapshot().await else {
-        append_log(log, "TMDB disabled — skipping logo refresh");
-        return Ok(());
-    };
+    let params: serde_json::Value =
+        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let batch = params
+        .get("batch_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(100);
+    use sqlx::Row;
+    let stale_cutoff = chimpflix_common::now_ms()
+        - crate::jobs::handlers::fetch_external_ratings::RATINGS_STALE_MS;
+    let rows = sqlx::query(
+        "SELECT id FROM items
+         WHERE (ratings_updated_at IS NULL OR ratings_updated_at < ?)
+           AND imdb_id IS NOT NULL
+         ORDER BY id LIMIT ?",
+    )
+    .bind(stale_cutoff)
+    .bind(batch)
+    .fetch_all(&state.pool)
+    .await?;
+    let item_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<i64, _>("id").ok())
+        .collect();
+
+    let queued = crate::jobs::handlers::fetch_external_ratings::enqueue_for_items(
+        &state.pool,
+        &item_ids,
+    )
+    .await?;
+    append_log(
+        log,
+        format!(
+            "ratings: enqueued {queued} per-item jobs (batch {} items)",
+            item_ids.len()
+        ),
+    );
+    Ok(())
+}
+
+/// Sweep: enqueue one `extract_embedded_subs` job per file whose
+/// container subtitles haven't been extracted yet.
+async fn extract_subs_sweep_task(
+    state: &AppState,
+    task: &ScheduledTask,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    let params: serde_json::Value =
+        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let batch = params
+        .get("batch_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(500);
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id FROM media_files
+         WHERE embedded_subs_extracted_at IS NULL
+           AND removed_at IS NULL
+         ORDER BY id LIMIT ?",
+    )
+    .bind(batch)
+    .fetch_all(&state.pool)
+    .await?;
+    let file_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<i64, _>("id").ok())
+        .collect();
+
+    let queued = crate::jobs::handlers::extract_embedded_subs::enqueue_for_files(
+        &state.pool,
+        &file_ids,
+    )
+    .await?;
+    append_log(
+        log,
+        format!(
+            "embedded subs: enqueued {queued} per-file jobs (batch {} files)",
+            file_ids.len()
+        ),
+    );
+    Ok(())
+}
+
+/// Sweep: enqueue one `detect_extras_item` job per item that hasn't
+/// been scanned yet or whose parent directory mtime has advanced.
+/// The walk + insert work lives in the per-item handler.
+async fn scan_extras_task(
+    state: &AppState,
+    task: &ScheduledTask,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
     let params: serde_json::Value =
         serde_json::from_str(&task.params_json).unwrap_or_default();
     let batch = params
@@ -1591,63 +1819,95 @@ async fn refresh_logos_task(
         .and_then(|v| v.as_i64())
         .unwrap_or(50);
 
-    // Pull (item_id, tmdb_id, kind) tuples for items missing a logo.
-    // ORDER BY id keeps the iteration deterministic across runs so a
-    // backlog drains predictably.
+    // Pick items either never scanned or stale (>30 days). The
+    // handler dedups on parent-dir mtime, so re-enqueueing a fresh
+    // item is a no-op there too.
+    use sqlx::Row;
+    let stale_cutoff = chimpflix_common::now_ms() - 30 * 24 * 60 * 60 * 1000;
+    let rows = sqlx::query(
+        "SELECT id FROM items
+         WHERE extras_scanned_at IS NULL OR extras_scanned_at < ?
+         ORDER BY id LIMIT ?",
+    )
+    .bind(stale_cutoff)
+    .bind(batch)
+    .fetch_all(&state.pool)
+    .await?;
+    let item_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<i64, _>("id").ok())
+        .collect();
+
+    let queued = crate::jobs::handlers::detect_extras_item::enqueue_for_items(
+        &state.pool,
+        &item_ids,
+    )
+    .await?;
+    append_log(
+        log,
+        format!(
+            "extras: enqueued {queued} per-item jobs (batch {} items)",
+            item_ids.len()
+        ),
+    );
+    Ok(())
+}
+
+/// Sweep: enqueue one `refresh_logos_item` job per item missing a
+/// logo. The actual TMDB fetch + DB write lives in the per-item
+/// handler ([`crate::jobs::handlers::refresh_logos_item`]) — this
+/// function just feeds the queue.
+///
+/// Pre-job-queue this function used to do the TMDB fetches inline,
+/// which meant a stuck network call blocked the entire sweep, retry
+/// semantics were ad-hoc, and per-item failures muddied the task
+/// outcome. Moving to per-item jobs gives each item its own retry
+/// curve under the worker pool's per-kind concurrency cap.
+async fn refresh_logos_task(
+    state: &AppState,
+    task: &ScheduledTask,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    if state.tmdb_snapshot().await.is_none() {
+        append_log(log, "TMDB disabled — skipping logo refresh");
+        return Ok(());
+    }
+    let params: serde_json::Value =
+        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let batch = params
+        .get("batch_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50);
+
+    // Pick a bounded batch of items missing a logo. ORDER BY id keeps
+    // iteration deterministic across runs so a backlog drains
+    // predictably; the per-item handler dedups on item_id so a re-run
+    // before workers finish is a no-op for in-flight items.
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT id, tmdb_id, kind FROM items \
+        "SELECT id FROM items \
          WHERE logo_path IS NULL AND tmdb_id IS NOT NULL \
          ORDER BY id LIMIT ?",
     )
     .bind(batch)
     .fetch_all(&state.pool)
     .await?;
+    let item_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<i64, _>("id").ok())
+        .collect();
 
-    let mut ok = 0usize;
-    let mut empty = 0usize;
-    let mut failed = 0usize;
-    for row in rows {
-        let id: i64 = row.try_get("id")?;
-        let tmdb_id: i64 = row.try_get("tmdb_id")?;
-        let kind: String = row.try_get("kind")?;
-        let result = match kind.as_str() {
-            "movie" => tmdb.fetch_movie_logo(tmdb_id).await,
-            "show" => tmdb.fetch_show_logo(tmdb_id).await,
-            other => {
-                warn!(item_id = id, kind = other, "unknown kind in refresh_logos");
-                continue;
-            }
-        };
-        match result {
-            Ok(Some(path)) => {
-                let url = chimpflix_metadata::tmdb_image_url(&path, "w500");
-                let now = chimpflix_common::now_ms();
-                if let Err(e) = sqlx::query(
-                    "UPDATE items SET logo_path = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(&url)
-                .bind(now)
-                .bind(id)
-                .execute(&state.pool)
-                .await
-                {
-                    failed += 1;
-                    warn!(item_id = id, error = %format!("{e:#}"), "logo upsert failed");
-                } else {
-                    ok += 1;
-                }
-            }
-            Ok(None) => empty += 1,
-            Err(e) => {
-                failed += 1;
-                warn!(item_id = id, tmdb_id, error = %format!("{e:#}"), "tmdb logo fetch failed");
-            }
-        }
-    }
+    let queued = crate::jobs::handlers::refresh_logos_item::enqueue_for_items(
+        &state.pool,
+        &item_ids,
+    )
+    .await?;
     append_log(
         log,
-        format!("logos: {ok} added, {empty} unavailable, {failed} failed"),
+        format!(
+            "logos: enqueued {queued} per-item jobs (batch {} items)",
+            item_ids.len()
+        ),
     );
     Ok(())
 }

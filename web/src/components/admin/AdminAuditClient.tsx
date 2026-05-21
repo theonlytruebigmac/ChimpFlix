@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   admin as adminApi,
   type AuditListResponse,
   type AuditLogEntry,
 } from "@/lib/chimpflix-api";
+import { DEFAULT_PAGE_SIZE, Pagination } from "./ui";
 
 interface Props {
   initial: AuditListResponse;
@@ -13,28 +14,46 @@ interface Props {
 
 export function AdminAuditClient({ initial }: Props) {
   const [entries, setEntries] = useState<AuditLogEntry[]>(initial.entries);
-  const [nextBefore, setNextBefore] = useState<number | null>(
-    initial.next_before,
-  );
+  const [total, setTotal] = useState<number>(initial.total);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function loadMore() {
-    if (nextBefore == null) return;
+  // Refetch whenever page or page-size changes. The server-rendered
+  // initial page (limit=50) is good enough for first paint; once
+  // the operator clicks a page button we take over with offset/limit.
+  // The setLoading/setError calls are React's documented
+  // "synchronise with external state" pattern — the URL/page/size
+  // is the input, the fetched entries are the output. Inline the
+  // disable so the rule doesn't flag this legitimate use.
+  useEffect(() => {
+    let cancelled = false;
+    /* eslint-disable react-hooks/set-state-in-effect */
     setLoading(true);
     setError(null);
-    try {
-      const page = await adminApi.audit.list({ before: nextBefore, limit: 50 });
-      setEntries((prev) => [...prev, ...page.entries]);
-      setNextBefore(page.next_before);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
+    /* eslint-enable react-hooks/set-state-in-effect */
+    adminApi.audit
+      .list({ limit: pageSize, offset: (page - 1) * pageSize })
+      .then((res) => {
+        if (cancelled) return;
+        setEntries(res.entries);
+        setTotal(res.total);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page, pageSize]);
 
-  if (entries.length === 0) {
+  if (entries.length === 0 && page === 1 && total === 0) {
     return (
       <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-12 text-center text-sm text-white/50">
         No admin actions recorded yet.
@@ -79,18 +98,26 @@ export function AdminAuditClient({ initial }: Props) {
           ))}
         </tbody>
       </table>
-      <div className="flex items-center justify-between gap-2 border-t border-white/5 bg-white/2 px-4 py-2 text-xs text-white/50">
-        <span>{entries.length} entries</span>
-        {nextBefore != null && (
-          <button
-            onClick={loadMore}
-            disabled={loading}
-            className="rounded border border-white/10 px-2 py-1 text-white/70 hover:bg-white/5 disabled:opacity-40"
-          >
-            {loading ? "Loading…" : "Load more"}
-          </button>
+      <div className="border-t border-white/5 bg-white/2 px-4 py-2">
+        {error && (
+          <div className="mb-2 text-xs text-red-400">{error}</div>
         )}
-        {error && <span className="text-red-400">{error}</span>}
+        <Pagination
+          page={page}
+          pageSize={pageSize}
+          total={total}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => {
+            setPageSize(s);
+            setPage(1);
+          }}
+          noun="entries"
+          leading={
+            loading ? (
+              <span className="text-[12px] text-white/45">Loading…</span>
+            ) : undefined
+          }
+        />
       </div>
     </div>
   );

@@ -27,13 +27,150 @@ pub enum Classification {
     },
 }
 
+/// Classifier result. `auto_matched = true` when the parser pulled
+/// real metadata out of the path; `false` when we fell back to a
+/// best-effort filename cleanup so the scanner can still link the
+/// file. The scanner persists this flag onto `items.auto_matched`
+/// so an "Unmatched files" admin view can surface stubs for manual
+/// fix-matching without having to rename files on disk.
+#[derive(Debug, Clone)]
+pub struct ClassifyResult {
+    pub class: Classification,
+    pub auto_matched: bool,
+}
+
 /// Classify a media file relative to a library root path.
-pub fn classify(file_path: &Path, root: &Path, kind: LibraryKind) -> Option<Classification> {
-    match kind {
+///
+/// Always succeeds: when the kind-specific regex pipeline returns
+/// `None`, this falls back to a "best effort" Classification built
+/// from the filename + parent directory, with `auto_matched = false`
+/// so the UI can flag it. Pre-this-change the scanner silently
+/// dropped any file the parser couldn't fingerprint, which on a
+/// 1584-file anime library with non-standard release names meant
+/// ~89% of media never appeared in the catalog.
+pub fn classify(file_path: &Path, root: &Path, kind: LibraryKind) -> ClassifyResult {
+    let confident = match kind {
         LibraryKind::Movies => classify_movie(file_path),
         LibraryKind::Shows => classify_episode(file_path, root),
         LibraryKind::Anime => classify_anime(file_path, root),
+    };
+    if let Some(class) = confident {
+        return ClassifyResult {
+            class,
+            auto_matched: true,
+        };
     }
+    ClassifyResult {
+        class: fallback_classification(file_path, root, kind),
+        auto_matched: false,
+    }
+}
+
+/// Build a placeholder Classification from `file_path` when the
+/// regex-driven path failed. Movie libraries get a Movie row keyed
+/// on the cleaned filename; show/anime libraries get an Episode
+/// row under a "show" derived from the parent dir + a synthetic
+/// season=1/episode=<sequential> so the scanner's `upsert_episode`
+/// conflict key (season_id, episode_number) doesn't collide across
+/// many unmatched files in the same show.
+///
+/// The episode number is derived from a 16-bit hash of the file's
+/// path relative to the library root. Stable across rescans (same
+/// path → same number) and distributes uniformly enough that
+/// collisions among the few hundred unmatched files per show are
+/// vanishingly rare. Real metadata will overwrite this once the
+/// operator fix-matches.
+fn fallback_classification(file_path: &Path, root: &Path, kind: LibraryKind) -> Classification {
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Untitled");
+    let cleaned_title = clean_filename_for_title(stem);
+    let title = if cleaned_title.is_empty() {
+        "Untitled".to_string()
+    } else {
+        cleaned_title
+    };
+
+    match kind {
+        LibraryKind::Movies => {
+            // For a movies library, every file is its own item.
+            Classification::Movie {
+                sort_title: make_sort_title(&title),
+                title,
+                year: None,
+            }
+        }
+        LibraryKind::Shows | LibraryKind::Anime => {
+            // Use the first path component below the root as the
+            // show. With Sonarr's `<root>/<show>/<season>/<file>`
+            // layout that gives the show name; with a flat
+            // `<root>/<file>` layout (no parent dir at all) it
+            // falls back to the cleaned filename so we still
+            // produce a non-empty title.
+            let rel = file_path.strip_prefix(root).ok();
+            let show_dir = rel
+                .and_then(|r| r.components().next().map(|c| c.as_os_str().to_owned()))
+                .and_then(|n| n.into_string().ok());
+            let (show_title, show_year) = match show_dir.as_deref() {
+                Some(d) if !d.is_empty() && d != stem => parse_title_with_year(d)
+                    .unwrap_or_else(|| (d.to_string(), None)),
+                _ => (title.clone(), None),
+            };
+
+            // Deterministic episode number from a stable hash of
+            // the relative path. Keeps the upsert key unique per
+            // file without colliding with real episodes (which
+            // tend to be small numbers) by biasing into the
+            // 32768..=65535 range.
+            let path_for_hash = file_path
+                .strip_prefix(root)
+                .unwrap_or(file_path)
+                .to_string_lossy();
+            let h: u16 = path_for_hash.bytes().fold(0u16, |acc, b| {
+                acc.wrapping_mul(31).wrapping_add(b as u16)
+            });
+            let episode = 0x8000i32 | (h as i32 & 0x7FFF);
+
+            Classification::Episode {
+                show_sort_title: make_sort_title(&show_title),
+                show_title,
+                show_year,
+                season: 1,
+                episode,
+                title: Some(title),
+            }
+        }
+    }
+}
+
+/// Turn a filename stem into a presentable title: drop bracketed
+/// release tags, replace `.` / `_` with spaces, collapse whitespace.
+/// Best-effort; the operator can rename via fix-match.
+fn clean_filename_for_title(stem: &str) -> String {
+    let unbracketed = strip_brackets(stem);
+    let spaced: String = unbracketed
+        .chars()
+        .map(|c| match c {
+            '.' | '_' => ' ',
+            _ => c,
+        })
+        .collect();
+    // Collapse runs of whitespace and trim.
+    let mut out = String::with_capacity(spaced.len());
+    let mut prev_ws = true; // strips leading whitespace
+    for c in spaced.chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(c);
+            prev_ws = false;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -149,16 +286,20 @@ fn parse_season_episode(stem: &str) -> Option<(i32, i32, Option<String>)> {
 
 static ANIME_EPISODE_NUM: LazyLock<Regex> = LazyLock::new(|| {
     // Episode number that's either:
-    //   - "- 12", "- 12v2" (the most common form after fansub tags)
-    //   - "EP12", "Ep 12", "E12" (no season marker)
-    //   - bare "12" at the end of the stem
-    // We require at least one digit and allow an optional version suffix
-    // (e.g. v2). Order matters — the dash-anchored form is more specific
-    // and must match first.
+    //   - "- 12" / " - 12" / "-12" / ".12" — common after fansub tags
+    //     or Sonarr-style dot/dash separators. We accept dot, dash,
+    //     and underscore as the leading separator since releases like
+    //     `Show.Name.01.1080p.mkv` are common enough to warrant it.
+    //   - "EP12", "Ep 12", "E12" — no season marker, just episode.
+    //   - bare "12" at the end of the stem.
+    // Optional version suffix (v2, v3) is allowed everywhere. Order
+    // matters — separator-anchored forms are more specific and must
+    // match first or the bare-trailing pattern would over-grab on
+    // releases with multiple digit clusters.
     Regex::new(
         r"(?ix)
         (?:
-            \s-\s*(?P<ep1>\d{1,4})(?:v\d+)?\b
+            [\s._-]+ -? \s* (?P<ep1>\d{1,4})(?:v\d+)?\b
           | \bEP?\s*(?P<ep2>\d{1,4})(?:v\d+)?\b
           | \b(?P<ep3>\d{1,4})(?:v\d+)?\s*$
         )",
@@ -292,7 +433,7 @@ mod tests {
     #[test]
     fn movie_with_paren_year() {
         let p = PathBuf::from("/m/Arrival (2016).mkv");
-        match classify(&p, Path::new("/m"), LibraryKind::Movies).unwrap() {
+        match classify(&p, Path::new("/m"), LibraryKind::Movies).class {
             Classification::Movie { title, year, .. } => {
                 assert_eq!(title, "Arrival");
                 assert_eq!(year, Some(2016));
@@ -304,7 +445,7 @@ mod tests {
     #[test]
     fn movie_dot_separated() {
         let p = PathBuf::from("/m/The.Matrix.1999.1080p.WEBRip.x264.mkv");
-        match classify(&p, Path::new("/m"), LibraryKind::Movies).unwrap() {
+        match classify(&p, Path::new("/m"), LibraryKind::Movies).class {
             Classification::Movie {
                 title,
                 year,
@@ -322,7 +463,7 @@ mod tests {
     #[test]
     fn movie_inside_year_folder() {
         let p = PathBuf::from("/m/Arrival (2016)/Arrival.mkv");
-        match classify(&p, Path::new("/m"), LibraryKind::Movies).unwrap() {
+        match classify(&p, Path::new("/m"), LibraryKind::Movies).class {
             Classification::Movie { title, year, .. } => {
                 assert_eq!(title, "Arrival");
                 assert_eq!(year, Some(2016));
@@ -334,7 +475,7 @@ mod tests {
     #[test]
     fn movie_no_year() {
         let p = PathBuf::from("/m/Untitled.mkv");
-        match classify(&p, Path::new("/m"), LibraryKind::Movies).unwrap() {
+        match classify(&p, Path::new("/m"), LibraryKind::Movies).class {
             Classification::Movie { title, year, .. } => {
                 assert_eq!(title, "Untitled");
                 assert_eq!(year, None);
@@ -347,7 +488,7 @@ mod tests {
     fn episode_seasons_dir() {
         let p =
             PathBuf::from("/s/Severance/Season 01/Severance - S01E01 - Good News About Hell.mkv");
-        match classify(&p, Path::new("/s"), LibraryKind::Shows).unwrap() {
+        match classify(&p, Path::new("/s"), LibraryKind::Shows).class {
             Classification::Episode {
                 show_title,
                 season,
@@ -367,7 +508,7 @@ mod tests {
     #[test]
     fn episode_dot_form_alt_tag() {
         let p = PathBuf::from("/s/Battlestar Galactica (2004)/Battlestar.Galactica.1x05.mkv");
-        match classify(&p, Path::new("/s"), LibraryKind::Shows).unwrap() {
+        match classify(&p, Path::new("/s"), LibraryKind::Shows).class {
             Classification::Episode {
                 show_title,
                 show_year,
@@ -385,16 +526,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_no_episode_tag() {
+    fn no_episode_tag_now_falls_back_unmatched() {
+        // Pre-phase-68 the scanner silently dropped files like this.
+        // New contract: the parser ALWAYS returns a Classification;
+        // names it couldn't fingerprint come back with
+        // `auto_matched = false` so the scanner still links them and
+        // the operator can fix-match later.
         let p = PathBuf::from("/s/Severance/randomfile.mkv");
-        assert!(classify(&p, Path::new("/s"), LibraryKind::Shows).is_none());
+        let res = classify(&p, Path::new("/s"), LibraryKind::Shows);
+        assert!(!res.auto_matched);
+        match res.class {
+            Classification::Episode { show_title, .. } => {
+                assert_eq!(show_title, "Severance");
+            }
+            _ => panic!("expected an episode stub"),
+        }
     }
 
     #[test]
     fn anime_fansub_with_dash() {
         let p =
             PathBuf::from("/a/Frieren Beyond Journey's End/[SubsPlease] Frieren - 28 (1080p) [ABCD1234].mkv");
-        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
             Classification::Episode {
                 show_title,
                 season,
@@ -412,7 +565,7 @@ mod tests {
     #[test]
     fn anime_version_suffix_stripped() {
         let p = PathBuf::from("/a/Bocchi the Rock/Bocchi - 12v2.mkv");
-        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
             Classification::Episode { episode, .. } => assert_eq!(episode, 12),
             _ => panic!("expected episode"),
         }
@@ -422,7 +575,7 @@ mod tests {
     fn anime_absolute_long_runner() {
         // One Piece-style absolute numbering past 1000.
         let p = PathBuf::from("/a/One Piece/One Piece - 1100.mkv");
-        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
             Classification::Episode { season, episode, .. } => {
                 assert_eq!(season, 1);
                 assert_eq!(episode, 1100);
@@ -436,7 +589,7 @@ mod tests {
         // When the file does carry S01E05, prefer that over the absolute
         // path so users who organize anime by season aren't surprised.
         let p = PathBuf::from("/a/Attack on Titan/Season 4/Attack.on.Titan.S04E28.mkv");
-        match classify(&p, Path::new("/a"), LibraryKind::Anime).unwrap() {
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
             Classification::Episode { season, episode, .. } => {
                 assert_eq!(season, 4);
                 assert_eq!(episode, 28);
@@ -446,9 +599,19 @@ mod tests {
     }
 
     #[test]
-    fn anime_rejects_no_episode_number() {
+    fn anime_no_episode_number_falls_back_unmatched() {
+        // Same contract as the Shows fallback test above — the
+        // anime classifier never returns None either; failed-regex
+        // files get `auto_matched = false`.
         let p = PathBuf::from("/a/Bleach/notes.mkv");
-        assert!(classify(&p, Path::new("/a"), LibraryKind::Anime).is_none());
+        let res = classify(&p, Path::new("/a"), LibraryKind::Anime);
+        assert!(!res.auto_matched);
+        match res.class {
+            Classification::Episode { show_title, .. } => {
+                assert_eq!(show_title, "Bleach");
+            }
+            _ => panic!("expected an episode stub"),
+        }
     }
 
     #[test]

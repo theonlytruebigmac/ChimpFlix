@@ -8,6 +8,7 @@ import {
   type WebhooksListResponse,
 } from "@/lib/chimpflix-api";
 import { Pill } from "./ui";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse }) {
   const [webhooks, setWebhooks] = useState(initial.webhooks);
@@ -100,6 +101,7 @@ function WebhookRow({
   const [mask, setMask] = useState<string[]>(initialMask);
   const [busy, setBusy] = useState(false);
   const [deliveries, setDeliveries] = useState<WebhookDelivery[] | null>(null);
+  const [askDelete, setAskDelete] = useState(false);
   // Handle for the 600ms post-test deliveries refresh. Tracked so an
   // unmount mid-wait cancels the pending fetch + setState pair.
   const testRefreshTimerRef = useRef<number | null>(null);
@@ -173,7 +175,7 @@ function WebhookRow({
   }
 
   async function remove() {
-    if (!window.confirm(`Delete webhook "${webhook.name}"?`)) return;
+    setAskDelete(false);
     setBusy(true);
     onError(null);
     try {
@@ -299,7 +301,7 @@ function WebhookRow({
             </button>
             <button
               disabled={busy}
-              onClick={remove}
+              onClick={() => setAskDelete(true)}
               className="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-50"
             >
               Delete
@@ -372,6 +374,17 @@ function WebhookRow({
             )}
           </div>
         </div>
+      )}
+      {askDelete && (
+        <ConfirmDialog
+          title={`Delete webhook "${webhook.name}"?`}
+          body="The endpoint will stop receiving events. In-flight deliveries finish; queued retries are dropped."
+          confirmLabel="Delete"
+          destructive
+          busy={busy}
+          onConfirm={() => void remove()}
+          onCancel={() => setAskDelete(false)}
+        />
       )}
     </div>
   );

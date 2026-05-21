@@ -10,6 +10,7 @@ import {
   type CollectionDetail,
   type ListedItem,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   initial: Collection[];
@@ -184,19 +185,25 @@ function CollectionRow({
   onChanged: () => Promise<void>;
   onError: (e: string) => void;
 }) {
-  async function remove() {
-    if (
-      !window.confirm(
-        `Delete collection “${collection.name}”? Member items remain in your library; only the grouping is removed.`,
-      )
-    ) {
-      return;
-    }
+  const [askDelete, setAskDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  function remove() {
+    // Trigger the inline confirm; actual deletion happens in
+    // `confirmDelete` after the operator clicks through the dialog.
+    setAskDelete(true);
+  }
+
+  async function confirmDelete() {
+    setDeleteBusy(true);
     try {
       await collectionsApi.delete(collection.id);
       await onChanged();
+      setAskDelete(false);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
@@ -243,6 +250,17 @@ function CollectionRow({
             <AutoCollectionDetail collection={collection} onError={onError} />
           )}
         </div>
+      )}
+      {askDelete && (
+        <ConfirmDialog
+          title={`Delete collection "${collection.name}"?`}
+          body="Member items remain in your library; only the grouping is removed."
+          confirmLabel="Delete"
+          destructive
+          busy={deleteBusy}
+          onConfirm={() => void confirmDelete()}
+          onCancel={() => setAskDelete(false)}
+        />
       )}
     </li>
   );

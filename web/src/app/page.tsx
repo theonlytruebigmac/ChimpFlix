@@ -1,14 +1,17 @@
+import { redirect } from "next/navigation";
 import { Suspense } from "react";
 import { CollectionsRail } from "@/components/CollectionsRail";
+import { EmptyHomeClient } from "@/components/EmptyHomeClient";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
 import { RailErrorBoundary } from "@/components/RailErrorBoundary";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
 import { Top10Rail } from "@/components/Top10Rail";
-import { TopNav } from "@/components/TopNav";
 import { pickHeroIndex } from "@/lib/hero";
 import {
+  ChimpFlixApiError,
+  admin as adminApi,
   collections as collectionsApi,
   items as itemsApi,
   libraries as librariesApi,
@@ -25,7 +28,27 @@ const MOVIE_GENRES = ["Action", "Comedy", "Drama"];
 const SHOW_GENRES = ["Drama", "Comedy", "Animation"];
 
 export default async function Home() {
-  await requireUser("/");
+  const user = await requireUser("/");
+  // First-run wizard auto-redirect. Owners/admins hitting Home on a
+  // fresh install would otherwise land on empty rails; bounce them
+  // into `/onboarding` instead. Viewers stay on Home — they can't
+  // add libraries anyway. The wizard flips `setup_completed = true`
+  // on finish or skip so this redirect only fires once.
+  if (user.role === "owner" || user.role === "admin") {
+    try {
+      const { settings } = await adminApi.settings.get();
+      if (!settings.setup_completed) {
+        redirect("/onboarding");
+      }
+    } catch (e) {
+      // 403 from /admin/settings means the user doesn't actually
+      // have admin scope (e.g. role downgraded mid-session). Fall
+      // through to normal Home rather than block.
+      if (!(e instanceof ChimpFlixApiError && e.status === 403)) {
+        throw e;
+      }
+    }
+  }
   const [{ libraries: allLibs }, { library_ids: hiddenIds }] =
     await Promise.all([librariesApi.list(), prefsApi.hiddenLibraries()]);
   const hidden = new Set(hiddenIds);
@@ -38,9 +61,49 @@ export default async function Home() {
   // hidden / user-hidden libraries don't leak in.
   const visibleLibIds = libs.map((l) => l.id);
 
+  // Empty-Home probe: a freshly-deployed instance with libraries
+  // configured but nothing scanned yet would otherwise render the
+  // full rail tree against an empty index, producing a black page
+  // with no explanation. A single `items.list(page_size=1)` returns
+  // `total` cheaply; if it's zero we swap in a friendly card with
+  // live scan progress. Wrap in try/catch so an items-API hiccup
+  // never breaks Home — fall through to the normal render and let
+  // the per-rail Suspense boundaries surface their own errors.
+  //
+  // When `visibleLibIds` is empty (operator has libraries but they're
+  // all visibility=hidden, or hasn't created any) we short-circuit to
+  // the empty state without hitting items.list — the backend treats
+  // an empty `library_ids` as "no filter, return everything" which
+  // would mask the empty state.
+  let itemTotal: number | null = null;
+  if (visibleLibIds.length === 0) {
+    itemTotal = 0;
+  } else {
+    try {
+      const probe = await itemsApi.list({
+        library_ids: visibleLibIds,
+        page_size: 1,
+      });
+      itemTotal = probe.total;
+    } catch {
+      itemTotal = null;
+    }
+  }
+  const isFreshlyEmpty = itemTotal === 0;
+
+  if (isFreshlyEmpty) {
+    return (
+      <main className="relative min-h-screen">
+        <EmptyHomeClient
+          libraries={libs}
+          isAdmin={user.role === "owner" || user.role === "admin"}
+        />
+      </main>
+    );
+  }
+
   return (
     <main className="relative">
-      <TopNav />
       <RailErrorBoundary label="HomeHero">
         <Suspense fallback={<HeroSkeleton />}>
           <HomeHero visibleLibIds={visibleLibIds} />

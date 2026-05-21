@@ -1,5 +1,4 @@
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
-import { TopNav } from "@/components/TopNav";
 
 // Shown by Next during cold first-byte for the home page (before our own
 // per-rail Suspense boundaries take over). Renders the same TopNav as
@@ -7,7 +6,6 @@ import { TopNav } from "@/components/TopNav";
 export default function HomeLoading() {
   return (
     <main className="relative">
-      <TopNav />
       <HeroSkeleton />
       <div className="relative z-20 space-y-1 pb-24 pt-4">
         <RailSkeleton title="Continue Watching" />

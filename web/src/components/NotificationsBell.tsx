@@ -261,7 +261,7 @@ function render(n: Notification): Rendered {
       return {
         title: `2FA disabled`,
         body: `@${username} turned off their two-factor.`,
-        href: "/settings/admin/users/users",
+        href: "/settings/admin/users",
       };
     }
     case "user.2fa.reset": {
@@ -270,7 +270,7 @@ function render(n: Notification): Rendered {
       return {
         title: `2FA reset for @${target}`,
         body: `@${actor} reset their 2FA from the admin panel.`,
-        href: "/settings/admin/users/users",
+        href: "/settings/admin/users",
       };
     }
     default:

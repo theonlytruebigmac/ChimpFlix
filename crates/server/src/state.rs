@@ -6,7 +6,8 @@ use std::sync::Arc;
 use chimpflix_common::Vault;
 use chimpflix_library::ServerSettings;
 use chimpflix_metadata::{
-    AniListClient, OpenSubtitlesClient, TmdbClient, TraktClient, TvMazeClient, TvdbClient,
+    AniListClient, OmdbClient, OpenSubtitlesClient, TmdbClient, TraktClient, TvMazeClient,
+    TvdbClient,
 };
 use chimpflix_transcoder::{FfmpegConfig, TranscodeManager, TranscoderCapabilities};
 use ipnet::IpNet;
@@ -47,6 +48,11 @@ pub type OpenSubtitlesHandle = Arc<RwLock<Option<OpenSubtitlesClient>>>;
 /// identity used to mint and refresh those tokens.
 pub type TraktHandle = Arc<RwLock<Option<TraktClient>>>;
 
+/// Hot-swappable OMDb client. `None` until the operator stores an
+/// OMDb API key in the vault (`omdb` slot). Consumed by the
+/// `fetch_external_ratings` per-item handler.
+pub type OmdbHandle = Arc<RwLock<Option<OmdbClient>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -66,6 +72,9 @@ pub struct AppState {
     /// `user_trakt_tokens` table at request time and combined with this
     /// client to make scoped API calls.
     pub trakt: TraktHandle,
+    /// OMDb client for the `fetch_external_ratings` per-item handler.
+    /// `None` until an OMDb API key is stored in the credential vault.
+    pub omdb: OmdbHandle,
     /// TVMaze fallback provider for shows. Always constructed (no key
     /// required); `None` only if HTTP client init fails.
     pub tvmaze: Option<TvMazeClient>,
@@ -128,6 +137,21 @@ pub struct AppState {
     /// that can lose a valid refresh_token.
     pub trakt_refresh_locks:
         Arc<RwLock<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Live, in-memory per-kind counters and recent-run ring
+    /// buffer. Used by the admin activity screen to render
+    /// "what's happening right now" without hitting SQLite on
+    /// every 5s poll. Reset on restart — historical data lives
+    /// in `task_kind_metrics_daily` instead.
+    pub task_metrics: crate::tasks::metrics::LiveMetrics,
+    /// Handle to the job-queue worker pool. Populated by main()
+    /// after `jobs::start()` returns. Wrapped in `Option` because
+    /// AppState is constructed before the pool is started (the
+    /// pool needs `state` to dispatch handlers) and wrapped in
+    /// RwLock so the settings PATCH handler can read it without
+    /// mutating AppState. `None` only between construction and
+    /// `jobs::start()` — a hard error elsewhere would still log
+    /// and continue rather than panic.
+    pub worker_pool: Arc<RwLock<Option<crate::jobs::WorkerPoolHandle>>>,
 }
 
 impl AppState {
@@ -173,6 +197,14 @@ impl AppState {
 
     pub async fn set_trakt(&self, client: Option<TraktClient>) {
         *self.trakt.write().await = client;
+    }
+
+    pub async fn omdb_snapshot(&self) -> Option<OmdbClient> {
+        self.omdb.read().await.clone()
+    }
+
+    pub async fn set_omdb(&self, client: Option<OmdbClient>) {
+        *self.omdb.write().await = client;
     }
 
     /// Try to acquire the scan lock for `library_id`. Returns true if

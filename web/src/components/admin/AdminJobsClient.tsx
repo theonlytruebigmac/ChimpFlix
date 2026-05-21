@@ -7,7 +7,8 @@ import {
   type JobStatusFilter,
   type JobSummary,
 } from "@/lib/chimpflix-api";
-import { Pill, FilterChip } from "./ui";
+import { DEFAULT_PAGE_SIZE, FilterChip, Pagination, Pill } from "./ui";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 /// Owner-only queue dashboard. Three sections:
 ///
@@ -23,13 +24,16 @@ import { Pill, FilterChip } from "./ui";
 /// the tab is hidden (no point burning CPU + API hits when nobody
 /// is looking).
 const POLL_MS = 4_000;
-const KINDS: { value: string; label: string }[] = [
-  { value: "", label: "All kinds" },
-  { value: "detect_markers_file", label: "Detect markers" },
-  { value: "generate_preview_sprite", label: "Preview sprite" },
-  { value: "build_chapter_thumbs", label: "Chapter thumbs" },
-  { value: "analyze_loudness", label: "Loudness" },
-];
+/// Permanent "All kinds" chip plus the dynamic kind list — the
+/// dynamic part is fetched from `/admin/tasks/activity` on mount so
+/// it auto-extends as new job kinds are registered. Used to be a
+/// hardcoded 4-item list that went stale as kinds were added
+/// (`bootstrap_season_refs`, `refresh_logos_item`, etc.), so jobs
+/// from new kinds were invisible to the filter.
+const ALL_KINDS_CHIP: { value: string; label: string } = {
+  value: "",
+  label: "All kinds",
+};
 const STATUSES: { value: "" | JobStatusFilter; label: string }[] = [
   { value: "", label: "All statuses" },
   { value: "queued", label: "Queued" },
@@ -49,15 +53,36 @@ export function AdminJobsClient({
   const [state, setState] = useState<{
     summary: JobSummary;
     jobs: JobRow[];
+    total: number;
     nowMs: number;
-  }>({ summary: initialSummary, jobs: initialJobs, nowMs: 0 });
+  }>({
+    summary: initialSummary,
+    jobs: initialJobs,
+    total: initialJobs.length,
+    nowMs: 0,
+  });
   const [kind, setKind] = useState<string>("");
   const [status, setStatus] = useState<"" | JobStatusFilter>("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  /// Dynamic chip list — fetched from `/admin/tasks/activity` so it
+  /// auto-extends to whatever kinds the binary actually has. Starts
+  /// as just the "All kinds" chip; the effect below adds the rest.
+  const [kinds, setKinds] = useState<{ value: string; label: string }[]>([
+    ALL_KINDS_CHIP,
+  ]);
   const [busyJobId, setBusyJobId] = useState<number | null>(null);
   const [sweepBusy, setSweepBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
+  const [clearDeadBusy, setClearDeadBusy] = useState(false);
   const [sweepResult, setSweepResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Gating state for the three confirmation dialogs. Booleans because
+  // each action targets the whole current state (no per-row picking) —
+  // no need for an object payload.
+  const [askProcessAll, setAskProcessAll] = useState(false);
+  const [askWipe, setAskWipe] = useState(false);
+  const [askClearDead, setAskClearDead] = useState(false);
   // Keep the alive flag in a ref so the polling interval sees the
   // latest value without re-creating the interval on every state
   // change (which would reset the cadence).
@@ -66,6 +91,32 @@ export function AdminJobsClient({
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+    };
+  }, []);
+
+  // One-shot kind discovery. The activity endpoint already returns
+  // every kind the server knows about (registry + any kind that's
+  // ever shown up in the queue), each with a human display name —
+  // exactly the shape we want for the filter chips. Sorted by
+  // label so the chip order is stable across page loads.
+  useEffect(() => {
+    let cancelled = false;
+    void adminApi.tasks
+      .activity()
+      .then((act) => {
+        if (cancelled) return;
+        const dynamic = act.per_kind
+          .map((k) => ({ value: k.kind, label: k.display_name }))
+          .sort((a, b) => a.label.localeCompare(b.label));
+        setKinds([ALL_KINDS_CHIP, ...dynamic]);
+      })
+      .catch(() => {
+        // Activity endpoint failed (rare). Stay on the "All kinds"
+        // fallback — the filter is non-essential; the table still
+        // works without per-kind chips.
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -80,11 +131,17 @@ export function AdminJobsClient({
           adminApi.jobs.list({
             kind: kind || undefined,
             status: status || undefined,
-            limit: 100,
+            limit: pageSize,
+          offset: (page - 1) * pageSize,
           }),
         ]);
         if (cancelled || !aliveRef.current) return;
-        setState({ summary, jobs: list.jobs, nowMs: Date.now() });
+        setState({
+          summary,
+          jobs: list.jobs,
+          total: list.total,
+          nowMs: Date.now(),
+        });
         setError(null);
       } catch (e) {
         if (cancelled) return;
@@ -100,16 +157,10 @@ export function AdminJobsClient({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [kind, status]);
+  }, [kind, status, page, pageSize]);
 
   async function processAllPending() {
-    if (
-      !window.confirm(
-        "Sweep every file lacking a pipeline artifact (markers, preview sprite, chapter thumbs, loudness) and enqueue jobs for them? This is idempotent — re-running while jobs are in flight is safe — but on a large library it can enqueue tens of thousands of rows. Proceed?",
-      )
-    ) {
-      return;
-    }
+    setAskProcessAll(false);
     setSweepBusy(true);
     setError(null);
     setSweepResult(null);
@@ -129,10 +180,16 @@ export function AdminJobsClient({
         adminApi.jobs.list({
           kind: kind || undefined,
           status: status || undefined,
-          limit: 100,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
         }),
       ]);
-      setState({ summary, jobs: list.jobs, nowMs: Date.now() });
+      setState({
+        summary,
+        jobs: list.jobs,
+        total: list.total,
+        nowMs: Date.now(),
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -142,13 +199,7 @@ export function AdminJobsClient({
 
   async function wipeQueued() {
     if (state.summary.queued === 0) return;
-    if (
-      !window.confirm(
-        `Delete all ${state.summary.queued.toLocaleString()} queued jobs? Running jobs will finish their current file but no more queued rows will be picked up. This is the "I clicked Process all pending by mistake" escape hatch.`,
-      )
-    ) {
-      return;
-    }
+    setAskWipe(false);
     setWipeBusy(true);
     setError(null);
     setSweepResult(null);
@@ -162,14 +213,53 @@ export function AdminJobsClient({
         adminApi.jobs.list({
           kind: kind || undefined,
           status: status || undefined,
-          limit: 100,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
         }),
       ]);
-      setState({ summary, jobs: list.jobs, nowMs: Date.now() });
+      setState({
+        summary,
+        jobs: list.jobs,
+        total: list.total,
+        nowMs: Date.now(),
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setWipeBusy(false);
+    }
+  }
+
+  async function clearDead() {
+    if (state.summary.dead === 0) return;
+    setAskClearDead(false);
+    setClearDeadBusy(true);
+    setError(null);
+    setSweepResult(null);
+    try {
+      const res = await adminApi.jobs.clearDead();
+      setSweepResult(
+        `Cleared ${res.removed.toLocaleString()} dead job${res.removed === 1 ? "" : "s"}.`,
+      );
+      const [summary, list] = await Promise.all([
+        adminApi.jobs.summary(),
+        adminApi.jobs.list({
+          kind: kind || undefined,
+          status: status || undefined,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
+        }),
+      ]);
+      setState({
+        summary,
+        jobs: list.jobs,
+        total: list.total,
+        nowMs: Date.now(),
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearDeadBusy(false);
     }
   }
 
@@ -183,11 +273,17 @@ export function AdminJobsClient({
         adminApi.jobs.list({
           kind: kind || undefined,
           status: status || undefined,
-          limit: 100,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
         }),
       ]);
-      // eslint-disable-next-line react-hooks/purity
-      setState({ summary, jobs: list.jobs, nowMs: Date.now() });
+      setState({
+        summary,
+        jobs: list.jobs,
+        total: list.total,
+        // eslint-disable-next-line react-hooks/purity
+        nowMs: Date.now(),
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -235,7 +331,15 @@ export function AdminJobsClient({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => void wipeQueued()}
+            onClick={() => setAskClearDead(true)}
+            disabled={clearDeadBusy || summary.dead === 0}
+            className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-2 text-sm font-medium text-red-300 hover:border-red-500/55 hover:bg-red-500/10 disabled:opacity-50"
+          >
+            {clearDeadBusy ? "Clearing…" : `Clear dead (${summary.dead})`}
+          </button>
+          <button
+            type="button"
+            onClick={() => setAskWipe(true)}
             disabled={wipeBusy || summary.queued === 0}
             className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-2 text-sm font-medium text-red-300 hover:border-red-500/55 hover:bg-red-500/10 disabled:opacity-50"
           >
@@ -243,13 +347,76 @@ export function AdminJobsClient({
           </button>
           <button
             type="button"
-            onClick={() => void processAllPending()}
+            onClick={() => setAskProcessAll(true)}
             disabled={sweepBusy}
             className="rounded-md border border-white/25 bg-white/5 px-4 py-2 text-sm font-medium text-white hover:border-white/45 hover:bg-white/10 disabled:opacity-50"
           >
             {sweepBusy ? "Sweeping…" : "Process all pending"}
           </button>
         </div>
+        {askProcessAll && (
+          <ConfirmDialog
+            title="Process all pending?"
+            body={
+              <>
+                <p>
+                  Sweep every file lacking a pipeline artifact (markers,
+                  preview sprite, chapter thumbs, loudness) and enqueue jobs
+                  for them.
+                </p>
+                <p className="mt-2">
+                  This is idempotent — re-running while jobs are in flight is
+                  safe — but on a large library it can enqueue tens of
+                  thousands of rows.
+                </p>
+              </>
+            }
+            confirmLabel="Process all"
+            busy={sweepBusy}
+            onConfirm={() => void processAllPending()}
+            onCancel={() => setAskProcessAll(false)}
+          />
+        )}
+        {askWipe && (
+          <ConfirmDialog
+            title={`Wipe ${summary.queued.toLocaleString()} queued job${summary.queued === 1 ? "" : "s"}?`}
+            body={
+              <>
+                <p>
+                  Running jobs will finish their current file but no more
+                  queued rows will be picked up.
+                </p>
+                <p className="mt-2 text-white/55">
+                  This is the &ldquo;I clicked Process all pending by
+                  mistake&rdquo; escape hatch.
+                </p>
+              </>
+            }
+            confirmLabel="Wipe queued"
+            destructive
+            busy={wipeBusy}
+            onConfirm={() => void wipeQueued()}
+            onCancel={() => setAskWipe(false)}
+          />
+        )}
+        {askClearDead && (
+          <ConfirmDialog
+            title={`Clear ${summary.dead.toLocaleString()} dead job${summary.dead === 1 ? "" : "s"}?`}
+            body={
+              <p>
+                Dead rows have exhausted{" "}
+                <code className="font-mono text-white/85">max_attempts</code>{" "}
+                (or have no handler at all — e.g. left over from a renamed
+                kind). Use this when a Requeue won&rsquo;t help.
+              </p>
+            }
+            confirmLabel="Clear dead"
+            destructive
+            busy={clearDeadBusy}
+            onConfirm={() => void clearDead()}
+            onCancel={() => setAskClearDead(false)}
+          />
+        )}
       </div>
 
       {/* Filter chips */}
@@ -258,11 +425,14 @@ export function AdminJobsClient({
           <span className="text-xs uppercase tracking-wider text-white/45">
             Kind
           </span>
-          {KINDS.map((k) => (
+          {kinds.map((k) => (
             <FilterChip
               key={k.value || "all"}
               active={kind === k.value}
-              onClick={() => setKind(k.value)}
+              onClick={() => {
+                setKind(k.value);
+                setPage(1);
+              }}
             >
               {k.label}
             </FilterChip>
@@ -276,7 +446,10 @@ export function AdminJobsClient({
             <FilterChip
               key={s.value || "all"}
               active={status === s.value}
-              onClick={() => setStatus(s.value)}
+              onClick={() => {
+                setStatus(s.value);
+                setPage(1);
+              }}
             >
               {s.label}
             </FilterChip>
@@ -351,6 +524,18 @@ export function AdminJobsClient({
           </table>
         </div>
       )}
+
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        total={state.total}
+        onPageChange={setPage}
+        onPageSizeChange={(s) => {
+          setPageSize(s);
+          setPage(1);
+        }}
+        noun="jobs"
+      />
 
       <p className="text-xs text-white/45">
         Refreshes every {POLL_MS / 1000}s while the tab is visible. Failed

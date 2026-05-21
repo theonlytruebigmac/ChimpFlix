@@ -15,6 +15,7 @@ import {
   type TranscoderPreset,
 } from "@/lib/chimpflix-api";
 import { Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 const HEVC_MODES: ReadonlyArray<{ value: HevcMode; label: string; hint: string }> = [
   {
@@ -107,6 +108,7 @@ export function AdminTranscoderClient({
     transcoder_background_preset: settings.transcoder_background_preset,
     transcoder_max_background_concurrent:
       settings.transcoder_max_background_concurrent,
+    job_workers: settings.job_workers,
     transcoder_hdr_tonemap_enabled: settings.transcoder_hdr_tonemap_enabled,
     transcoder_hdr_tonemap_algo: settings.transcoder_hdr_tonemap_algo,
     transcoder_hevc_encoding_mode: (settings.transcoder_hevc_encoding_mode ??
@@ -137,6 +139,7 @@ export function AdminTranscoderClient({
   const [maxBackgroundConcurrent, setMaxBackgroundConcurrent] = useState(
     baseline.transcoder_max_background_concurrent,
   );
+  const [jobWorkers, setJobWorkers] = useState(baseline.job_workers);
   const [tonemapEnabled, setTonemapEnabled] = useState(
     baseline.transcoder_hdr_tonemap_enabled,
   );
@@ -238,6 +241,7 @@ export function AdminTranscoderClient({
     "Max background jobs":
       maxBackgroundConcurrent !==
       baseline.transcoder_max_background_concurrent,
+    "Job queue workers": jobWorkers !== baseline.job_workers,
     "Tone map HDR sources":
       tonemapEnabled !== baseline.transcoder_hdr_tonemap_enabled,
     "Tonemap algorithm":
@@ -262,6 +266,7 @@ export function AdminTranscoderClient({
       transcoder_hw_strictness: hwStrictness,
       transcoder_background_preset: backgroundPreset,
       transcoder_max_background_concurrent: maxBackgroundConcurrent,
+      job_workers: jobWorkers,
       transcoder_hdr_tonemap_enabled: tonemapEnabled,
       transcoder_hdr_tonemap_algo: tonemapAlgo,
       transcoder_hevc_encoding_mode: hevcMode,
@@ -278,6 +283,7 @@ export function AdminTranscoderClient({
       transcoder_hw_strictness: hwStrictness,
       transcoder_background_preset: backgroundPreset,
       transcoder_max_background_concurrent: maxBackgroundConcurrent,
+      job_workers: jobWorkers,
       transcoder_hdr_tonemap_enabled: tonemapEnabled,
       transcoder_hdr_tonemap_algo: tonemapAlgo,
       transcoder_hevc_encoding_mode: hevcMode,
@@ -294,6 +300,7 @@ export function AdminTranscoderClient({
     setHwStrictness(baseline.transcoder_hw_strictness);
     setBackgroundPreset(baseline.transcoder_background_preset);
     setMaxBackgroundConcurrent(baseline.transcoder_max_background_concurrent);
+    setJobWorkers(baseline.job_workers);
     setTonemapEnabled(baseline.transcoder_hdr_tonemap_enabled);
     setTonemapAlgo(baseline.transcoder_hdr_tonemap_algo);
     setHevcMode(baseline.transcoder_hevc_encoding_mode);
@@ -574,6 +581,24 @@ export function AdminTranscoderClient({
             }
           />
         </SettingsRow>
+        <SettingsRow
+          label="Job queue workers"
+          help="How many worker tasks pull from the durable job queue (marker detection, preview sprites, chapter thumbs, loudness). Each worker can run any kind, so raising this lets more pipeline kinds make progress in parallel when files pile up. Applies live — shrinking drains workers as soon as they finish their current job."
+          changed={dirtyFields["Job queue workers"]}
+        >
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={jobWorkers}
+            onChange={(e) => setJobWorkers(Number(e.target.value))}
+            className={
+              dirtyFields["Job queue workers"]
+                ? INPUT_CHANGED_CLASS
+                : INPUT_CLASS
+            }
+          />
+        </SettingsRow>
       </SettingsCard>
 
       {/* ── HDR tone mapping ──────────────────────────────────────── */}
@@ -809,6 +834,7 @@ function PresetRow({
   onError: (msg: string | null) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [askDelete, setAskDelete] = useState(false);
 
   async function toggle() {
     setBusy(true);
@@ -824,7 +850,7 @@ function PresetRow({
   }
 
   async function remove() {
-    if (!window.confirm(`Delete preset "${preset.name}"?`)) return;
+    setAskDelete(false);
     setBusy(true);
     onError(null);
     try {
@@ -838,6 +864,7 @@ function PresetRow({
   }
 
   return (
+    <>
     <tr className="border-t border-white/5">
       <td className="px-4 py-2 font-medium">{preset.name}</td>
       <td className="px-4 py-2 tabular-nums text-white/70">
@@ -861,13 +888,25 @@ function PresetRow({
       <td className="whitespace-nowrap px-4 py-2 text-right">
         <button
           disabled={busy}
-          onClick={remove}
+          onClick={() => setAskDelete(true)}
           className="rounded border border-white/15 px-2 py-1 text-xs text-white/50 hover:border-red-500/50 hover:text-red-300"
         >
           Delete
         </button>
       </td>
     </tr>
+    {askDelete && (
+      <ConfirmDialog
+        title={`Delete preset "${preset.name}"?`}
+        body="Active sessions using this preset keep running. New sessions will fall back to the default."
+        confirmLabel="Delete"
+        destructive
+        busy={busy}
+        onConfirm={() => void remove()}
+        onCancel={() => setAskDelete(false)}
+      />
+    )}
+    </>
   );
 }
 

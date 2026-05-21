@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  friendlyErrorMessage,
   items as itemsApi,
   type ItemDetail,
   type MatchCandidate,
@@ -55,8 +56,11 @@ export function FixMatchDialog({
       const res = await itemsApi.matchSearch(detail.id, q.trim(), y);
       setCandidates(res.candidates);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setCandidates([]);
+      setError(friendlyErrorMessage(e));
+      // Leave candidates as null so the dialog renders only the error
+      // banner — setting it to [] would also show "No matches", which
+      // is misleading when the real failure is an upstream/server error.
+      setCandidates(null);
     } finally {
       setSearching(false);
     }
@@ -71,7 +75,7 @@ export function FixMatchDialog({
       onApplied(next);
       onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyErrorMessage(e));
     } finally {
       setApplying(null);
     }

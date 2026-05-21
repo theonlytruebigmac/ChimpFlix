@@ -6,6 +6,7 @@ import {
   type OptimizedVersion,
   type TranscoderPreset,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   initial: OptimizedVersion[];
@@ -16,6 +17,8 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
   const [versions, setVersions] = useState(initial);
   const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [askDeleteId, setAskDeleteId] = useState<number | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   async function refresh() {
     try {
@@ -26,13 +29,21 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
     }
   }
 
-  async function remove(id: number) {
-    if (!window.confirm("Delete this optimized version (file + DB row)?")) return;
+  function remove(id: number) {
+    setAskDeleteId(id);
+  }
+
+  async function confirmDelete() {
+    if (askDeleteId == null) return;
+    setDeleteBusy(true);
     try {
-      await adminApi.optimized.delete(id);
+      await adminApi.optimized.delete(askDeleteId);
       await refresh();
+      setAskDeleteId(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
@@ -125,6 +136,17 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
             </tbody>
           </table>
         </div>
+      )}
+      {askDeleteId != null && (
+        <ConfirmDialog
+          title="Delete this optimized version?"
+          body="The transcoded file on disk and the DB row will both be removed. The source file is untouched."
+          confirmLabel="Delete"
+          destructive
+          busy={deleteBusy}
+          onConfirm={() => void confirmDelete()}
+          onCancel={() => setAskDeleteId(null)}
+        />
       )}
     </div>
   );

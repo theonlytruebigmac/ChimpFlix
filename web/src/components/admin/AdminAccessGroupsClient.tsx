@@ -9,6 +9,7 @@ import {
   type Library,
   type User,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   initialGroups: AccessGroup[];
@@ -28,6 +29,8 @@ export function AdminAccessGroupsClient({
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [askDelete, setAskDelete] = useState<{ id: number; name: string } | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   async function refreshList() {
     try {
@@ -69,23 +72,25 @@ export function AdminAccessGroupsClient({
     }
   }
 
-  async function deleteGroup(id: number, name: string) {
-    if (
-      !window.confirm(
-        `Delete group "${name}"? Members will lose any access that came only from this group. Direct grants are kept.`,
-      )
-    ) {
-      return;
-    }
+  function deleteGroup(id: number, name: string) {
+    setAskDelete({ id, name });
+  }
+
+  async function confirmDeleteGroup() {
+    if (!askDelete) return;
+    setDeleteBusy(true);
     try {
-      await adminApi.accessGroups.delete(id);
-      if (activeId === id) {
+      await adminApi.accessGroups.delete(askDelete.id);
+      if (activeId === askDelete.id) {
         setActiveId(null);
         setDetail(null);
       }
       await refreshList();
+      setAskDelete(null);
     } catch (e) {
       setError(parseError(e));
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
@@ -182,6 +187,17 @@ export function AdminAccessGroupsClient({
           />
         )}
       </section>
+      {askDelete && (
+        <ConfirmDialog
+          title={`Delete group "${askDelete.name}"?`}
+          body="Members will lose any access that came only from this group. Direct grants on each user are kept."
+          confirmLabel="Delete group"
+          destructive
+          busy={deleteBusy}
+          onConfirm={() => void confirmDeleteGroup()}
+          onCancel={() => setAskDelete(null)}
+        />
+      )}
     </div>
   );
 }

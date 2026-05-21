@@ -1,0 +1,532 @@
+:root {
+  --bg: #f7f4ec;
+  --ink: #2a2a2a;
+  --ink-light: #555;
+  --muted: #888;
+  --paper-edge: rgba(0, 0, 0, 0.08);
+  --node-bg: #fffdf6;
+  --node-border: #2a2a2a;
+  --node-shadow: 0 2px 0 rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.04);
+
+  --c-trigger: #2a7a3a;
+  --c-trigger-bg: #e5f1e0;
+  --c-auto: #2a5d8a;
+  --c-auto-bg: #e0ecf3;
+  --c-gated: #8a5a1a;
+  --c-gated-bg: #f4ead4;
+  --c-safety: #6a4a8a;
+  --c-safety-bg: #ece2f3;
+  --c-event: #3a3a3a;
+  --c-event-bg: #ececec;
+  --c-terminal: #8a2a2a;
+  --c-terminal-bg: #f4d8d4;
+  --c-external: #1f6f6a;
+  --c-external-bg: #d8eeec;
+  --todo: #b03020;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  padding: 32px 24px 96px;
+  line-height: 1.45;
+}
+
+.handwritten {
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+}
+
+header.page {
+  max-width: 1180px;
+  margin: 0 auto 24px;
+  text-align: center;
+}
+
+header.page h1 {
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+  font-size: 52px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  letter-spacing: 0.5px;
+}
+
+header.page .subtitle {
+  color: var(--ink-light);
+  font-size: 15px;
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+nav.crumbs {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 24px auto 36px;
+  font-size: 14px;
+  max-width: 1180px;
+}
+
+nav.crumbs a {
+  color: var(--ink-light);
+  text-decoration: none;
+  padding: 7px 14px;
+  border-radius: 20px;
+  border: 1.5px dashed transparent;
+  transition: border-color 0.15s;
+}
+
+nav.crumbs a.active {
+  border-color: var(--node-border);
+  background: var(--node-bg);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+nav.crumbs a:hover {
+  border-color: var(--node-border);
+}
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+section.stage {
+  margin: 56px 0;
+}
+
+section.stage > h2 {
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+  font-size: 32px;
+  margin: 0 0 8px;
+  text-align: center;
+  color: var(--ink);
+}
+
+section.stage > .stage-desc {
+  text-align: center;
+  color: var(--ink-light);
+  font-size: 14px;
+  max-width: 720px;
+  margin: 0 auto 28px;
+}
+
+.row {
+  display: flex;
+  gap: 24px;
+  justify-content: center;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+
+.row.tight { gap: 14px; }
+
+.col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.arrow {
+  font-size: 28px;
+  color: var(--ink);
+  line-height: 1;
+  text-align: center;
+  margin: 2px 0;
+  user-select: none;
+}
+
+.arrow .label {
+  display: block;
+  font-family: ui-sans-serif, sans-serif;
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  margin-top: 2px;
+}
+
+.node {
+  position: relative;
+  background: var(--node-bg);
+  border: 2px solid var(--node-border);
+  border-radius: 14px;
+  padding: 12px 14px 14px;
+  width: 240px;
+  box-shadow: var(--node-shadow);
+  text-align: left;
+}
+
+.node.wide { width: 280px; }
+.node.narrow { width: 200px; }
+
+.node .title {
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.node .kind-chip {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 8px;
+  border: 1px solid currentColor;
+  opacity: 0.7;
+}
+
+.node .meta {
+  font-size: 11.5px;
+  color: var(--ink-light);
+  margin: 4px 0;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  line-height: 1.35;
+}
+
+.node .meta .label {
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+  min-width: 46px;
+}
+
+.node .meta .val { flex: 1; }
+
+.node .ref {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", "Menlo", monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(0, 0, 0, 0.12);
+  overflow-wrap: anywhere;
+}
+
+.node .todo {
+  position: absolute;
+  top: -10px;
+  right: -8px;
+  background: var(--todo);
+  color: white;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 3px 8px;
+  border-radius: 10px;
+  border: 1.5px solid var(--node-border);
+  text-transform: uppercase;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  transform: rotate(3deg);
+}
+
+.node.trigger { background: var(--c-trigger-bg); border-color: var(--c-trigger); }
+.node.trigger .title { color: var(--c-trigger); }
+
+.node.event { background: var(--c-event-bg); }
+.node.event .title { color: var(--c-event); }
+
+.node.auto { background: var(--c-auto-bg); border-color: var(--c-auto); }
+.node.auto .title { color: var(--c-auto); }
+
+.node.gated { background: var(--c-gated-bg); border-color: var(--c-gated); }
+.node.gated .title { color: var(--c-gated); }
+
+.node.safety { background: var(--c-safety-bg); border-color: var(--c-safety); }
+.node.safety .title { color: var(--c-safety); }
+
+.node.terminal { background: var(--c-terminal-bg); border-color: var(--c-terminal); }
+.node.terminal .title { color: var(--c-terminal); }
+
+.node.external { background: var(--c-external-bg); border-color: var(--c-external); }
+.node.external .title { color: var(--c-external); }
+
+.group {
+  border: 2.5px dashed var(--node-border);
+  border-radius: 18px;
+  padding: 36px 22px 22px;
+  position: relative;
+  background: rgba(255, 253, 246, 0.45);
+  margin-top: 16px;
+}
+
+.group.tight { padding-top: 30px; }
+
+.group-label {
+  position: absolute;
+  top: -16px;
+  left: 28px;
+  background: var(--bg);
+  padding: 0 12px;
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+  font-size: 22px;
+  color: var(--ink);
+}
+
+.group-label.right {
+  left: auto;
+  right: 28px;
+}
+
+.group .sublabel {
+  text-align: center;
+  font-size: 12px;
+  color: var(--ink-light);
+  font-style: italic;
+  margin: -8px 0 18px;
+}
+
+.subgroup-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 22px 12px 14px;
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+  font-size: 20px;
+  color: var(--ink);
+}
+
+.subgroup-header::before,
+.subgroup-header::after {
+  content: "";
+  flex: 1;
+  height: 1.5px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.subgroup-header .tag {
+  font-family: ui-sans-serif, sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 8px;
+  border: 1.5px solid currentColor;
+}
+
+.subgroup-header.gated {
+  color: var(--c-gated);
+}
+
+.subgroup-header.auto {
+  color: var(--c-auto);
+}
+
+.legend {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin: 28px auto;
+  padding: 14px 20px;
+  border: 1.5px solid var(--paper-edge);
+  border-radius: 14px;
+  max-width: 1100px;
+  background: rgba(255, 255, 255, 0.45);
+  font-size: 12.5px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.legend-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  border: 1.5px solid var(--node-border);
+}
+
+.legend-swatch.trigger { background: var(--c-trigger-bg); }
+.legend-swatch.event { background: var(--c-event-bg); }
+.legend-swatch.auto { background: var(--c-auto-bg); }
+.legend-swatch.gated { background: var(--c-gated-bg); }
+.legend-swatch.safety { background: var(--c-safety-bg); }
+.legend-swatch.terminal { background: var(--c-terminal-bg); }
+.legend-swatch.external { background: var(--c-external-bg); }
+
+.legend-swatch.todo {
+  background: var(--todo);
+  border-color: var(--node-border);
+}
+
+.notes {
+  margin: 56px auto 0;
+  padding: 22px 26px;
+  border-left: 5px solid var(--node-border);
+  background: rgba(255, 255, 255, 0.45);
+  font-size: 14px;
+  color: var(--ink-light);
+  max-width: 1100px;
+  border-radius: 0 10px 10px 0;
+}
+
+.notes h3 {
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+  margin-top: 0;
+  font-size: 26px;
+  color: var(--ink);
+}
+
+.notes ul {
+  margin: 0;
+  padding-left: 22px;
+}
+
+.notes li { margin-bottom: 10px; }
+
+.notes code {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1.5px 5px;
+  border-radius: 4px;
+}
+
+.fan-connector {
+  display: flex;
+  justify-content: center;
+  align-items: stretch;
+  position: relative;
+  height: 40px;
+  margin: 4px 0;
+}
+
+.fan-connector::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 12%;
+  right: 12%;
+  height: 2px;
+  background: var(--ink);
+}
+
+.fan-connector .drop {
+  width: 2px;
+  background: var(--ink);
+  position: relative;
+}
+
+.fan-connector .drop::after {
+  content: "▼";
+  position: absolute;
+  bottom: -6px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.fan-row {
+  display: flex;
+  justify-content: space-around;
+  width: 100%;
+  pointer-events: none;
+}
+
+.fan-row .drop {
+  pointer-events: all;
+}
+
+.connection-band {
+  margin: 28px 0;
+  padding: 18px 22px;
+  background: rgba(255, 255, 255, 0.35);
+  border: 2px dashed var(--ink);
+  border-radius: 12px;
+  text-align: center;
+  font-size: 13.5px;
+  color: var(--ink-light);
+  font-style: italic;
+  max-width: 900px;
+  margin-left: auto;
+  margin-right: auto;
+  position: relative;
+}
+
+.connection-band::before {
+  content: "↕";
+  position: absolute;
+  top: -18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg);
+  padding: 0 8px;
+  font-size: 26px;
+  color: var(--ink);
+  font-style: normal;
+}
+
+.connection-band strong { color: var(--ink); }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 22px;
+  margin: 32px 0;
+}
+
+.card {
+  background: var(--node-bg);
+  border: 2px solid var(--node-border);
+  border-radius: 16px;
+  padding: 22px;
+  box-shadow: var(--node-shadow);
+  text-decoration: none;
+  color: var(--ink);
+  transition: transform 0.15s;
+  display: block;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+}
+
+.card h3 {
+  font-family: "Caveat", "Patrick Hand", "Bradley Hand", "Marker Felt", cursive, sans-serif;
+  font-size: 26px;
+  margin: 0 0 8px;
+  color: var(--ink);
+}
+
+.card p {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  color: var(--ink-light);
+}
+
+.card .pipeline-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.card .pipeline-list li::before {
+  content: "→ ";
+  color: var(--ink);
+}

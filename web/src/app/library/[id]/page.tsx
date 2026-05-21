@@ -1,10 +1,10 @@
 import { notFound } from "next/navigation";
+import Link from "next/link";
 import { Suspense } from "react";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
-import { TopNav } from "@/components/TopNav";
 import { pickHeroIndex } from "@/lib/hero";
 import {
   items as itemsApi,
@@ -67,7 +67,6 @@ export default async function LibraryPage({
 
   return (
     <main className="relative">
-      <TopNav />
       <Suspense fallback={<HeroSkeleton />}>
         <LibraryHero lib={lib} kind={kind} />
       </Suspense>
@@ -80,6 +79,37 @@ export default async function LibraryPage({
             <GenreRail lib={lib} kind={kind} genre={g} />
           </Suspense>
         ))}
+        {/*
+          "Browse all" call-out — full inventory grid for finding a
+          specific title or fixing unmatched files. Sits below the
+          rails so it doesn't pre-empt the Netflix-style discovery
+          flow at the top, but stays visible (not buried in a menu).
+        */}
+        <div className="px-4 pt-10 pb-2 sm:px-8 md:px-12">
+          <Link
+            href={`/library/${lib.id}/browse`}
+            className="inline-flex items-center gap-2 rounded-md border border-white/15 bg-white/2 px-4 py-2.5 text-sm font-medium text-white/85 transition-colors hover:border-white/35 hover:bg-white/5 hover:text-white"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <rect x="3" y="3" width="7" height="7" />
+              <rect x="14" y="3" width="7" height="7" />
+              <rect x="3" y="14" width="7" height="7" />
+              <rect x="14" y="14" width="7" height="7" />
+            </svg>
+            Browse all titles
+            <span className="ml-1 text-white/45">→</span>
+          </Link>
+        </div>
       </div>
       <ModalRoot />
     </main>

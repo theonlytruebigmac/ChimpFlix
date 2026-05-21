@@ -2,8 +2,19 @@
 //! video file, probe it, persist rows, optionally enrich via TMDB,
 //! emit progress events along the way.
 //!
-//! v0.1 limitations:
-//!   * Sequential processing (no concurrent ffprobe). Speed up later.
+//! Performance shape:
+//!   * Per-file work (ffprobe + DB upserts + TMDB enrichment) runs
+//!     in parallel via `buffer_unordered(SCAN_PARALLELISM)`. ffprobe
+//!     and the metadata HTTP calls dominate latency, both are I/O
+//!     bound, so concurrency gets near-linear speedup.
+//!   * TMDB `fetch_season` calls are memoised per scan on
+//!     `(show_tmdb_id, season_number)` — a 50-episode show used to
+//!     hit the same endpoint 50 times.
+//!   * `ffprobe` failures no longer drop the file. We persist the
+//!     `media_files` row with NULL technical fields and log a warn;
+//!     the operator can fix the source and re-scan or refresh.
+//!
+//! Remaining caveats:
 //!   * No removal of media_files for deleted-from-disk paths. Future work.
 //!   * Title-only matching for items (`UNIQUE (library_id, kind, sort_title)`);
 //!     two distinct movies with the same title in the same library collide.
@@ -14,10 +25,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
-use chimpflix_metadata::{AniListClient, TmdbClient, TvMazeClient, TvdbClient};
-use chimpflix_transcoder::FfmpegConfig;
+use chimpflix_metadata::{AniListClient, TmdbClient, TmdbSeason, TvMazeClient, TvdbClient};
+use chimpflix_transcoder::{FfmpegConfig, ProbeResult};
+use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -25,6 +37,20 @@ use crate::events::{ScanEmitter, ScanEvent};
 use crate::models::{ItemKind, LibraryKind};
 use crate::parser::{self, Classification};
 use crate::queries;
+
+/// How many files the scanner processes concurrently. Each in-flight
+/// task can hold one ffprobe subprocess + a handful of outstanding
+/// HTTP requests against TMDB/TVDB/TVMaze/AniList. 8 keeps the box
+/// usefully busy without saturating either ffprobe spawns or the
+/// metadata APIs' polite-client expectations.
+const SCAN_PARALLELISM: usize = 8;
+
+/// Per-scan cache of TMDB season fetches. Keyed on
+/// `(show_tmdb_id, season_number)`. Lives only for the duration of a
+/// single scan — we deliberately don't persist this across scans so
+/// freshly-aired episodes show up on the next run without manual
+/// invalidation.
+type SeasonCache = Mutex<HashMap<(i64, i32), Arc<TmdbSeason>>>;
 
 /// Process-wide semaphore that bounds how many WebVTT pre-warm
 /// ffmpegs can run at once. Before this cap was added, a fresh scan
@@ -195,28 +221,62 @@ async fn scan_inner(
         "scan candidates collected"
     );
 
+    let existing = Arc::new(existing);
+    let agents = Arc::new(agents);
+    let cache_root_owned: Option<PathBuf> = cache_root.map(Path::to_path_buf);
+    let season_cache: Arc<SeasonCache> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Clone the network clients up front so each parallel worker owns
+    // its own handle. reqwest::Client is internally Arc'd, so this is
+    // a cheap refcount bump per worker — not duplicated state.
+    let pool_owned = pool.clone();
+    let ffmpeg_owned = ffmpeg.clone();
+    let tmdb_owned = tmdb.cloned();
+    let tvdb_owned = tvdb.cloned();
+    let anilist_owned = anilist.cloned();
+    let tvmaze_owned = tvmaze.cloned();
+
+    let mut tasks = stream::iter(candidates.into_iter())
+        .map(|(root, path)| {
+            let pool = pool_owned.clone();
+            let ffmpeg = ffmpeg_owned.clone();
+            let tmdb = tmdb_owned.clone();
+            let tvdb = tvdb_owned.clone();
+            let anilist = anilist_owned.clone();
+            let tvmaze = tvmaze_owned.clone();
+            let agents = agents.clone();
+            let existing = existing.clone();
+            let cache_root = cache_root_owned.clone();
+            let season_cache = season_cache.clone();
+            async move {
+                let res = process_file(
+                    &pool,
+                    &ffmpeg,
+                    tmdb.as_ref(),
+                    tvdb.as_ref(),
+                    anilist.as_ref(),
+                    tvmaze.as_ref(),
+                    &agents,
+                    &existing,
+                    library_id,
+                    library_kind,
+                    &root,
+                    &path,
+                    cache_root.as_deref(),
+                    &season_cache,
+                )
+                .await;
+                (path, res)
+            }
+        })
+        .buffer_unordered(SCAN_PARALLELISM);
+
     let mut counters = Counters::default();
     let mut since_progress = 0i64;
 
-    for (root, path) in candidates {
+    while let Some((path, res)) = tasks.next().await {
         counters.files_seen += 1;
-        match process_file(
-            pool,
-            ffmpeg,
-            tmdb,
-            tvdb,
-            anilist,
-            tvmaze,
-            &agents,
-            &existing,
-            library_id,
-            library_kind,
-            &root,
-            &path,
-            cache_root,
-        )
-        .await
-        {
+        match res {
             Ok((queries::FileOutcome::Added, Some(media_file_id))) => {
                 counters.files_added += 1;
                 // Hand the new file off to the discovery pipeline.
@@ -322,7 +382,6 @@ async fn collect_candidates(roots: &[String]) -> Result<Vec<(PathBuf, PathBuf)>>
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn process_file(
     pool: &SqlitePool,
     ffmpeg: &FfmpegConfig,
@@ -337,6 +396,7 @@ async fn process_file(
     root: &Path,
     path: &Path,
     cache_root: Option<&Path>,
+    season_cache: &SeasonCache,
 ) -> Result<(queries::FileOutcome, Option<i64>)> {
     // Non-UTF8 paths used to fail silently up the error chain with
     // only the generic "non-UTF8 path" message in the scan job log.
@@ -376,25 +436,51 @@ async fn process_file(
         return Ok((queries::FileOutcome::Unchanged, None));
     }
 
-    let classification = match parser::classify(path, root, library_kind) {
-        Some(c) => c,
-        None => {
-            // Bumped from `debug` to `info` and added the stem so
-            // operators can see which filenames the parser couldn't
-            // parse. Skipped files used to vanish silently — common
-            // cause is unusual release-name formatting that doesn't
-            // match the season/episode regexes.
-            info!(
-                stem = %path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
+    // `classify` is total now — it always returns a Classification.
+    // When the regex pipeline couldn't extract clean metadata it
+    // falls back to a cleaned-filename stub with `auto_matched =
+    // false`. We persist that flag onto `items.auto_matched` so
+    // the admin UI can surface a "fix this" affordance without
+    // making the file invisible.
+    let parser::ClassifyResult {
+        class: classification,
+        auto_matched,
+    } = parser::classify(path, root, library_kind);
+    if !auto_matched {
+        // Keep the info log so operators can grep for surprising
+        // names; the file is no longer dropped silently.
+        info!(
+            stem = %path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
+            path = %path.display(),
+            library_kind = ?library_kind,
+            "scanner: classifier couldn't extract season/episode/title — linking as unmatched (fix via the Unmatched files admin view)"
+        );
+    }
+
+    // ffprobe can fail for legitimate reasons (truncated file, weird
+    // container, sample/.nfo masquerading as .mkv, foreign-encoded
+    // filename that ffprobe's quoting chokes on). Pre-this-change a
+    // probe failure dropped the file from the catalog entirely; we now
+    // log and persist the row with NULL technical fields so it's still
+    // visible. Operators can fix the source and either rescan or use
+    // the Refresh metadata path to re-probe.
+    let probe = match chimpflix_transcoder::probe(ffmpeg, path).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
                 path = %path.display(),
-                library_kind = ?library_kind,
-                "scanner: skipping file — classifier couldn't extract season/episode/title; rename to match an SxxExx pattern or move into a typed folder"
+                error = %format!("{e:#}"),
+                "scanner: ffprobe failed; linking file with empty technical metadata"
             );
-            return Ok((queries::FileOutcome::Unchanged, None));
+            ProbeResult {
+                duration_ms: None,
+                bit_rate: None,
+                size_bytes: None,
+                container: None,
+                streams: Vec::new(),
+            }
         }
     };
-
-    let probe = chimpflix_transcoder::probe(ffmpeg, path).await?;
 
     let mut movie_hint: Option<MovieHint> = None;
     let mut show_hint: Option<ShowHint> = None;
@@ -407,10 +493,24 @@ async fn process_file(
             sort_title,
             year,
         } => {
-            let id =
-                queries::upsert_item(pool, library_id, ItemKind::Movie, &title, &sort_title, year)
-                    .await?;
-            movie_hint = Some(MovieHint { title, year, id });
+            let id = queries::upsert_item_with_match(
+                pool,
+                library_id,
+                ItemKind::Movie,
+                &title,
+                &sort_title,
+                year,
+                auto_matched,
+            )
+            .await?;
+            // Movie hints drive TMDB enrichment. Skip enriching
+            // unmatched stubs — the cleaned filename is unlikely to
+            // resolve to a real TMDB match and we'd just burn quota
+            // on garbage queries. Enrichment will re-run after the
+            // operator fix-matches.
+            if auto_matched {
+                movie_hint = Some(MovieHint { title, year, id });
+            }
             item_id = Some(id);
             episode_id = None;
         }
@@ -422,27 +522,31 @@ async fn process_file(
             episode,
             title,
         } => {
-            let show_id = queries::upsert_item(
+            let show_id = queries::upsert_item_with_match(
                 pool,
                 library_id,
                 ItemKind::Show,
                 &show_title,
                 &show_sort_title,
                 show_year,
+                auto_matched,
             )
             .await?;
             let season_id = queries::upsert_season(pool, show_id, season).await?;
             let fallback_title = title.unwrap_or_else(|| format!("Episode {episode}"));
             let ep_id = queries::upsert_episode(pool, season_id, episode, &fallback_title).await?;
 
-            show_hint = Some(ShowHint {
-                show_title,
-                show_year,
-                show_id,
-                season_number: season,
-                episode_number: episode,
-                episode_id: ep_id,
-            });
+            // Same enrichment-skip rationale as the Movie arm.
+            if auto_matched {
+                show_hint = Some(ShowHint {
+                    show_title,
+                    show_year,
+                    show_id,
+                    season_number: season,
+                    episode_number: episode,
+                    episode_id: ep_id,
+                });
+            }
             item_id = None;
             episode_id = Some(ep_id);
         }
@@ -556,7 +660,7 @@ async fn process_file(
         if matches!(library_kind, LibraryKind::Anime) && agents.is_enabled("anilist") {
             apply_anilist_for_show(pool, anilist, &hint).await;
         }
-        tmdb_apply_show(pool, tmdb, tvdb, tvmaze, &hint).await;
+        tmdb_apply_show(pool, tmdb, tvdb, tvmaze, season_cache, &hint).await;
     }
 
     // Return the file_id so the caller can emit a FileAdded event
@@ -733,6 +837,14 @@ pub async fn refresh_item_metadata(
             };
             let tid = meta.tmdb_id;
             queries::apply_show_metadata(pool, item_id, &meta).await?;
+            // Per-episode enrichment. Without this, episode titles stay
+            // at whatever the parser extracted from the filename
+            // ("Spring Time Bluray-1080p") instead of the TMDB title
+            // ("Spring Time"). Scan-time `tmdb_apply_show` only runs
+            // once per file discovered, but the Refresh button enters
+            // here — so we walk every local season + episode and
+            // overwrite with TMDB's text.
+            refresh_show_episodes(pool, client, item_id, tid).await;
             tid
         }
     };
@@ -806,11 +918,103 @@ async fn enrich_credits_and_extras(
     }
 }
 
+/// Walk every local season+episode of `show_id` and overwrite the
+/// episode rows with TMDB's metadata. Used by the `/items/{id}/refresh`
+/// path — scan-time enrichment already runs per-file, but the
+/// Refresh button doesn't go through that path and would otherwise
+/// leave episode titles stuck at whatever the parser pulled out of
+/// the filename. Best-effort: any per-season TMDB failure is logged
+/// and we move on so a single bad fetch doesn't abort the whole
+/// refresh.
+async fn refresh_show_episodes(
+    pool: &SqlitePool,
+    client: &TmdbClient,
+    show_id: i64,
+    show_tmdb_id: i64,
+) {
+    let seasons: Vec<i32> = match sqlx::query(
+        "SELECT DISTINCT season_number FROM seasons WHERE show_id = ? ORDER BY season_number",
+    )
+    .bind(show_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| sqlx::Row::try_get::<i32, _>(r, "season_number").ok())
+            .collect(),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), show_id, "refresh: list local seasons failed");
+            return;
+        }
+    };
+
+    for season_number in seasons {
+        let season_meta = match client.fetch_season(show_tmdb_id, season_number).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %format!("{e:#}"),
+                    show_id,
+                    season_number,
+                    "refresh: TMDB season fetch failed; episode titles left as-is"
+                );
+                continue;
+            }
+        };
+        // Fetch all local episode ids for this season in one query so
+        // we can loop in-process rather than per-episode SELECTs.
+        let local_eps = match sqlx::query(
+            "SELECT e.id, e.episode_number FROM episodes e
+             JOIN seasons s ON e.season_id = s.id
+             WHERE s.show_id = ? AND s.season_number = ?",
+        )
+        .bind(show_id)
+        .bind(season_number)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|r| {
+                    let id: i64 = sqlx::Row::try_get(&r, "id").ok()?;
+                    let n: i32 = sqlx::Row::try_get(&r, "episode_number").ok()?;
+                    Some((id, n))
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), show_id, season_number, "refresh: list local episodes failed");
+                continue;
+            }
+        };
+
+        for (ep_id, ep_num) in local_eps {
+            let Some(ep_meta) = season_meta
+                .episodes
+                .iter()
+                .find(|e| e.episode_number == ep_num)
+            else {
+                continue;
+            };
+            if let Err(e) = queries::apply_episode_metadata(pool, ep_id, ep_meta).await {
+                warn!(
+                    error = %format!("{e:#}"),
+                    show_id,
+                    season_number,
+                    episode_number = ep_num,
+                    "refresh: apply episode metadata"
+                );
+            }
+        }
+    }
+}
+
 async fn tmdb_apply_show(
     pool: &SqlitePool,
     tmdb: Option<&TmdbClient>,
     tvdb: Option<&TvdbClient>,
     tvmaze: Option<&TvMazeClient>,
+    season_cache: &SeasonCache,
     hint: &ShowHint,
 ) {
     let Some(client) = tmdb else { return };
@@ -860,7 +1064,7 @@ async fn tmdb_apply_show(
     apply_tvdb_for_show(pool, tvdb, hint).await;
 
     if let Some(show_tmdb_id) = show_tmdb_id {
-        match client.fetch_season(show_tmdb_id, hint.season_number).await {
+        match fetch_season_cached(season_cache, client, show_tmdb_id, hint.season_number).await {
             Ok(season) => {
                 if let Some(ep_meta) = season
                     .episodes
@@ -882,6 +1086,36 @@ async fn tmdb_apply_show(
             ),
         }
     }
+}
+
+/// Memoised wrapper around `TmdbClient::fetch_season`. Same season
+/// requested twice within a scan only hits the network once. Returns
+/// the cached `Arc<TmdbSeason>` so callers don't have to deep-clone.
+///
+/// On error, propagates the network error to the caller without
+/// caching — a transient TMDB failure on episode 1 shouldn't poison
+/// episode 2 for the rest of the scan.
+async fn fetch_season_cached(
+    cache: &SeasonCache,
+    client: &TmdbClient,
+    show_tmdb_id: i64,
+    season_number: i32,
+) -> anyhow::Result<Arc<TmdbSeason>> {
+    let key = (show_tmdb_id, season_number);
+    {
+        let guard = cache.lock().await;
+        if let Some(hit) = guard.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    let season = client.fetch_season(show_tmdb_id, season_number).await?;
+    let arc = Arc::new(season);
+    let mut guard = cache.lock().await;
+    // Two parallel workers can race to populate the same key. Either
+    // wins — they'd have produced equivalent results — but we
+    // deliberately don't overwrite a winner that beat us by handing
+    // back what's already there.
+    Ok(guard.entry(key).or_insert(arc).clone())
 }
 
 async fn apply_tvmaze_for_show(

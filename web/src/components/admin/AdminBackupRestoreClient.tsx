@@ -6,6 +6,7 @@ import {
   type BackupEntry,
   type ListBackupsResponse,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 /// Admin surface for the persisted auto-backup snapshots
 /// (`<data_dir>/backups/auto/`). Lists every snapshot with size +
@@ -18,6 +19,8 @@ export function AdminBackupRestoreClient() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null); // filename or "cancel"
   const [confirmRestore, setConfirmRestore] = useState<BackupEntry | null>(null);
+  const [askDelete, setAskDelete] = useState<BackupEntry | null>(null);
+  const [askCancelRestore, setAskCancelRestore] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   // Captured once at mount so render is a pure function of state.
   // Refreshed on every backup list reload so the "Xh ago" labels
@@ -74,10 +77,14 @@ export function AdminBackupRestoreClient() {
     }
   }
 
-  async function deleteOne(entry: BackupEntry) {
-    if (!window.confirm(`Delete backup ${entry.filename}? This cannot be undone.`)) {
-      return;
-    }
+  function deleteOne(entry: BackupEntry) {
+    setAskDelete(entry);
+  }
+
+  async function confirmDeleteOne() {
+    if (!askDelete) return;
+    const entry = askDelete;
+    setAskDelete(null);
     setBusy(entry.filename);
     setError(null);
     try {
@@ -106,10 +113,12 @@ export function AdminBackupRestoreClient() {
     }
   }
 
-  async function cancelRestore() {
-    if (!window.confirm("Cancel the staged restore? The current database will keep loading on next restart.")) {
-      return;
-    }
+  function cancelRestore() {
+    setAskCancelRestore(true);
+  }
+
+  async function confirmCancelRestore() {
+    setAskCancelRestore(false);
     setBusy("cancel");
     setError(null);
     try {
@@ -236,6 +245,28 @@ export function AdminBackupRestoreClient() {
           onConfirm={performStageRestore}
           onCancel={() => setConfirmRestore(null)}
           busy={busy === confirmRestore.filename}
+        />
+      )}
+      {askDelete && (
+        <ConfirmDialog
+          title={`Delete backup ${askDelete.filename}?`}
+          body="The snapshot file is removed from disk. This cannot be undone — restoring later would require re-creating a backup."
+          confirmLabel="Delete"
+          destructive
+          busy={busy === askDelete.filename}
+          onConfirm={() => void confirmDeleteOne()}
+          onCancel={() => setAskDelete(null)}
+        />
+      )}
+      {askCancelRestore && (
+        <ConfirmDialog
+          title="Cancel the staged restore?"
+          body="The current database keeps loading on next restart. The chosen snapshot is no longer queued for restore."
+          confirmLabel="Cancel restore"
+          destructive
+          busy={busy === "cancel"}
+          onConfirm={() => void confirmCancelRestore()}
+          onCancel={() => setAskCancelRestore(false)}
         />
       )}
     </div>

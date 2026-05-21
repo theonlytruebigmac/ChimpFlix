@@ -40,6 +40,7 @@ import {
 import { EditMetadataDialog } from "./EditMetadataDialog";
 import { MarkerEditor } from "./MarkerEditor";
 import { FixMatchDialog } from "./FixMatchDialog";
+import { MergeIntoDialog } from "./MergeIntoDialog";
 import { prefetchPlay } from "@/lib/play-prefetch";
 import { cancelPrewarm, prewarmFor } from "@/lib/prewarm";
 import { detectClientCapabilities } from "@/lib/client-caps";
@@ -1178,6 +1179,7 @@ function AdminActions({
   const [open, setOpen] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [showMatch, setShowMatch] = useState(false);
+  const [showMerge, setShowMerge] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
   const [showAddToCollection, setShowAddToCollection] = useState(false);
   // Owner-only marker editor — opens for movies' primary file. Shows
@@ -1360,6 +1362,15 @@ function AdminActions({
           },
           {
             kind: "item",
+            label: "Merge into…",
+            icon: TargetIcon,
+            onClick: () => {
+              setOpen(false);
+              setShowMerge(true);
+            },
+          },
+          {
+            kind: "item",
             label: refreshing ? "Refreshing…" : "Refresh metadata",
             icon: RefreshIcon,
             disabled: refreshing,
@@ -1427,6 +1438,20 @@ function AdminActions({
           detail={detail}
           onClose={() => setShowMatch(false)}
           onApplied={(next) => onUpdated(next)}
+        />
+      )}
+      {showMerge && (
+        <MergeIntoDialog
+          detail={detail}
+          onClose={() => setShowMerge(false)}
+          // After a merge, the SOURCE item (this modal's subject) has
+          // been deleted — its id no longer resolves. Pop the URL back
+          // to the page that opened us so the rails refetch and the
+          // duplicate no longer shows.
+          onMerged={() => {
+            setShowMerge(false);
+            router.back();
+          }}
         />
       )}
       {showDelete && (

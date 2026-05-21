@@ -562,6 +562,12 @@ pub async fn list_items(
             "i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".to_string(),
         );
     }
+    if let Some(matched) = filter.auto_matched {
+        where_clauses.push(format!(
+            "i.auto_matched = {}",
+            if matched { "1" } else { "0" }
+        ));
+    }
     where_clauses.push(library_filter_sql("i.library_id", accessible));
     let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
 
@@ -1595,131 +1601,6 @@ pub async fn list_markers_full(
         .collect()
 }
 
-/// Stored chromaprint fingerprint for a show's intro/theme. Powers
-/// the per-show signature match in the detect_markers pipeline. The
-/// `fingerprint` BLOB is a packed little-endian u32 array — decode
-/// via `chimpflix_transcoder::fingerprint::decode_blob`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ShowIntroFingerprint {
-    pub id: i64,
-    pub show_id: i64,
-    pub season_id: Option<i64>,
-    pub fingerprint: Vec<u8>,
-    pub duration_ms: i64,
-    pub captured_from_media_file_id: Option<i64>,
-    pub captured_at: i64,
-    pub captured_by: String,
-}
-
-/// Insert or replace the canonical intro fingerprint for
-/// `(show_id, season_id)`. Pass `season_id = None` for the show-wide
-/// row. A 'manual' row is never silently overwritten by an 'auto'
-/// upsert — the second-to-last `WHERE` clause enforces operator
-/// supremacy.
-pub async fn upsert_show_intro_fingerprint(
-    pool: &SqlitePool,
-    show_id: i64,
-    season_id: Option<i64>,
-    fingerprint: &[u8],
-    duration_ms: i64,
-    captured_from_media_file_id: Option<i64>,
-    captured_by: &str,
-) -> Result<()> {
-    let now = chimpflix_common::now_ms();
-    // SQLite's UPSERT requires the conflict-target columns to match
-    // an actual index. Our unique index keys on `(show_id,
-    // COALESCE(season_id, -1))`, so the ON CONFLICT clause uses the
-    // same expression to nominate the same index. The WHERE guard
-    // blocks an 'auto' write from replacing an existing 'manual' row.
-    sqlx::query(
-        "INSERT INTO show_intro_fingerprints
-            (show_id, season_id, fingerprint, duration_ms,
-             captured_from_media_file_id, captured_at, captured_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (show_id, COALESCE(season_id, -1)) DO UPDATE SET
-            fingerprint = excluded.fingerprint,
-            duration_ms = excluded.duration_ms,
-            captured_from_media_file_id = excluded.captured_from_media_file_id,
-            captured_at = excluded.captured_at,
-            captured_by = excluded.captured_by
-         WHERE captured_by = 'auto' OR excluded.captured_by = 'manual'",
-    )
-    .bind(show_id)
-    .bind(season_id)
-    .bind(fingerprint)
-    .bind(duration_ms)
-    .bind(captured_from_media_file_id)
-    .bind(now)
-    .bind(captured_by)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Look up the canonical intro fingerprint for the given show (and
-/// optional season). Returns `None` when no fingerprint has been
-/// captured yet — the detect_markers task falls back to blackdetect
-/// in that case.
-pub async fn get_show_intro_fingerprint(
-    pool: &SqlitePool,
-    show_id: i64,
-    season_id: Option<i64>,
-) -> Result<Option<ShowIntroFingerprint>> {
-    // Two-step: prefer a per-season row when one exists; fall back to
-    // the show-wide (season_id IS NULL) row otherwise. We can't do
-    // this in one query without a CTE that's awkward in SQLite, so
-    // we just check season-scope first then show-scope.
-    if let Some(season_id) = season_id
-        && let Some(row) = sqlx::query(
-            "SELECT id, show_id, season_id, fingerprint, duration_ms,
-                    captured_from_media_file_id, captured_at, captured_by
-             FROM show_intro_fingerprints
-             WHERE show_id = ? AND season_id = ?",
-        )
-        .bind(show_id)
-        .bind(season_id)
-        .fetch_optional(pool)
-        .await?
-    {
-        return Ok(Some(ShowIntroFingerprint {
-            id: row.try_get("id")?,
-            show_id: row.try_get("show_id")?,
-            season_id: row.try_get("season_id").ok().flatten(),
-            fingerprint: row.try_get("fingerprint")?,
-            duration_ms: row.try_get("duration_ms")?,
-            captured_from_media_file_id: row
-                .try_get("captured_from_media_file_id")
-                .ok()
-                .flatten(),
-            captured_at: row.try_get("captured_at")?,
-            captured_by: row.try_get("captured_by")?,
-        }));
-    }
-    let row = sqlx::query(
-        "SELECT id, show_id, season_id, fingerprint, duration_ms,
-                captured_from_media_file_id, captured_at, captured_by
-         FROM show_intro_fingerprints
-         WHERE show_id = ? AND season_id IS NULL",
-    )
-    .bind(show_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else { return Ok(None) };
-    Ok(Some(ShowIntroFingerprint {
-        id: row.try_get("id")?,
-        show_id: row.try_get("show_id")?,
-        season_id: row.try_get("season_id").ok().flatten(),
-        fingerprint: row.try_get("fingerprint")?,
-        duration_ms: row.try_get("duration_ms")?,
-        captured_from_media_file_id: row
-            .try_get("captured_from_media_file_id")
-            .ok()
-            .flatten(),
-        captured_at: row.try_get("captured_at")?,
-        captured_by: row.try_get("captured_by")?,
-    }))
-}
-
 /// Resolve the parent show id for a media file. Returns `None` for
 /// files that belong to a movie (no show), or when the file row /
 /// linked episode / season can't be found. Used by the
@@ -1763,105 +1644,6 @@ pub async fn show_and_season_for_media_file(
     .await?;
     let Some(row) = row else { return Ok(None) };
     Ok(Some((row.try_get("show_id")?, row.try_get("season_id")?)))
-}
-
-/// Delete the stored fingerprint(s) for a show. Pass `season_id =
-/// Some(_)` to clear just that season's row; `None` clears the
-/// show-wide row only. To wipe everything for a show, call once with
-/// each scope (or use [`delete_all_show_intro_fingerprints`]).
-pub async fn delete_show_intro_fingerprint(
-    pool: &SqlitePool,
-    show_id: i64,
-    season_id: Option<i64>,
-) -> Result<u64> {
-    let result = if let Some(sid) = season_id {
-        sqlx::query(
-            "DELETE FROM show_intro_fingerprints WHERE show_id = ? AND season_id = ?",
-        )
-        .bind(show_id)
-        .bind(sid)
-        .execute(pool)
-        .await?
-    } else {
-        sqlx::query(
-            "DELETE FROM show_intro_fingerprints WHERE show_id = ? AND season_id IS NULL",
-        )
-        .bind(show_id)
-        .execute(pool)
-        .await?
-    };
-    Ok(result.rows_affected())
-}
-
-/// Wipe every fingerprint row attached to a show, across all season
-/// scopes including the show-wide row. Used by the operator's "Clear
-/// fingerprint" UI which is intentionally scope-agnostic.
-pub async fn delete_all_show_intro_fingerprints(
-    pool: &SqlitePool,
-    show_id: i64,
-) -> Result<u64> {
-    let result =
-        sqlx::query("DELETE FROM show_intro_fingerprints WHERE show_id = ?")
-            .bind(show_id)
-            .execute(pool)
-            .await?;
-    Ok(result.rows_affected())
-}
-
-/// Joined row used by the admin "Intro fingerprints" listing page —
-/// pairs every fingerprint with the show's display title so the
-/// operator can read "Breaking Bad — captured 2d ago" instead of
-/// "show_id=42 — captured 2d ago". Show + season titles come from
-/// the items table.
-#[derive(Debug, Clone, Serialize)]
-pub struct ShowIntroFingerprintListing {
-    pub id: i64,
-    pub show_id: i64,
-    pub show_title: String,
-    pub season_id: Option<i64>,
-    pub season_number: Option<i64>,
-    pub duration_ms: i64,
-    pub captured_from_media_file_id: Option<i64>,
-    pub captured_at: i64,
-    pub captured_by: String,
-}
-
-/// List every captured fingerprint, joined to the show title for
-/// the admin listing page. Ordered most-recent-first so the page's
-/// default sort matches operator intuition (what did I do last?).
-pub async fn list_all_show_intro_fingerprints(
-    pool: &SqlitePool,
-) -> Result<Vec<ShowIntroFingerprintListing>> {
-    let rows = sqlx::query(
-        "SELECT f.id, f.show_id, i.title AS show_title,
-                f.season_id, s.season_number,
-                f.duration_ms, f.captured_from_media_file_id,
-                f.captured_at, f.captured_by
-         FROM show_intro_fingerprints f
-         JOIN items i ON i.id = f.show_id
-         LEFT JOIN seasons s ON s.id = f.season_id
-         ORDER BY f.captured_at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
-    rows.iter()
-        .map(|r| {
-            Ok(ShowIntroFingerprintListing {
-                id: r.try_get("id")?,
-                show_id: r.try_get("show_id")?,
-                show_title: r.try_get("show_title")?,
-                season_id: r.try_get("season_id").ok().flatten(),
-                season_number: r.try_get("season_number").ok().flatten(),
-                duration_ms: r.try_get("duration_ms")?,
-                captured_from_media_file_id: r
-                    .try_get("captured_from_media_file_id")
-                    .ok()
-                    .flatten(),
-                captured_at: r.try_get("captured_at")?,
-                captured_by: r.try_get("captured_by")?,
-            })
-        })
-        .collect()
 }
 
 /// Replace every manual marker on a media file with `new_markers`.
@@ -4514,10 +4296,26 @@ pub async fn upsert_item(
     sort_title: &str,
     year: Option<i32>,
 ) -> Result<i64> {
+    upsert_item_with_match(pool, library_id, kind, title, sort_title, year, true).await
+}
+
+/// Same as [`upsert_item`] but lets the caller flag a row as
+/// `auto_matched = false`. Used by the scanner when the parser
+/// couldn't extract a confident title — the file still becomes
+/// visible/playable, just with the "unmatched" affordance in the UI.
+pub async fn upsert_item_with_match(
+    pool: &SqlitePool,
+    library_id: i64,
+    kind: ItemKind,
+    title: &str,
+    sort_title: &str,
+    year: Option<i32>,
+    auto_matched: bool,
+) -> Result<i64> {
     let now = now_ms();
     let row = sqlx::query(
-        "INSERT INTO items (library_id, kind, title, sort_title, year, added_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO items (library_id, kind, title, sort_title, year, auto_matched, added_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(library_id, kind, sort_title) DO UPDATE SET
              title = excluded.title,
              year = COALESCE(items.year, excluded.year),
@@ -4529,11 +4327,27 @@ pub async fn upsert_item(
     .bind(title)
     .bind(sort_title)
     .bind(year)
+    .bind(i64::from(auto_matched))
     .bind(now)
     .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(row.try_get("id")?)
+}
+
+/// Flip `items.auto_matched` to true. Called by the Fix Match flow
+/// once an operator confirms the metadata so the row drops out of
+/// the "Unmatched" surface.
+pub async fn mark_item_auto_matched(pool: &SqlitePool, item_id: i64) -> Result<()> {
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE items SET auto_matched = 1, updated_at = ? WHERE id = ?",
+    )
+    .bind(now)
+    .bind(item_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn upsert_season(pool: &SqlitePool, show_id: i64, season_number: i32) -> Result<i64> {
@@ -4810,7 +4624,13 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
     let now = now_ms();
     let locked = fetch_locked_fields(pool, item_id).await?;
     let title = pick(&locked, "title", meta.title.clone());
-    let sort_title = title.as_deref().map(make_sort_title);
+    // Deliberately NOT updating sort_title here. The scanner's upsert
+    // key is (library_id, kind, sort_title) — derived from the parsed
+    // folder name. Overwriting it from the TMDB title means that the
+    // next rescan of any file in the same folder produces a stale key
+    // and inserts a *new* item row, causing a duplicate. Sort order
+    // is therefore driven by the on-disk folder name, which matches
+    // how the operator already organizes the library.
     let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
     let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
     let tagline = pick(&locked, "tagline", meta.tagline.clone()).flatten();
@@ -4828,13 +4648,16 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
         .as_deref()
         .map(|p| tmdb_image_url(p, "w500"));
 
+    // `title_present` is the gate for the "title-derived fields"
+    // (original_title / summary / tagline) — if TMDB returned no title
+    // we don't overwrite them. Bound once, referenced via three CASEs.
+    let title_present = title.is_some();
     sqlx::query(
         "UPDATE items SET
             title = COALESCE(?, title),
-            sort_title = COALESCE(?, sort_title),
-            original_title = CASE WHEN ?2 IS NOT NULL THEN ? ELSE original_title END,
-            summary = CASE WHEN ?2 IS NOT NULL THEN ? ELSE summary END,
-            tagline = CASE WHEN ?2 IS NOT NULL THEN ? ELSE tagline END,
+            original_title = CASE WHEN ? THEN ? ELSE original_title END,
+            summary = CASE WHEN ? THEN ? ELSE summary END,
+            tagline = CASE WHEN ? THEN ? ELSE tagline END,
             year = COALESCE(?, year),
             duration_ms = COALESCE(duration_ms, ?),
             rating_audience = COALESCE(?, rating_audience),
@@ -4846,12 +4669,11 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
          WHERE id = ?",
     )
     .bind(&title)
-    .bind(&sort_title)
+    .bind(title_present)
     .bind(&original_title)
-    .bind(&original_title)
+    .bind(title_present)
     .bind(&summary)
-    .bind(&summary)
-    .bind(&tagline)
+    .bind(title_present)
     .bind(&tagline)
     .bind(year)
     .bind(duration_ms)
@@ -4902,7 +4724,12 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
     let now = now_ms();
     let locked = fetch_locked_fields(pool, item_id).await?;
     let title = pick(&locked, "title", meta.title.clone());
-    let sort_title = title.as_deref().map(make_sort_title);
+    // Deliberately NOT updating sort_title here — see [apply_movie_metadata]
+    // for the reason. Same dedup-key argument applies to shows: the
+    // scanner upserts by (library_id, kind, sort_title), and overwriting
+    // it from a TMDB-renamed title is what caused duplicate show rows
+    // (e.g. one folder "The Agency (2024)" producing both "The Agency"
+    // and "The Agency: Central Intelligence" items).
     let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
     let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
     let year = pick(&locked, "year", meta.year).flatten();
@@ -4911,12 +4738,12 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
         .as_deref()
         .map(|p| tmdb_image_url(p, "w500"));
 
+    let title_present = title.is_some();
     sqlx::query(
         "UPDATE items SET
             title = COALESCE(?, title),
-            sort_title = COALESCE(?, sort_title),
-            original_title = CASE WHEN ?2 IS NOT NULL THEN ? ELSE original_title END,
-            summary = CASE WHEN ?2 IS NOT NULL THEN ? ELSE summary END,
+            original_title = CASE WHEN ? THEN ? ELSE original_title END,
+            summary = CASE WHEN ? THEN ? ELSE summary END,
             year = COALESCE(?, year),
             tmdb_id = ?,
             imdb_id = COALESCE(?, imdb_id),
@@ -4926,10 +4753,9 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
          WHERE id = ?",
     )
     .bind(&title)
-    .bind(&sort_title)
+    .bind(title_present)
     .bind(&original_title)
-    .bind(&original_title)
-    .bind(&summary)
+    .bind(title_present)
     .bind(&summary)
     .bind(year)
     .bind(meta.tmdb_id)
@@ -5715,7 +5541,10 @@ pub async fn apply_show_metadata_anilist(
     let now = now_ms();
     let locked = fetch_locked_fields(pool, item_id).await?;
     let title = pick(&locked, "title", Some(meta.title.clone())).flatten();
-    let sort_title = title.as_deref().map(make_sort_title);
+    // Deliberately NOT updating sort_title — see [apply_movie_metadata]
+    // for the reason. AniList enrichment was the same source of duplicate
+    // item rows: original folder name "K-On!" → enriched to "Keion!" →
+    // dedup-key mismatch on next scan.
     let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
     let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
     let year = pick(&locked, "year", meta.year).flatten();
@@ -5733,7 +5562,6 @@ pub async fn apply_show_metadata_anilist(
     sqlx::query(
         "UPDATE items SET
             title = COALESCE(?, title),
-            sort_title = COALESCE(?, sort_title),
             original_title = COALESCE(?, original_title),
             summary = COALESCE(?, summary),
             year = COALESCE(?, year),
@@ -5744,7 +5572,6 @@ pub async fn apply_show_metadata_anilist(
          WHERE id = ?",
     )
     .bind(&title)
-    .bind(&sort_title)
     .bind(&original_title)
     .bind(&summary)
     .bind(year)
@@ -6443,17 +6270,25 @@ pub async fn enqueue_job_unique(
     dedup_value: i64,
 ) -> Result<Option<i64>> {
     let mut tx = pool.begin().await?;
-    let inserted = enqueue_job_unique_tx(&mut tx, input, dedup_field, dedup_value).await?;
+    // `&mut *tx` derefs through Transaction to the underlying
+    // SqliteConnection — matches the new tx-helper signatures.
+    let inserted = enqueue_job_unique_tx(&mut *tx, input, dedup_field, dedup_value).await?;
     tx.commit().await?;
     Ok(inserted)
 }
 
-/// Transactional variant — call within an existing transaction
-/// when enqueuing multiple jobs as a group (e.g. the discovery
-/// pipeline's four-kind fan-out per FileAdded). One tx = one fsync
-/// instead of one per kind.
-pub async fn enqueue_job_unique_tx<'a>(
-    tx: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
+/// Connection-scoped variant — call within an existing transaction
+/// (the caller is responsible for BEGIN/COMMIT) when enqueuing
+/// multiple jobs as a group (e.g. the discovery pipeline's
+/// four-kind fan-out per FileAdded). One tx = one fsync instead of
+/// one per kind. Takes a raw `SqliteConnection` rather than a
+/// `Transaction` so the caller can choose `BEGIN IMMEDIATE` over
+/// sqlx's default deferred BEGIN — important on the discovery path
+/// where a concurrent scanner write can otherwise trigger
+/// `SQLITE_BUSY_SNAPSHOT` (517) when this fn upgrades its read
+/// snapshot to a write.
+pub async fn enqueue_job_unique_tx(
+    conn: &mut sqlx::SqliteConnection,
     input: JobInput,
     dedup_field: &str,
     dedup_value: i64,
@@ -6475,19 +6310,20 @@ pub async fn enqueue_job_unique_tx<'a>(
     .bind(&input.kind)
     .bind(&key)
     .bind(dedup_value)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *conn)
     .await?;
     if existing.is_some() {
         return Ok(None);
     }
-    let id = enqueue_job_tx(tx, input).await?;
+    let id = enqueue_job_tx(conn, input).await?;
     Ok(Some(id))
 }
 
-/// Transactional variant of `enqueue_job` — pairs with
-/// `enqueue_job_unique_tx` for the batched-pipeline path.
-pub async fn enqueue_job_tx<'a>(
-    tx: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
+/// Connection-scoped variant of `enqueue_job` — pairs with
+/// `enqueue_job_unique_tx` for the batched-pipeline path. Caller
+/// owns the surrounding transaction.
+pub async fn enqueue_job_tx(
+    conn: &mut sqlx::SqliteConnection,
     input: JobInput,
 ) -> Result<i64> {
     let now = now_ms();
@@ -6504,7 +6340,7 @@ pub async fn enqueue_job_tx<'a>(
     .bind(input.max_attempts)
     .bind(run_after)
     .bind(now)
-    .execute(&mut **tx)
+    .execute(&mut *conn)
     .await?;
     Ok(res.last_insert_rowid())
 }
@@ -6653,6 +6489,24 @@ pub async fn mark_job_failed(
     error: &str,
     backoff_ms: i64,
 ) -> Result<()> {
+    mark_job_failed_with_class(pool, job_id, error, backoff_ms, None).await
+}
+
+/// Same as [`mark_job_failed`] but records an `error_class` (one of
+/// the variants in [`crate::jobs::error_class::ErrorClass`] when the
+/// caller is the server crate, or an arbitrary string otherwise).
+///
+/// `force_terminal` short-circuits the attempts/max_attempts check
+/// and immediately moves the row to `dead`. Used for terminal
+/// failure classes (auth failure, permanent file errors) so the
+/// retry budget isn't wasted on errors that won't recover.
+pub async fn mark_job_failed_with_class(
+    pool: &SqlitePool,
+    job_id: i64,
+    error: &str,
+    backoff_ms: i64,
+    error_class: Option<&str>,
+) -> Result<()> {
     let now = now_ms();
     let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
         .bind(job_id)
@@ -6660,31 +6514,36 @@ pub async fn mark_job_failed(
         .await?;
     let attempts: i64 = row.try_get("attempts")?;
     let max_attempts: i64 = row.try_get("max_attempts")?;
-    if attempts >= max_attempts {
+    let force_terminal = matches!(error_class, Some("external_auth") | Some("permanent"));
+    if force_terminal || attempts >= max_attempts {
         sqlx::query(
             "UPDATE jobs
              SET status      = 'dead',
                  locked_at   = NULL,
                  finished_at = ?,
-                 last_error  = ?
+                 last_error  = ?,
+                 error_class = ?
              WHERE id = ?",
         )
         .bind(now)
         .bind(error)
+        .bind(error_class)
         .bind(job_id)
         .execute(pool)
         .await?;
     } else {
         sqlx::query(
             "UPDATE jobs
-             SET status     = 'failed',
-                 locked_at  = NULL,
-                 run_after  = ?,
-                 last_error = ?
+             SET status      = 'failed',
+                 locked_at   = NULL,
+                 run_after   = ?,
+                 last_error  = ?,
+                 error_class = ?
              WHERE id = ?",
         )
         .bind(now + backoff_ms)
         .bind(error)
+        .bind(error_class)
         .bind(job_id)
         .execute(pool)
         .await?;
@@ -6739,14 +6598,16 @@ pub async fn job_summary(pool: &SqlitePool) -> Result<JobSummary> {
 
 /// List recent jobs for the admin queue page. `kind_filter` narrows
 /// to one kind; `status_filter` narrows to one status. `limit`
-/// defaults to 100 and is clamped to 500.
+/// defaults to 100 and is clamped to 500; `offset` defaults to 0.
 pub async fn list_jobs(
     pool: &SqlitePool,
     kind_filter: Option<&str>,
     status_filter: Option<JobStatus>,
     limit: i64,
+    offset: i64,
 ) -> Result<Vec<JobRow>> {
     let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
     let mut sql = String::from("SELECT * FROM jobs WHERE 1 = 1");
     if kind_filter.is_some() {
         sql.push_str(" AND kind = ?");
@@ -6754,7 +6615,7 @@ pub async fn list_jobs(
     if status_filter.is_some() {
         sql.push_str(" AND status = ?");
     }
-    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
     let mut q = sqlx::query(&sql);
     if let Some(k) = kind_filter {
         q = q.bind(k);
@@ -6762,9 +6623,36 @@ pub async fn list_jobs(
     if let Some(s) = status_filter {
         q = q.bind(s.as_db_str());
     }
-    q = q.bind(limit);
+    q = q.bind(limit).bind(offset);
     let rows = q.fetch_all(pool).await?;
     rows.iter().map(JobRow::from_row).collect()
+}
+
+/// Total job count matching the same filters as [`list_jobs`].
+/// Companion to that function for the admin queue pagination
+/// footer — knowing the total lets us render "X–Y of Z" + a
+/// last-page button without an extra round trip on every page tick.
+pub async fn count_jobs(
+    pool: &SqlitePool,
+    kind_filter: Option<&str>,
+    status_filter: Option<JobStatus>,
+) -> Result<i64> {
+    let mut sql = String::from("SELECT COUNT(*) AS n FROM jobs WHERE 1 = 1");
+    if kind_filter.is_some() {
+        sql.push_str(" AND kind = ?");
+    }
+    if status_filter.is_some() {
+        sql.push_str(" AND status = ?");
+    }
+    let mut q = sqlx::query(&sql);
+    if let Some(k) = kind_filter {
+        q = q.bind(k);
+    }
+    if let Some(s) = status_filter {
+        q = q.bind(s.as_db_str());
+    }
+    let row = q.fetch_one(pool).await?;
+    Ok(row.try_get("n").unwrap_or(0))
 }
 
 /// Periodic cleanup that bounds the `jobs` table size. Without
@@ -6805,6 +6693,254 @@ pub async fn cleanup_old_jobs(
     .await?
     .rows_affected();
     Ok((succ, dead))
+}
+
+/// Outcome of a [merge_items] call. All counts are zero on failure
+/// (the transaction is rolled back), so a non-zero `moved_files`
+/// indicates the merge committed.
+#[derive(Debug, serde::Serialize)]
+pub struct MergeReport {
+    /// Number of media files re-pointed from the source item / its
+    /// episodes onto the target.
+    pub moved_files: u64,
+    /// New season rows created on the target because the source had a
+    /// season number the target lacked.
+    pub created_seasons: u64,
+    /// New episode rows created on the target because the source had
+    /// an (season, episode) the target lacked.
+    pub created_episodes: u64,
+}
+
+/// Move every media file from `source_id` onto `target_id`, then delete
+/// the source item row. Used by the admin "Merge into…" affordance to
+/// fix duplicate items (typically created when TMDB enrichment renamed
+/// a show after initial scan, breaking the sort_title-based dedup).
+///
+/// Both items must be in the same library and have the same kind.
+/// For shows, seasons/episodes are matched by `(season_number, episode_number)`
+/// and created on the target when missing. If both items have a media
+/// file attached to the same `(season, episode)` the merge is refused —
+/// the operator must remove one before retrying.
+///
+/// Transactional: any error rolls back the whole operation.
+pub async fn merge_items(
+    pool: &SqlitePool,
+    source_id: i64,
+    target_id: i64,
+) -> Result<MergeReport> {
+    if source_id == target_id {
+        anyhow::bail!("source and target are the same item");
+    }
+
+    // Acquire a connection and start the tx with BEGIN IMMEDIATE so
+    // we hold the WAL write lock from the first statement. The
+    // default `pool.begin()` issues plain BEGIN (deferred), which
+    // upgrades from a read snapshot on the first write and can race
+    // other writers → SQLITE_BUSY mid-merge. Merge touches many
+    // rows (every episode of the source); the upfront lock is worth
+    // the small contention cost. We commit/rollback manually rather
+    // than via sqlx::Transaction because the latter always issues a
+    // deferred BEGIN.
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .context("BEGIN IMMEDIATE for merge")?;
+    let result = merge_items_inner(&mut conn, source_id, target_id).await;
+    match &result {
+        Ok(_) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+        }
+        Err(_) => {
+            // Best-effort rollback. If this fails the connection
+            // gets dropped, which auto-rolls-back the tx anyway.
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+    }
+    result
+}
+
+async fn merge_items_inner(
+    conn: &mut sqlx::SqliteConnection,
+    source_id: i64,
+    target_id: i64,
+) -> Result<MergeReport> {
+    #[derive(sqlx::FromRow)]
+    struct ItemHeader {
+        library_id: i64,
+        kind: String,
+    }
+    let source: ItemHeader =
+        sqlx::query_as("SELECT library_id, kind FROM items WHERE id = ?")
+            .bind(source_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("source item {source_id} not found"))?;
+    let target: ItemHeader =
+        sqlx::query_as("SELECT library_id, kind FROM items WHERE id = ?")
+            .bind(target_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("target item {target_id} not found"))?;
+    if source.library_id != target.library_id {
+        anyhow::bail!("source and target are in different libraries");
+    }
+    if source.kind != target.kind {
+        anyhow::bail!(
+            "kind mismatch: source is {} but target is {}",
+            source.kind,
+            target.kind
+        );
+    }
+
+    let mut report = MergeReport {
+        moved_files: 0,
+        created_seasons: 0,
+        created_episodes: 0,
+    };
+
+    match source.kind.as_str() {
+        "movie" => {
+            // Movies are flat: re-point media_files.item_id from source to
+            // target. CHECK constraint on media_files allows item_id OR
+            // episode_id but not both, so we never need to touch episode_id.
+            let moved = sqlx::query("UPDATE media_files SET item_id = ? WHERE item_id = ?")
+                .bind(target_id)
+                .bind(source_id)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+            report.moved_files = moved;
+        }
+        "show" => {
+            #[derive(sqlx::FromRow)]
+            struct SourceEp {
+                episode_id: i64,
+                season_number: i32,
+                episode_number: i32,
+                episode_title: String,
+            }
+            // Pull every source episode in one query — cheaper than
+            // walking seasons one at a time, and the result fits
+            // comfortably in memory even for long-running shows.
+            let source_eps: Vec<SourceEp> = sqlx::query_as(
+                "SELECT e.id AS episode_id, s.season_number, e.episode_number, e.title AS episode_title
+                 FROM episodes e
+                 JOIN seasons s ON e.season_id = s.id
+                 WHERE s.show_id = ?",
+            )
+            .bind(source_id)
+            .fetch_all(&mut *conn)
+            .await?;
+
+            let now = now_ms();
+            for ep in source_eps {
+                // Find or create the matching season on the target.
+                let existing_season: Option<(i64,)> = sqlx::query_as(
+                    "SELECT id FROM seasons WHERE show_id = ? AND season_number = ?",
+                )
+                .bind(target_id)
+                .bind(ep.season_number)
+                .fetch_optional(&mut *conn)
+                .await?;
+                let target_season_id = if let Some((id,)) = existing_season {
+                    id
+                } else {
+                    let row = sqlx::query(
+                        "INSERT INTO seasons (show_id, season_number) VALUES (?, ?) RETURNING id",
+                    )
+                    .bind(target_id)
+                    .bind(ep.season_number)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    report.created_seasons += 1;
+                    row.try_get::<i64, _>("id")?
+                };
+
+                // Find or create the matching episode on the target.
+                let existing_episode: Option<(i64,)> = sqlx::query_as(
+                    "SELECT id FROM episodes WHERE season_id = ? AND episode_number = ?",
+                )
+                .bind(target_season_id)
+                .bind(ep.episode_number)
+                .fetch_optional(&mut *conn)
+                .await?;
+                let target_episode_id = if let Some((id,)) = existing_episode {
+                    // Conflict guard: if the target already has a
+                    // media_file for this episode, we have two physical
+                    // copies of the same logical episode. Refuse the
+                    // merge rather than guess which to keep.
+                    let target_has_file: Option<(i64,)> =
+                        sqlx::query_as("SELECT id FROM media_files WHERE episode_id = ? LIMIT 1")
+                            .bind(id)
+                            .fetch_optional(&mut *conn)
+                            .await?;
+                    let source_has_file: Option<(i64,)> =
+                        sqlx::query_as("SELECT id FROM media_files WHERE episode_id = ? LIMIT 1")
+                            .bind(ep.episode_id)
+                            .fetch_optional(&mut *conn)
+                            .await?;
+                    if target_has_file.is_some() && source_has_file.is_some() {
+                        anyhow::bail!(
+                            "merge refused: both items have a media file for S{:02}E{:02}. Delete one before merging.",
+                            ep.season_number,
+                            ep.episode_number,
+                        );
+                    }
+                    id
+                } else {
+                    let row = sqlx::query(
+                        "INSERT INTO episodes (season_id, episode_number, title, added_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    )
+                    .bind(target_season_id)
+                    .bind(ep.episode_number)
+                    .bind(&ep.episode_title)
+                    .bind(now)
+                    .bind(now)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    report.created_episodes += 1;
+                    row.try_get::<i64, _>("id")?
+                };
+
+                // Re-point any media_files on the source episode to the
+                // target episode. We've already verified above that we
+                // don't double-attach.
+                let moved =
+                    sqlx::query("UPDATE media_files SET episode_id = ? WHERE episode_id = ?")
+                        .bind(target_episode_id)
+                        .bind(ep.episode_id)
+                        .execute(&mut *conn)
+                        .await?
+                        .rows_affected();
+                report.moved_files += moved;
+            }
+        }
+        other => anyhow::bail!("unsupported kind {other:?}"),
+    }
+
+    // Cascade-delete the source. Seasons → episodes go via ON DELETE
+    // CASCADE; the media files we re-pointed above survive because
+    // they no longer reference any source row.
+    sqlx::query("DELETE FROM items WHERE id = ?")
+        .bind(source_id)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(report)
+}
+
+/// Immediately delete every `dead` row regardless of `finished_at`.
+/// Backs the admin "Clear dead" button. Useful when stale rows
+/// accumulate from a renamed/removed job kind — those rows never get
+/// retried (no handler) and `cleanup_old_jobs` waits for the TTL
+/// before sweeping. Returns the count of rows deleted.
+pub async fn clear_dead_jobs(pool: &SqlitePool) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM jobs WHERE status = 'dead'")
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 /// Bulk delete queued jobs — admin "wipe queue" affordance for the
@@ -7284,6 +7420,12 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.setup_completed {
+        sqlx::query("UPDATE server_settings SET setup_completed = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.transcoder_max_concurrent {
         sqlx::query("UPDATE server_settings SET transcoder_max_concurrent = ? WHERE id = 1")
             .bind(v)
@@ -7327,6 +7469,12 @@ pub async fn update_server_settings(
         .bind(v)
         .execute(&mut *tx)
         .await?;
+    }
+    if let Some(v) = patch.job_workers {
+        sqlx::query("UPDATE server_settings SET job_workers = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(v) = patch.transcoder_hdr_tonemap_enabled {
         sqlx::query(
@@ -7594,6 +7742,40 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.chapter_thumbs_enabled {
+        sqlx::query("UPDATE server_settings SET chapter_thumbs_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.loudness_analysis_enabled {
+        sqlx::query("UPDATE server_settings SET loudness_analysis_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.subtitle_fetch_enabled {
+        sqlx::query("UPDATE server_settings SET subtitle_fetch_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.embedded_subs_extract_enabled {
+        sqlx::query(
+            "UPDATE server_settings SET embedded_subs_extract_enabled = ? WHERE id = 1",
+        )
+        .bind(i64::from(v))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(v) = patch.external_ratings_enabled {
+        sqlx::query(
+            "UPDATE server_settings SET external_ratings_enabled = ? WHERE id = 1",
+        )
+        .bind(i64::from(v))
+        .execute(&mut *tx)
+        .await?;
+    }
     if let Some(v) = patch.extras_json {
         sqlx::query("UPDATE server_settings SET extras_json = ? WHERE id = 1")
             .bind(v)
@@ -7658,6 +7840,37 @@ pub async fn list_audit(
             .await?
     };
     rows.iter().map(AuditLogEntry::from_row).collect()
+}
+
+/// Offset/limit variant for the admin UI's paged audit table.
+/// Cursor-based [`list_audit`] is kept for any future API consumer
+/// that wants O(1) deep-scroll; the admin page wants jump-to-page
+/// + total-count, which means we pay an OFFSET (acceptable here —
+/// audit_log is bounded by retention, typically <100k rows).
+pub async fn list_audit_paged(
+    pool: &SqlitePool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AuditLogEntry>> {
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
+    let rows = sqlx::query(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(AuditLogEntry::from_row).collect()
+}
+
+/// Total audit_log rows. Companion to [`list_audit_paged`] for the
+/// pagination footer.
+pub async fn count_audit(pool: &SqlitePool) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM audit_log")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("n").unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -10156,6 +10369,227 @@ pub async fn top_platforms(
         .collect()
 }
 
+// ─── Task metrics rollup ──────────────────────────────────────────────
+
+/// One finished job's summary, used to build the daily rollup. The
+/// rollup task fetches a slice of these for the prior UTC day and
+/// aggregates in-process.
+#[derive(Debug, Clone)]
+pub struct FinishedJobSummary {
+    pub kind: String,
+    /// "succeeded" or "dead". Anything else is filtered out at SQL.
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+/// Return finished jobs (succeeded + dead) with finished_at in
+/// `[start_ms, end_ms)`. Window is inclusive of start, exclusive of
+/// end — matches the "previous-day rollup" pattern used by the
+/// scheduler task.
+pub async fn list_finished_jobs_in_window(
+    pool: &SqlitePool,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<FinishedJobSummary>> {
+    let rows = sqlx::query(
+        "SELECT kind, status, started_at, finished_at
+         FROM jobs
+         WHERE finished_at IS NOT NULL
+           AND finished_at >= ?
+           AND finished_at < ?
+           AND status IN ('succeeded', 'dead')",
+    )
+    .bind(start_ms)
+    .bind(end_ms)
+    .fetch_all(pool)
+    .await?;
+    let out: Vec<FinishedJobSummary> = rows
+        .iter()
+        .map(|r| FinishedJobSummary {
+            kind: r.try_get::<String, _>("kind").unwrap_or_default(),
+            status: r.try_get::<String, _>("status").unwrap_or_default(),
+            started_at: r.try_get::<Option<i64>, _>("started_at").ok().flatten(),
+            finished_at: r.try_get::<Option<i64>, _>("finished_at").ok().flatten(),
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Upsert a per-kind daily aggregate. `(day, kind)` is the natural
+/// key. Re-running the rollup for the same day overwrites — which
+/// is the intent (the previous-day computation is deterministic
+/// modulo what's still in the `jobs` table).
+pub async fn upsert_task_metrics_daily(
+    pool: &SqlitePool,
+    day: i64,
+    kind: &str,
+    success_count: i64,
+    failure_count: i64,
+    p50_duration_ms: Option<i64>,
+    p95_duration_ms: Option<i64>,
+    targets_processed: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_kind_metrics_daily
+            (day, kind, success_count, failure_count, p50_duration_ms, p95_duration_ms, targets_processed)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(day, kind) DO UPDATE SET
+            success_count = excluded.success_count,
+            failure_count = excluded.failure_count,
+            p50_duration_ms = excluded.p50_duration_ms,
+            p95_duration_ms = excluded.p95_duration_ms,
+            targets_processed = excluded.targets_processed",
+    )
+    .bind(day)
+    .bind(kind)
+    .bind(success_count)
+    .bind(failure_count)
+    .bind(p50_duration_ms)
+    .bind(p95_duration_ms)
+    .bind(targets_processed)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── Tacet season fingerprint references ───────────────────────────────
+
+/// Resolve which show + season a media_file belongs to. Returns
+/// `None` when the file is a movie (no associated episode row),
+/// when it's been removed, or when the metadata isn't populated
+/// yet (a brand-new episode whose item match hasn't landed).
+pub async fn resolve_show_and_season_for_file(
+    pool: &SqlitePool,
+    file_id: i64,
+) -> Result<Option<(i64, i32)>> {
+    let row = sqlx::query(
+        "SELECT s.show_id AS show_id, s.season_number AS season_number
+         FROM media_files mf
+         JOIN episodes e ON e.id = mf.episode_id
+         JOIN seasons s ON s.id = e.season_id
+         WHERE mf.id = ? AND mf.removed_at IS NULL",
+    )
+    .bind(file_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.try_get::<i64, _>("show_id").unwrap_or(0),
+            r.try_get::<i32, _>("season_number").unwrap_or(0),
+        )
+    }))
+}
+
+/// Count media_files in a given season with non-null durations. The
+/// duration filter mirrors what `bootstrap_season_refs` itself
+/// requires — files without a probe-known duration can't be
+/// fingerprinted reliably.
+pub async fn count_episodes_in_season(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_number: i32,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n
+         FROM media_files mf
+         JOIN episodes e ON e.id = mf.episode_id
+         JOIN seasons s ON s.id = e.season_id
+         WHERE s.show_id = ?
+           AND s.season_number = ?
+           AND mf.removed_at IS NULL
+           AND mf.duration_ms IS NOT NULL",
+    )
+    .bind(show_id)
+    .bind(season_number)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("n").unwrap_or(0))
+}
+
+/// List every media_file path in a season — used by
+/// `bootstrap_season_refs` to feed tacet's reference builder.
+pub async fn list_episode_paths_in_season(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_number: i32,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT mf.path AS path
+         FROM media_files mf
+         JOIN episodes e ON e.id = mf.episode_id
+         JOIN seasons s ON s.id = e.season_id
+         WHERE s.show_id = ?
+           AND s.season_number = ?
+           AND mf.removed_at IS NULL
+           AND mf.duration_ms IS NOT NULL
+         ORDER BY e.episode_number ASC",
+    )
+    .bind(show_id)
+    .bind(season_number)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("path").ok())
+        .collect())
+}
+
+/// Loaded blobs for a season's intro + credits reference fingerprints,
+/// or `None` if the season hasn't been bootstrapped yet.
+pub struct SeasonRefsBlobs {
+    pub intro: Vec<u8>,
+    pub credits: Vec<u8>,
+    pub built_at: i64,
+}
+
+pub async fn load_season_refs_blobs(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_number: i32,
+) -> Result<Option<SeasonRefsBlobs>> {
+    let row = sqlx::query(
+        "SELECT intro_refs_blob, credits_refs_blob, refs_built_at
+         FROM show_season_intro_refs
+         WHERE show_id = ? AND season_number = ?",
+    )
+    .bind(show_id)
+    .bind(season_number)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| SeasonRefsBlobs {
+        intro: r.try_get::<Vec<u8>, _>("intro_refs_blob").unwrap_or_default(),
+        credits: r.try_get::<Vec<u8>, _>("credits_refs_blob").unwrap_or_default(),
+        built_at: r.try_get::<i64, _>("refs_built_at").unwrap_or(0),
+    }))
+}
+
+pub async fn upsert_season_refs_blobs(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_number: i32,
+    intro_blob: &[u8],
+    credits_blob: &[u8],
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO show_season_intro_refs
+            (show_id, season_number, intro_refs_blob, credits_refs_blob, refs_built_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(show_id, season_number) DO UPDATE SET
+            intro_refs_blob = excluded.intro_refs_blob,
+            credits_refs_blob = excluded.credits_refs_blob,
+            refs_built_at = excluded.refs_built_at",
+    )
+    .bind(show_id)
+    .bind(season_number)
+    .bind(intro_blob)
+    .bind(credits_blob)
+    .bind(now_ms())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10346,6 +10780,7 @@ mod tests {
                 run_after INTEGER NOT NULL DEFAULT 0,
                 locked_at INTEGER,
                 last_error TEXT,
+                error_class TEXT,
                 created_at INTEGER NOT NULL,
                 started_at INTEGER,
                 finished_at INTEGER

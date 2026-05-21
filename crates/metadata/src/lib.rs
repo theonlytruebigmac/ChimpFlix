@@ -11,6 +11,7 @@
 //! complexity into the callers instead of removing it.
 
 pub mod anilist;
+pub mod omdb;
 pub mod opensubtitles;
 pub mod tmdb;
 pub mod trakt;
@@ -18,11 +19,12 @@ pub mod tvdb;
 pub mod tvmaze;
 
 pub use anilist::{AniListClient, AniListShow};
+pub use omdb::{OmdbClient, OmdbRatings};
 pub use opensubtitles::{OpenSubtitlesClient, OpenSubtitlesCreds, SearchParams, SubtitleHit};
 pub use tmdb::{
     TmdbCandidate, TmdbCastMember, TmdbClient, TmdbCollection, TmdbCollectionPart,
     TmdbCollectionStub, TmdbCredits, TmdbCrewMember, TmdbEpisode, TmdbKind, TmdbMovie, TmdbPoster,
-    TmdbReview, TmdbSeason, TmdbShow, TmdbVideo, tmdb_image_url,
+    TmdbReview, TmdbSeason, TmdbShow, TmdbUpstreamError, TmdbVideo, tmdb_image_url,
 };
 pub use trakt::{
     DeviceCodeResponse, DevicePollResult, HistoryEntry, HistoryPush, PlaybackEntry, RatingEntry,

@@ -20,10 +20,11 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
   {
     title: "Status",
     items: [
-      // Home replaces the old Dashboard: hero stats, recent activity,
-      // alerts, and quick actions all in one surface. The standalone
-      // Alerts + Stats pages remain as deep-dive views — Home links
-      // into them via the "View all" affordances on each card.
+      // Home replaces the old Dashboard: hero stats, recent
+      // activity, alerts, and quick actions all in one surface.
+      // The standalone Alerts + Stats pages remain as deep-dive
+      // views — Home links into them via the "View all"
+      // affordances on each card.
       { href: "/settings/admin", label: "Home" },
       { href: "/settings/admin/status/alerts", label: "Alerts" },
       { href: "/settings/admin/status/stats", label: "Stats" },
@@ -37,9 +38,10 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
       { href: "/settings/admin/server/network", label: "Network" },
       { href: "/settings/admin/server/transcoder", label: "Transcoder" },
       { href: "/settings/admin/server/credentials", label: "Credentials" },
-      { href: "/settings/admin/server/email", label: "Email" },
-      { href: "/settings/admin/server/webhooks", label: "Webhooks" },
-      { href: "/settings/admin/server/privacy", label: "Privacy" },
+      {
+        href: "/settings/admin/server/notifications",
+        label: "Notifications",
+      },
     ],
     disabled: [],
   },
@@ -50,40 +52,28 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
       { href: "/settings/admin/library/libraries", label: "Libraries" },
       { href: "/settings/admin/library/collections", label: "Collections" },
       { href: "/settings/admin/library/agents", label: "Metadata Agents" },
-      { href: "/settings/admin/library/scheduled-tasks", label: "Scheduled Tasks" },
-      { href: "/settings/admin/library/optimized", label: "Optimized Versions" },
-      { href: "/settings/admin/library/items", label: "Bulk operations" },
-      { href: "/settings/admin/library/preroll", label: "Pre-roll" },
+      {
+        href: "/settings/admin/library/scheduled-tasks",
+        label: "Scheduled Tasks",
+      },
+      {
+        href: "/settings/admin/library/optimized",
+        label: "Optimized Versions",
+      },
     ],
     disabled: [],
   },
   {
     title: "Users",
-    items: [
-      { href: "/settings/admin/users/users", label: "Users" },
-      { href: "/settings/admin/users/invites", label: "Invites" },
-      { href: "/settings/admin/users/access", label: "Access" },
-      { href: "/settings/admin/users/groups", label: "Groups" },
-      { href: "/settings/admin/users/devices", label: "Devices" },
-    ],
+    items: [{ href: "/settings/admin/users", label: "Users" }],
     disabled: [],
   },
   {
     title: "Maintenance",
     items: [
       { href: "/settings/admin/maintenance", label: "Overview" },
-      { href: "/settings/admin/maintenance/audit", label: "Audit Log" },
       { href: "/settings/admin/maintenance/backup", label: "Backup" },
       { href: "/settings/admin/maintenance/logs", label: "Logs" },
-      { href: "/settings/admin/maintenance/health", label: "Library Health" },
-      {
-        href: "/settings/admin/maintenance/intro-fingerprints",
-        label: "Intro fingerprints",
-      },
-      {
-        href: "/settings/admin/maintenance/jobs",
-        label: "Job queue",
-      },
     ],
     disabled: [],
   },

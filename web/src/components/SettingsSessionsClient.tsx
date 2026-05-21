@@ -6,12 +6,15 @@ import {
   ChimpFlixApiError,
   type MySessionEntry,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 export function SettingsSessionsClient() {
   const [sessions, setSessions] = useState<MySessionEntry[] | null>(null);
   const [busy, setBusy] = useState<number | "all" | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [askRevokeOne, setAskRevokeOne] = useState<{ id: number; label: string } | null>(null);
+  const [askRevokeOthers, setAskRevokeOthers] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -27,10 +30,14 @@ export function SettingsSessionsClient() {
     }
   }
 
-  async function revokeOne(id: number, label: string) {
-    if (!window.confirm(`Sign out ${label}? That device will need to log in again.`)) {
-      return;
-    }
+  function revokeOne(id: number, label: string) {
+    setAskRevokeOne({ id, label });
+  }
+
+  async function confirmRevokeOne() {
+    if (!askRevokeOne) return;
+    const { id, label } = askRevokeOne;
+    setAskRevokeOne(null);
     setBusy(id);
     setError(null);
     setMessage(null);
@@ -45,14 +52,12 @@ export function SettingsSessionsClient() {
     }
   }
 
-  async function revokeOthers() {
-    if (
-      !window.confirm(
-        "Sign out of all other devices? You'll stay signed in here; every other session needs to log in again.",
-      )
-    ) {
-      return;
-    }
+  function revokeOthers() {
+    setAskRevokeOthers(true);
+  }
+
+  async function confirmRevokeOthers() {
+    setAskRevokeOthers(false);
     setBusy("all");
     setError(null);
     setMessage(null);
@@ -147,6 +152,28 @@ export function SettingsSessionsClient() {
         </div>
       )}
       {message && <p className="text-xs text-white/70">{message}</p>}
+      {askRevokeOne && (
+        <ConfirmDialog
+          title={`Sign out ${askRevokeOne.label}?`}
+          body="That device will need to log in again. Anything currently playing on it stops at the next heartbeat."
+          confirmLabel="Sign out"
+          destructive
+          busy={busy === askRevokeOne.id}
+          onConfirm={() => void confirmRevokeOne()}
+          onCancel={() => setAskRevokeOne(null)}
+        />
+      )}
+      {askRevokeOthers && (
+        <ConfirmDialog
+          title="Sign out of all other devices?"
+          body="You'll stay signed in here; every other session needs to log in again."
+          confirmLabel="Sign out others"
+          destructive
+          busy={busy === "all"}
+          onConfirm={() => void confirmRevokeOthers()}
+          onCancel={() => setAskRevokeOthers(false)}
+        />
+      )}
     </div>
   );
 }

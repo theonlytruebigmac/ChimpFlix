@@ -417,7 +417,7 @@ function LibraryDrawer({
     if (dirtyFields["Allow media deletion"]) {
       patch.allow_media_deletion = allowMediaDeletion;
     }
-    const { library } = await librariesApi.update(lib.id, patch);
+    const library = await librariesApi.update(lib.id, patch);
     onUpdated(library);
     setBaseline({
       episode_sort_order: library.episode_sort_order,

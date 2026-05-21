@@ -9,6 +9,7 @@ import {
   type ScanJob,
 } from "@/lib/chimpflix-api";
 import { LibraryAccessClient } from "./LibraryAccessClient";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface Props {
   initial: Library[];
@@ -33,6 +34,8 @@ export function SettingsLibrariesClient({ initial }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [scansForId, setScansForId] = useState<number | null>(null);
   const [scans, setScans] = useState<ScanJob[]>([]);
+  const [askDetect, setAskDetect] = useState<number | null>(null);
+  const [askDelete, setAskDelete] = useState<{ id: number; name: string } | null>(null);
   const [scansLoading, setScansLoading] = useState(false);
   const [accessForId, setAccessForId] = useState<number | null>(null);
 
@@ -52,14 +55,14 @@ export function SettingsLibrariesClient({ initial }: Props) {
     }
   }
 
-  async function detectMarkers(id: number) {
-    if (
-      !window.confirm(
-        "Run intro/credits detection for every file in this library? This can take a while — files are processed sequentially in the background.",
-      )
-    ) {
-      return;
-    }
+  function detectMarkers(id: number) {
+    setAskDetect(id);
+  }
+
+  async function confirmDetectMarkers() {
+    if (askDetect == null) return;
+    const id = askDetect;
+    setAskDetect(null);
     setBusy(id);
     setMessage(null);
     try {
@@ -76,14 +79,14 @@ export function SettingsLibrariesClient({ initial }: Props) {
     }
   }
 
-  async function deleteLibrary(id: number, name: string) {
-    if (
-      !window.confirm(
-        `Delete library "${name}"? Items and play state for this library will be removed.`,
-      )
-    ) {
-      return;
-    }
+  function deleteLibrary(id: number, name: string) {
+    setAskDelete({ id, name });
+  }
+
+  async function confirmDeleteLibrary() {
+    if (!askDelete) return;
+    const { id, name } = askDelete;
+    setAskDelete(null);
     setBusy(id);
     setMessage(null);
     try {
@@ -312,6 +315,27 @@ export function SettingsLibrariesClient({ initial }: Props) {
         </button>
         {message && <span className="text-white/70">{message}</span>}
       </div>
+      {askDetect != null && (
+        <ConfirmDialog
+          title="Run marker detection on this library?"
+          body="Every file gets scanned for intro/credits markers. This can take a while — files are processed sequentially in the background. You can keep using the app meanwhile."
+          confirmLabel="Run"
+          busy={busy === askDetect}
+          onConfirm={() => void confirmDetectMarkers()}
+          onCancel={() => setAskDetect(null)}
+        />
+      )}
+      {askDelete && (
+        <ConfirmDialog
+          title={`Delete library "${askDelete.name}"?`}
+          body="Items and play state for this library will be removed. The underlying files on disk are not touched."
+          confirmLabel="Delete library"
+          destructive
+          busy={busy === askDelete.id}
+          onConfirm={() => void confirmDeleteLibrary()}
+          onCancel={() => setAskDelete(null)}
+        />
+      )}
     </div>
   );
 }

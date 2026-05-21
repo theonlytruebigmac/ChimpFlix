@@ -21,6 +21,12 @@ pub enum ApiError {
     Conflict(String),
     #[error("too many requests: {0}")]
     TooManyRequests(String),
+    /// Upstream third-party API (TMDB, TVDB, OpenSubtitles, …) returned
+    /// something we can't act on — empty body, malformed JSON, 5xx, etc.
+    /// Distinct from Internal so the UI can render "try again" instead
+    /// of a generic 500 banner.
+    #[error("bad upstream: {0}")]
+    BadGateway(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -46,6 +52,7 @@ impl IntoResponse for ApiError {
             ApiError::TooManyRequests(m) => {
                 (StatusCode::TOO_MANY_REQUESTS, "too_many_requests", m.clone())
             }
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, "bad_upstream", m.clone()),
             ApiError::Internal(e) => {
                 error!(error = %format!("{e:#}"), "internal error");
                 (

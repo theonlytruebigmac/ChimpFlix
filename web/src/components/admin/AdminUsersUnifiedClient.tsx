@@ -22,6 +22,7 @@ import {
   type DrawerTab,
   type PillTone,
 } from "./ui";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   currentUserId: number;
@@ -431,6 +432,12 @@ function UserDrawer({
   const [tab, setTab] = useState("profile");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Confirmation gating — boolean per action since each fires against
+  // the single `user` this drawer is rendered for.
+  const [askSendReset, setAskSendReset] = useState(false);
+  const [askResetTwoFactor, setAskResetTwoFactor] = useState(false);
+  const [askKickSessions, setAskKickSessions] = useState(false);
+  const [askDeleteUser, setAskDeleteUser] = useState(false);
   const sessionCount = sessions.length;
   const canActOnTarget =
     user.id !== currentUserId && tier(currentUserRole) >= tier(user.role);
@@ -479,14 +486,11 @@ function UserDrawer({
       /* error surfaced */
     }
   }
-  async function sendPasswordReset() {
-    if (
-      !window.confirm(
-        `Send a password reset email to "${user.display_name ?? user.username}"? The link expires in 1 hour.`,
-      )
-    ) {
-      return;
-    }
+  function sendPasswordReset() {
+    setAskSendReset(true);
+  }
+  async function confirmSendPasswordReset() {
+    setAskSendReset(false);
     try {
       const r = await withBusy("reset", () =>
         adminApi.sendUserPasswordReset(user.id),
@@ -496,14 +500,11 @@ function UserDrawer({
       /* error surfaced */
     }
   }
-  async function resetTwoFactor() {
-    if (
-      !window.confirm(
-        `Reset 2FA for "${user.display_name ?? user.username}"? They'll log in with just their password until they re-enroll.`,
-      )
-    ) {
-      return;
-    }
+  function resetTwoFactor() {
+    setAskResetTwoFactor(true);
+  }
+  async function confirmResetTwoFactor() {
+    setAskResetTwoFactor(false);
     try {
       await withBusy("2fa", () => adminApi.resetUserTwoFactor(user.id));
       onMessage("2FA reset.");
@@ -511,15 +512,12 @@ function UserDrawer({
       /* error surfaced */
     }
   }
-  async function kickSessions() {
+  function kickSessions() {
     if (sessionCount === 0) return;
-    if (
-      !window.confirm(
-        `Revoke all ${sessionCount} active session${sessionCount === 1 ? "" : "s"} for "${user.display_name ?? user.username}"?`,
-      )
-    ) {
-      return;
-    }
+    setAskKickSessions(true);
+  }
+  async function confirmKickSessions() {
+    setAskKickSessions(false);
     try {
       await withBusy("kick", async () => {
         for (const s of sessions) {
@@ -539,14 +537,11 @@ function UserDrawer({
       /* error surfaced */
     }
   }
-  async function deleteUser() {
-    if (
-      !window.confirm(
-        `Delete user "${user.display_name ?? user.username}"? Their sessions and watch state will be removed.`,
-      )
-    ) {
-      return;
-    }
+  function deleteUser() {
+    setAskDeleteUser(true);
+  }
+  async function confirmDeleteUser() {
+    setAskDeleteUser(false);
     try {
       await withBusy("delete", () => authApi.deleteUser(user.id));
       onMessage(`Removed "${user.display_name ?? user.username}".`);
@@ -623,6 +618,49 @@ function UserDrawer({
 
         {tab === "audit" && <AuditTab username={user.username} />}
       </DrawerBody>
+      {askSendReset && (
+        <ConfirmDialog
+          title={`Send password reset to "${user.display_name ?? user.username}"?`}
+          body="A reset link is emailed to the address on file. The link expires in 1 hour and can only be used once."
+          confirmLabel="Send"
+          busy={busy === "reset"}
+          onConfirm={() => void confirmSendPasswordReset()}
+          onCancel={() => setAskSendReset(false)}
+        />
+      )}
+      {askResetTwoFactor && (
+        <ConfirmDialog
+          title={`Reset 2FA for "${user.display_name ?? user.username}"?`}
+          body="They'll log in with just their password until they re-enroll. Existing recovery codes are invalidated."
+          confirmLabel="Reset 2FA"
+          destructive
+          busy={busy === "2fa"}
+          onConfirm={() => void confirmResetTwoFactor()}
+          onCancel={() => setAskResetTwoFactor(false)}
+        />
+      )}
+      {askKickSessions && (
+        <ConfirmDialog
+          title={`Revoke all ${sessionCount} active session${sessionCount === 1 ? "" : "s"}?`}
+          body={`"${user.display_name ?? user.username}" will be signed out of every device. Anything currently playing stops at the next heartbeat.`}
+          confirmLabel="Revoke sessions"
+          destructive
+          busy={busy === "kick"}
+          onConfirm={() => void confirmKickSessions()}
+          onCancel={() => setAskKickSessions(false)}
+        />
+      )}
+      {askDeleteUser && (
+        <ConfirmDialog
+          title={`Delete user "${user.display_name ?? user.username}"?`}
+          body="Their sessions, watch state, and personal lists will be removed. Library files on disk are untouched."
+          confirmLabel="Delete user"
+          destructive
+          busy={busy === "delete"}
+          onConfirm={() => void confirmDeleteUser()}
+          onCancel={() => setAskDeleteUser(false)}
+        />
+      )}
     </Drawer>
   );
 }
@@ -861,10 +899,10 @@ function AuditTab({ username }: { username: string }) {
       not yet wired into this drawer. Until then, the global audit log
       at{" "}
       <a
-        href="/settings/admin/maintenance/audit"
+        href="/settings/admin/maintenance/logs/audit"
         className="text-white/80 underline hover:text-white"
       >
-        Maintenance → Audit log
+        Maintenance → Logs → Audit trail
       </a>{" "}
       shows every admin action across the server.
     </p>

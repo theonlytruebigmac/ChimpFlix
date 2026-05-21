@@ -29,6 +29,15 @@ pub struct NetworkResponse {
     pub max_remote_streams_per_user: i64,
     pub lan_networks: String,
     pub auth_bypass_cidrs: String,
+    /// Operator-pinned listen socket (overrides the BIND_ADDR env at
+    /// runtime). Must be in the response — the admin form binds a
+    /// text input to this value and `bind_interface.trim()` on save
+    /// would explode with `cannot access property 'trim' of
+    /// undefined` if the field was missing from the JSON. (The bug
+    /// presented as "Save failed: can't access property trim, k is
+    /// undefined" when adjusting the CORS allowlist, because the
+    /// page-load fetch didn't include this key.)
+    pub bind_interface: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -50,6 +59,8 @@ pub struct NetworkUpdate {
     pub lan_networks: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_bypass_cidrs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_interface: Option<String>,
 }
 
 fn response_from(s: chimpflix_library::ServerSettings) -> NetworkResponse {
@@ -62,6 +73,7 @@ fn response_from(s: chimpflix_library::ServerSettings) -> NetworkResponse {
         max_remote_streams_per_user: s.max_remote_streams_per_user,
         lan_networks: s.lan_networks,
         auth_bypass_cidrs: s.auth_bypass_cidrs,
+        bind_interface: s.bind_interface,
     }
 }
 
@@ -92,6 +104,7 @@ pub async fn patch(
         max_remote_streams_per_user: input.max_remote_streams_per_user,
         lan_networks: input.lan_networks.clone(),
         auth_bypass_cidrs: input.auth_bypass_cidrs.clone(),
+        bind_interface: input.bind_interface.clone(),
         ..Default::default()
     };
     // All validation is centralized in

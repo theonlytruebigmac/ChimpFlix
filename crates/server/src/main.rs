@@ -16,6 +16,7 @@ mod session_watcher;
 mod ssrf;
 mod state;
 mod subtitles_lookup;
+mod tasks;
 mod totp;
 mod trakt_sync;
 mod webhooks;
@@ -29,8 +30,8 @@ use anyhow::Context;
 use chimpflix_common::Vault;
 use chimpflix_library::queries;
 use chimpflix_metadata::{
-    AniListClient, OpenSubtitlesClient, OpenSubtitlesCreds, TmdbClient, TraktClient, TraktCreds,
-    TvdbClient,
+    AniListClient, OmdbClient, OpenSubtitlesClient, OpenSubtitlesCreds, TmdbClient, TraktClient,
+    TraktCreds, TvdbClient,
 };
 use chimpflix_transcoder::{FfmpegConfig, TranscodeManager};
 use sqlx::SqlitePool;
@@ -176,6 +177,13 @@ async fn main() -> anyhow::Result<()> {
         None => info!("Trakt disabled — no credentials under /admin/server/credentials"),
     }
     let trakt = Arc::new(RwLock::new(trakt));
+
+    let omdb = build_omdb_from_vault(&pool, &vault).await?;
+    match &omdb {
+        Some(_) => info!("OMDb ratings enabled"),
+        None => info!("OMDb disabled — no key under /admin/server/credentials"),
+    }
+    let omdb = Arc::new(RwLock::new(omdb));
     // TVMaze is a free fallback for shows; no key required. We always
     // try to construct it — a failure here just means we skip the fallback
     // (it's not fatal to enrichment).
@@ -267,6 +275,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Operator-controllable worker count for the durable job queue.
+    // Captured here before `initial_settings` is moved into the
+    // Arc<RwLock> so the jobs::start call below doesn't need to take
+    // a read lock. Clamped defensively in case a hand-edited DB row
+    // bypassed the schema CHECK.
+    let job_workers = initial_settings.job_workers.clamp(1, 16) as usize;
     // Reap orphaned sessions on the operator's configured idle window.
     // The client sends a keepalive ping every 60s (and on every HLS
     // manifest/segment request), so the default 90s floor catches a
@@ -335,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
         anilist,
         opensubtitles,
         trakt,
+        omdb,
         tvmaze,
         hub,
         auth: AuthConfig {
@@ -358,6 +373,8 @@ async fn main() -> anyhow::Result<()> {
         trakt_refresh_locks: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
+        task_metrics: crate::tasks::metrics::LiveMetrics::new(),
+        worker_pool: Arc::new(tokio::sync::RwLock::new(None)),
     };
 
     // Scheduled tasks: flip orphaned `running` rows, seed defaults, spawn
@@ -375,25 +392,23 @@ async fn main() -> anyhow::Result<()> {
     scheduler::spawn(state.clone());
     // Durable background job queue (see `crates/server/src/jobs/`).
     // Runs reclaim on startup so anything left as `running` from a
-    // previous crash gets put back in the queue. Two workers lets
-    // two CPU-bound ffmpeg detection passes run in parallel — fine
-    // on any host with 4+ cores; raise to 3 only if the box has
-    // headroom and live transcodes aren't competing.
-    jobs::start(state.clone(), jobs::build_router(), 2).await;
+    // previous crash gets put back in the queue. Worker count is
+    // operator-controllable (server_settings.job_workers, default 2)
+    // — bump it on hosts with CPU headroom to let more pipeline
+    // kinds run in parallel; lower it on small boxes where live
+    // transcodes need the cores.
+    let worker_pool =
+        jobs::start(state.clone(), jobs::build_router(), job_workers).await;
+    *state.worker_pool.write().await = Some(worker_pool);
     webhooks::spawn(state.clone());
     session_watcher::spawn(state.hub.clone(), state.transcoder.clone());
-    // Filesystem watcher is gated on the operator's `scan_automatically`
-    // setting (default on). Manual scans + scheduled `scan_library`
-    // tasks still work when off — this only controls the
-    // notify-driven real-time path. Read once at startup; toggling
-    // takes effect on next restart so we don't have to tear down +
-    // re-spawn the watcher mid-flight.
-    let settings_now = state.settings.read().await.clone();
-    if settings_now.scan_automatically {
-        file_watcher::spawn(state.clone());
-    } else {
-        info!("scan_automatically = false; file watcher not started");
-    }
+    // Filesystem watcher is always spawned — it consults the live
+    // `scan_automatically` setting on every event tick so admins can
+    // toggle real-time ingestion without restarting. When the toggle
+    // is off, the watcher still receives kernel inotify events (near-
+    // zero CPU at idle) but drops them without queueing scans, so
+    // flipping the switch back on resumes immediately.
+    file_watcher::spawn(state.clone());
 
     let app = api::router(state);
     let listener = TcpListener::bind(bind_addr)
@@ -624,6 +639,16 @@ async fn build_trakt_from_vault(
     };
     let creds = TraktCreds::parse(&raw)?;
     Ok(Some(TraktClient::from_creds(creds)?))
+}
+
+async fn build_omdb_from_vault(
+    pool: &SqlitePool,
+    vault: &Vault,
+) -> anyhow::Result<Option<OmdbClient>> {
+    let Some(key) = vault_get_or_warn(pool, vault, "omdb").await else {
+        return Ok(None);
+    };
+    Ok(Some(OmdbClient::new(key)?))
 }
 
 async fn shutdown_signal() {
