@@ -122,6 +122,11 @@ pub async fn get(
 /// Returns `(total_bytes, used_bytes)` for the filesystem hosting `path`,
 /// or `None` if the path is not statvfs-able. Implemented with a direct
 /// libc call to avoid pulling in `nix` / `sysinfo` for one syscall.
+// `libc::statvfs`'s fields are `c_ulong`, which is already u64 on
+// x86_64 Linux/macOS but u32 on 32-bit targets. The `as u64` casts
+// are intentional cross-platform widening — clippy reads them as
+// redundant on the CI host arch.
+#[allow(clippy::unnecessary_cast)]
 fn statvfs_usage(path: &str) -> Option<(u64, u64)> {
     if !StdPath::new(path).exists() {
         return None;
