@@ -8,8 +8,8 @@
 use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use chimpflix_library::{AccessMatrixEntry, NewAuditEntry, SessionSummary, queries};
 
 use crate::client_ip::EffectiveClientIp;
@@ -53,8 +53,7 @@ pub async fn list_sessions(
     // Non-Owner Admins shouldn't be able to enumerate the Owner's
     // active sessions (their IPs, UAs, and the bare existence of
     // current logins). Owners see everything; Admins see Admins + Users.
-    let exclude_owners =
-        !matches!(actor.role, chimpflix_library::UserRole::Owner);
+    let exclude_owners = !matches!(actor.role, chimpflix_library::UserRole::Owner);
     let sessions = queries::list_all_sessions_filtered(&state.pool, exclude_owners)
         .await
         .map_err(ApiError::Internal)?;
@@ -388,7 +387,9 @@ pub async fn send_password_reset(
         // admin isn't left wondering why no email arrived.
         PasswordResetResponse {
             ok: false,
-            message: "Email is not configured — set SMTP under Settings → Server → Email, then retry.".to_string(),
+            message:
+                "Email is not configured — set SMTP under Settings → Server → Email, then retry."
+                    .to_string(),
         }
     };
 

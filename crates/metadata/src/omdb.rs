@@ -70,17 +70,22 @@ impl OmdbClient {
         let resp = self
             .http
             .get(&self.base_url)
-            .query(&[("apikey", self.api_key.as_str()), ("i", imdb_id), ("tomatoes", "true")])
+            .query(&[
+                ("apikey", self.api_key.as_str()),
+                ("i", imdb_id),
+                ("tomatoes", "true"),
+            ])
             .send()
             .await
             .context("omdb http send")?;
         if !resp.status().is_success() {
-            anyhow::bail!("omdb http {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "omdb http {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
         }
-        let raw: RawResponse = resp
-            .json()
-            .await
-            .context("omdb body decode")?;
+        let raw: RawResponse = resp.json().await.context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             // OMDb returns these two error strings for both unknown
             // IMDb ids and unindexed-yet-released titles. Treat as a

@@ -2,8 +2,8 @@
 //! trailerMuted stay in localStorage on the client).
 
 use axum::Json;
-use axum::http::StatusCode;
 use axum::extract::State;
+use axum::http::StatusCode;
 use chimpflix_library::queries;
 use serde::{Deserialize, Serialize};
 

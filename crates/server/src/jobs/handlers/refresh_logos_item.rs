@@ -25,8 +25,7 @@ pub struct Payload {
 }
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { item_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { item_id } = serde_json::from_value(payload).context("invalid payload")?;
 
     let Some(tmdb) = state.tmdb_snapshot().await else {
         // No TMDB client — succeed quietly. Operator removed the
@@ -113,10 +112,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
 
 /// Enqueue one `refresh_logos_item` job per item id. Deduped on
 /// item_id so re-triggering while jobs are in flight is safe.
-pub async fn enqueue_for_items(
-    pool: &sqlx::SqlitePool,
-    item_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_items(pool: &sqlx::SqlitePool, item_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &item_id in item_ids {
         let payload = serde_json::json!({ "item_id": item_id });

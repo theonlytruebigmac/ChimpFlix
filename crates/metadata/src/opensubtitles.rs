@@ -92,10 +92,7 @@ impl OpenSubtitlesClient {
         Ok(())
     }
 
-    pub async fn search_for_movie(
-        &self,
-        params: SearchParams<'_>,
-    ) -> Result<Vec<SubtitleHit>> {
+    pub async fn search_for_movie(&self, params: SearchParams<'_>) -> Result<Vec<SubtitleHit>> {
         self.search_inner(params, None, None).await
     }
 
@@ -217,9 +214,7 @@ impl OpenSubtitlesClient {
         const MAX_SUBTITLE_BYTES: u64 = 10 * 1024 * 1024;
         if let Some(len) = dl.content_length() {
             if len > MAX_SUBTITLE_BYTES {
-                bail!(
-                    "OpenSubtitles download oversized: {len} bytes > {MAX_SUBTITLE_BYTES} max"
-                );
+                bail!("OpenSubtitles download oversized: {len} bytes > {MAX_SUBTITLE_BYTES} max");
             }
         }
         let bytes = dl.bytes().await.context("read subtitle body")?;
@@ -276,7 +271,9 @@ impl OpenSubtitlesClient {
             );
         }
         let parsed: LoginResponse = resp.json().await.context("parse login response")?;
-        parsed.token.ok_or_else(|| anyhow!("OpenSubtitles login returned no token"))
+        parsed
+            .token
+            .ok_or_else(|| anyhow!("OpenSubtitles login returned no token"))
     }
 }
 
@@ -292,7 +289,10 @@ fn looks_like_text_subtitle(bytes: &[u8]) -> bool {
     if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
         head = &head[3..];
     }
-    while head.first().is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')) {
+    while head
+        .first()
+        .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    {
         head = &head[1..];
     }
     let head = &head[..head.len().min(256)];
@@ -304,9 +304,9 @@ fn looks_like_text_subtitle(bytes: &[u8]) -> bool {
         // The C1 control range (0x80-0x9f) and NUL/DEL are rejected
         // — they're what binary headers (PNG \x89, etc.) hit.
         Err(_) => {
-            return head.iter().all(|&b| {
-                matches!(b, 0x20..=0x7e | b'\t' | b'\n' | b'\r' | 0xa0..=0xff)
-            });
+            return head
+                .iter()
+                .all(|&b| matches!(b, 0x20..=0x7e | b'\t' | b'\n' | b'\r' | 0xa0..=0xff));
         }
     };
     // WebVTT: must start with the magic header.
@@ -314,16 +314,16 @@ fn looks_like_text_subtitle(bytes: &[u8]) -> bool {
         return true;
     }
     // ASS / SSA: section headers.
-    if as_str.starts_with("[Script Info]") || as_str.starts_with("[V4 Styles]")
-        || as_str.starts_with("[V4+ Styles]") || as_str.starts_with("[Events]")
+    if as_str.starts_with("[Script Info]")
+        || as_str.starts_with("[V4 Styles]")
+        || as_str.starts_with("[V4+ Styles]")
+        || as_str.starts_with("[Events]")
     {
         return true;
     }
     // SRT: first event index, e.g. "1\n00:00:01,000 --> ...".
     // Accept any leading digit followed within ~30 chars by an arrow.
-    if as_str.bytes().next().is_some_and(|b| b.is_ascii_digit())
-        && as_str.contains("-->")
-    {
+    if as_str.bytes().next().is_some_and(|b| b.is_ascii_digit()) && as_str.contains("-->") {
         return true;
     }
     false
@@ -335,7 +335,9 @@ mod sniff_tests {
 
     #[test]
     fn accepts_webvtt() {
-        assert!(looks_like_text_subtitle(b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi"));
+        assert!(looks_like_text_subtitle(
+            b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi"
+        ));
     }
     #[test]
     fn accepts_ass() {

@@ -53,8 +53,7 @@ async fn run(state: AppState) -> Result<()> {
     // which only re-checks library paths (not their contents).
     let overflow_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let overflow_flag_cb = overflow_flag.clone();
-    let (tx, mut rx) =
-        mpsc::channel::<notify::Result<notify::Event>>(16384);
+    let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(16384);
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
         if tx.try_send(res).is_err() {
             // Channel full — record the drop so the main loop can
@@ -223,11 +222,9 @@ fn match_library(paths: &[(PathBuf, i64)], event_path: &std::path::Path) -> Opti
 }
 
 async fn library_paths(state: &AppState) -> Result<Vec<(PathBuf, i64)>> {
-    let rows = sqlx::query(
-        "SELECT library_id, path FROM library_paths",
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let rows = sqlx::query("SELECT library_id, path FROM library_paths")
+        .fetch_all(&state.pool)
+        .await?;
     let mut out: Vec<(PathBuf, i64)> = rows
         .iter()
         .filter_map(|row| {

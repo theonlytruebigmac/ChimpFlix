@@ -145,15 +145,7 @@ pub async fn delete(
     if !removed {
         return Err(ApiError::NotFound);
     }
-    audit_change(
-        &state,
-        actor.id,
-        "access_group.delete",
-        id,
-        None,
-        &headers,
-    )
-    .await;
+    audit_change(&state, actor.id, "access_group.delete", id, None, &headers).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

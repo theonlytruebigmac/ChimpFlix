@@ -23,11 +23,11 @@ use chrono::{DateTime, Local, TimeZone};
 // Inlined into every element via `style=""`. Defined as `const &str` so
 // callers compose by `format!()` rather than typing the raw strings.
 
-const FONT_STACK: &str =
-    "\"Helvetica Neue\", Helvetica, Arial, sans-serif";
+const FONT_STACK: &str = "\"Helvetica Neue\", Helvetica, Arial, sans-serif";
 
 const STYLE_BODY: &str = "background:#000000;margin:0 auto;padding:0;max-width:600px;color:#ffffff;font-family:\"Helvetica Neue\",Helvetica,Arial,sans-serif";
-const STYLE_HEADER: &str = "background:#000000;padding:28px 32px 24px;text-align:left;border-bottom:4px solid #e50914";
+const STYLE_HEADER: &str =
+    "background:#000000;padding:28px 32px 24px;text-align:left;border-bottom:4px solid #e50914";
 const STYLE_BRAND: &str = "color:#e50914;font-size:28px;font-weight:900;letter-spacing:0.04em;text-transform:uppercase;text-decoration:none;display:inline-block;line-height:1";
 const STYLE_CONTENT: &str = "background:#141414;padding:36px 32px";
 const STYLE_EYEBROW: &str = "color:#b3b3b3;font-size:11px;text-transform:uppercase;letter-spacing:0.2em;margin:0 0 12px;padding-top:4px";
@@ -242,7 +242,9 @@ pub fn section_callout(kind: CalloutKind, body_html: &str) -> String {
 /// strings (e.g., display names, ids, dates). Keys are also escaped
 /// but typically literal copy.
 pub fn section_kv(rows: &[(&str, &str)]) -> String {
-    let mut out = format!(r#"<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="{STYLE_KV}">"#);
+    let mut out = format!(
+        r#"<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="{STYLE_KV}">"#
+    );
     for (k, v) in rows {
         out.push_str(&format!(
             r#"<tr><td style="{STYLE_KV_K}">{}</td><td style="{STYLE_KV_V}">{}</td></tr>"#,

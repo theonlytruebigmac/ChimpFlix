@@ -5,11 +5,8 @@
 //!   1. User opens Settings → Two-Factor → "Set up"
 //!   2. POST /auth/2fa/enroll {password}     → server returns otpauth URI
 //!   3. User scans QR in their authenticator
-//!   4. POST /auth/2fa/verify {code}         → server marks verified +
-//!      returns 10 recovery codes (shown once)
-//!   5. From now on, every login goes:
-//!        POST /auth/login                   → {status: "2fa_required", challenge}
-//!        POST /auth/2fa/login {challenge,code|recovery_code} → session
+//!   4. POST /auth/2fa/verify {code}         — server marks verified and returns 10 recovery codes (shown once)
+//!   5. From now on, every login goes: POST /auth/login → {status: "2fa_required", challenge}, then POST /auth/2fa/login {challenge,code|recovery_code} → session
 //!
 //! Enroll/disable/regenerate-codes all require the password re-entry —
 //! a stolen session shouldn't be enough to weaken the account's 2FA.
@@ -108,14 +105,16 @@ pub async fn enroll(
     Json(input): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, ApiError> {
     if state.settings.read().await.totp_enforcement == "disabled" {
-        return Err(ApiError::validation("2FA enrollment is disabled by the server administrator"));
+        return Err(ApiError::validation(
+            "2FA enrollment is disabled by the server administrator",
+        ));
     }
     reverify_password(&state, user.id, &input.password).await?;
 
     let issuer = state.settings.read().await.server_name.clone();
     let account = user.username.clone();
-    let material = totp::generate_enrollment(&state.vault, &issuer, &account)
-        .map_err(ApiError::Internal)?;
+    let material =
+        totp::generate_enrollment(&state.vault, &issuer, &account).map_err(ApiError::Internal)?;
     queries::upsert_user_totp(
         &state.pool,
         user.id,
@@ -356,12 +355,8 @@ pub async fn challenge_login(
     headers: HeaderMap,
     Json(input): Json<ChallengeLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = totp::parse_challenge(
-        &input.challenge,
-        &state.auth.session_secret,
-        now_ms(),
-    )
-    .ok_or_else(invalid_credentials)?;
+    let user_id = totp::parse_challenge(&input.challenge, &state.auth.session_secret, now_ms())
+        .ok_or_else(invalid_credentials)?;
 
     let attempt_key = format!("2fa:{user_id}");
     if let Some(wait) = state.login_attempts.check(&attempt_key).await {
@@ -425,8 +420,7 @@ pub async fn challenge_login(
     if let Err(e) = queries::record_user_login(&state.pool, user.id, Some(ip_str.as_str())).await {
         warn!(error = %format!("{e:#}"), user_id = user.id, "record_user_login");
     }
-    let (session_cookie, csrf_cookie) =
-        issue_session(&state, &user, &headers, Some(ip)).await?;
+    let (session_cookie, csrf_cookie) = issue_session(&state, &user, &headers, Some(ip)).await?;
     let used_recovery = input
         .recovery_code
         .as_deref()
@@ -457,9 +451,10 @@ pub async fn challenge_login(
     // recovery code, regenerate them" without bloating the body.
     if used_recovery {
         if let Ok(v) = HeaderValue::from_str("1") {
-            response
-                .headers_mut()
-                .insert(axum::http::HeaderName::from_static("x-chimpflix-recovery-used"), v);
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-chimpflix-recovery-used"),
+                v,
+            );
         }
     }
     // Suppress unused-constant warning until something needs to look at
@@ -472,11 +467,7 @@ pub async fn challenge_login(
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn reverify_password(
-    state: &AppState,
-    user_id: i64,
-    password: &str,
-) -> Result<(), ApiError> {
+async fn reverify_password(state: &AppState, user_id: i64, password: &str) -> Result<(), ApiError> {
     if password.is_empty() {
         return Err(ApiError::validation("password is required"));
     }
@@ -521,11 +512,8 @@ async fn issue_session(
     .map_err(ApiError::Internal)?;
 
     let value = cookie::build_value(session_id, &nonce, &state.auth.session_secret);
-    let session_cookie = cookie::set_cookie_header(
-        &value,
-        SESSION_MAX_AGE_S,
-        state.auth.cookie_secure,
-    );
+    let session_cookie =
+        cookie::set_cookie_header(&value, SESSION_MAX_AGE_S, state.auth.cookie_secure);
     // Issue the double-submit CSRF companion cookie. Same shape as
     // crate::api::auth::issue_session — see the comment there.
     let csrf = cookie::csrf_token(session_id, &nonce, &state.auth.session_secret);

@@ -7,8 +7,8 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use chimpflix_library::{NewAuditEntry, queries, scanner};
 use serde::{Deserialize, Serialize};
 
@@ -179,9 +179,7 @@ pub async fn detect_markers(
             }
         };
         let file_ids: Vec<i64> = match detail.item.kind {
-            chimpflix_library::ItemKind::Movie => {
-                detail.files.iter().map(|f| f.id).collect()
-            }
+            chimpflix_library::ItemKind::Movie => detail.files.iter().map(|f| f.id).collect(),
             chimpflix_library::ItemKind::Show => {
                 match sqlx::query_scalar::<_, i64>(
                     "SELECT mf.id
@@ -205,11 +203,8 @@ pub async fn detect_markers(
                 }
             }
         };
-        match crate::jobs::handlers::detect_markers_file::enqueue_for_files(
-            &state.pool,
-            &file_ids,
-        )
-        .await
+        match crate::jobs::handlers::detect_markers_file::enqueue_for_files(&state.pool, &file_ids)
+            .await
         {
             Ok(_) => ok += 1,
             Err(e) => errors.push(BulkError {
@@ -219,8 +214,18 @@ pub async fn detect_markers(
         }
     }
     let failed = errors.len();
-    audit_with(&state, actor.id, &headers, "items.bulk.detect_markers", &req).await;
-    Ok((StatusCode::ACCEPTED, Json(BulkReport { ok, failed, errors })))
+    audit_with(
+        &state,
+        actor.id,
+        &headers,
+        "items.bulk.detect_markers",
+        &req,
+    )
+    .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BulkReport { ok, failed, errors }),
+    ))
 }
 
 fn cap_check(n: usize) -> Result<(), ApiError> {

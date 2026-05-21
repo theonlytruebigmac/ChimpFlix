@@ -120,7 +120,10 @@ mod tests {
         for i in 1..bands.len() {
             let prev_width = bands[i - 1].1 - bands[i - 1].0;
             let curr_width = bands[i].1 - bands[i].0;
-            assert!(curr_width >= prev_width, "Bands should grow logarithmically");
+            assert!(
+                curr_width >= prev_width,
+                "Bands should grow logarithmically"
+            );
         }
     }
 

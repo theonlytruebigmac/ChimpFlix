@@ -91,50 +91,13 @@ fn allows_beacon_csrf_skip(path: &str) -> bool {
     segments.len() == 1 && !segments[0].is_empty()
 }
 
-#[cfg(test)]
-mod beacon_skip_tests {
-    use super::allows_beacon_csrf_skip;
-
-    #[test]
-    fn accepts_canonical_close() {
-        assert!(allows_beacon_csrf_skip(
-            "/api/v1/stream/sessions/abc123/close"
-        ));
-    }
-    #[test]
-    fn rejects_no_session_id() {
-        assert!(!allows_beacon_csrf_skip("/api/v1/stream/sessions//close"));
-    }
-    #[test]
-    fn rejects_extra_suffix() {
-        assert!(!allows_beacon_csrf_skip(
-            "/api/v1/stream/sessions/abc/close/extra"
-        ));
-    }
-    #[test]
-    fn rejects_double_slash_in_id() {
-        assert!(!allows_beacon_csrf_skip(
-            "/api/v1/stream/sessions/abc//close"
-        ));
-    }
-    #[test]
-    fn rejects_unrelated_routes() {
-        assert!(!allows_beacon_csrf_skip("/api/v1/auth/login"));
-        assert!(!allows_beacon_csrf_skip("/api/v1/stream/sessions/abc"));
-    }
-}
-
-pub async fn layer(
-    State(state): State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn layer(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     if !is_mutating(req.method()) {
         return next.run(req).await;
     }
 
     let path = req.uri().path();
-    let strict = STRICT_CSRF_PATHS.iter().any(|p| path == *p);
+    let strict = STRICT_CSRF_PATHS.contains(&path);
 
     // Non-strict route + no session cookie → nothing to forge. Let the
     // handler 401 if it cares. Strict routes always run the Origin check
@@ -196,7 +159,7 @@ pub async fn layer(
         .headers()
         .get(header::REFERER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| origin_from_url(s));
+        .and_then(origin_from_url);
 
     let candidate = origin_value.or(referer_value);
 
@@ -301,4 +264,37 @@ fn find_named_cookie(header_value: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod beacon_skip_tests {
+    use super::allows_beacon_csrf_skip;
+
+    #[test]
+    fn accepts_canonical_close() {
+        assert!(allows_beacon_csrf_skip(
+            "/api/v1/stream/sessions/abc123/close"
+        ));
+    }
+    #[test]
+    fn rejects_no_session_id() {
+        assert!(!allows_beacon_csrf_skip("/api/v1/stream/sessions//close"));
+    }
+    #[test]
+    fn rejects_extra_suffix() {
+        assert!(!allows_beacon_csrf_skip(
+            "/api/v1/stream/sessions/abc/close/extra"
+        ));
+    }
+    #[test]
+    fn rejects_double_slash_in_id() {
+        assert!(!allows_beacon_csrf_skip(
+            "/api/v1/stream/sessions/abc//close"
+        ));
+    }
+    #[test]
+    fn rejects_unrelated_routes() {
+        assert!(!allows_beacon_csrf_skip("/api/v1/auth/login"));
+        assert!(!allows_beacon_csrf_skip("/api/v1/stream/sessions/abc"));
+    }
 }

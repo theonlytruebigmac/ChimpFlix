@@ -206,7 +206,11 @@ pub async fn test_reachability(
                 public_url: Some(public_url),
                 status_code: Some(status),
                 latency_ms: Some(started.elapsed().as_millis() as i64),
-                error: if ok { None } else { Some(format!("HTTP {status}")) },
+                error: if ok {
+                    None
+                } else {
+                    Some(format!("HTTP {status}"))
+                },
             }))
         }
         Err(e) => Ok(Json(ReachabilityResponse {

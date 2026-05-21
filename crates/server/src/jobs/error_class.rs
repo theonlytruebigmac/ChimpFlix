@@ -180,28 +180,28 @@ pub fn backoff_for_class(class: ErrorClass, attempt: i64) -> Option<i64> {
         // OMDb key is exhausted, retrying twice an hour just
         // burns log noise.
         ErrorClass::ExternalRateLimit => &[
-            5 * 60 * 1000,        // 5m
-            15 * 60 * 1000,       // 15m
-            60 * 60 * 1000,       // 1h
-            6 * 60 * 60 * 1000,   // 6h
-            24 * 60 * 60 * 1000,  // 24h
+            5 * 60 * 1000,       // 5m
+            15 * 60 * 1000,      // 15m
+            60 * 60 * 1000,      // 1h
+            6 * 60 * 60 * 1000,  // 6h
+            24 * 60 * 60 * 1000, // 24h
         ],
         // Timeouts get short retries: the next attempt usually
         // works once load eases.
         ErrorClass::Timeout => &[
-            30 * 1000,            // 30s
-            2 * 60 * 1000,        // 2m
-            5 * 60 * 1000,        // 5m
+            30 * 1000,     // 30s
+            2 * 60 * 1000, // 2m
+            5 * 60 * 1000, // 5m
         ],
         // Transient: matches the legacy curve we used pre-Phase
         // 5b, so a binary upgrade doesn't suddenly change retry
         // pacing for the most common case.
         ErrorClass::Transient => &[
-            5 * 1000,             // 5s
-            30 * 1000,            // 30s
-            2 * 60 * 1000,        // 2m
-            10 * 60 * 1000,       // 10m
-            30 * 60 * 1000,       // 30m
+            5 * 1000,       // 5s
+            30 * 1000,      // 30s
+            2 * 60 * 1000,  // 2m
+            10 * 60 * 1000, // 10m
+            30 * 60 * 1000, // 30m
         ],
         // Already handled by `is_terminal` above; unreachable.
         ErrorClass::ExternalAuth | ErrorClass::Permanent => &[],
@@ -221,11 +221,20 @@ mod tests {
 
     #[test]
     fn rate_limit_classified_by_429() {
-        assert_eq!(classify(&make("OMDb 429: rate limit exceeded")), ErrorClass::ExternalRateLimit);
+        assert_eq!(
+            classify(&make("OMDb 429: rate limit exceeded")),
+            ErrorClass::ExternalRateLimit
+        );
         assert_eq!(classify(&make("http 429")), ErrorClass::ExternalRateLimit);
-        assert_eq!(classify(&make("Rate Limit hit")), ErrorClass::ExternalRateLimit);
+        assert_eq!(
+            classify(&make("Rate Limit hit")),
+            ErrorClass::ExternalRateLimit
+        );
         // Reqwest's Display format
-        assert_eq!(classify(&make("error sending request (429 Too Many Requests)")), ErrorClass::ExternalRateLimit);
+        assert_eq!(
+            classify(&make("error sending request (429 Too Many Requests)")),
+            ErrorClass::ExternalRateLimit
+        );
     }
 
     #[test]
@@ -257,19 +266,31 @@ mod tests {
     #[test]
     fn timeout_classified() {
         assert_eq!(classify(&make("operation timed out")), ErrorClass::Timeout);
-        assert_eq!(classify(&make("ffmpeg watchdog killed child")), ErrorClass::Timeout);
+        assert_eq!(
+            classify(&make("ffmpeg watchdog killed child")),
+            ErrorClass::Timeout
+        );
         assert_eq!(classify(&make("deadline exceeded")), ErrorClass::Timeout);
     }
 
     #[test]
     fn permanent_classified() {
-        assert_eq!(classify(&make("No such file or directory")), ErrorClass::Permanent);
-        assert_eq!(classify(&make("invalid data: garbled mkv header")), ErrorClass::Permanent);
+        assert_eq!(
+            classify(&make("No such file or directory")),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            classify(&make("invalid data: garbled mkv header")),
+            ErrorClass::Permanent
+        );
     }
 
     #[test]
     fn unknown_falls_back_to_transient() {
-        assert_eq!(classify(&make("something unusual happened")), ErrorClass::Transient);
+        assert_eq!(
+            classify(&make("something unusual happened")),
+            ErrorClass::Transient
+        );
     }
 
     #[test]

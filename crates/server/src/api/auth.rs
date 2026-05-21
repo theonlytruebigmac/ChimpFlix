@@ -41,6 +41,10 @@ pub struct AuthResponse {
 /// discriminator before destructuring:
 ///   * `authenticated` — session cookie set, `user` populated.
 ///   * `2fa_required` — no cookie, follow up with /auth/2fa/login.
+// API-response enum: the size delta between variants doesn't matter
+// (constructed once per HTTP response, immediately serialized) and
+// boxing `User` here would just churn the call sites.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum LoginResponse {
@@ -123,7 +127,11 @@ pub async fn setup(
     }
     validate_username(&input.username)?;
     validate_password(&input.password)?;
-    let email = input.email.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let email = input
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if let Some(addr) = email {
         validate_email(addr)?;
     }
@@ -159,10 +167,9 @@ pub async fn setup(
                 public_url: Some(Some(origin.clone())),
                 ..Default::default()
             };
-            let updated =
-                queries::update_server_settings(&state.pool, Some(user.id), patch)
-                    .await
-                    .map_err(ApiError::Internal)?;
+            let updated = queries::update_server_settings(&state.pool, Some(user.id), patch)
+                .await
+                .map_err(ApiError::Internal)?;
             *state.settings.write().await = updated;
             info!(public_url = %origin, "seeded public_url from setup request origin");
         }
@@ -170,12 +177,7 @@ pub async fn setup(
 
     let cookies = issue_session(&state, &user, &headers, Some(ip)).await?;
     info!(user_id = user.id, "setup complete");
-    Ok(authed_response(
-        StatusCode::CREATED,
-        user,
-        cookies,
-        &state,
-    ))
+    Ok(authed_response(StatusCode::CREATED, user, cookies, &state))
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +274,10 @@ pub async fn login(
                                 "argon2 rehash-on-login persist failed",
                             );
                         } else {
-                            info!(user_id = user.id, "upgraded password hash to stronger argon2 params");
+                            info!(
+                                user_id = user.id,
+                                "upgraded password hash to stronger argon2 params"
+                            );
                         }
                     }
                     Err(e) => warn!(
@@ -293,7 +298,9 @@ pub async fn login(
     let totp_record = queries::get_user_totp(&state.pool, user.id)
         .await
         .map_err(ApiError::Internal)?;
-    let has_verified_totp = totp_record.as_ref().is_some_and(|r| r.verified_at.is_some());
+    let has_verified_totp = totp_record
+        .as_ref()
+        .is_some_and(|r| r.verified_at.is_some());
 
     // Enforce server-wide `totp_enforcement = "required"` at the
     // login gate. Without this check the policy was a UI fiction
@@ -406,7 +413,10 @@ pub async fn list_my_sessions(
         .into_iter()
         .map(|s| {
             let current = s.id == user.session_id;
-            MySessionEntry { session: s, current }
+            MySessionEntry {
+                session: s,
+                current,
+            }
         })
         .collect();
     Ok(Json(MySessionsResponse { sessions }))
@@ -454,11 +464,13 @@ pub async fn revoke_other_sessions(
     user: AuthUser,
     headers: HeaderMap,
 ) -> Result<Json<RevokeOthersResponse>, ApiError> {
-    let revoked =
-        queries::delete_sessions_for_user_except(&state.pool, user.id, user.session_id)
-            .await
-            .map_err(ApiError::Internal)?;
-    info!(user_id = user.id, revoked, "user signed out of other sessions");
+    let revoked = queries::delete_sessions_for_user_except(&state.pool, user.id, user.session_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    info!(
+        user_id = user.id,
+        revoked, "user signed out of other sessions"
+    );
     audit_auth(
         &state,
         "auth.sessions.revoke_others",
@@ -483,7 +495,10 @@ pub async fn logout(
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some(raw) = cookie::find_cookie(cookie_header, crate::auth::cookie_name(state.auth.cookie_secure)) {
+    if let Some(raw) = cookie::find_cookie(
+        cookie_header,
+        crate::auth::cookie_name(state.auth.cookie_secure),
+    ) {
         if let Some((session_id, _)) = cookie::parse_value(raw, &state.auth.session_secret) {
             queries::delete_session(&state.pool, session_id)
                 .await
@@ -507,7 +522,9 @@ pub async fn logout(
     if let Ok(hv) = HeaderValue::from_str(&clear_session) {
         response.headers_mut().append(SET_COOKIE, hv);
     } else {
-        warn!("logout: failed to format clear-cookie header — client will keep cookie until expiry");
+        warn!(
+            "logout: failed to format clear-cookie header — client will keep cookie until expiry"
+        );
     }
     if let Ok(hv) = HeaderValue::from_str(&clear_csrf) {
         response.headers_mut().append(SET_COOKIE, hv);
@@ -615,11 +632,14 @@ pub async fn change_password(
     queries::update_user_password(&state.pool, user.id, &new_hash)
         .await
         .map_err(ApiError::Internal)?;
-    let revoked =
-        queries::delete_sessions_for_user_except(&state.pool, user.id, user.session_id)
-            .await
-            .unwrap_or(0);
-    info!(user_id = user.id, sessions_revoked = revoked, "password changed");
+    let revoked = queries::delete_sessions_for_user_except(&state.pool, user.id, user.session_id)
+        .await
+        .unwrap_or(0);
+    info!(
+        user_id = user.id,
+        sessions_revoked = revoked,
+        "password changed"
+    );
     audit_auth(
         &state,
         "auth.password_change.success",
@@ -775,12 +795,7 @@ pub async fn register(
 
     let cookies = issue_session(&state, &user, &headers, Some(ip)).await?;
     info!(user_id = user.id, "register");
-    Ok(authed_response(
-        StatusCode::CREATED,
-        user,
-        cookies,
-        &state,
-    ))
+    Ok(authed_response(StatusCode::CREATED, user, cookies, &state))
 }
 
 // ---------------------------------------------------------------------------
@@ -886,18 +901,10 @@ pub async fn create_invite(
         match Mailer::from_settings(&settings, &state.pool, &state.vault).await {
             Ok(Some(mailer)) => {
                 let server_name = settings.server_name.clone();
-                let html = invite_email_html(
-                    &server_name,
-                    accept_url.as_deref(),
-                    &code,
-                    expires_at,
-                );
-                let text = invite_email_text(
-                    &server_name,
-                    accept_url.as_deref(),
-                    &code,
-                    expires_at,
-                );
+                let html =
+                    invite_email_html(&server_name, accept_url.as_deref(), &code, expires_at);
+                let text =
+                    invite_email_text(&server_name, accept_url.as_deref(), &code, expires_at);
                 let subject = format!("Your {server_name} invitation");
                 let outgoing = OutgoingMessage {
                     to_address: addr,
@@ -1210,8 +1217,7 @@ pub async fn confirm_email_change(
     // config or send error doesn't block the change.
     if let Some(prior) = old_email.as_deref() {
         let settings = state.settings.read().await.clone();
-        if let Ok(Some(mailer)) =
-            Mailer::from_settings(&settings, &state.pool, &state.vault).await
+        if let Ok(Some(mailer)) = Mailer::from_settings(&settings, &state.pool, &state.vault).await
         {
             let server_name = settings.server_name.clone();
             let html = email_change_alert_html(&server_name, &new_email);
@@ -1457,16 +1463,8 @@ pub async fn request_password_reset(
             Ok(Some(mailer)) => {
                 let server_name = settings.server_name.clone();
                 let subject = format!("Reset your {server_name} password");
-                let html = password_reset_email_html(
-                    &server_name,
-                    reset_url.as_deref(),
-                    &token,
-                );
-                let text = password_reset_email_text(
-                    &server_name,
-                    reset_url.as_deref(),
-                    &token,
-                );
+                let html = password_reset_email_html(&server_name, reset_url.as_deref(), &token);
+                let text = password_reset_email_text(&server_name, reset_url.as_deref(), &token);
                 if let Err(e) = mailer
                     .send(OutgoingMessage {
                         to_address: email,
@@ -1529,11 +1527,10 @@ pub async fn confirm_password_reset(
     validate_password(&input.new_password)?;
 
     let token_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
-    let (token_id, user_id) =
-        queries::find_active_password_reset_token(&state.pool, &token_hash)
-            .await
-            .map_err(ApiError::Internal)?
-            .ok_or_else(|| ApiError::validation("token is invalid or expired"))?;
+    let (token_id, user_id) = queries::find_active_password_reset_token(&state.pool, &token_hash)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::validation("token is invalid or expired"))?;
 
     let hash = password::hash(&input.new_password).map_err(ApiError::Internal)?;
     let revoked = queries::consume_password_reset(&state.pool, token_id, user_id, &hash)
@@ -1544,7 +1541,9 @@ pub async fn confirm_password_reset(
             // message to the client so leaked errors can't fingerprint
             // the schema or hint at concurrent reset attempts.
             warn!(error = %format!("{e:#}"), user_id, "consume_password_reset");
-            ApiError::validation("could not complete password reset; the token may have already been used")
+            ApiError::validation(
+                "could not complete password reset; the token may have already been used",
+            )
         })?;
 
     info!(user_id, sessions_revoked = revoked, "password reset");
@@ -1685,9 +1684,7 @@ pub async fn update_user(
     // Hierarchy guard for the REQUESTED role — only owners may
     // promote anyone to owner. Admins can promote users ↔ admins
     // freely below the owner ceiling.
-    if matches!(input.role, UserRole::Owner)
-        && !matches!(actor.role, UserRole::Owner)
-    {
+    if matches!(input.role, UserRole::Owner) && !matches!(actor.role, UserRole::Owner) {
         return Err(ApiError::Forbidden);
     }
     let user = queries::set_user_role(&state.pool, id, input.role)
@@ -1706,17 +1703,26 @@ pub async fn update_user(
 /// Used to seed `public_url` so the CSRF middleware accepts the same
 /// browser on subsequent requests without manual config.
 fn setup_origin_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = v.trim();
         if !trimmed.is_empty() && trimmed != "null" {
             return Some(trimmed.to_string());
         }
     }
-    let referer = headers.get(axum::http::header::REFERER).and_then(|v| v.to_str().ok())?;
+    let referer = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())?;
     let after_scheme = referer.find("://")?;
     let rest = &referer[after_scheme + 3..];
     let host_end = rest.find('/').unwrap_or(rest.len());
-    Some(format!("{}{}", &referer[..after_scheme + 3], &rest[..host_end]))
+    Some(format!(
+        "{}{}",
+        &referer[..after_scheme + 3],
+        &rest[..host_end]
+    ))
 }
 
 fn validate_username(name: &str) -> Result<(), ApiError> {
@@ -1777,9 +1783,7 @@ fn validate_avatar_url(url: &str) -> Result<(), ApiError> {
     // surface. https-only is conservative and matches every legit
     // avatar source (Gravatar, S3, GitHub avatars, etc.).
     if !url.starts_with("https://") {
-        return Err(ApiError::validation(
-            "avatar_url must start with https://",
-        ));
+        return Err(ApiError::validation("avatar_url must start with https://"));
     }
     // Reject control chars + whitespace embedded in the URL — header
     // injection / HTML smuggling territory.
@@ -1823,17 +1827,60 @@ fn is_obviously_bad_password(password: &str) -> bool {
     // and `passw0rd` are intentionally enumerated rather than regex-
     // ed because the check is O(N) over a tiny constant either way.
     const BANNED: &[&str] = &[
-        "password", "password1", "password12", "password123", "password1234",
-        "passw0rd", "passw0rd1", "letmein", "welcome", "welcome1",
-        "qwerty", "qwerty123", "qwertyuiop", "abc12345", "abcd1234",
-        "admin123", "adminadmin", "iloveyou", "monkey", "monkey123",
-        "dragon", "dragon123", "master", "master123", "shadow",
-        "111111", "1111111", "11111111", "123123", "123123123",
-        "12345678", "123456789", "1234567890", "qazwsx", "qazwsxedc",
-        "trustno1", "sunshine", "princess", "ashley", "michael",
-        "jennifer", "jordan23", "football", "baseball", "freedom",
-        "starwars", "superman", "batman", "111222", "12341234",
-        "asdf1234", "asdfasdf", "letmein1", "letmein123",
+        "password",
+        "password1",
+        "password12",
+        "password123",
+        "password1234",
+        "passw0rd",
+        "passw0rd1",
+        "letmein",
+        "welcome",
+        "welcome1",
+        "qwerty",
+        "qwerty123",
+        "qwertyuiop",
+        "abc12345",
+        "abcd1234",
+        "admin123",
+        "adminadmin",
+        "iloveyou",
+        "monkey",
+        "monkey123",
+        "dragon",
+        "dragon123",
+        "master",
+        "master123",
+        "shadow",
+        "111111",
+        "1111111",
+        "11111111",
+        "123123",
+        "123123123",
+        "12345678",
+        "123456789",
+        "1234567890",
+        "qazwsx",
+        "qazwsxedc",
+        "trustno1",
+        "sunshine",
+        "princess",
+        "ashley",
+        "michael",
+        "jennifer",
+        "jordan23",
+        "football",
+        "baseball",
+        "freedom",
+        "starwars",
+        "superman",
+        "batman",
+        "111222",
+        "12341234",
+        "asdf1234",
+        "asdfasdf",
+        "letmein1",
+        "letmein123",
     ];
     if BANNED.contains(&lc.as_str()) {
         return true;
@@ -1911,21 +1958,15 @@ async fn issue_session(
     .map_err(ApiError::Internal)?;
 
     let value = cookie::build_value(session_id, &nonce, &state.auth.session_secret);
-    let session_cookie = cookie::set_cookie_header(
-        &value,
-        SESSION_MAX_AGE_S,
-        state.auth.cookie_secure,
-    );
+    let session_cookie =
+        cookie::set_cookie_header(&value, SESSION_MAX_AGE_S, state.auth.cookie_secure);
     // Issue the double-submit CSRF companion cookie alongside. The
     // token is deterministic (HMAC of session_id + nonce keyed by the
     // server secret) so the middleware doesn't need to read any DB
     // state to verify — just recompute and compare.
     let csrf = cookie::csrf_token(session_id, &nonce, &state.auth.session_secret);
-    let csrf_cookie = cookie::set_csrf_cookie_header(
-        &csrf,
-        SESSION_MAX_AGE_S,
-        state.auth.cookie_secure,
-    );
+    let csrf_cookie =
+        cookie::set_csrf_cookie_header(&csrf, SESSION_MAX_AGE_S, state.auth.cookie_secure);
     Ok((session_cookie, csrf_cookie))
 }
 
@@ -1990,11 +2031,8 @@ pub(crate) async fn audit_auth(
 /// use `authed_response` because their happy path is always
 /// authenticated (no 2FA challenge applies — the user has no enrollment).
 fn authed_login_response(user: User, cookies: (String, String)) -> axum::response::Response {
-    let mut response = (
-        StatusCode::OK,
-        Json(LoginResponse::Authenticated { user }),
-    )
-        .into_response();
+    let mut response =
+        (StatusCode::OK, Json(LoginResponse::Authenticated { user })).into_response();
     let (session_cookie, csrf_cookie) = cookies;
     response.headers_mut().append(
         SET_COOKIE,

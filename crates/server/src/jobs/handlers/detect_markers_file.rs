@@ -44,8 +44,7 @@ pub struct Payload {
 }
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { file_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { file_id } = serde_json::from_value(payload).context("invalid payload")?;
 
     let Some((path, _duration_ms, markers_already_detected)) =
         sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
@@ -77,9 +76,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         .context("resolve show + season for file")?;
 
     let (intro_refs, credits_refs) = match season_ctx {
-        Some((show_id, season_number)) => {
-            load_refs(&state.pool, show_id, season_number).await?
-        }
+        Some((show_id, season_number)) => load_refs(&state.pool, show_id, season_number).await?,
         None => (vec![], vec![]),
     };
 
@@ -221,9 +218,7 @@ async fn maybe_enqueue_bootstrap(
     if already {
         return Ok(());
     }
-    let _ =
-        super::bootstrap_season_refs::enqueue_for_season(pool, show_id, season_number)
-            .await?;
+    let _ = super::bootstrap_season_refs::enqueue_for_season(pool, show_id, season_number).await?;
     Ok(())
 }
 
@@ -231,10 +226,7 @@ async fn maybe_enqueue_bootstrap(
 /// bulk) — enqueues one detect_markers_file job per media_file_id,
 /// deduped on file_id so a re-trigger while a job is in flight
 /// doesn't pile up duplicates.
-pub async fn enqueue_for_files(
-    pool: &sqlx::SqlitePool,
-    file_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_files(pool: &sqlx::SqlitePool, file_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &file_id in file_ids {
         let payload = serde_json::json!({ "file_id": file_id });

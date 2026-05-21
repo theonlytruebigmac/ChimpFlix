@@ -73,9 +73,12 @@ impl TraktClient {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(UA_HEADER, HeaderValue::from_static(USER_AGENT));
-        headers.insert("trakt-api-version", HeaderValue::from_static(TRAKT_API_VERSION));
-        let api_key_value = HeaderValue::from_str(client_id)
-            .context("Trakt client_id has non-ASCII characters")?;
+        headers.insert(
+            "trakt-api-version",
+            HeaderValue::from_static(TRAKT_API_VERSION),
+        );
+        let api_key_value =
+            HeaderValue::from_str(client_id).context("Trakt client_id has non-ASCII characters")?;
         headers.insert("trakt-api-key", api_key_value);
         let http = reqwest::Client::builder()
             .default_headers(headers)
@@ -102,7 +105,12 @@ impl TraktClient {
     pub async fn device_code(&self) -> Result<DeviceCodeResponse> {
         let url = format!("{}/oauth/device/code", self.base_url);
         let body = json!({ "client_id": self.client_id });
-        let resp = self.http.post(&url).json(&body).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -129,7 +137,12 @@ impl TraktClient {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         });
-        let resp = self.http.post(&url).json(&body).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         if status.is_success() {
@@ -162,7 +175,12 @@ impl TraktClient {
             "grant_type": "refresh_token",
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
         });
-        let resp = self.http.post(&url).json(&body).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -172,14 +190,12 @@ impl TraktClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        resp.json::<TokenPair>().await.context("parse Trakt refresh response")
+        resp.json::<TokenPair>()
+            .await
+            .context("parse Trakt refresh response")
     }
 
-    pub async fn push_history(
-        &self,
-        access_token: &str,
-        entries: &[HistoryPush],
-    ) -> Result<()> {
+    pub async fn push_history(&self, access_token: &str, entries: &[HistoryPush]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -187,11 +203,19 @@ impl TraktClient {
         let mut episodes = Vec::new();
         for e in entries {
             match e {
-                HistoryPush::Movie { tmdb_id, watched_at } => movies.push(json!({
+                HistoryPush::Movie {
+                    tmdb_id,
+                    watched_at,
+                } => movies.push(json!({
                     "watched_at": watched_at,
                     "ids": { "tmdb": tmdb_id },
                 })),
-                HistoryPush::Episode { tmdb_show_id, season, episode, watched_at } => {
+                HistoryPush::Episode {
+                    tmdb_show_id,
+                    season,
+                    episode,
+                    watched_at,
+                } => {
                     episodes.push(json!({
                         "watched_at": watched_at,
                         "show": { "ids": { "tmdb": tmdb_show_id } },
@@ -233,10 +257,7 @@ impl TraktClient {
             .context("parse Trakt history")
     }
 
-    pub async fn pull_playback(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<PlaybackEntry>> {
+    pub async fn pull_playback(&self, access_token: &str) -> Result<Vec<PlaybackEntry>> {
         let url = format!("{}/sync/playback?limit=200", self.base_url);
         let resp = self
             .http
@@ -253,13 +274,13 @@ impl TraktClient {
             .context("parse Trakt playback")
     }
 
-    pub async fn push_rating(
-        &self,
-        access_token: &str,
-        entry: RatingPush,
-    ) -> Result<()> {
+    pub async fn push_rating(&self, access_token: &str, entry: RatingPush) -> Result<()> {
         let (movies, episodes) = match entry {
-            RatingPush::Movie { tmdb_id, rating, rated_at } => (
+            RatingPush::Movie {
+                tmdb_id,
+                rating,
+                rated_at,
+            } => (
                 vec![json!({
                     "rated_at": rated_at,
                     "rating": rating,
@@ -267,7 +288,13 @@ impl TraktClient {
                 })],
                 vec![],
             ),
-            RatingPush::Episode { tmdb_show_id, season, episode, rating, rated_at } => (
+            RatingPush::Episode {
+                tmdb_show_id,
+                season,
+                episode,
+                rating,
+                rated_at,
+            } => (
                 vec![],
                 vec![json!({
                     "rated_at": rated_at,
@@ -288,17 +315,17 @@ impl TraktClient {
         Ok(())
     }
 
-    pub async fn remove_rating(
-        &self,
-        access_token: &str,
-        entry: RatingPush,
-    ) -> Result<()> {
+    pub async fn remove_rating(&self, access_token: &str, entry: RatingPush) -> Result<()> {
         let (movies, episodes) = match entry {
-            RatingPush::Movie { tmdb_id, .. } => (
-                vec![json!({ "ids": { "tmdb": tmdb_id } })],
-                vec![],
-            ),
-            RatingPush::Episode { tmdb_show_id, season, episode, .. } => (
+            RatingPush::Movie { tmdb_id, .. } => {
+                (vec![json!({ "ids": { "tmdb": tmdb_id } })], vec![])
+            }
+            RatingPush::Episode {
+                tmdb_show_id,
+                season,
+                episode,
+                ..
+            } => (
                 vec![],
                 vec![json!({
                     "show": { "ids": { "tmdb": tmdb_show_id } },
@@ -310,14 +337,12 @@ impl TraktClient {
             ),
         };
         let body = json!({ "movies": movies, "shows": episodes });
-        self.user_post("/sync/ratings/remove", access_token, &body).await?;
+        self.user_post("/sync/ratings/remove", access_token, &body)
+            .await?;
         Ok(())
     }
 
-    pub async fn pull_ratings(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<RatingEntry>> {
+    pub async fn pull_ratings(&self, access_token: &str) -> Result<Vec<RatingEntry>> {
         let url = format!("{}/sync/ratings", self.base_url);
         let resp = self
             .http
@@ -540,6 +565,9 @@ mod tests {
 
     #[test]
     fn urlencode_keeps_alphanum_escapes_colon() {
-        assert_eq!(urlencode("2024-01-19T12:34:56Z"), "2024-01-19T12%3A34%3A56Z");
+        assert_eq!(
+            urlencode("2024-01-19T12:34:56Z"),
+            "2024-01-19T12%3A34%3A56Z"
+        );
     }
 }

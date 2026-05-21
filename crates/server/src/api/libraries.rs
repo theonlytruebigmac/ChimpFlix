@@ -157,7 +157,14 @@ pub async fn trigger_scan(
     let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(state.clone(), emitter);
     tokio::spawn(async move {
         if let Err(e) = chimpflix_library::run_scan(
-            pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job_id,
+            pool,
+            ffmpeg,
+            tmdb,
+            tvdb,
+            anilist,
+            tvmaze,
+            library_id,
+            job_id,
             Some(cache_root),
             emitter,
         )
@@ -324,11 +331,9 @@ async fn evict_subtitle_caches(cache_root: &std::path::Path, paths: &[String]) {
     let paths: Vec<String> = paths.to_vec();
     tokio::spawn(async move {
         for p in paths {
-            let _ = chimpflix_transcoder::evict_text_subs_cache(
-                &cache_root,
-                std::path::Path::new(&p),
-            )
-            .await;
+            let _ =
+                chimpflix_transcoder::evict_text_subs_cache(&cache_root, std::path::Path::new(&p))
+                    .await;
         }
     });
 }
@@ -365,12 +370,11 @@ pub async fn refresh_metadata(
     };
     let tvdb = state.tvdb_snapshot().await;
     let tvmaze = state.tvmaze.clone();
-    let item_ids: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM items WHERE library_id = ?")
-            .bind(library_id)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(|e| ApiError::Internal(e.into()))?;
+    let item_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM items WHERE library_id = ?")
+        .bind(library_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
     let queued = item_ids.len();
     let pool = state.pool.clone();
     tokio::spawn(async move {
@@ -411,10 +415,9 @@ pub async fn generate_previews(
         .await?
         .ok_or(ApiError::NotFound)?;
     // Batch = 0 means "no per-call cap" inside the query.
-    let candidates =
-        queries::list_media_files_needing_previews(&state.pool, Some(library_id), 0)
-            .await
-            .map_err(ApiError::Internal)?;
+    let candidates = queries::list_media_files_needing_previews(&state.pool, Some(library_id), 0)
+        .await
+        .map_err(ApiError::Internal)?;
     let queued = candidates.len();
     if queued == 0 {
         return Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued: 0 })));

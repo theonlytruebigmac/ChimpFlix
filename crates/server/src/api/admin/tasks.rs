@@ -2,8 +2,8 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use chimpflix_common::now_ms;
 use chimpflix_library::{
     NewAuditEntry, NewScheduledTask, ScheduledTask, ScheduledTaskUpdate, TaskRun, queries,
@@ -177,7 +177,7 @@ pub async fn list_runs(
 
 fn validate_kind(kind: &str) -> Result<(), ApiError> {
     let known: Vec<&str> = scheduler::registry().into_iter().map(|t| t.kind).collect();
-    if !known.iter().any(|k| *k == kind) {
+    if !known.contains(&kind) {
         return Err(ApiError::validation(format!(
             "unknown task kind `{kind}` — valid kinds: {}",
             known.join(", ")
@@ -219,19 +219,16 @@ fn validate_params(kind: &str, params_json: &str) -> Result<(), ApiError> {
         return Err(ApiError::validation("params_json must be a JSON object"));
     }
     // Kind-specific shape checks.
-    match kind {
-        "scan_library" => {
-            if !parsed.get("library_id").and_then(|v| v.as_i64()).is_some() {
-                return Err(ApiError::validation(format!(
-                    "{kind} requires params.library_id (integer)"
-                )));
-            }
-        }
-        // `detect_markers` accepts an OPTIONAL library_id; omitted =
-        // run for every library. The scheduler dispatch iterates
-        // libraries when missing. The Plex-style simple-view toggle
-        // relies on this — the row it creates has empty params.
-        _ => {}
+    //
+    // `detect_markers` accepts an OPTIONAL library_id (omitted = run
+    // for every library, the scheduler dispatch iterates libraries
+    // when missing) — the Plex-style simple-view toggle relies on
+    // this since the row it creates has empty params. Only
+    // `scan_library` enforces the field.
+    if kind == "scan_library" && parsed.get("library_id").and_then(|v| v.as_i64()).is_none() {
+        return Err(ApiError::validation(format!(
+            "{kind} requires params.library_id (integer)"
+        )));
     }
     Ok(())
 }

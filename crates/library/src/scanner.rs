@@ -404,18 +404,15 @@ async fn process_file(
     // an obvious cause; the lossy display string here lets them see
     // *which* file got rejected (typically a Latin-1 filename that
     // the filesystem driver didn't normalize) so they can rename it.
-    let path_str = path
-        .to_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let lossy = path.to_string_lossy();
-            warn!(
-                path_lossy = %lossy,
-                root = %root.display(),
-                "scanner: skipping file with non-UTF8 path; rename via shell to recover"
-            );
-            anyhow::anyhow!("non-UTF8 path: {lossy}")
-        })?;
+    let path_str = path.to_str().map(|s| s.to_string()).ok_or_else(|| {
+        let lossy = path.to_string_lossy();
+        warn!(
+            path_lossy = %lossy,
+            root = %root.display(),
+            "scanner: skipping file with non-UTF8 path; rename via shell to recover"
+        );
+        anyhow::anyhow!("non-UTF8 path: {lossy}")
+    })?;
 
     let meta = tokio::fs::metadata(path)
         .await
@@ -640,13 +637,29 @@ async fn process_file(
     }
 
     if let Some(hint) = movie_hint {
-        let tmdb = if agents.is_enabled("tmdb") { tmdb } else { None };
-        let tvdb = if agents.is_enabled("tvdb") { tvdb } else { None };
+        let tmdb = if agents.is_enabled("tmdb") {
+            tmdb
+        } else {
+            None
+        };
+        let tvdb = if agents.is_enabled("tvdb") {
+            tvdb
+        } else {
+            None
+        };
         tmdb_apply_movie(pool, tmdb, tvdb, &hint).await;
     }
     if let Some(hint) = show_hint {
-        let tmdb = if agents.is_enabled("tmdb") { tmdb } else { None };
-        let tvdb = if agents.is_enabled("tvdb") { tvdb } else { None };
+        let tmdb = if agents.is_enabled("tmdb") {
+            tmdb
+        } else {
+            None
+        };
+        let tvdb = if agents.is_enabled("tvdb") {
+            tvdb
+        } else {
+            None
+        };
         let tvmaze = if agents.is_enabled("tvmaze") {
             tvmaze
         } else {
@@ -720,11 +733,7 @@ async fn tmdb_apply_movie(
     apply_tvdb_for_movie(pool, tvdb, hint).await;
 }
 
-async fn apply_tvdb_for_movie(
-    pool: &SqlitePool,
-    tvdb: Option<&TvdbClient>,
-    hint: &MovieHint,
-) {
+async fn apply_tvdb_for_movie(pool: &SqlitePool, tvdb: Option<&TvdbClient>, hint: &MovieHint) {
     let Some(client) = tvdb else { return };
     match client.lookup_movie(&hint.title, hint.year).await {
         Ok(Some(meta)) => {
@@ -773,13 +782,13 @@ async fn apply_collection_for_item(
     }
     match client.fetch_collection(stub.tmdb_id).await {
         Ok(full) => {
-            if let Err(e) =
-                queries::enrich_collection_overview(pool, collection_id, &full).await
-            {
+            if let Err(e) = queries::enrich_collection_overview(pool, collection_id, &full).await {
                 warn!(error = %format!("{e:#}"), "enrich collection failed");
             }
         }
-        Err(e) => warn!(error = %format!("{e:#}"), tmdb_id = stub.tmdb_id, "collection fetch failed"),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), tmdb_id = stub.tmdb_id, "collection fetch failed")
+        }
     }
 }
 
@@ -849,8 +858,14 @@ pub async fn refresh_item_metadata(
         }
     };
 
-    enrich_credits_and_extras(pool, client, item_id, tmdb_id, matches!(kind, ItemKind::Show))
-        .await;
+    enrich_credits_and_extras(
+        pool,
+        client,
+        item_id,
+        tmdb_id,
+        matches!(kind, ItemKind::Show),
+    )
+    .await;
 
     // Run TVMaze + TVDB after TMDB so they only fill the holes TMDB left.
     match kind {
@@ -1118,22 +1133,16 @@ async fn fetch_season_cached(
     Ok(guard.entry(key).or_insert(arc).clone())
 }
 
-async fn apply_tvmaze_for_show(
-    pool: &SqlitePool,
-    tvmaze: Option<&TvMazeClient>,
-    hint: &ShowHint,
-) {
+async fn apply_tvmaze_for_show(pool: &SqlitePool, tvmaze: Option<&TvMazeClient>, hint: &ShowHint) {
     let Some(client) = tvmaze else { return };
     // Only call TVMaze when there's still something for it to contribute:
     // skip when summary AND year AND imdb_id are all already set.
-    let row = sqlx::query(
-        "SELECT title, summary, year, imdb_id, tvdb_id FROM items WHERE id = ?",
-    )
-    .bind(hint.show_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let row = sqlx::query("SELECT title, summary, year, imdb_id, tvdb_id FROM items WHERE id = ?")
+        .bind(hint.show_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
     let Some(row) = row else { return };
     let summary: Option<String> = sqlx::Row::try_get(&row, "summary").ok().flatten();
     let year: Option<i32> = sqlx::Row::try_get(&row, "year").ok().flatten();
@@ -1144,14 +1153,14 @@ async fn apply_tvmaze_for_show(
     }
     match client.lookup_show(&hint.show_title).await {
         Ok(Some(meta)) => {
-            if let Err(e) =
-                queries::apply_show_metadata_tvmaze(pool, hint.show_id, &meta).await
-            {
+            if let Err(e) = queries::apply_show_metadata_tvmaze(pool, hint.show_id, &meta).await {
                 warn!(error = %format!("{e:#}"), "apply TVMaze metadata");
             }
         }
         Ok(None) => debug!(title = %hint.show_title, "no TVMaze match"),
-        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVMaze lookup failed"),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVMaze lookup failed")
+        }
     }
 }
 
@@ -1177,22 +1186,18 @@ async fn apply_anilist_for_show(
     }
     match client.lookup_show(&hint.show_title, hint.show_year).await {
         Ok(Some(meta)) => {
-            if let Err(e) =
-                queries::apply_show_metadata_anilist(pool, hint.show_id, &meta).await
-            {
+            if let Err(e) = queries::apply_show_metadata_anilist(pool, hint.show_id, &meta).await {
                 warn!(error = %format!("{e:#}"), "apply AniList show metadata");
             }
         }
         Ok(None) => debug!(title = %hint.show_title, "no AniList match"),
-        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.show_title, "AniList lookup failed"),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), title = %hint.show_title, "AniList lookup failed")
+        }
     }
 }
 
-async fn apply_tvdb_for_show(
-    pool: &SqlitePool,
-    tvdb: Option<&TvdbClient>,
-    hint: &ShowHint,
-) {
+async fn apply_tvdb_for_show(pool: &SqlitePool, tvdb: Option<&TvdbClient>, hint: &ShowHint) {
     let Some(client) = tvdb else { return };
     // Skip the API call when nothing TVDB can contribute remains. Same
     // null-check shape as TVMaze; original_title is the one TVDB-only
@@ -1210,8 +1215,7 @@ async fn apply_tvdb_for_show(
     let year: Option<i32> = sqlx::Row::try_get(&row, "year").ok().flatten();
     let imdb_id: Option<String> = sqlx::Row::try_get(&row, "imdb_id").ok().flatten();
     let tvdb_id: Option<i64> = sqlx::Row::try_get(&row, "tvdb_id").ok().flatten();
-    let original_title: Option<String> =
-        sqlx::Row::try_get(&row, "original_title").ok().flatten();
+    let original_title: Option<String> = sqlx::Row::try_get(&row, "original_title").ok().flatten();
     if summary.is_some()
         && year.is_some()
         && imdb_id.is_some()
@@ -1222,13 +1226,13 @@ async fn apply_tvdb_for_show(
     }
     match client.lookup_show(&hint.show_title, hint.show_year).await {
         Ok(Some(meta)) => {
-            if let Err(e) =
-                queries::apply_show_metadata_tvdb(pool, hint.show_id, &meta).await
-            {
+            if let Err(e) = queries::apply_show_metadata_tvdb(pool, hint.show_id, &meta).await {
                 warn!(error = %format!("{e:#}"), "apply TVDB show metadata");
             }
         }
         Ok(None) => debug!(title = %hint.show_title, "no TVDB show match"),
-        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVDB show lookup failed"),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVDB show lookup failed")
+        }
     }
 }

@@ -7,15 +7,15 @@
 //! Total duration is read separately via `ffprobe` — much cheaper than
 //! decoding the whole file just to learn how long it is.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 
-use crate::audio::AudioRegion;
 use crate::Config;
+use crate::audio::AudioRegion;
 
 /// Cache the result of "is ffmpeg on PATH?" — checked once per process.
 static FFMPEG_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -95,7 +95,9 @@ pub fn decode_region(
     });
 
     let mut bytes = Vec::with_capacity(1 << 20);
-    stdout.read_to_end(&mut bytes).context("reading ffmpeg stdout")?;
+    stdout
+        .read_to_end(&mut bytes)
+        .context("reading ffmpeg stdout")?;
     let status = child.wait().context("waiting on ffmpeg")?;
     let stderr_buf = stderr_handle.join().unwrap_or_default();
 
@@ -147,7 +149,7 @@ pub fn probe_duration(path: &Path) -> Result<f64> {
     let trimmed = s.trim();
     let duration: f64 = trimmed
         .parse()
-        .with_context(|| format!("parsing ffprobe duration {:?}", trimmed))?;
+        .with_context(|| format!("parsing ffprobe duration {trimmed:?}"))?;
     Ok(duration)
 }
 

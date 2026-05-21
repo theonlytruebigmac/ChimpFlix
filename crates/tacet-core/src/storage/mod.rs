@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::fingerprint::Fingerprint;
 use crate::matching::ReferenceFingerprint;
@@ -35,8 +35,8 @@ impl Store {
         fs::create_dir_all(&fp_dir)?;
 
         let db_path = data_dir.join("tacet.db");
-        let conn = Connection::open(&db_path)
-            .with_context(|| format!("opening {}", db_path.display()))?;
+        let conn =
+            Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
         conn.execute_batch(
             r#"
@@ -252,7 +252,7 @@ impl Store {
     fn season_dir(&self, series_id: &str, season: u32) -> PathBuf {
         self.fp_dir
             .join(sanitize(series_id))
-            .join(format!("s{:02}", season))
+            .join(format!("s{season:02}"))
     }
 
     fn episode_fp_path(
@@ -262,8 +262,11 @@ impl Store {
         episode_index: u32,
         kind: FingerprintKind,
     ) -> PathBuf {
-        self.season_dir(series_id, season)
-            .join(format!("e{:02}.{}.bin", episode_index, kind.suffix()))
+        self.season_dir(series_id, season).join(format!(
+            "e{:02}.{}.bin",
+            episode_index,
+            kind.suffix()
+        ))
     }
 
     fn reference_path(
@@ -273,8 +276,11 @@ impl Store {
         kind: FingerprintKind,
         cluster_idx: usize,
     ) -> PathBuf {
-        self.season_dir(series_id, season)
-            .join(format!("{}.ref.{}.bin", kind.suffix(), cluster_idx))
+        self.season_dir(series_id, season).join(format!(
+            "{}.ref.{}.bin",
+            kind.suffix(),
+            cluster_idx
+        ))
     }
 }
 
@@ -316,8 +322,7 @@ fn write_bincode<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let bytes = bincode::serialize(value)?;
-    fs::write(path, bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

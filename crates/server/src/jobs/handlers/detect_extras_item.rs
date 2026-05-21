@@ -45,32 +45,31 @@ const EXTRA_EXTENSIONS: &[&str] = &[
 /// `item_extras.kind` column set already used by the TMDB-fetched
 /// (YouTube) extras path so the UI sees a single list per item.
 const EXTRA_DIRS: &[(&str, &str)] = &[
-    ("extras",            "clip"),
-    ("featurettes",       "featurette"),
+    ("extras", "clip"),
+    ("featurettes", "featurette"),
     ("behind the scenes", "behind_the_scenes"),
-    ("deleted scenes",    "deleted_scene"),
-    ("interviews",        "clip"),
-    ("scenes",            "clip"),
-    ("shorts",            "clip"),
-    ("trailers",          "trailer"),
+    ("deleted scenes", "deleted_scene"),
+    ("interviews", "clip"),
+    ("scenes", "clip"),
+    ("shorts", "clip"),
+    ("trailers", "trailer"),
 ];
 
 /// Filename suffixes (before the extension) → kind. Matches patterns
 /// like `Movie Title-trailer.mp4`.
 const EXTRA_SUFFIXES: &[(&str, &str)] = &[
-    ("-trailer",         "trailer"),
-    ("-teaser",          "teaser"),
+    ("-trailer", "trailer"),
+    ("-teaser", "teaser"),
     ("-behindthescenes", "behind_the_scenes"),
-    ("-deleted",         "deleted_scene"),
-    ("-featurette",      "featurette"),
-    ("-interview",       "clip"),
-    ("-scene",           "clip"),
-    ("-short",           "clip"),
+    ("-deleted", "deleted_scene"),
+    ("-featurette", "featurette"),
+    ("-interview", "clip"),
+    ("-scene", "clip"),
+    ("-short", "clip"),
 ];
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { item_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { item_id } = serde_json::from_value(payload).context("invalid payload")?;
 
     let Some(item_dir) = resolve_item_directory(&state, item_id).await? else {
         // Item has no media files we can locate — nothing to scan.
@@ -83,8 +82,11 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         .fetch_optional(&state.pool)
         .await
         .context("items extras_dir_mtime lookup")?;
-    let last_mtime: Option<i64> = row
-        .and_then(|r| r.try_get::<Option<i64>, _>("extras_dir_mtime").ok().flatten());
+    let last_mtime: Option<i64> = row.and_then(|r| {
+        r.try_get::<Option<i64>, _>("extras_dir_mtime")
+            .ok()
+            .flatten()
+    });
 
     if let (Some(cur), Some(prev)) = (current_mtime, last_mtime) {
         if cur <= prev {
@@ -222,18 +224,12 @@ fn walk_sync(item_dir: &Path) -> Result<Vec<DiscoveredExtra>> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if let Some((_, kind)) =
-                EXTRA_DIRS.iter().find(|(dirname, _)| *dirname == name_lc)
-            {
+            if let Some((_, kind)) = EXTRA_DIRS.iter().find(|(dirname, _)| *dirname == name_lc) {
                 collect_dir_videos(&path, kind, &mut out)?;
             }
         } else if file_type.is_file() {
             if let Some((kind, title)) = classify_file_suffix(&path) {
-                out.push(DiscoveredExtra {
-                    kind,
-                    path,
-                    title,
-                });
+                out.push(DiscoveredExtra { kind, path, title });
             }
         }
     }
@@ -259,11 +255,7 @@ fn collect_dir_videos(
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        out.push(DiscoveredExtra {
-            kind,
-            path,
-            title,
-        });
+        out.push(DiscoveredExtra { kind, path, title });
     }
     Ok(())
 }
@@ -294,11 +286,7 @@ fn classify_file_suffix(path: &Path) -> Option<(&'static str, String)> {
     None
 }
 
-async fn upsert_extras(
-    state: &AppState,
-    item_id: i64,
-    extras: &[DiscoveredExtra],
-) -> Result<()> {
+async fn upsert_extras(state: &AppState, item_id: i64, extras: &[DiscoveredExtra]) -> Result<()> {
     // The `item_extras` table is shared with the TMDB-fetched
     // (YouTube) path. Local discoveries write rows with
     // `source = 'local'` and `source_id = <absolute path>`; uniquely
@@ -328,10 +316,7 @@ async fn upsert_extras(
 
 /// Enqueue one `detect_extras_item` job per item id. Deduped on
 /// item_id so a re-trigger while jobs are in flight is safe.
-pub async fn enqueue_for_items(
-    pool: &sqlx::SqlitePool,
-    item_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_items(pool: &sqlx::SqlitePool, item_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &item_id in item_ids {
         let payload = serde_json::json!({ "item_id": item_id });

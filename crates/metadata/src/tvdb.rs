@@ -77,7 +77,10 @@ impl TvdbClient {
             return Ok(None);
         };
         let id: i64 = hit.tvdb_id.parse().with_context(|| {
-            format!("TVDB search returned non-numeric series id {:?}", hit.tvdb_id)
+            format!(
+                "TVDB search returned non-numeric series id {:?}",
+                hit.tvdb_id
+            )
         })?;
         self.fetch_show(id).await.map(Some)
     }
@@ -92,31 +95,27 @@ impl TvdbClient {
             return Ok(None);
         };
         let id: i64 = hit.tvdb_id.parse().with_context(|| {
-            format!("TVDB search returned non-numeric movie id {:?}", hit.tvdb_id)
+            format!(
+                "TVDB search returned non-numeric movie id {:?}",
+                hit.tvdb_id
+            )
         })?;
         self.fetch_movie(id).await.map(Some)
     }
 
     pub async fn fetch_show(&self, tvdb_id: i64) -> Result<TvdbShow> {
-        let raw: Envelope<RawSeriesExtended> = self
-            .get(&format!("/series/{tvdb_id}/extended"))
-            .await?;
+        let raw: Envelope<RawSeriesExtended> =
+            self.get(&format!("/series/{tvdb_id}/extended")).await?;
         Ok(TvdbShow::from_raw(raw.data))
     }
 
     pub async fn fetch_movie(&self, tvdb_id: i64) -> Result<TvdbMovie> {
-        let raw: Envelope<RawMovieExtended> = self
-            .get(&format!("/movies/{tvdb_id}/extended"))
-            .await?;
+        let raw: Envelope<RawMovieExtended> =
+            self.get(&format!("/movies/{tvdb_id}/extended")).await?;
         Ok(TvdbMovie::from_raw(raw.data))
     }
 
-    async fn search(
-        &self,
-        query: &str,
-        kind: &str,
-        year: Option<i32>,
-    ) -> Result<Vec<SearchHit>> {
+    async fn search(&self, query: &str, kind: &str, year: Option<i32>) -> Result<Vec<SearchHit>> {
         let mut params: Vec<(&str, String)> = vec![
             ("query", query.to_string()),
             ("type", kind.to_string()),
@@ -150,10 +149,7 @@ impl TvdbClient {
             if !params.is_empty() {
                 req = req.query(params);
             }
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("GET {url}"))?;
+            let resp = req.send().await.with_context(|| format!("GET {url}"))?;
             let status = resp.status();
             if status.as_u16() == 401 && attempt == 0 {
                 // Stale or rejected token. Drop it and retry once.
@@ -199,7 +195,10 @@ impl TvdbClient {
     async fn login(&self) -> Result<String> {
         let url = format!("{}/login", self.base_url);
         let mut body = serde_json::Map::new();
-        body.insert("apikey".into(), serde_json::Value::String(self.apikey.clone()));
+        body.insert(
+            "apikey".into(),
+            serde_json::Value::String(self.apikey.clone()),
+        );
         if let Some(pin) = &self.pin {
             body.insert("pin".into(), serde_json::Value::String(pin.clone()));
         }
@@ -218,10 +217,7 @@ impl TvdbClient {
                 body.chars().take(200).collect::<String>()
             );
         }
-        let env: Envelope<LoginData> = resp
-            .json()
-            .await
-            .context("parse TVDB login response")?;
+        let env: Envelope<LoginData> = resp.json().await.context("parse TVDB login response")?;
         Ok(env.data.token)
     }
 }
@@ -420,7 +416,9 @@ fn pick_original_alias(aliases: &[RawAlias], title: &str) -> Option<String> {
         .iter()
         .find(|a| {
             a.language.as_deref().is_some_and(|l| l != "eng")
-                && a.name.as_deref().is_some_and(|n| n != title && !n.is_empty())
+                && a.name
+                    .as_deref()
+                    .is_some_and(|n| n != title && !n.is_empty())
         })
         .and_then(|a| a.name.clone())
 }

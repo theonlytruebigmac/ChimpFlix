@@ -47,7 +47,10 @@ pub fn parse_cron(expr: &str) -> Result<Schedule> {
 
 pub fn next_after(expr: &str, after_ms: i64) -> Result<i64> {
     let schedule = parse_cron(expr)?;
-    let after = Utc.timestamp_millis_opt(after_ms).single().unwrap_or_else(Utc::now);
+    let after = Utc
+        .timestamp_millis_opt(after_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
     let next = schedule
         .after(&after)
         .next()
@@ -127,10 +130,7 @@ pub fn snap_to_maintenance_window(t_ms: i64, win_start: &str, win_end: &str) -> 
     let end_today_or_tomorrow = if wraps {
         // End time is tomorrow morning.
         let tomorrow = today.succ_opt().unwrap_or(today);
-        match Local
-            .from_local_datetime(&tomorrow.and_time(end))
-            .single()
-        {
+        match Local.from_local_datetime(&tomorrow.and_time(end)).single() {
             Some(d) => d,
             None => return t_ms,
         }
@@ -149,7 +149,9 @@ pub fn snap_to_maintenance_window(t_ms: i64, win_start: &str, win_end: &str) -> 
     // 03:00 — that's inside the window that opened the previous day).
     if wraps {
         if let Some(yesterday) = today.pred_opt() {
-            let start_y = Local.from_local_datetime(&yesterday.and_time(start)).single();
+            let start_y = Local
+                .from_local_datetime(&yesterday.and_time(start))
+                .single();
             let end_y = Local.from_local_datetime(&today.and_time(end)).single();
             if let (Some(s), Some(e)) = (start_y, end_y) {
                 if t >= s && t < e {
@@ -449,7 +451,11 @@ async fn execute(state: AppState, task: ScheduledTask) {
         Ok(()) => ("success", None),
         Err(e) => ("failed", Some(format!("{e:#}"))),
     };
-    let log = log_buf.lock().ok().map(|s| s.clone()).filter(|s| !s.is_empty());
+    let log = log_buf
+        .lock()
+        .ok()
+        .map(|s| s.clone())
+        .filter(|s| !s.is_empty());
 
     let next = match compute_next_run_with_settings(
         &state,
@@ -545,7 +551,10 @@ async fn dispatch(
     if matches!(gate, crate::tasks::GateState::DisabledByAdmin) {
         append_log(
             log,
-            format!("skipped: kind `{}` is gated off in server settings", task.kind),
+            format!(
+                "skipped: kind `{}` is gated off in server settings",
+                task.kind
+            ),
         );
         return Ok(());
     }
@@ -573,12 +582,9 @@ async fn dispatch(
                 .unwrap_or(30)
                 .clamp(1, 3650);
             let day_ms: i64 = 24 * 60 * 60 * 1000;
-            let (succ_removed, dead_removed) = queries::cleanup_old_jobs(
-                &state.pool,
-                succ_days * day_ms,
-                dead_days * day_ms,
-            )
-            .await?;
+            let (succ_removed, dead_removed) =
+                queries::cleanup_old_jobs(&state.pool, succ_days * day_ms, dead_days * day_ms)
+                    .await?;
             append_log(
                 log,
                 format!(
@@ -593,8 +599,8 @@ async fn dispatch(
             // (default 90). The audit log is append-only and grows
             // unbounded otherwise; 90 days is enough to investigate
             // most incidents while keeping the table size sane.
-            let params: serde_json::Value = serde_json::from_str(&task.params_json)
-                .unwrap_or_else(|_| serde_json::json!({}));
+            let params: serde_json::Value =
+                serde_json::from_str(&task.params_json).unwrap_or_else(|_| serde_json::json!({}));
             let retention_days = params
                 .get("retention_days")
                 .and_then(|v| v.as_i64())
@@ -604,8 +610,7 @@ async fn dispatch(
             let removed = queries::cleanup_old_audit_log(&state.pool, cutoff).await?;
             let pwreset_removed =
                 queries::cleanup_expired_password_reset_tokens(&state.pool).await?;
-            let echange_removed =
-                queries::cleanup_expired_email_change_tokens(&state.pool).await?;
+            let echange_removed = queries::cleanup_expired_email_change_tokens(&state.pool).await?;
             append_log(
                 log,
                 format!(
@@ -640,8 +645,8 @@ async fn dispatch(
             Ok(())
         }
         "scan_library" => {
-            let params: serde_json::Value = serde_json::from_str(&task.params_json)
-                .context("parse params_json")?;
+            let params: serde_json::Value =
+                serde_json::from_str(&task.params_json).context("parse params_json")?;
             let library_id = params
                 .get("library_id")
                 .and_then(|v| v.as_i64())
@@ -658,9 +663,7 @@ async fn dispatch(
             if !state.try_acquire_library_scan(library_id).await {
                 append_log(
                     log,
-                    format!(
-                        "skipped: a scan for library {library_id} is already in progress"
-                    ),
+                    format!("skipped: a scan for library {library_id} is already in progress"),
                 );
                 return Ok(());
             }
@@ -701,17 +704,24 @@ async fn dispatch(
                         });
                     }
                 }
-                let _guard = ScanLockGuard { state: release_state, library_id };
-                let inner_emitter: chimpflix_library::ScanEmitter =
-                    Arc::new(move |evt| {
-                        hub.publish(crate::events::Event::Scan(evt));
-                    });
-                let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(
-                    pipeline_state,
-                    inner_emitter,
-                );
+                let _guard = ScanLockGuard {
+                    state: release_state,
+                    library_id,
+                };
+                let inner_emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
+                    hub.publish(crate::events::Event::Scan(evt));
+                });
+                let emitter =
+                    crate::jobs::pipeline::wrap_emitter_for_pipeline(pipeline_state, inner_emitter);
                 if let Err(e) = scanner::run_scan(
-                    pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, library_id, job_id,
+                    pool,
+                    ffmpeg,
+                    tmdb,
+                    tvdb,
+                    anilist,
+                    tvmaze,
+                    library_id,
+                    job_id,
                     Some(cache_root),
                     emitter,
                 )
@@ -1056,8 +1066,7 @@ pub fn registry() -> Vec<TaskKindInfo> {
                           analysis. Idempotent — files with existing \
                           auto markers are skipped. Heavy: capped per \
                           tick via params.batch_size (default 32).",
-            params_schema:
-                r#"{"library_id": "number (required)", "batch_size": "number (optional; default 32)"}"#,
+            params_schema: r#"{"library_id": "number (required)", "batch_size": "number (optional; default 32)"}"#,
             default_frequency: "weekly",
             default_requires_maintenance_window: true,
         },
@@ -1066,8 +1075,7 @@ pub fn registry() -> Vec<TaskKindInfo> {
             display_name: "Fetch external subtitles",
             description: "Pull subtitles from OpenSubtitles for items \
                           missing them, in the configured languages.",
-            params_schema:
-                r#"{"library_id": "number (optional)", "languages": "string[] (optional; default ['en'])"}"#,
+            params_schema: r#"{"library_id": "number (optional)", "languages": "string[] (optional; default ['en'])"}"#,
             default_frequency: "weekly",
             default_requires_maintenance_window: true,
         },
@@ -1077,8 +1085,7 @@ pub fn registry() -> Vec<TaskKindInfo> {
             description: "Build per-file thumbnail sprites the player uses \
                           for hover/scrub previews. Idempotent — files with \
                           a sprite already are skipped.",
-            params_schema:
-                r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 4)", "interval_s": "number (optional; default 10)"}"#,
+            params_schema: r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 4)", "interval_s": "number (optional; default 10)"}"#,
             default_frequency: "daily",
             default_requires_maintenance_window: true,
         },
@@ -1090,8 +1097,7 @@ pub fn registry() -> Vec<TaskKindInfo> {
                           Files without chapter metadata are marked \
                           processed on first pass so they don't get \
                           re-probed.",
-            params_schema:
-                r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 8)"}"#,
+            params_schema: r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 8)"}"#,
             default_frequency: "weekly",
             default_requires_maintenance_window: true,
         },
@@ -1117,8 +1123,7 @@ pub fn registry() -> Vec<TaskKindInfo> {
                           uses these for precise per-file normalization \
                           when audio_normalize is enabled. Slow — ~2 min \
                           per 45-min episode.",
-            params_schema:
-                r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 4)"}"#,
+            params_schema: r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 4)"}"#,
             default_frequency: "weekly",
             default_requires_maintenance_window: true,
         },
@@ -1221,8 +1226,7 @@ async fn generate_previews_task(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
     let per_library_cap = params
         .get("batch_size")
@@ -1230,22 +1234,17 @@ async fn generate_previews_task(
         .unwrap_or(500)
         .max(1);
 
-    let candidates = queries::list_media_files_needing_previews(
-        &state.pool,
-        library_id,
-        per_library_cap,
-    )
-    .await?;
+    let candidates =
+        queries::list_media_files_needing_previews(&state.pool, library_id, per_library_cap)
+            .await?;
     if candidates.is_empty() {
         append_log(log, "no files need previews — queue is the active path");
         return Ok(());
     }
     let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
-    let enqueued = crate::jobs::handlers::generate_preview_sprite::enqueue_for_files(
-        &state.pool,
-        &file_ids,
-    )
-    .await?;
+    let enqueued =
+        crate::jobs::handlers::generate_preview_sprite::enqueue_for_files(&state.pool, &file_ids)
+            .await?;
     append_log(
         log,
         format!("enqueued {enqueued} generate_preview_sprite jobs"),
@@ -1261,8 +1260,7 @@ async fn generate_chapter_thumbs_task(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
     let per_library_cap = params
         .get("batch_size")
@@ -1270,22 +1268,20 @@ async fn generate_chapter_thumbs_task(
         .unwrap_or(500)
         .max(1);
 
-    let candidates = queries::list_media_files_needing_chapter_thumbs(
-        &state.pool,
-        library_id,
-        per_library_cap,
-    )
-    .await?;
+    let candidates =
+        queries::list_media_files_needing_chapter_thumbs(&state.pool, library_id, per_library_cap)
+            .await?;
     if candidates.is_empty() {
-        append_log(log, "no files need chapter thumbs — queue is the active path");
+        append_log(
+            log,
+            "no files need chapter thumbs — queue is the active path",
+        );
         return Ok(());
     }
     let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
-    let enqueued = crate::jobs::handlers::build_chapter_thumbs::enqueue_for_files(
-        &state.pool,
-        &file_ids,
-    )
-    .await?;
+    let enqueued =
+        crate::jobs::handlers::build_chapter_thumbs::enqueue_for_files(&state.pool, &file_ids)
+            .await?;
     append_log(
         log,
         format!("enqueued {enqueued} build_chapter_thumbs jobs"),
@@ -1301,8 +1297,7 @@ async fn analyze_loudness_task(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
     let per_library_cap = params
         .get("batch_size")
@@ -1310,32 +1305,23 @@ async fn analyze_loudness_task(
         .unwrap_or(500)
         .max(1);
 
-    let candidates = queries::list_media_files_needing_loudness(
-        &state.pool,
-        library_id,
-        per_library_cap,
-    )
-    .await?;
+    let candidates =
+        queries::list_media_files_needing_loudness(&state.pool, library_id, per_library_cap)
+            .await?;
     if candidates.is_empty() {
         append_log(log, "no files need loudness — queue is the active path");
         return Ok(());
     }
     let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
-    let enqueued = crate::jobs::handlers::analyze_loudness::enqueue_for_files(
-        &state.pool,
-        &file_ids,
-    )
-    .await?;
+    let enqueued =
+        crate::jobs::handlers::analyze_loudness::enqueue_for_files(&state.pool, &file_ids).await?;
     append_log(log, format!("enqueued {enqueued} analyze_loudness jobs"));
     Ok(())
 }
 
-async fn verify_backups_task(
-    state: &AppState,
-    log: &Arc<std::sync::Mutex<String>>,
-) -> Result<()> {
-    use sqlx::sqlite::SqlitePoolOptions;
+async fn verify_backups_task(state: &AppState, log: &Arc<std::sync::Mutex<String>>) -> Result<()> {
     use sqlx::ConnectOptions;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::str::FromStr;
 
     let dir = state
@@ -1409,8 +1395,9 @@ async fn verify_backups_task(
                 continue;
             }
         };
-        let integrity: Result<String, _> =
-            sqlx::query_scalar("PRAGMA integrity_check").fetch_one(&pool).await;
+        let integrity: Result<String, _> = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await;
         match integrity {
             Ok(s) if s == "ok" => ok += 1,
             Ok(s) => bad.push(format!("{name}: integrity_check returned `{s}`")),
@@ -1425,13 +1412,14 @@ async fn verify_backups_task(
         for b in &bad {
             append_log(log, b);
         }
-        append_log(
-            log,
-            format!("{ok} ok, {} corrupted/unreadable", bad.len()),
-        );
+        append_log(log, format!("{ok} ok, {} corrupted/unreadable", bad.len()));
         // Surface as a task error so the operator's alerts panel
         // flags it — silent log entries would be too easy to miss.
-        anyhow::bail!("{} of {} backups failed verification", bad.len(), ok + bad.len());
+        anyhow::bail!(
+            "{} of {} backups failed verification",
+            bad.len(),
+            ok + bad.len()
+        );
     }
     Ok(())
 }
@@ -1565,8 +1553,7 @@ async fn purge_removed_files_task(
     task: &chimpflix_library::ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let grace_days = params
         .get("grace_days")
         .and_then(|v| v.as_i64())
@@ -1607,7 +1594,7 @@ async fn purge_removed_files_task(
             ),
         );
     } else {
-        append_log(log, format!("grace={}d nothing to purge", grace_days));
+        append_log(log, format!("grace={grace_days}d nothing to purge"));
     }
     Ok(())
 }
@@ -1640,12 +1627,9 @@ async fn rollup_task_metrics_task(
     let yesterday_midnight = today_midnight - day_ms;
     let day_key = yesterday_midnight; // store epoch-ms of the day's UTC start
 
-    let rows = queries::list_finished_jobs_in_window(
-        &state.pool,
-        yesterday_midnight,
-        today_midnight,
-    )
-    .await?;
+    let rows =
+        queries::list_finished_jobs_in_window(&state.pool, yesterday_midnight, today_midnight)
+            .await?;
 
     // Bucket per kind, accumulating durations + status counts.
     struct Bucket {
@@ -1695,8 +1679,7 @@ async fn rollup_task_metrics_task(
     append_log(
         log,
         format!(
-            "rolled up {wrote} kinds for {} (window {} → {})",
-            yesterday_midnight, yesterday_midnight, today_midnight,
+            "rolled up {wrote} kinds for {yesterday_midnight} (window {yesterday_midnight} → {today_midnight})"
         ),
     );
     Ok(())
@@ -1722,8 +1705,7 @@ async fn refresh_ratings_task(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
@@ -1746,11 +1728,9 @@ async fn refresh_ratings_task(
         .filter_map(|r| r.try_get::<i64, _>("id").ok())
         .collect();
 
-    let queued = crate::jobs::handlers::fetch_external_ratings::enqueue_for_items(
-        &state.pool,
-        &item_ids,
-    )
-    .await?;
+    let queued =
+        crate::jobs::handlers::fetch_external_ratings::enqueue_for_items(&state.pool, &item_ids)
+            .await?;
     append_log(
         log,
         format!(
@@ -1768,8 +1748,7 @@ async fn extract_subs_sweep_task(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
@@ -1789,11 +1768,9 @@ async fn extract_subs_sweep_task(
         .filter_map(|r| r.try_get::<i64, _>("id").ok())
         .collect();
 
-    let queued = crate::jobs::handlers::extract_embedded_subs::enqueue_for_files(
-        &state.pool,
-        &file_ids,
-    )
-    .await?;
+    let queued =
+        crate::jobs::handlers::extract_embedded_subs::enqueue_for_files(&state.pool, &file_ids)
+            .await?;
     append_log(
         log,
         format!(
@@ -1812,8 +1789,7 @@ async fn scan_extras_task(
     task: &ScheduledTask,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
@@ -1838,11 +1814,9 @@ async fn scan_extras_task(
         .filter_map(|r| r.try_get::<i64, _>("id").ok())
         .collect();
 
-    let queued = crate::jobs::handlers::detect_extras_item::enqueue_for_items(
-        &state.pool,
-        &item_ids,
-    )
-    .await?;
+    let queued =
+        crate::jobs::handlers::detect_extras_item::enqueue_for_items(&state.pool, &item_ids)
+            .await?;
     append_log(
         log,
         format!(
@@ -1872,8 +1846,7 @@ async fn refresh_logos_task(
         append_log(log, "TMDB disabled — skipping logo refresh");
         return Ok(());
     }
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let batch = params
         .get("batch_size")
         .and_then(|v| v.as_i64())
@@ -1897,11 +1870,9 @@ async fn refresh_logos_task(
         .filter_map(|r| r.try_get::<i64, _>("id").ok())
         .collect();
 
-    let queued = crate::jobs::handlers::refresh_logos_item::enqueue_for_items(
-        &state.pool,
-        &item_ids,
-    )
-    .await?;
+    let queued =
+        crate::jobs::handlers::refresh_logos_item::enqueue_for_items(&state.pool, &item_ids)
+            .await?;
     append_log(
         log,
         format!(
@@ -1915,10 +1886,7 @@ async fn refresh_logos_task(
 /// Pull Trakt history + playback for every linked user. Per-user
 /// failures log and the task itself still succeeds — one bad token
 /// shouldn't poison the run.
-async fn trakt_pull_task(
-    state: &AppState,
-    log: &Arc<std::sync::Mutex<String>>,
-) -> Result<()> {
+async fn trakt_pull_task(state: &AppState, log: &Arc<std::sync::Mutex<String>>) -> Result<()> {
     if state.trakt_snapshot().await.is_none() {
         append_log(log, "Trakt disabled — skipping pull");
         return Ok(());
@@ -1967,11 +1935,13 @@ async fn fetch_subtitles_task(
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
     if state.opensubtitles_snapshot().await.is_none() {
-        append_log(log, "OpenSubtitles disabled — set credentials in /admin/server/credentials");
+        append_log(
+            log,
+            "OpenSubtitles disabled — set credentials in /admin/server/credentials",
+        );
         return Ok(());
     };
-    let params: serde_json::Value =
-        serde_json::from_str(&task.params_json).unwrap_or_default();
+    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
     let library_id = params.get("library_id").and_then(|v| v.as_i64());
     let languages: Vec<String> = params
         .get("languages")
@@ -2094,8 +2064,7 @@ mod tests {
     #[test]
     fn compute_next_run_manual_never_fires() {
         let now = local_ms(2026, 5, 18, 12, 0);
-        let next =
-            compute_next_run("manual", "0 0 * * * *", now, false, "02:00", "09:00").unwrap();
+        let next = compute_next_run("manual", "0 0 * * * *", now, false, "02:00", "09:00").unwrap();
         assert_eq!(next, NEVER_RUN_AT_MS);
     }
 
@@ -2109,8 +2078,7 @@ mod tests {
     #[test]
     fn compute_next_run_hourly_no_window_is_plus_one_hour() {
         let now = local_ms(2026, 5, 18, 12, 0);
-        let next =
-            compute_next_run("hourly", "0 0 * * * *", now, false, "02:00", "09:00").unwrap();
+        let next = compute_next_run("hourly", "0 0 * * * *", now, false, "02:00", "09:00").unwrap();
         assert_eq!(next, now + 3_600_000);
     }
 
@@ -2119,8 +2087,7 @@ mod tests {
         // now+24h = May 19 12:00 — past that day's window (closed at
         // 09:00) — should snap to May 20 02:00.
         let now = local_ms(2026, 5, 18, 12, 0);
-        let next =
-            compute_next_run("daily", "0 0 3 * * *", now, true, "02:00", "09:00").unwrap();
+        let next = compute_next_run("daily", "0 0 3 * * *", now, true, "02:00", "09:00").unwrap();
         let want = local_ms(2026, 5, 20, 2, 0);
         assert_eq!(next, want);
     }
@@ -2130,8 +2097,7 @@ mod tests {
         // 5-field cron normalized to 7-field: every minute. After
         // 12:00:00 the next firing is at most ~60s later.
         let now = local_ms(2026, 5, 18, 12, 0);
-        let next = compute_next_run("custom", "* * * * *", now, false, "02:00", "09:00")
-            .unwrap();
+        let next = compute_next_run("custom", "* * * * *", now, false, "02:00", "09:00").unwrap();
         assert!(next > now);
         assert!(next - now <= Duration::minutes(2).num_milliseconds());
     }
@@ -2146,4 +2112,3 @@ mod tests {
         assert_eq!(out, want);
     }
 }
-

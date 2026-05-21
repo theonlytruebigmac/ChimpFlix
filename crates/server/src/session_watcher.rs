@@ -26,8 +26,7 @@ pub fn spawn(hub: Hub, transcoder: TranscodeManager) {
         loop {
             sleep(POLL_INTERVAL).await;
             let snapshot = transcoder.list_sessions();
-            let current: BTreeSet<String> =
-                snapshot.iter().map(|s| s.id.clone()).collect();
+            let current: BTreeSet<String> = snapshot.iter().map(|s| s.id.clone()).collect();
             if current != last {
                 hub.publish(Event::Sessions(SessionsEvent::snapshot(snapshot)));
                 last = current;

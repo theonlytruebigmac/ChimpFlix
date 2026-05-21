@@ -49,12 +49,9 @@ pub async fn list(
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
-    let chapters = chimpflix_transcoder::probe_chapters(
-        &state.ffmpeg,
-        std::path::Path::new(&path),
-    )
-    .await
-    .unwrap_or_default();
+    let chapters = chimpflix_transcoder::probe_chapters(&state.ffmpeg, std::path::Path::new(&path))
+        .await
+        .unwrap_or_default();
     let status = queries::get_chapter_thumbs_status(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?;
@@ -90,8 +87,7 @@ pub async fn thumb(
 ) -> Result<Response, ApiError> {
     access::ensure_file_accessible(&state, &user, id).await?;
     let root = state.data_dir.join("chapter_thumbs");
-    let path =
-        chimpflix_transcoder::chapter_thumbs::thumb_path(&root, id, index);
+    let path = chimpflix_transcoder::chapter_thumbs::thumb_path(&root, id, index);
     if !path.exists() {
         return Err(ApiError::NotFound);
     }

@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chimpflix_library::queries::{
-    claim_next_job_excluding_kinds, mark_job_dead, mark_job_failed_with_class,
-    mark_job_succeeded, reclaim_orphan_jobs, touch_job_lease,
+    claim_next_job_excluding_kinds, mark_job_dead, mark_job_failed_with_class, mark_job_succeeded,
+    reclaim_orphan_jobs, touch_job_lease,
 };
 
 use self::error_class::{backoff_for_class, classify};
@@ -76,7 +76,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Single source of truth is now [`crate::tasks::registry`]; adding
 /// a new kind there picks up the cap here automatically. With 2
 /// workers + per-kind caps a typical backlog like 1000 marker jobs
-/// + 500 subtitle jobs ends up running 1 marker + 4 subtitles in
+/// and 500 subtitle jobs ends up running 1 marker + 4 subtitles in
 /// flight instead of dogpiling either kind.
 fn build_kind_semaphores(_default_limit: usize) -> HashMap<String, Arc<Semaphore>> {
     let mut map = HashMap::new();
@@ -115,6 +115,21 @@ impl KindLimiter {
             .filter(|(_, sem)| sem.available_permits() == 0)
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// Swap the semaphore for `kind` to one with `new_cap` permits.
+    /// Live jobs continue to hold permits on the *old* semaphore and
+    /// finish normally — when they drop their permit, the old Arc is
+    /// reclaimed. Newly arriving jobs acquire from the new semaphore.
+    ///
+    /// Transient overshoot: shrinking from N→M while N jobs are live
+    /// briefly leaves N old + 0 new in flight. Once those drain, the
+    /// new cap takes effect. No correctness issue — the cap is a
+    /// throttle, not a hard limit.
+    async fn resize(&self, kind: &str, new_cap: usize) {
+        let cap = new_cap.max(1);
+        let mut semaphores = self.semaphores.write().await;
+        semaphores.insert(kind.to_string(), Arc::new(Semaphore::new(cap)));
     }
 
     /// Acquire a permit for `kind`. Creates the semaphore on first
@@ -288,11 +303,19 @@ impl WorkerPoolHandle {
                 self.spawn_worker();
             }
         }
-        info!(
-            from = current,
-            to = clamped,
-            "job worker pool resized",
-        );
+        info!(from = current, to = clamped, "job worker pool resized",);
+    }
+
+    /// Apply per-kind concurrency overrides without restart. Called
+    /// from the admin settings PATCH path when `job_kind_concurrency`
+    /// changes. Each key/value pair swaps that kind's in-flight
+    /// semaphore for one with the new cap; unknown keys are ignored
+    /// (forward-compat for kinds added/removed across versions).
+    pub async fn apply_kind_concurrency(&self, overrides: &HashMap<String, usize>) {
+        for (kind, cap) in overrides {
+            self.limiter.resize(kind, *cap).await;
+            info!(kind = %kind, cap = *cap, "kind concurrency cap applied");
+        }
     }
 
     fn spawn_worker(&self) {
@@ -310,11 +333,7 @@ impl WorkerPoolHandle {
 /// Reclaim orphans, then spawn `n_workers` polling loops. Returns a
 /// [`WorkerPoolHandle`] that can resize the pool live without a
 /// process restart.
-pub async fn start(
-    state: AppState,
-    router: JobRouter,
-    n_workers: usize,
-) -> WorkerPoolHandle {
+pub async fn start(state: AppState, router: JobRouter, n_workers: usize) -> WorkerPoolHandle {
     // Boot-time reclaim: any row left in `status='running'` is by
     // definition orphaned — the worker that claimed it lived in a
     // previous process that no longer exists. Passing `lease_ttl=0`
@@ -385,16 +404,11 @@ async fn worker_loop(
                     // ever exist for this kind in this process, so
                     // burning attempts is pure churn. Go straight to
                     // terminal `dead`.
-                    let _ = mark_job_dead(
-                        &state.pool,
-                        job.id,
-                        "no handler registered for kind",
-                    )
-                    .await;
+                    let _ =
+                        mark_job_dead(&state.pool, job.id, "no handler registered for kind").await;
                     continue;
                 };
-                let payload: Value =
-                    serde_json::from_str(&job.payload).unwrap_or(Value::Null);
+                let payload: Value = serde_json::from_str(&job.payload).unwrap_or(Value::Null);
                 let kind = job.kind.clone();
 
                 // Hold a per-kind concurrency permit for the
@@ -432,9 +446,7 @@ async fn worker_loop(
                 let heartbeat = tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                        if let Err(e) =
-                            touch_job_lease(&heartbeat_state.pool, heartbeat_id).await
-                        {
+                        if let Err(e) = touch_job_lease(&heartbeat_state.pool, heartbeat_id).await {
                             warn!(
                                 job_id = heartbeat_id,
                                 error = %format!("{e:#}"),
@@ -460,9 +472,7 @@ async fn worker_loop(
                                 },
                             );
                         }
-                        if let Err(e) =
-                            mark_job_succeeded(&state.pool, job.id).await
-                        {
+                        if let Err(e) = mark_job_succeeded(&state.pool, job.id).await {
                             error!(
                                 worker = worker_id,
                                 job_id = job.id,
@@ -503,8 +513,7 @@ async fn worker_loop(
                         // non-terminal-but-uncovered case (defensive),
                         // and so the log line below shows a useful
                         // number.
-                        let backoff = class_backoff
-                            .unwrap_or_else(|| backoff_ms(job.attempts));
+                        let backoff = class_backoff.unwrap_or_else(|| backoff_ms(job.attempts));
                         warn!(
                             worker = worker_id,
                             job_id = job.id,

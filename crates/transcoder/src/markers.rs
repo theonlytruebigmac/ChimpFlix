@@ -156,8 +156,7 @@ async fn scan_blackdetect(
             // time before merging.
             let tail_offset_secs = ((dur - SCAN_WINDOW_MS) / 1000).max(0) as u64;
             let mut tail =
-                scan_blackdetect_range(cfg, path, tail_offset_secs, Some(SCAN_WINDOW_SECS))
-                    .await?;
+                scan_blackdetect_range(cfg, path, tail_offset_secs, Some(SCAN_WINDOW_SECS)).await?;
             let offset_ms = (tail_offset_secs as i64) * 1000;
             for r in tail.iter_mut() {
                 r.start_ms += offset_ms;
@@ -243,8 +242,8 @@ pub(crate) fn classify_chapters(
             continue;
         };
         let lower = title.to_ascii_lowercase();
-        let is_intro = (lower.contains("opening") || lower.contains("intro"))
-            && ch.start_ms <= intro_cutoff;
+        let is_intro =
+            (lower.contains("opening") || lower.contains("intro")) && ch.start_ms <= intro_cutoff;
         let is_credits = (lower.contains("end credits")
             || lower.contains("closing credit")
             || lower == "credits"

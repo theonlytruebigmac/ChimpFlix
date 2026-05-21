@@ -197,7 +197,11 @@ mod tests {
     #[test]
     fn job_kind_and_sweep_kind_resolve_to_same_metadata() {
         for k in all_kinds() {
-            assert!(find_kind(k.job_kind).is_some(), "job_kind miss: {}", k.job_kind);
+            assert!(
+                find_kind(k.job_kind).is_some(),
+                "job_kind miss: {}",
+                k.job_kind
+            );
             if let Some(sweep) = k.sweep_kind {
                 let by_sweep = find_kind(sweep).expect("sweep_kind miss");
                 assert_eq!(by_sweep.job_kind, k.job_kind, "lookup divergence");
@@ -209,7 +213,11 @@ mod tests {
     fn no_duplicate_job_kinds() {
         let mut seen = std::collections::HashSet::new();
         for k in all_kinds() {
-            assert!(seen.insert(k.job_kind), "duplicate job_kind: {}", k.job_kind);
+            assert!(
+                seen.insert(k.job_kind),
+                "duplicate job_kind: {}",
+                k.job_kind
+            );
         }
     }
 

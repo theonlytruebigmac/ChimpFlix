@@ -87,7 +87,12 @@ pub fn compile_to_sql(rule: &SmartRule) -> Result<CompiledRule> {
     let mut needs_genres_join = false;
 
     for cond in &rule.conditions {
-        let clause = compile_condition(cond, &mut bindings, &mut needs_tags_join, &mut needs_genres_join)?;
+        let clause = compile_condition(
+            cond,
+            &mut bindings,
+            &mut needs_tags_join,
+            &mut needs_genres_join,
+        )?;
         clauses.push(clause);
     }
     if needs_tags_join {
@@ -123,9 +128,7 @@ fn compile_condition(
             require_op(op, &["eq", "ne"])?;
             let v = expect_string(&cond.value)?;
             if !matches!(v.as_str(), "movie" | "show" | "episode") {
-                return Err(anyhow!(
-                    "kind must be one of movie / show / episode"
-                ));
+                return Err(anyhow!("kind must be one of movie / show / episode"));
             }
             bindings.push(Bind::Text(v));
             Ok(format!("i.kind {} ?", sql_op(op)))
@@ -163,8 +166,9 @@ fn compile_condition(
                 if list.is_empty() {
                     return Err(anyhow!("library_id `in` set must be non-empty"));
                 }
-                let placeholders =
-                    std::iter::repeat("?").take(list.len()).collect::<Vec<_>>().join(",");
+                let placeholders = std::iter::repeat_n("?", list.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 for n in list {
                     bindings.push(Bind::Int(n));
                 }
@@ -264,7 +268,9 @@ fn expect_real(v: &serde_json::Value) -> Result<f64> {
 }
 
 fn expect_range_int(v: &serde_json::Value) -> Result<(i64, i64)> {
-    let arr = v.as_array().ok_or_else(|| anyhow!("between expects [lo, hi]"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow!("between expects [lo, hi]"))?;
     if arr.len() != 2 {
         return Err(anyhow!("between value must be exactly two elements"));
     }
@@ -272,7 +278,9 @@ fn expect_range_int(v: &serde_json::Value) -> Result<(i64, i64)> {
 }
 
 fn expect_range_real(v: &serde_json::Value) -> Result<(f64, f64)> {
-    let arr = v.as_array().ok_or_else(|| anyhow!("between expects [lo, hi]"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow!("between expects [lo, hi]"))?;
     if arr.len() != 2 {
         return Err(anyhow!("between value must be exactly two elements"));
     }
@@ -289,7 +297,9 @@ fn expect_int_list(v: &serde_json::Value) -> Result<Vec<i64>> {
 /// Escape % and _ so a user-typed substring with wildcards in it
 /// (e.g. searching for a "50_") doesn't act as a wildcard.
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
@@ -387,9 +397,7 @@ mod tests {
             conds.push_str(r#"{"field":"kind","op":"eq","value":"movie"}"#);
         }
         conds.push(']');
-        let r = rule_from(&format!(
-            r#"{{"operator":"and","conditions":{conds}}}"#
-        ));
+        let r = rule_from(&format!(r#"{{"operator":"and","conditions":{conds}}}"#));
         assert!(compile_to_sql(&r).is_err());
     }
 

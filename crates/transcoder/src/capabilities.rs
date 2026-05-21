@@ -94,9 +94,11 @@ impl HwDecoderCapabilities {
 }
 
 pub async fn detect_capabilities(cfg: &FfmpegConfig) -> TranscoderCapabilities {
-    let mut caps = TranscoderCapabilities::default();
-    caps.ffmpeg_version = ffmpeg_version(cfg).await;
-    caps.hwaccels = ffmpeg_hwaccels(cfg).await;
+    let mut caps = TranscoderCapabilities {
+        ffmpeg_version: ffmpeg_version(cfg).await,
+        hwaccels: ffmpeg_hwaccels(cfg).await,
+        ..Default::default()
+    };
     let encoders = ffmpeg_encoders(cfg).await;
     let h264_candidates = [
         "h264_vaapi",
@@ -168,13 +170,12 @@ async fn enumerate_gpu_devices() -> Vec<GpuDevice> {
 /// or when it exits non-zero (no NVIDIA driver, no permissions, etc).
 async fn enumerate_nvidia() -> Vec<GpuDevice> {
     let output = tokio::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name",
-            "--format=csv,noheader,nounits",
-        ])
+        .args(["--query-gpu=index,name", "--format=csv,noheader,nounits"])
         .output()
         .await;
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     if !output.status.success() {
         return Vec::new();
     }
@@ -239,13 +240,7 @@ async fn enumerate_vaapi() -> Vec<GpuDevice> {
 /// Codec set we care about for HW decode. Order is most-common
 /// first so the typical "h264 source" probe completes before we
 /// move on to the less-common codecs.
-const DECODER_CODECS: &[&str] = &[
-    "h264",
-    "hevc",
-    "vp9",
-    "av1",
-    "mpeg2video",
-];
+const DECODER_CODECS: &[&str] = &["h264", "hevc", "vp9", "av1", "mpeg2video"];
 
 /// For each codec we care about, generate a 1-frame synthetic source
 /// in that codec via the corresponding libavcodec encoder, then try
@@ -276,9 +271,9 @@ async fn probe_decoders_for(cfg: &FfmpegConfig, hwaccel: &str) -> Vec<String> {
 /// codecs (h264/hevc/mpeg2) we mux to mpegts; for everything else
 /// we use mp4 / matroska as appropriate.
 ///
-/// The probe deliberately avoids producing real output — `-f null`
-/// + `-frames:v 1` keeps the test minimal. ~50ms per probe on a
-/// healthy box; up to SMOKE_TIMEOUT on a hung driver.
+/// The probe deliberately avoids producing real output: `-f null` and
+/// `-frames:v 1` keep the test minimal. ~50ms per probe on a healthy
+/// box; up to SMOKE_TIMEOUT on a hung driver.
 async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> bool {
     // Per-codec encoder + container shape for the test stream.
     // We render the test through software encoders only — the goal
@@ -323,8 +318,7 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
 
     // Try to decode it via the hwaccel.
     let mut dec_cmd = tokio::process::Command::new(&cfg.ffmpeg);
-    dec_cmd
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    dec_cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     if hwaccel == "vaapi" {
         dec_cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
     }
@@ -383,12 +377,7 @@ async fn smoke_test_encoder(cfg: &FfmpegConfig, encoder: &str) -> bool {
     if encoder.contains("_vaapi") {
         cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
     }
-    cmd.args([
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=320x240:d=0.1:r=1",
-    ]);
+    cmd.args(["-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.1:r=1"]);
     // VAAPI insists on NV12 frames uploaded to the GPU. Other
     // encoders are happy with plain yuv420p.
     let vf = if encoder.contains("_vaapi") {
@@ -397,15 +386,7 @@ async fn smoke_test_encoder(cfg: &FfmpegConfig, encoder: &str) -> bool {
         "format=yuv420p"
     };
     cmd.args(["-vf", vf]);
-    cmd.args([
-        "-c:v",
-        encoder,
-        "-frames:v",
-        "1",
-        "-f",
-        "null",
-        "-",
-    ]);
+    cmd.args(["-c:v", encoder, "-frames:v", "1", "-f", "null", "-"]);
 
     match tokio::time::timeout(SMOKE_TIMEOUT, cmd.output()).await {
         Ok(Ok(out)) => out.status.success(),
@@ -424,10 +405,7 @@ async fn ffmpeg_version(cfg: &FfmpegConfig) -> Option<String> {
     s.lines().next().map(|line| {
         // The first line is like "ffmpeg version 6.1.2 …" — trim noise to
         // the first whitespace-separated chunk after "version".
-        line.split_whitespace()
-            .nth(2)
-            .unwrap_or(line)
-            .to_string()
+        line.split_whitespace().nth(2).unwrap_or(line).to_string()
     })
 }
 

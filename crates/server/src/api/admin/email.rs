@@ -15,8 +15,8 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
-use axum::http::header::USER_AGENT;
 use axum::http::StatusCode;
+use axum::http::header::USER_AGENT;
 use chimpflix_library::{NewAuditEntry, queries};
 use serde::{Deserialize, Serialize};
 
@@ -204,7 +204,12 @@ pub async fn test(
         .map_err(|e| ApiError::validation(format!("SMTP connection failed: {e}")))?;
 
     let mut message = "SMTP handshake succeeded".to_string();
-    if let Some(addr) = req.send_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(addr) = req
+        .send_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         // Quick syntactic sanity check before bothering the relay.
         if !addr.contains('@') || addr.len() > 320 {
             return Err(ApiError::validation("send_to must look like local@domain"));
@@ -257,20 +262,21 @@ pub async fn test(
             })
         };
 
-        let test_text = crate::mail_template::render_email_text(crate::mail_template::EmailTextOpts {
-            server_name: &settings.server_name,
-            headline: "SMTP delivery is working",
-            body: &format!(
-                "This is a test email from your ChimpFlix server. If you're reading this, the \
+        let test_text =
+            crate::mail_template::render_email_text(crate::mail_template::EmailTextOpts {
+                server_name: &settings.server_name,
+                headline: "SMTP delivery is working",
+                body: &format!(
+                    "This is a test email from your ChimpFlix server. If you're reading this, the \
                  credentials and host/port combo under Settings → Server → Email are valid and \
                  outbound mail will reach your users.\n\n\
                  Server: {host_port}\n\
                  Security: {security}\n\
                  From: {from}\n\
                  Sent: {when}",
-            ),
-            footer_note: "You can safely delete this email.",
-        });
+                ),
+                footer_note: "You can safely delete this email.",
+            });
 
         mailer
             .send(OutgoingMessage {
@@ -305,8 +311,5 @@ pub async fn test(
         },
     )
     .await;
-    Ok(Json(TestResponse {
-        ok: true,
-        message,
-    }))
+    Ok(Json(TestResponse { ok: true, message }))
 }

@@ -28,6 +28,7 @@ import {
   HeroCard,
   Pagination,
   Pill,
+  SaveBar,
   type PillTone,
 } from "./ui";
 
@@ -37,19 +38,54 @@ interface Props {
   /// `Date.now()` snapshot from the server fetch (see
   /// AdminTasksOverviewClient for the SSR-hydration motivation).
   initialNowMs: number;
+  /// Raw JSON string from `server_settings.job_kind_concurrency` —
+  /// already validated as a JSON object on the server. Parsed once
+  /// into state for the per-kind cap editor.
+  initialKindConcurrency: string;
 }
 
 const REFRESH_MS = 5_000;
+
+/// Parse the `job_kind_concurrency` JSON. Tolerates a missing /
+/// malformed payload by returning an empty map — the editor still
+/// renders, just with every kind showing its registry default.
+function parseOverrides(raw: string): Record<string, number> {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out: Record<string, number> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "number" && Number.isFinite(v) && v >= 1) {
+          out[k] = Math.floor(v);
+        }
+      }
+      return out;
+    }
+  } catch {
+    // fall through
+  }
+  return {};
+}
 
 export function AdminTasksActivityClient({
   initialActivity,
   initialSummary,
   initialNowMs,
+  initialKindConcurrency,
 }: Props) {
   const [activity, setActivity] = useState(initialActivity);
   const [summary, setSummary] = useState(initialSummary);
   const [nowMs, setNowMs] = useState(initialNowMs);
   const [error, setError] = useState<string | null>(null);
+  // Per-kind concurrency editor state. Baseline mirrors what's
+  // persisted; current is the live edits the operator hasn't saved
+  // yet. Both keyed by `job_kind`; absent key = use registry default.
+  const [capBaseline, setCapBaseline] = useState<Record<string, number>>(() =>
+    parseOverrides(initialKindConcurrency),
+  );
+  const [capOverrides, setCapOverrides] = useState<Record<string, number>>(() =>
+    parseOverrides(initialKindConcurrency),
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -101,9 +137,66 @@ export function AdminTasksActivityClient({
         <RecentRunsCard runs={activity.recent_runs} nowMs={nowMs} />
       </div>
 
+      <ConcurrencyEditorCard
+        rows={activity.per_kind}
+        overrides={capOverrides}
+        onChange={setCapOverrides}
+      />
+
       <FailedJobsCard failed={activity.failed} nowMs={nowMs} />
+
+      <SaveBar
+        dirtyCount={countDirtyOverrides(capBaseline, capOverrides)}
+        summary="per-kind concurrency caps"
+        onDiscard={() => setCapOverrides(capBaseline)}
+        onSave={async () => {
+          // Send only kinds that diverge from the registry default,
+          // so the stored JSON stays small and a future registry
+          // bump to a higher default applies automatically. Build
+          // off `activity.per_kind` for the default lookup.
+          const defaults: Record<string, number> = {};
+          for (const r of activity.per_kind) {
+            defaults[r.kind] = r.default_concurrency;
+          }
+          const payload: Record<string, number> = {};
+          for (const [k, v] of Object.entries(capOverrides)) {
+            if (defaults[k] !== v) payload[k] = v;
+          }
+          await adminApi.settings.patch({
+            job_kind_concurrency: JSON.stringify(payload),
+          });
+          setCapBaseline(capOverrides);
+        }}
+      />
     </div>
   );
+}
+
+/// Resolve the effective cap for a kind: explicit override wins,
+/// otherwise the registry default. The editor displays this number
+/// (vs the registry default in the hint) so the operator always
+/// sees the *active* value.
+function effectiveCap(
+  row: ActivityKindHealth,
+  overrides: Record<string, number>,
+): number {
+  return overrides[row.kind] ?? row.default_concurrency;
+}
+
+/// SaveBar dirty count = number of kinds whose effective value
+/// differs from the baseline. We only count kinds, not transitions
+/// (e.g. setting a value back to the default removes the key from
+/// the payload but still counts as a saved edit).
+function countDirtyOverrides(
+  baseline: Record<string, number>,
+  current: Record<string, number>,
+): number {
+  const keys = new Set([...Object.keys(baseline), ...Object.keys(current)]);
+  let n = 0;
+  for (const k of keys) {
+    if (baseline[k] !== current[k]) n++;
+  }
+  return n;
 }
 
 // ─── Hero strip ────────────────────────────────────────────────────────
@@ -216,6 +309,101 @@ function PerKindHealthRow({ row }: { row: ActivityKindHealth }) {
       >
         {row.recent_errors}
       </span>
+    </div>
+  );
+}
+
+// ─── Per-kind concurrency editor ───────────────────────────────────────
+
+function ConcurrencyEditorCard({
+  rows,
+  overrides,
+  onChange,
+}: {
+  rows: ActivityKindHealth[];
+  overrides: Record<string, number>;
+  onChange: (next: Record<string, number>) => void;
+}) {
+  // Filter to registry-known kinds only — legacy custom-cron rows
+  // surface with default_concurrency=1 and aren't actually capped
+  // by `KindLimiter`. Surfacing them here would imply editability
+  // we can't honour at the worker layer.
+  const eligible = rows.filter((r) => r.default_concurrency >= 1);
+  if (eligible.length === 0) return null;
+
+  function setCapFor(kind: string, value: number, fallback: number) {
+    const next = { ...overrides };
+    // Setting to the registry default removes the key — keeps the
+    // stored JSON minimal. The SaveBar still flags this as a dirty
+    // change so the operator sees "reset" feedback.
+    if (value === fallback) {
+      delete next[kind];
+    } else {
+      next[kind] = value;
+    }
+    onChange(next);
+  }
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
+      <div className="border-b border-white/8 px-4 py-3">
+        <div className="text-[13.5px] font-semibold text-white/95">
+          Per-kind concurrency
+        </div>
+        <div className="text-xs text-white/55">
+          Raise the cap on a kind to let more of it run in parallel.
+          Defaults are conservative — bump CPU-heavy kinds (markers /
+          preview) on hefty boxes. Saved changes apply live; no
+          restart required.
+        </div>
+      </div>
+      <div className="grid grid-cols-[1fr_120px_90px] border-b border-white/8 bg-white/3 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-[0.07em] text-white/55">
+        <span>Kind</span>
+        <span className="text-right">Default</span>
+        <span className="text-right">Cap</span>
+      </div>
+      {eligible.map((r) => {
+        const value = effectiveCap(r, overrides);
+        const isOverride = overrides[r.kind] !== undefined;
+        return (
+          <div
+            key={r.kind}
+            className="grid grid-cols-[1fr_120px_90px] items-center gap-2 border-b border-white/8 px-3 py-2 text-[12.5px] last:border-b-0"
+          >
+            <span className="min-w-0 truncate font-medium text-white/95">
+              {r.display_name}
+              <span className="ml-2 font-mono text-[10.5px] text-white/40">
+                {r.kind}
+              </span>
+            </span>
+            <span className="text-right font-mono tabular-nums text-white/55">
+              {r.default_concurrency}
+              {isOverride && (
+                <span className="ml-2 text-[10px] uppercase tracking-wider text-amber-300/80">
+                  overridden
+                </span>
+              )}
+            </span>
+            <span className="flex justify-end">
+              <input
+                type="number"
+                min={1}
+                max={32}
+                value={value}
+                onChange={(e) => {
+                  const n = Math.max(
+                    1,
+                    Math.min(32, Number.parseInt(e.target.value, 10) || 1),
+                  );
+                  setCapFor(r.kind, n, r.default_concurrency);
+                }}
+                className="w-16 rounded border border-white/15 bg-black/20 px-2 py-1 text-right font-mono text-[12.5px] text-white/90 focus:border-accent focus:outline-none"
+                aria-label={`Concurrency cap for ${r.display_name}`}
+              />
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }

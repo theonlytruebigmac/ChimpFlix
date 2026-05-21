@@ -20,19 +20,17 @@ pub struct Payload {
 }
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { file_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { file_id } = serde_json::from_value(payload).context("invalid payload")?;
 
-    let Some((path, generated_at)) =
-        sqlx::query_as::<_, (String, Option<i64>)>(
-            "SELECT path, chapter_thumbs_generated_at
+    let Some((path, generated_at)) = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT path, chapter_thumbs_generated_at
              FROM media_files
              WHERE id = ? AND removed_at IS NULL",
-        )
-        .bind(file_id)
-        .fetch_optional(&state.pool)
-        .await
-        .context("media_files lookup")?
+    )
+    .bind(file_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("media_files lookup")?
     else {
         return Ok(());
     };
@@ -62,11 +60,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
     let root = state.data_dir.join("chapter_thumbs");
     let mut produced = 0usize;
     for (idx, ch) in chapters.iter().enumerate() {
-        let output = chimpflix_transcoder::chapter_thumbs::thumb_path(
-            &root,
-            file_id,
-            idx as u32,
-        );
+        let output = chimpflix_transcoder::chapter_thumbs::thumb_path(&root, file_id, idx as u32);
         match chimpflix_transcoder::chapter_thumbs::extract_chapter_thumb(
             &state.ffmpeg,
             path_ref,
@@ -88,14 +82,16 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
     queries::record_chapter_thumbs_generated(&state.pool, file_id, chapters.len() as i64)
         .await
         .context("stamp chapter thumbs")?;
-    info!(file_id, chapters = chapters.len(), produced, "chapter thumbs built");
+    info!(
+        file_id,
+        chapters = chapters.len(),
+        produced,
+        "chapter thumbs built"
+    );
     Ok(())
 }
 
-pub async fn enqueue_for_files(
-    pool: &sqlx::SqlitePool,
-    file_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_files(pool: &sqlx::SqlitePool, file_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &file_id in file_ids {
         let payload = serde_json::json!({ "file_id": file_id });

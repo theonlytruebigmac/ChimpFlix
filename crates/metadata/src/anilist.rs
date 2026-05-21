@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chimpflix_common::USER_AGENT;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT as UA_HEADER};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT as UA_HEADER,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
@@ -68,9 +70,8 @@ impl AniListClient {
         // The minimal query that exercises both the GraphQL pipeline and
         // (if a token is set) the auth header. SiteStatistics returns a
         // tiny payload and works without authentication.
-        let resp: GraphQlResponse<SiteStatsData> = self
-            .post_graphql(SITE_STATS_QUERY, &json!({}))
-            .await?;
+        let resp: GraphQlResponse<SiteStatsData> =
+            self.post_graphql(SITE_STATS_QUERY, &json!({})).await?;
         resp.data
             .context("AniList responded but the data was missing")?;
         Ok(())
@@ -78,11 +79,7 @@ impl AniListClient {
 
     /// Single best-match search. `type: ANIME` and the optional year
     /// scoping correspond to AniList's most-popular sort.
-    pub async fn lookup_show(
-        &self,
-        query: &str,
-        year: Option<i32>,
-    ) -> Result<Option<AniListShow>> {
+    pub async fn lookup_show(&self, query: &str, year: Option<i32>) -> Result<Option<AniListShow>> {
         let vars = match year {
             Some(y) => json!({
                 "search": query,
@@ -318,7 +315,7 @@ struct RawStudio {
 
 impl AniListShow {
     fn from_raw(r: RawMedia) -> Self {
-        let title_struct = r.title.unwrap_or_else(|| RawTitle {
+        let title_struct = r.title.unwrap_or(RawTitle {
             romaji: None,
             english: None,
             native: None,
@@ -332,7 +329,10 @@ impl AniListShow {
             .or_else(|| native.clone())
             .unwrap_or_else(|| format!("AniList #{}", r.id));
         let original_title = native.filter(|n| Some(n) != english.as_ref());
-        let summary = r.description.map(|s| strip_html(&s)).filter(|s| !s.is_empty());
+        let summary = r
+            .description
+            .map(|s| strip_html(&s))
+            .filter(|s| !s.is_empty());
 
         let cover = r.cover_image.unwrap_or(RawCoverImage {
             extra_large: None,

@@ -77,8 +77,7 @@ pub async fn set_for_library(
 
     // Reject duplicate agent_name entries and unknown agents.
     let registry = build_registry(&state).await;
-    let known: std::collections::HashSet<&str> =
-        registry.iter().map(|a| a.name.as_str()).collect();
+    let known: std::collections::HashSet<&str> = registry.iter().map(|a| a.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
     for a in &input.agents {
         if !seen.insert(a.agent_name.as_str()) {

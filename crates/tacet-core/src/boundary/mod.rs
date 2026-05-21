@@ -33,8 +33,7 @@ pub fn refine(region: &AudioRegion, rough_start: f64, rough_end: f64) -> (f64, f
         return (rough_start, rough_end);
     }
 
-    let window_samples =
-        ((RMS_WINDOW_SECONDS * region.sample_rate as f64) as usize).max(1);
+    let window_samples = ((RMS_WINDOW_SECONDS * region.sample_rate as f64) as usize).max(1);
     let rms = compute_rms_db(&region.samples, window_samples);
     if rms.len() < 3 {
         return (rough_start, rough_end);
@@ -46,9 +45,8 @@ pub fn refine(region: &AudioRegion, rough_start: f64, rough_end: f64) -> (f64, f
     let to_window = |t_abs: f64| -> isize {
         ((t_abs - region.offset_seconds) / window_seconds).round() as isize
     };
-    let to_seconds = |w: isize| -> f64 {
-        region.offset_seconds + (w as f64 + 0.5) * window_seconds
-    };
+    let to_seconds =
+        |w: isize| -> f64 { region.offset_seconds + (w as f64 + 0.5) * window_seconds };
 
     let start_w = find_best_transition(&rms, to_window(rough_start), radius_windows, Edge::Onset);
     let end_w = find_best_transition(&rms, to_window(rough_end), radius_windows, Edge::Offset);
@@ -71,12 +69,7 @@ enum Edge {
     Offset,
 }
 
-fn find_best_transition(
-    rms: &[f32],
-    center: isize,
-    radius: isize,
-    edge: Edge,
-) -> Option<isize> {
+fn find_best_transition(rms: &[f32], center: isize, radius: isize, edge: Edge) -> Option<isize> {
     let lo = (center - radius).max(1);
     let hi = (center + radius).min(rms.len() as isize - 1);
     if lo >= hi {
@@ -99,11 +92,7 @@ fn find_best_transition(
     }
 
     // Require the transition to be at least 3 dB — otherwise we're snapping to noise.
-    if best_score >= 3.0 {
-        best_w
-    } else {
-        None
-    }
+    if best_score >= 3.0 { best_w } else { None }
 }
 
 fn compute_rms_db(samples: &[f32], window: usize) -> Vec<f32> {

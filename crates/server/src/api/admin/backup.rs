@@ -33,8 +33,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chimpflix_library::NewAuditEntry;
 use serde::Serialize;
@@ -184,18 +184,31 @@ pub async fn list(
         .map_err(|e| ApiError::Internal(e.into()))?;
 
     let mut entries: Vec<BackupEntry> = Vec::new();
-    let mut rd = fs::read_dir(&dir).await.map_err(|e| ApiError::Internal(e.into()))?;
-    while let Some(entry) = rd.next_entry().await.map_err(|e| ApiError::Internal(e.into()))? {
+    let mut rd = fs::read_dir(&dir)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    while let Some(entry) = rd
+        .next_entry()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?
+    {
         let path = entry.path();
         // Filter to expected naming so unrelated files (a stray
         // chimpflix.db copy, an editor swap file) don't appear.
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         if !is_valid_backup_name(&name) {
             continue;
         }
-        let meta = entry.metadata().await.map_err(|e| ApiError::Internal(e.into()))?;
+        let meta = entry
+            .metadata()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
         if !meta.is_file() {
             continue;
         }
@@ -234,9 +247,7 @@ pub async fn download(
     AxumPath(filename): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     let path = resolve_backup_path(&state.data_dir, &filename)?;
-    let meta = fs::metadata(&path)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
+    let meta = fs::metadata(&path).await.map_err(|_| ApiError::NotFound)?;
     let size = meta.len();
     let file = fs::File::open(&path)
         .await
@@ -339,10 +350,7 @@ pub async fn stage_restore(
     // Open read-only and confirm `users` exists. Cheap probe; doesn't
     // run any migrations or change the file.
     {
-        let url = format!(
-            "sqlite:{}?mode=ro&immutable=1",
-            src.to_string_lossy()
-        );
+        let url = format!("sqlite:{}?mode=ro&immutable=1", src.to_string_lossy());
         match sqlx::SqlitePool::connect(&url).await {
             Ok(pool) => {
                 let probe: Result<(i64,), _> = sqlx::query_as(
@@ -596,9 +604,7 @@ mod tests {
     fn accepts_well_formed_names() {
         assert!(is_valid_backup_name("chimpflix-1.db"));
         assert!(is_valid_backup_name("chimpflix-1715890000.db"));
-        assert!(is_valid_backup_name(
-            "chimpflix-99999999999999999999999.db"
-        ));
+        assert!(is_valid_backup_name("chimpflix-99999999999999999999999.db"));
     }
 
     #[test]
@@ -615,7 +621,7 @@ mod tests {
         if over.len() <= 64 {
             assert!(is_valid_backup_name(&over));
         }
-        let huge: String = std::iter::repeat('1').take(80).collect();
+        let huge: String = "1".repeat(80);
         let huge_name = format!("chimpflix-{huge}.db");
         assert!(!is_valid_backup_name(&huge_name));
     }

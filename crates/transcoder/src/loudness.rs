@@ -40,10 +40,7 @@ struct LoudnormJson {
 /// Measure the integrated loudness of the first audio stream in
 /// `input`. Returns `None` when the file has no audio or the filter
 /// can't produce useful numbers (e.g. clipped input that scores `-inf`).
-pub async fn measure(
-    cfg: &FfmpegConfig,
-    input: &Path,
-) -> Result<Option<LoudnessMeasurement>> {
+pub async fn measure(cfg: &FfmpegConfig, input: &Path) -> Result<Option<LoudnessMeasurement>> {
     // -vn drops video, -sn drops subs, -dn drops data — we only need
     // audio. The loudnorm filter in print mode emits JSON to stderr
     // and a null muxer keeps the encoder from doing work.
@@ -86,8 +83,8 @@ pub async fn measure(
         );
     }
 
-    let stderr = String::from_utf8(output.stderr)
-        .context("ffmpeg loudnorm stderr was not utf-8")?;
+    let stderr =
+        String::from_utf8(output.stderr).context("ffmpeg loudnorm stderr was not utf-8")?;
     let json = extract_json_block(&stderr).ok_or_else(|| {
         anyhow!(
             "no loudnorm JSON block in ffmpeg stderr for {}",

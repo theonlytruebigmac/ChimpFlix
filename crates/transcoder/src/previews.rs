@@ -66,9 +66,7 @@ pub async fn generate_sprite(
     // normalises the width (height auto-derived; trunc to even avoids
     // ffmpeg's "height not divisible by 2" warning on odd aspect ratios);
     // tile composes them into a single image.
-    let vf = format!(
-        "fps=1/{interval_s},scale={tile_width}:-2,tile={cols}x{rows}"
-    );
+    let vf = format!("fps=1/{interval_s},scale={tile_width}:-2,tile={cols}x{rows}");
     // file: prefix prevents leading-`-` filenames from being parsed as
     // ffmpeg flags (see crate::safe_ffmpeg_input).
     let safe_input = crate::safe_ffmpeg_input(input);
@@ -127,11 +125,7 @@ pub async fn generate_sprite(
     })
 }
 
-async fn probe_tile_height(
-    ffmpeg: &FfmpegConfig,
-    sprite: &Path,
-    rows: u32,
-) -> Result<u32> {
+async fn probe_tile_height(ffmpeg: &FfmpegConfig, sprite: &Path, rows: u32) -> Result<u32> {
     let output = ffmpeg
         .background_ffprobe()
         .args([
@@ -151,7 +145,10 @@ async fn probe_tile_height(
         .await
         .context("spawn ffprobe for sprite dimensions")?;
     if !output.status.success() {
-        bail!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();

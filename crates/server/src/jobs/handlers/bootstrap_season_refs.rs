@@ -48,10 +48,9 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         season_number,
     } = serde_json::from_value(payload).context("invalid payload")?;
 
-    let episode_count =
-        queries::count_episodes_in_season(&state.pool, show_id, season_number)
-            .await
-            .context("count episodes in season")?;
+    let episode_count = queries::count_episodes_in_season(&state.pool, show_id, season_number)
+        .await
+        .context("count episodes in season")?;
     if episode_count < MIN_EPISODES_FOR_BOOTSTRAP {
         // Not enough episodes to bootstrap yet. A future detect
         // call will re-trigger us once the season reaches the
@@ -59,10 +58,9 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         return Ok(());
     }
 
-    let raw_paths =
-        queries::list_episode_paths_in_season(&state.pool, show_id, season_number)
-            .await
-            .context("list episode paths in season")?;
+    let raw_paths = queries::list_episode_paths_in_season(&state.pool, show_id, season_number)
+        .await
+        .context("list episode paths in season")?;
     let paths: Vec<PathBuf> = raw_paths.iter().map(PathBuf::from).collect();
     let config = tacet::Config::default();
 
@@ -87,10 +85,9 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
     // refs slice, which puts tacet into blackframe-only mode for
     // that season. An admin can rebuild later by clearing the row.
     let empty_refs = refs.intro.is_empty() && refs.credits.is_empty();
-    let intro_blob = bincode::serialize(&refs.intro)
-        .context("bincode serialize intro refs")?;
-    let credits_blob = bincode::serialize(&refs.credits)
-        .context("bincode serialize credits refs")?;
+    let intro_blob = bincode::serialize(&refs.intro).context("bincode serialize intro refs")?;
+    let credits_blob =
+        bincode::serialize(&refs.credits).context("bincode serialize credits refs")?;
 
     queries::upsert_season_refs_blobs(
         &state.pool,
@@ -147,7 +144,9 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
     // (Otherwise the early-exit check would short-circuit.)
     if !ids.is_empty() {
         // build "?,?,?,..." placeholder string for the IN clause
-        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "UPDATE media_files SET markers_detected_at = NULL WHERE id IN ({placeholders})"
         );
@@ -159,11 +158,8 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
             .await
             .context("clear markers_detected_at for re-detection")?;
     }
-    let _enqueued = crate::jobs::handlers::detect_markers_file::enqueue_for_files(
-        &state.pool,
-        &ids,
-    )
-    .await?;
+    let _enqueued =
+        crate::jobs::handlers::detect_markers_file::enqueue_for_files(&state.pool, &ids).await?;
     Ok(())
 }
 

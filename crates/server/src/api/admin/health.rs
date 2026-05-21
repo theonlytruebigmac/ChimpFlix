@@ -228,10 +228,8 @@ pub struct HealthItemsResponse {
 ///   - `no_metadata`      — items lacking every external metadata id
 ///   - `no_poster`        — items with no poster image
 ///   - `no_backdrop`      — items with no backdrop image
-///   - `orphan_episodes`  — episodes with no media_file (the show
-///                          exists; just no file)
-///   - `orphan_media_files` — media_files with neither item nor
-///                            episode (scanner rejected the match)
+///   - `orphan_episodes`  — episodes with no media_file (show exists)
+///   - `orphan_media_files` — media_files with neither item nor episode
 ///
 /// Bounded result set (max 500 rows per call); the `total` count gives
 /// the operator a "what you're seeing is N of M" indicator without
@@ -328,8 +326,7 @@ pub async fn items(
                 .into_iter()
                 .map(|r| {
                     let id: i64 = r.try_get("id").unwrap_or(0);
-                    let year: Option<i32> =
-                        r.try_get::<Option<i32>, _>("year").ok().flatten();
+                    let year: Option<i32> = r.try_get::<Option<i32>, _>("year").ok().flatten();
                     let kind: String = r.try_get("kind").unwrap_or_default();
                     let kind_label = if kind == "show" { "Series" } else { "Film" };
                     let subtitle = match year {
@@ -353,9 +350,12 @@ pub async fn items(
             (rows, total)
         }
         "no_poster" | "no_backdrop" => {
-            let img_kind = if category == "no_poster" { "poster" } else { "backdrop" };
-            let count_sql =
-                "SELECT COUNT(*) FROM items i
+            let img_kind = if category == "no_poster" {
+                "poster"
+            } else {
+                "backdrop"
+            };
+            let count_sql = "SELECT COUNT(*) FROM items i
                  WHERE NOT EXISTS (
                     SELECT 1 FROM images img
                     WHERE img.item_id = i.id AND img.kind = ?
@@ -386,8 +386,7 @@ pub async fn items(
                 .into_iter()
                 .map(|r| {
                     let id: i64 = r.try_get("id").unwrap_or(0);
-                    let year: Option<i32> =
-                        r.try_get::<Option<i32>, _>("year").ok().flatten();
+                    let year: Option<i32> = r.try_get::<Option<i32>, _>("year").ok().flatten();
                     let kind: String = r.try_get("kind").unwrap_or_default();
                     let kind_label = if kind == "show" { "Series" } else { "Film" };
                     let subtitle = match year {
@@ -441,8 +440,7 @@ pub async fn items(
                 .map(|r| {
                     let id: i64 = r.try_get("id").unwrap_or(0);
                     let ep_title: String = r.try_get("ep_title").unwrap_or_default();
-                    let show_title: String =
-                        r.try_get("show_title").unwrap_or_default();
+                    let show_title: String = r.try_get("show_title").unwrap_or_default();
                     let s: i64 = r.try_get("season_number").unwrap_or(0);
                     let e: i64 = r.try_get("episode_number").unwrap_or(0);
                     let show_id: Option<i64> = r.try_get("show_id").ok();
@@ -450,9 +448,7 @@ pub async fn items(
                         id,
                         kind: "episode",
                         title: format!("{show_title} — {ep_title}"),
-                        subtitle: Some(format!(
-                            "Season {s} · Episode {e}",
-                        )),
+                        subtitle: Some(format!("Season {s} · Episode {e}",)),
                         library_name: r
                             .try_get::<Option<String>, _>("library_name")
                             .ok()

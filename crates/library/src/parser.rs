@@ -113,8 +113,9 @@ fn fallback_classification(file_path: &Path, root: &Path, kind: LibraryKind) -> 
                 .and_then(|r| r.components().next().map(|c| c.as_os_str().to_owned()))
                 .and_then(|n| n.into_string().ok());
             let (show_title, show_year) = match show_dir.as_deref() {
-                Some(d) if !d.is_empty() && d != stem => parse_title_with_year(d)
-                    .unwrap_or_else(|| (d.to_string(), None)),
+                Some(d) if !d.is_empty() && d != stem => {
+                    parse_title_with_year(d).unwrap_or_else(|| (d.to_string(), None))
+                }
                 _ => (title.clone(), None),
             };
 
@@ -127,9 +128,9 @@ fn fallback_classification(file_path: &Path, root: &Path, kind: LibraryKind) -> 
                 .strip_prefix(root)
                 .unwrap_or(file_path)
                 .to_string_lossy();
-            let h: u16 = path_for_hash.bytes().fold(0u16, |acc, b| {
-                acc.wrapping_mul(31).wrapping_add(b as u16)
-            });
+            let h: u16 = path_for_hash
+                .bytes()
+                .fold(0u16, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u16));
             let episode = 0x8000i32 | (h as i32 & 0x7FFF);
 
             Classification::Episode {
@@ -545,8 +546,9 @@ mod tests {
 
     #[test]
     fn anime_fansub_with_dash() {
-        let p =
-            PathBuf::from("/a/Frieren Beyond Journey's End/[SubsPlease] Frieren - 28 (1080p) [ABCD1234].mkv");
+        let p = PathBuf::from(
+            "/a/Frieren Beyond Journey's End/[SubsPlease] Frieren - 28 (1080p) [ABCD1234].mkv",
+        );
         match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
             Classification::Episode {
                 show_title,
@@ -576,7 +578,9 @@ mod tests {
         // One Piece-style absolute numbering past 1000.
         let p = PathBuf::from("/a/One Piece/One Piece - 1100.mkv");
         match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
-            Classification::Episode { season, episode, .. } => {
+            Classification::Episode {
+                season, episode, ..
+            } => {
                 assert_eq!(season, 1);
                 assert_eq!(episode, 1100);
             }
@@ -590,7 +594,9 @@ mod tests {
         // path so users who organize anime by season aren't surprised.
         let p = PathBuf::from("/a/Attack on Titan/Season 4/Attack.on.Titan.S04E28.mkv");
         match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
-            Classification::Episode { season, episode, .. } => {
+            Classification::Episode {
+                season, episode, ..
+            } => {
                 assert_eq!(season, 4);
                 assert_eq!(episode, 28);
             }

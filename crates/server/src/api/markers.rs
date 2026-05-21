@@ -143,14 +143,13 @@ pub async fn list_for_media_file(
     _owner: OwnerAuth,
     Path(media_file_id): Path<i64>,
 ) -> Result<Json<MarkerListResponse>, ApiError> {
-    let duration_ms = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT duration_ms FROM media_files WHERE id = ?",
-    )
-    .bind(media_file_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?
-    .ok_or(ApiError::NotFound)?;
+    let duration_ms =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT duration_ms FROM media_files WHERE id = ?")
+            .bind(media_file_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?
+            .ok_or(ApiError::NotFound)?;
     let markers = queries::list_markers_full(&state.pool, media_file_id)
         .await
         .map_err(ApiError::Internal)?;
@@ -191,20 +190,18 @@ pub async fn replace_manual(
 ) -> Result<Json<MarkerListResponse>, ApiError> {
     // Confirm the file exists + grab duration_ms for the response and
     // for the validation clamp below.
-    let duration_ms = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT duration_ms FROM media_files WHERE id = ?",
-    )
-    .bind(media_file_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?
-    .ok_or(ApiError::NotFound)?;
+    let duration_ms =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT duration_ms FROM media_files WHERE id = ?")
+            .bind(media_file_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?
+            .ok_or(ApiError::NotFound)?;
 
     // Server-side validation. The editor enforces these too but a
     // hand-rolled PUT can sneak past, and a busted marker (negative
     // width, kind="banana") makes the player look broken.
-    let mut rows: Vec<(String, i64, i64, Option<String>)> =
-        Vec::with_capacity(input.markers.len());
+    let mut rows: Vec<(String, i64, i64, Option<String>)> = Vec::with_capacity(input.markers.len());
     for m in &input.markers {
         let kind = m.kind.trim().to_ascii_lowercase();
         if !matches!(kind.as_str(), "intro" | "credits" | "commercial") {
@@ -246,4 +243,3 @@ pub async fn replace_manual(
         markers,
     }))
 }
-

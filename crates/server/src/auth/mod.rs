@@ -81,11 +81,7 @@ pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 /// (session + csrf) stay in sync about whether they're locked to a
 /// secure origin.
 pub fn csrf_cookie_name(secure: bool) -> &'static str {
-    if secure {
-        "__Host-cf_csrf"
-    } else {
-        "cf_csrf"
-    }
+    if secure { "__Host-cf_csrf" } else { "cf_csrf" }
 }
 
 #[derive(Clone)]

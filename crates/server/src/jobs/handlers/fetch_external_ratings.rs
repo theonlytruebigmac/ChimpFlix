@@ -26,8 +26,7 @@ pub struct Payload {
 }
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { item_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { item_id } = serde_json::from_value(payload).context("invalid payload")?;
 
     let Some(client) = state.omdb_snapshot().await else {
         // No API key configured — succeed silently. The operator
@@ -48,8 +47,10 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         return Ok(()); // item deleted between enqueue + run
     };
     let imdb_id: Option<String> = row.try_get("imdb_id").ok().flatten();
-    let updated_at: Option<i64> =
-        row.try_get::<Option<i64>, _>("ratings_updated_at").ok().flatten();
+    let updated_at: Option<i64> = row
+        .try_get::<Option<i64>, _>("ratings_updated_at")
+        .ok()
+        .flatten();
 
     // Idempotency: skip if already fresh. Re-check at execute time
     // because a parallel run could have updated it between enqueue
@@ -74,8 +75,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
 
     match client.fetch_ratings(&imdb_id).await {
         Ok(Some(ratings)) => {
-            let json = serde_json::to_string(&ratings)
-                .context("serialize OmdbRatings")?;
+            let json = serde_json::to_string(&ratings).context("serialize OmdbRatings")?;
             sqlx::query(
                 "UPDATE items
                  SET ratings_json = ?, ratings_updated_at = ?, updated_at = ?
@@ -120,10 +120,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
 
 /// Enqueue one `fetch_external_ratings` job per item. Deduped on
 /// item_id so a re-trigger while jobs are in flight is safe.
-pub async fn enqueue_for_items(
-    pool: &sqlx::SqlitePool,
-    item_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_items(pool: &sqlx::SqlitePool, item_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &item_id in item_ids {
         let payload = serde_json::json!({ "item_id": item_id });

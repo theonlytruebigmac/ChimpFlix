@@ -2,8 +2,8 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use chimpflix_library::queries::{self, CollectionRow};
 use chimpflix_library::ListedItem;
+use chimpflix_library::queries::{self, CollectionRow};
 use serde::{Deserialize, Serialize};
 
 use crate::api::error::ApiError;
@@ -59,7 +59,6 @@ pub async fn get_one(
     let collection = queries::get_collection(&state.pool, id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
-    let items =
-        queries::list_items_in_collection(&state.pool, id, user.id, acc.as_deref()).await?;
+    let items = queries::list_items_in_collection(&state.pool, id, user.id, acc.as_deref()).await?;
     Ok(Json(CollectionDetail { collection, items }))
 }

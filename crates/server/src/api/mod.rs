@@ -8,7 +8,6 @@ mod collections;
 mod cors;
 mod csrf;
 mod episodes;
-mod two_factor;
 pub mod error;
 mod health;
 mod items;
@@ -27,6 +26,7 @@ mod stream;
 mod subtitles;
 mod tags;
 mod trakt;
+mod two_factor;
 mod ws;
 
 use std::time::Duration;
@@ -123,10 +123,7 @@ pub fn router(state: AppState) -> Router {
             "/auth/me/email/request-change",
             post(auth::request_email_change),
         )
-        .route(
-            "/auth/me/email/confirm",
-            post(auth::confirm_email_change),
-        )
+        .route("/auth/me/email/confirm", post(auth::confirm_email_change))
         .route("/auth/users", get(auth::list_users))
         .route(
             "/auth/users/{id}",
@@ -178,10 +175,7 @@ pub fn router(state: AppState) -> Router {
             "/libraries/{id}/generate-previews",
             post(libraries::generate_previews),
         )
-        .route(
-            "/items/{id}/detect-markers",
-            post(markers::detect_for_item),
-        )
+        .route("/items/{id}/detect-markers", post(markers::detect_for_item))
         // Per-media-file marker editor (operator-only) — used by the
         // owner-side marker-correction UI. The player-side surface
         // gets markers via the item detail response and never edits.
@@ -195,7 +189,10 @@ pub fn router(state: AppState) -> Router {
         .route("/items", get(items::list))
         .route("/items/trending", get(items::trending))
         .route("/items/{id}", get(items::get_one).patch(items::patch_item))
-        .route("/items/{id}/media", axum::routing::delete(items::delete_item_media))
+        .route(
+            "/items/{id}/media",
+            axum::routing::delete(items::delete_item_media),
+        )
         .route("/items/{id}/trailer", get(items::trailer))
         .route("/items/{id}/similar", get(items::similar))
         .route("/items/{id}/refresh", post(items::refresh))
@@ -283,10 +280,7 @@ pub fn router(state: AppState) -> Router {
         // only supports POST, and sendBeacon is the most reliable way to
         // fire a teardown request as the page is being unloaded (PWA
         // force-close in particular, where fetch+keepalive can be dropped).
-        .route(
-            "/stream/sessions/{id}/close",
-            post(stream::delete_session),
-        )
+        .route("/stream/sessions/{id}/close", post(stream::delete_session))
         .route("/stream/sessions/{id}/pause", post(stream::pause_session))
         .route("/stream/sessions/{id}/resume", post(stream::resume_session))
         .route(
@@ -308,22 +302,23 @@ pub fn router(state: AppState) -> Router {
         // Collections (movie franchises + admin-curated manual collections)
         .route("/collections", get(collections::list))
         .route("/collections/{id}", get(collections::get_one))
-        .route("/collections/{id}/poster/blob", get(admin::collections::get_poster_blob))
-        .route("/collections/{id}/backdrop/blob", get(admin::collections::get_backdrop_blob))
-        // Admin CRUD for manual collections (auto collections are read-only)
         .route(
-            "/admin/collections",
-            post(admin::collections::create),
+            "/collections/{id}/poster/blob",
+            get(admin::collections::get_poster_blob),
         )
         .route(
+            "/collections/{id}/backdrop/blob",
+            get(admin::collections::get_backdrop_blob),
+        )
+        // Admin CRUD for manual collections (auto collections are read-only)
+        .route("/admin/collections", post(admin::collections::create))
+        .route(
             "/admin/collections/{id}",
-            axum::routing::patch(admin::collections::update)
-                .delete(admin::collections::delete),
+            axum::routing::patch(admin::collections::update).delete(admin::collections::delete),
         )
         .route(
             "/admin/collections/{id}/items",
-            post(admin::collections::add_items)
-                .put(admin::collections::reorder),
+            post(admin::collections::add_items).put(admin::collections::reorder),
         )
         .route(
             "/admin/collections/{id}/items/{item_id}",
@@ -359,7 +354,10 @@ pub fn router(state: AppState) -> Router {
             post(admin::bulk::refresh_metadata),
         )
         .route("/admin/items/bulk/add-tag", post(admin::bulk::add_tag))
-        .route("/admin/items/bulk/remove-tag", post(admin::bulk::remove_tag))
+        .route(
+            "/admin/items/bulk/remove-tag",
+            post(admin::bulk::remove_tag),
+        )
         .route(
             "/admin/items/bulk/detect-markers",
             post(admin::bulk::detect_markers),
@@ -385,11 +383,11 @@ pub fn router(state: AppState) -> Router {
         )
         // Notifications (per-user inbox)
         .route("/notifications", get(notifications::list))
-        .route("/notifications/unread-count", get(notifications::unread_count))
         .route(
-            "/notifications/{id}/read",
-            post(notifications::mark_read),
+            "/notifications/unread-count",
+            get(notifications::unread_count),
         )
+        .route("/notifications/{id}/read", post(notifications::mark_read))
         .route(
             "/notifications/read-all",
             post(notifications::mark_all_read),
@@ -403,8 +401,7 @@ pub fn router(state: AppState) -> Router {
         // Prefs
         .route(
             "/prefs/hidden-libraries",
-            get(prefs::get_hidden_libraries)
-                .put(prefs::put_hidden_libraries),
+            get(prefs::get_hidden_libraries).put(prefs::put_hidden_libraries),
         )
         // Admin (owner-only)
         .route("/admin/backup", post(admin::backup::backup))
@@ -430,28 +427,33 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/stats/activity", get(admin::stats::activity))
         .route("/admin/stats/top-users", get(admin::stats::top_users))
         .route("/admin/stats/top-items", get(admin::stats::top_items))
-        .route("/admin/stats/top-platforms", get(admin::stats::top_platforms))
-        .route("/admin/stats/top-libraries", get(admin::stats::top_libraries))
+        .route(
+            "/admin/stats/top-platforms",
+            get(admin::stats::top_platforms),
+        )
+        .route(
+            "/admin/stats/top-libraries",
+            get(admin::stats::top_libraries),
+        )
         .route("/admin/stats/now-playing", get(admin::stats::now_playing))
-        .route("/admin/stats/plays-per-day", get(admin::stats::plays_per_day))
-        .route("/admin/stats/plays-per-hour", get(admin::stats::plays_per_hour))
+        .route(
+            "/admin/stats/plays-per-day",
+            get(admin::stats::plays_per_day),
+        )
+        .route(
+            "/admin/stats/plays-per-hour",
+            get(admin::stats::plays_per_hour),
+        )
         .route(
             "/admin/settings",
             get(admin::settings::get).patch(admin::settings::patch),
         )
-        .route(
-            "/admin/settings/email",
-            get(admin::email::get_status),
-        )
+        .route("/admin/settings/email", get(admin::email::get_status))
         .route(
             "/admin/settings/email/password",
-            axum::routing::put(admin::email::set_password)
-                .delete(admin::email::clear_password),
+            axum::routing::put(admin::email::set_password).delete(admin::email::clear_password),
         )
-        .route(
-            "/admin/settings/email/test",
-            post(admin::email::test),
-        )
+        .route("/admin/settings/email/test", post(admin::email::test))
         .route("/admin/audit", get(admin::audit::list))
         .route("/admin/library-health", get(admin::health::get))
         .route("/admin/library-health/items", get(admin::health::items))
@@ -479,9 +481,15 @@ pub fn router(state: AppState) -> Router {
         // Registry-driven overview (new admin UI in Phase 7). Sibling
         // to the legacy `/admin/tasks` CRUD surface; the existing
         // advanced-editor view still uses the row-based endpoints.
-        .route("/admin/tasks/overview", get(admin::tasks_overview::overview))
+        .route(
+            "/admin/tasks/overview",
+            get(admin::tasks_overview::overview),
+        )
         .route("/admin/tasks/summary", get(admin::tasks_overview::summary))
-        .route("/admin/tasks/activity", get(admin::tasks_overview::activity))
+        .route(
+            "/admin/tasks/activity",
+            get(admin::tasks_overview::activity),
+        )
         .route(
             "/admin/tasks/kind/{kind}",
             get(admin::tasks_overview::kind_detail)
@@ -524,7 +532,10 @@ pub fn router(state: AppState) -> Router {
             "/admin/webhooks/{id}",
             axum::routing::patch(admin::webhooks::update).delete(admin::webhooks::delete),
         )
-        .route("/admin/webhooks/{id}/test", post(admin::webhooks::test_fire))
+        .route(
+            "/admin/webhooks/{id}/test",
+            post(admin::webhooks::test_fire),
+        )
         .route(
             "/admin/webhooks/{id}/deliveries",
             get(admin::webhooks::list_deliveries),
@@ -536,8 +547,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/admin/users/{id}/sessions",
-            get(admin::users::list_user_sessions)
-                .delete(admin::users::revoke_user_sessions),
+            get(admin::users::list_user_sessions).delete(admin::users::revoke_user_sessions),
         )
         .route(
             "/admin/users/{id}/2fa/reset",
@@ -575,8 +585,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/admin/users/{id}/access-groups",
-            get(admin::access_groups::get_user_groups)
-                .put(admin::access_groups::set_user_groups),
+            get(admin::access_groups::get_user_groups).put(admin::access_groups::set_user_groups),
         )
         .route(
             "/admin/optimized",
@@ -618,10 +627,7 @@ pub fn router(state: AppState) -> Router {
         // Cap JSON body size for safety; multipart routes set their own
         // per-handler limits via Multipart's `max_length`.
         .layer(RequestBodyLimitLayer::new(DEFAULT_BODY_LIMIT_BYTES))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            csrf::layer,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), csrf::layer))
         // Client-IP resolution runs before csrf + rate-limit + auth so
         // those layers all read from the same authoritative
         // `EffectiveClientIp` extension. Outer than csrf in the chain
@@ -634,10 +640,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             security_headers::layer,
         ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            cors::layer,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), cors::layer))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

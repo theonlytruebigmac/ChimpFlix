@@ -18,8 +18,8 @@ use serde::Serialize;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use crate::hwaccel::{EncoderPreset, HwAccel, VideoCodec};
 use crate::FfmpegConfig;
+use crate::hwaccel::{EncoderPreset, HwAccel, VideoCodec};
 
 /// What ffmpeg is doing with the source video stream for this session.
 /// `Copy` skips the encoder entirely (just remuxes source packets into
@@ -381,11 +381,7 @@ impl Drop for Session {
         // unmount cleanup, etc.) killed it. If we see "child exited"
         // BEFORE this Drop, ffmpeg died on its own (OOM, GPU crash,
         // internal error) — investigate at the kernel/driver level.
-        let pid = self
-            ._child
-            .lock()
-            .ok()
-            .and_then(|c| c.id());
+        let pid = self._child.lock().ok().and_then(|c| c.id());
         info!(
             session_id = %self.id,
             ?pid,
@@ -466,9 +462,7 @@ impl Session {
         }
         // Bank the time we were paused so paused_ms_so_far() stays
         // monotonic across pause/resume cycles.
-        let started = self
-            .pause_started_at
-            .swap(0, Ordering::Relaxed);
+        let started = self.pause_started_at.swap(0, Ordering::Relaxed);
         if started > 0 {
             let delta = (now_ms() - started).max(0);
             self.total_paused_ms.fetch_add(delta, Ordering::Relaxed);
@@ -691,10 +685,7 @@ impl TranscodeManager {
         // request can't ask ffmpeg to emit 16K @ 10 Gbps. Defaults kick
         // in when the caller doesn't override.
         let (target_height, target_video_bitrate_bps) = match quality_target {
-            Some((h, b)) => (
-                h.clamp(144, 2160),
-                b.clamp(100_000, 50_000_000),
-            ),
+            Some((h, b)) => (h.clamp(144, 2160), b.clamp(100_000, 50_000_000)),
             None => (DEFAULT_TARGET_HEIGHT, DEFAULT_TARGET_VIDEO_BITRATE_BPS),
         };
 
@@ -707,10 +698,9 @@ impl TranscodeManager {
         // sessions can't ABR because there's no encoder to retarget.
         // Fallback also has to be strictly smaller than the primary or
         // it adds no value.
-        let subtitle_is_burn = subtitle_index.is_some()
-            && !subtitle_codec.is_some_and(is_text_subtitle_codec);
-        let abr_eligible = matches!(video_treatment, VideoTreatment::Reencode)
-            && !subtitle_is_burn;
+        let subtitle_is_burn =
+            subtitle_index.is_some() && !subtitle_codec.is_some_and(is_text_subtitle_codec);
+        let abr_eligible = matches!(video_treatment, VideoTreatment::Reencode) && !subtitle_is_burn;
         let resolved_fallback = if abr_eligible {
             fallback_variant.and_then(|(fh, fbps)| {
                 let fh = fh.clamp(144, 2160);
@@ -788,7 +778,7 @@ impl TranscodeManager {
         // the same source. No card-model database needed.
         let use_hwaccel_decode = match hwaccel.paired_decoder() {
             Some(name) => source_video_codec
-                .map(|c| normalize_codec_for_decoder(c))
+                .map(normalize_codec_for_decoder)
                 .is_some_and(|c| self.inner.capabilities.decoders.supports(name, &c)),
             None => false,
         };
@@ -1064,8 +1054,7 @@ impl TranscodeManager {
                     // asking for `v2/index.m3u8` and 404'ing; the
                     // reverse just wastes the second encoder branch.
                     && s.fallback_variant == fallback_variant
-                    && pos_delta >= -BACK_TOLERANCE_MS
-                    && pos_delta <= MAX_AHEAD_MS
+                    && (-BACK_TOLERANCE_MS..=MAX_AHEAD_MS).contains(&pos_delta)
                     && pos_delta <= max_encoded_ahead
             })
             .cloned()
@@ -1252,12 +1241,8 @@ impl TranscodeManager {
     /// this to emit `stop` events to `playback_events` so the admin
     /// Stats page can attribute bandwidth + final session metadata
     /// without a per-segment DB write.
-    pub fn spawn_reaper_with_hook<F>(
-        &self,
-        idle_threshold_ms: i64,
-        interval_s: u64,
-        on_reaped: F,
-    ) where
+    pub fn spawn_reaper_with_hook<F>(&self, idle_threshold_ms: i64, interval_s: u64, on_reaped: F)
+    where
         F: Fn(SessionSnapshot) + Send + Sync + 'static,
     {
         let manager = self.clone();
@@ -1290,7 +1275,7 @@ impl TranscodeManager {
 /// keyframes at the nearest possible frame to each Nx multiple. The
 /// HLS muxer then cuts segments at those boundaries.
 fn apply_hls_keyframe_args(cmd: &mut Command, hwaccel: HwAccel) {
-    let expr = format!("expr:gte(t,n_forced*{})", HLS_SEGMENT_DURATION_S);
+    let expr = format!("expr:gte(t,n_forced*{HLS_SEGMENT_DURATION_S})");
     cmd.args(["-force_key_frames", &expr]);
     // NVENC defaults `-forced-idr 0`, which emits a non-IDR I-frame
     // for forced keyframes. Some HLS clients (notably older Safari +
@@ -1351,7 +1336,10 @@ async fn spawn_ffmpeg(
     let segment_pattern = primary_dir.join(format!("seg-%03d.{segment_ext}"));
     let fallback_paths = fallback_variant.map(|_| {
         let d = session_dir.join(FALLBACK_VARIANT_NAME);
-        (d.join("index.m3u8"), d.join(format!("seg-%03d.{segment_ext}")))
+        (
+            d.join("index.m3u8"),
+            d.join(format!("seg-%03d.{segment_ext}")),
+        )
     });
     let start_seconds = (start_position_ms.max(0) as f64) / 1000.0;
 
@@ -1670,7 +1658,12 @@ async fn spawn_ffmpeg(
 
                 // Variant 1 (primary).
                 cmd.args(["-map", "[v1]"]);
-                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
+                hwaccel.apply_encoder_for(
+                    &mut cmd,
+                    target_video_codec,
+                    target_video_bitrate_bps,
+                    encoder_preset,
+                );
                 apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
 
@@ -1719,7 +1712,12 @@ async fn spawn_ffmpeg(
                      [vs]{scale},setpts=PTS-STARTPTS{hw_suffix}[v]"
                 );
                 cmd.args(["-filter_complex", &fc]).args(["-map", "[v]"]);
-                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
+                hwaccel.apply_encoder_for(
+                    &mut cmd,
+                    target_video_codec,
+                    target_video_bitrate_bps,
+                    encoder_preset,
+                );
                 apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
             }
@@ -1735,9 +1733,7 @@ async fn spawn_ffmpeg(
                     "scale"
                 };
                 let scale_fmt = if gpu_native { ":format=nv12" } else { "" };
-                let scale = format!(
-                    "{tonemap}{scaler}=-2:'min({target_height},ih)'{scale_fmt}"
-                );
+                let scale = format!("{tonemap}{scaler}=-2:'min({target_height},ih)'{scale_fmt}");
                 let mut vf = scale.clone();
                 // Normalize to 8-bit YUV before subtitle compositing.
                 // libass + the `subtitles=` filter render glyphs into
@@ -1766,12 +1762,11 @@ async fn spawn_ffmpeg(
                         // remux it'd have to scan end-to-end. When
                         // extracted, the only stream is the subtitle
                         // we want, so `si=0`.
-                        let (sub_path, sub_si) =
-                            if let Some(p) = extracted_sub.as_ref() {
-                                (p.as_path(), 0u32)
-                            } else {
-                                (input, si)
-                            };
+                        let (sub_path, sub_si) = if let Some(p) = extracted_sub.as_ref() {
+                            (p.as_path(), 0u32)
+                        } else {
+                            (input, si)
+                        };
                         let escaped = escape_for_filter(&sub_path.to_string_lossy());
                         vf = format!("{vf},subtitles=filename='{escaped}':si={sub_si}");
                         if let Some(style) = subtitle_style.as_deref() {
@@ -1791,7 +1786,12 @@ async fn spawn_ffmpeg(
                     vf = format!("{vf}{hw_suffix}");
                 }
                 cmd.args(["-vf", &vf]).args(["-map", "0:v:0"]);
-                hwaccel.apply_encoder_for(&mut cmd, target_video_codec, target_video_bitrate_bps, encoder_preset);
+                hwaccel.apply_encoder_for(
+                    &mut cmd,
+                    target_video_codec,
+                    target_video_bitrate_bps,
+                    encoder_preset,
+                );
                 apply_hls_keyframe_args(&mut cmd, hwaccel);
                 emit_output(&mut cmd, &manifest, &segment_pattern, audio_index);
             }
@@ -1942,8 +1942,7 @@ async fn spawn_ffmpeg(
                                             // so fmp4 sessions logged
                                             // seg_count=0 forever.
                                             if name.starts_with("seg-")
-                                                && (name.ends_with(".ts")
-                                                    || name.ends_with(".m4s"))
+                                                && (name.ends_with(".ts") || name.ends_with(".m4s"))
                                             {
                                                 seg_count += 1;
                                             }
@@ -2037,13 +2036,8 @@ async fn spawn_ffmpeg(
                 // `WNOHANG` flag which makes it non-blocking. The
                 // status variable lives on the stack for the duration
                 // of the call. No raw pointers escape this scope.
-                let r = unsafe {
-                    libc::waitpid(
-                        pid_u32 as libc::pid_t,
-                        &mut status,
-                        libc::WNOHANG,
-                    )
-                };
+                let r =
+                    unsafe { libc::waitpid(pid_u32 as libc::pid_t, &mut status, libc::WNOHANG) };
                 if r > 0 {
                     let low = status & 0x7f;
                     if low == 0 {
@@ -2081,8 +2075,8 @@ async fn spawn_ffmpeg(
             // is the normal anime-MKV / PGS-subtitle case — log at
             // INFO so the operator's WARN feed isn't flooded with
             // non-actionable events.
-            let still_running_clean = exit_detail.starts_with("still running")
-                && filtered.is_empty();
+            let still_running_clean =
+                exit_detail.starts_with("still running") && filtered.is_empty();
             if still_running_clean {
                 info!(
                     session_id = %session_id_str,
@@ -2254,9 +2248,7 @@ fn is_benign_ffmpeg_line(line: &str) -> bool {
     // "Could not find codec parameters … (Attachment: none): unknown
     // codec" line. We don't output attachments, so these are pure
     // noise on every session start.
-    if line.contains("Could not find codec parameters")
-        && line.contains("Attachment:")
-    {
+    if line.contains("Could not find codec parameters") && line.contains("Attachment:") {
         return true;
     }
     if line.contains("Consider increasing the value for the 'analyzeduration'") {
@@ -2324,9 +2316,8 @@ fn sanitize_subtitle_style(input: Option<&str>) -> Option<String> {
     if s.is_empty() || s.len() > 512 {
         return None;
     }
-    let safe = |c: char| {
-        c.is_ascii_alphanumeric() || matches!(c, '=' | ',' | '&' | '.' | '+' | '-')
-    };
+    let safe =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '=' | ',' | '&' | '.' | '+' | '-');
     if !s.chars().all(safe) {
         return None;
     }
@@ -2374,7 +2365,10 @@ async fn extract_full_webvtt_to(
         anyhow::bail!("ffmpeg webvtt extraction exited {:?}", status.code());
     }
     if tokio::fs::metadata(dest).await.is_err() {
-        anyhow::bail!("webvtt extraction reported success but {} is missing", dest.display());
+        anyhow::bail!(
+            "webvtt extraction reported success but {} is missing",
+            dest.display()
+        );
     }
     Ok(())
 }
@@ -2427,7 +2421,7 @@ fn shift_webvtt_timestamps(body: &str, shift_seconds: f64) -> String {
                 let trimmed = after_arrow.trim_start();
                 let leading_ws_len = after_arrow.len() - trimmed.len();
                 let leading_ws = &after_arrow[..leading_ws_len];
-                let (right_ts, tail) = match trimmed.find(|c: char| c == ' ' || c == '\t') {
+                let (right_ts, tail) = match trimmed.find([' ', '\t']) {
                     Some(i) => (&trimmed[..i], &trimmed[i..]),
                     None => (trimmed, ""),
                 };
@@ -2559,7 +2553,11 @@ fn parse_vtt_timestamp(s: &str) -> Option<f64> {
     let s = s.trim();
     let parts: Vec<&str> = s.split(':').collect();
     let (h, m, rest) = match parts.len() {
-        3 => (parts[0].parse::<f64>().ok()?, parts[1].parse::<f64>().ok()?, parts[2]),
+        3 => (
+            parts[0].parse::<f64>().ok()?,
+            parts[1].parse::<f64>().ok()?,
+            parts[2],
+        ),
         2 => (0.0, parts[0].parse::<f64>().ok()?, parts[1]),
         _ => return None,
     };
@@ -2606,9 +2604,7 @@ async fn extract_webvtt_sidecar(
     // walk up two levels to get the cache root. This works because
     // TranscodeManager::start creates the session dir under
     // `<cache_root>/<session_id>` consistently.
-    let cache_root = session_dir
-        .parent()
-        .unwrap_or(session_dir);
+    let cache_root = session_dir.parent().unwrap_or(session_dir);
     // media_file_id isn't visible here; instead key the cache by
     // the input file path's canonical form (resolved symlinks +
     // absolute) so different sessions of the same source hit the
@@ -2998,7 +2994,10 @@ mod tests {
         };
         let chain = cfg.build_chain(Some("hdr10"));
         assert!(chain.contains("tonemap=tonemap=mobius"));
-        assert!(chain.ends_with(','), "trailing comma keeps caller splice clean: {chain:?}");
+        assert!(
+            chain.ends_with(','),
+            "trailing comma keeps caller splice clean: {chain:?}"
+        );
     }
 
     #[test]

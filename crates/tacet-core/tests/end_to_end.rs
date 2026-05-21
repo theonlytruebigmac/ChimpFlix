@@ -5,7 +5,7 @@
 //! the intro and the boundary refiner snaps the end near the chirp's offset.
 
 use tacet::audio::AudioRegion;
-use tacet::detection::{detect_season, EpisodeFile, Season};
+use tacet::detection::{EpisodeFile, Season, detect_season};
 use tacet::fingerprint;
 use tacet::matching;
 use tacet::storage::{FingerprintKind, Store};
@@ -65,7 +65,11 @@ fn matcher_finds_shared_intro_across_synthetic_episodes() {
         matching::build_reference(&fps.iter().collect::<Vec<_>>(), &config).expect("reference");
 
     // The reference should contain a meaningful fraction of the input hashes.
-    assert!(reference.len() > 50, "reference too sparse: {}", reference.len());
+    assert!(
+        reference.len() > 50,
+        "reference too sparse: {}",
+        reference.len()
+    );
 
     for (i, fp) in fps.iter().enumerate() {
         let m = matching::match_against_reference(&reference, fp, &config)
@@ -102,7 +106,12 @@ fn detect_and_persist_writes_markers_and_references() {
 
     let reference = matching::build_reference(&fps.iter().collect::<Vec<_>>(), &config).unwrap();
     store
-        .save_references("synthetic", 1, FingerprintKind::Intro, std::slice::from_ref(&reference))
+        .save_references(
+            "synthetic",
+            1,
+            FingerprintKind::Intro,
+            std::slice::from_ref(&reference),
+        )
         .unwrap();
     for (i, fp) in fps.iter().enumerate() {
         store

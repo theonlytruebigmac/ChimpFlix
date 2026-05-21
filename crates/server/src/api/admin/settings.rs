@@ -51,12 +51,22 @@ pub async fn patch(
     }
 
     // Hot-apply settings whose runtime effect isn't just "next time
-    // someone reads the cache." Right now that's only the job
-    // worker pool size — `transcoder_max_background_concurrent` is
-    // already hot because the scheduler reads it fresh every tick.
+    // someone reads the cache." `transcoder_max_background_concurrent`
+    // is already hot because the scheduler reads it fresh every tick.
     if let Some(target) = input.job_workers {
         if let Some(handle) = state.worker_pool.read().await.clone() {
             handle.resize(target.max(1) as usize);
+        }
+    }
+    if let Some(raw) = input.job_kind_concurrency.as_deref() {
+        // Already validated as well-formed JSON of the right shape;
+        // unwrap is fine, but fall back gracefully if anything sneaks
+        // past so a malformed payload can't crash the request.
+        if let Ok(overrides) = serde_json::from_str::<std::collections::HashMap<String, usize>>(raw)
+        {
+            if let Some(handle) = state.worker_pool.read().await.clone() {
+                handle.apply_kind_concurrency(&overrides).await;
+            }
         }
     }
 
@@ -170,9 +180,25 @@ pub fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
     }
     if let Some(n) = patch.job_workers {
         if !(1..=16).contains(&n) {
-            return Err(ApiError::validation(
-                "job_workers must be between 1 and 16",
-            ));
+            return Err(ApiError::validation("job_workers must be between 1 and 16"));
+        }
+    }
+    if let Some(raw) = patch.job_kind_concurrency.as_deref() {
+        // Shape: JSON object whose values are positive integers in
+        // [1, 32]. The cap of 32 matches the worker pool ceiling — a
+        // per-kind cap higher than total workers is just confusing.
+        let map: std::collections::HashMap<String, i64> =
+            serde_json::from_str(raw).map_err(|e| {
+                ApiError::validation(format!(
+                    "job_kind_concurrency must be a JSON object mapping kind → integer: {e}"
+                ))
+            })?;
+        for (k, v) in &map {
+            if !(1..=32).contains(v) {
+                return Err(ApiError::validation(format!(
+                    "job_kind_concurrency[{k}] must be between 1 and 32 (got {v})"
+                )));
+            }
         }
     }
     if let Some(ref s) = patch.transcoder_hdr_tonemap_algo {

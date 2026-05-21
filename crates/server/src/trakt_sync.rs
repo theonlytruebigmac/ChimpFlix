@@ -31,11 +31,7 @@ const REFRESH_LEAD_MS: i64 = 5 * 60 * 1000;
 /// resulting token string. Returns `None` (and doesn't call `f`) when
 /// the user has no Trakt link or the operator hasn't configured the
 /// app credentials.
-pub async fn with_user_client<F, Fut, T>(
-    state: &AppState,
-    user_id: i64,
-    f: F,
-) -> Result<Option<T>>
+pub async fn with_user_client<F, Fut, T>(state: &AppState, user_id: i64, f: F) -> Result<Option<T>>
 where
     F: FnOnce(Arc<TraktClient>, String) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -43,7 +39,8 @@ where
     let Some(client) = state.trakt_snapshot().await else {
         return Ok(None);
     };
-    let Some(mut tokens) = queries::get_trakt_tokens(&state.pool, &state.vault, user_id).await? else {
+    let Some(mut tokens) = queries::get_trakt_tokens(&state.pool, &state.vault, user_id).await?
+    else {
         return Ok(None);
     };
     if tokens.expires_at - now_ms() < REFRESH_LEAD_MS {
@@ -127,14 +124,9 @@ pub async fn push_rating_remove(state: &AppState, user_id: i64, event: RatingPus
 
 /// Pull Trakt history since the last successful sync and mark matching
 /// items watched locally. Returns (movies_marked, episodes_marked).
-pub async fn pull_user_history(
-    state: &AppState,
-    user_id: i64,
-) -> Result<(usize, usize)> {
-    let Some((mut movie_count, mut episode_count)) = with_user_client(
-        state,
-        user_id,
-        |client, token| {
+pub async fn pull_user_history(state: &AppState, user_id: i64) -> Result<(usize, usize)> {
+    let Some((mut movie_count, mut episode_count)) =
+        with_user_client(state, user_id, |client, token| {
             let pool = state.pool.clone();
             let vault = state.vault.clone();
             async move {
@@ -143,9 +135,7 @@ pub async fn pull_user_history(
                     .as_ref()
                     .and_then(|t| t.last_synced_at)
                     .map(epoch_ms_to_iso);
-                let entries = client
-                    .pull_history(&token, since_iso.as_deref())
-                    .await?;
+                let entries = client.pull_history(&token, since_iso.as_deref()).await?;
                 let mut movies = 0usize;
                 let mut episodes = 0usize;
                 for entry in entries {
@@ -156,27 +146,27 @@ pub async fn pull_user_history(
                             if let Some(item_id) =
                                 find_local_item_by_tmdb(&pool, tmdb_id, "movie").await
                             {
-                                let _ = queries::set_watched(
-                                    &pool, user_id, Some(item_id), None, true,
-                                )
-                                .await;
+                                let _ =
+                                    queries::set_watched(&pool, user_id, Some(item_id), None, true)
+                                        .await;
                                 movies += 1;
                             }
                         }
                         "episode" => {
                             let Some(show) = entry.show else { continue };
                             let Some(ep) = entry.episode else { continue };
-                            let Some(show_tmdb) = show.ids.tmdb else { continue };
-                            if let Some(episode_id) = find_local_episode(
-                                &pool,
-                                show_tmdb,
-                                ep.season,
-                                ep.number,
-                            )
-                            .await
+                            let Some(show_tmdb) = show.ids.tmdb else {
+                                continue;
+                            };
+                            if let Some(episode_id) =
+                                find_local_episode(&pool, show_tmdb, ep.season, ep.number).await
                             {
                                 let _ = queries::set_watched(
-                                    &pool, user_id, None, Some(episode_id), true,
+                                    &pool,
+                                    user_id,
+                                    None,
+                                    Some(episode_id),
+                                    true,
                                 )
                                 .await;
                                 episodes += 1;
@@ -187,9 +177,9 @@ pub async fn pull_user_history(
                 }
                 Ok::<_, anyhow::Error>((movies, episodes))
             }
-        },
-    )
-    .await? else {
+        })
+        .await?
+    else {
         return Ok((0, 0));
     };
     queries::update_trakt_last_synced(&state.pool, user_id, now_ms()).await?;
@@ -203,10 +193,7 @@ pub async fn pull_user_history(
 
 /// Pull Trakt's `/sync/playback` and write any progress entry that's
 /// newer than ours into local `play_state`. Best-effort.
-pub async fn pull_user_playback(
-    state: &AppState,
-    user_id: i64,
-) -> Result<usize> {
+pub async fn pull_user_playback(state: &AppState, user_id: i64) -> Result<usize> {
     let Some(applied) = with_user_client(state, user_id, |client, token| {
         let pool = state.pool.clone();
         async move {
@@ -225,40 +212,29 @@ pub async fn pull_user_playback(
                             // have one — fall back to 0 (no harm).
                             let duration =
                                 lookup_item_duration_ms(&pool, item_id).await.unwrap_or(0);
-                            let position_ms =
-                                ((e.progress / 100.0) * duration as f64) as i64;
-                            let _ = apply_position(
-                                &pool,
-                                user_id,
-                                Some(item_id),
-                                None,
-                                position_ms,
-                            )
-                            .await;
+                            let position_ms = ((e.progress / 100.0) * duration as f64) as i64;
+                            let _ =
+                                apply_position(&pool, user_id, Some(item_id), None, position_ms)
+                                    .await;
                             applied += 1;
                         }
                     }
                     "episode" => {
                         let Some(show) = e.show else { continue };
                         let Some(ep) = e.episode else { continue };
-                        let Some(show_tmdb) = show.ids.tmdb else { continue };
+                        let Some(show_tmdb) = show.ids.tmdb else {
+                            continue;
+                        };
                         if let Some(episode_id) =
                             find_local_episode(&pool, show_tmdb, ep.season, ep.number).await
                         {
-                            let duration =
-                                lookup_episode_duration_ms(&pool, episode_id)
-                                    .await
-                                    .unwrap_or(0);
-                            let position_ms =
-                                ((e.progress / 100.0) * duration as f64) as i64;
-                            let _ = apply_position(
-                                &pool,
-                                user_id,
-                                None,
-                                Some(episode_id),
-                                position_ms,
-                            )
-                            .await;
+                            let duration = lookup_episode_duration_ms(&pool, episode_id)
+                                .await
+                                .unwrap_or(0);
+                            let position_ms = ((e.progress / 100.0) * duration as f64) as i64;
+                            let _ =
+                                apply_position(&pool, user_id, None, Some(episode_id), position_ms)
+                                    .await;
                             applied += 1;
                         }
                     }
@@ -268,7 +244,8 @@ pub async fn pull_user_playback(
             Ok::<usize, anyhow::Error>(applied)
         }
     })
-    .await? else {
+    .await?
+    else {
         return Ok(0);
     };
     Ok(applied)
@@ -296,20 +273,14 @@ async fn apply_position(
     Ok(())
 }
 
-async fn find_local_item_by_tmdb(
-    pool: &SqlitePool,
-    tmdb_id: i64,
-    kind: &str,
-) -> Option<i64> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM items WHERE tmdb_id = ? AND kind = ? LIMIT 1",
-    )
-    .bind(tmdb_id)
-    .bind(kind)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
+async fn find_local_item_by_tmdb(pool: &SqlitePool, tmdb_id: i64, kind: &str) -> Option<i64> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM items WHERE tmdb_id = ? AND kind = ? LIMIT 1")
+        .bind(tmdb_id)
+        .bind(kind)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn find_local_episode(
@@ -399,4 +370,3 @@ pub async fn episode_trakt_coords(
     let episode: i32 = row.try_get("episode")?;
     Ok(show_tmdb.map(|t| (t, season, episode)))
 }
-

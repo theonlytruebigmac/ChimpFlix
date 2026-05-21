@@ -85,7 +85,10 @@ pub async fn extract_chapter_thumb(
             )
         })?;
     if !status.success() {
-        anyhow::bail!("ffmpeg chapter-thumb extraction exited non-zero for {}", input.display());
+        anyhow::bail!(
+            "ffmpeg chapter-thumb extraction exited non-zero for {}",
+            input.display()
+        );
     }
     debug!(input = %input.display(), seek_s, output = %output.display(), "chapter thumb extracted");
     Ok(())

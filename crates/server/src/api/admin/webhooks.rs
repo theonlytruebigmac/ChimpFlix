@@ -2,8 +2,8 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use chimpflix_library::{
     NewAuditEntry, NewWebhook, Webhook, WebhookDelivery, WebhookUpdate, queries,
 };
@@ -50,7 +50,15 @@ pub async fn create(
     let webhook = queries::create_webhook(&state.pool, &state.vault, input.clone())
         .await
         .map_err(ApiError::Internal)?;
-    audit(&state, actor.id, &headers, "webhook.create", webhook.id, &input).await;
+    audit(
+        &state,
+        actor.id,
+        &headers,
+        "webhook.create",
+        webhook.id,
+        &input,
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(WebhookResponse { webhook })))
 }
 
@@ -113,14 +121,10 @@ pub async fn test_fire(
         }
     });
     let payload_str = payload.to_string();
-    let delivery_id = queries::create_webhook_delivery(
-        &state.pool,
-        hook.id,
-        "webhook.test",
-        &payload_str,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
+    let delivery_id =
+        queries::create_webhook_delivery(&state.pool, hook.id, "webhook.test", &payload_str)
+            .await
+            .map_err(ApiError::Internal)?;
     let st = state.clone();
     tokio::spawn(async move {
         // Reuse the dispatcher's attempt path indirectly by publishing a
@@ -193,10 +197,9 @@ pub async fn list_deliveries(
     Path(id): Path<i64>,
     Query(params): Query<DeliveriesParams>,
 ) -> Result<Json<DeliveriesResponse>, ApiError> {
-    let deliveries =
-        queries::list_webhook_deliveries(&state.pool, id, params.limit.unwrap_or(50))
-            .await
-            .map_err(ApiError::Internal)?;
+    let deliveries = queries::list_webhook_deliveries(&state.pool, id, params.limit.unwrap_or(50))
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(DeliveriesResponse { deliveries }))
 }
 

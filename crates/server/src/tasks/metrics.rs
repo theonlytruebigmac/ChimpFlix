@@ -135,14 +135,22 @@ impl LiveMetrics {
     /// Snapshot the in-flight count for `kind`. 0 for kinds that
     /// have never run since this process started.
     pub fn in_flight(&self, kind: &str) -> u32 {
-        let g = self.inner.in_flight.lock().expect("metrics in_flight mutex poisoned");
+        let g = self
+            .inner
+            .in_flight
+            .lock()
+            .expect("metrics in_flight mutex poisoned");
         g.get(kind).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     /// Snapshot every kind's in-flight count. Used by the admin
     /// API to render the activity screen in one call.
     pub fn in_flight_snapshot(&self) -> HashMap<String, u32> {
-        let g = self.inner.in_flight.lock().expect("metrics in_flight mutex poisoned");
+        let g = self
+            .inner
+            .in_flight
+            .lock()
+            .expect("metrics in_flight mutex poisoned");
         g.iter()
             .map(|(k, c)| ((*k).to_string(), c.load(Ordering::Relaxed)))
             .collect()
@@ -150,7 +158,11 @@ impl LiveMetrics {
 
     /// Snapshot recent runs for `kind`, newest first.
     pub fn recent(&self, kind: &str) -> Vec<RunRecord> {
-        let g = self.inner.recent.lock().expect("metrics recent mutex poisoned");
+        let g = self
+            .inner
+            .recent
+            .lock()
+            .expect("metrics recent mutex poisoned");
         match g.get(kind) {
             Some(buf) => buf.snapshot_newest_first(),
             None => Vec::new(),
@@ -158,14 +170,22 @@ impl LiveMetrics {
     }
 
     fn counter_for(&self, kind: &'static str) -> Arc<AtomicU32> {
-        let mut g = self.inner.in_flight.lock().expect("metrics in_flight mutex poisoned");
+        let mut g = self
+            .inner
+            .in_flight
+            .lock()
+            .expect("metrics in_flight mutex poisoned");
         g.entry(kind)
             .or_insert_with(|| Arc::new(AtomicU32::new(0)))
             .clone()
     }
 
     fn ring_for(&self, kind: &'static str) -> Arc<RingBuffer> {
-        let mut g = self.inner.recent.lock().expect("metrics recent mutex poisoned");
+        let mut g = self
+            .inner
+            .recent
+            .lock()
+            .expect("metrics recent mutex poisoned");
         g.entry(kind)
             .or_insert_with(|| Arc::new(RingBuffer::default()))
             .clone()

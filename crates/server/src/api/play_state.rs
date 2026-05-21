@@ -74,13 +74,9 @@ pub async fn set_watched(
     }
 
     if let Some(show_id) = req.show_id {
-        let episode_ids = queries::set_all_episodes_watched_for_show(
-            &state.pool,
-            user.id,
-            show_id,
-            req.watched,
-        )
-        .await?;
+        let episode_ids =
+            queries::set_all_episodes_watched_for_show(&state.pool, user.id, show_id, req.watched)
+                .await?;
         // Fan out Trakt history pushes — one per episode. Each call
         // is already fire-and-forget; spawning N concurrent tasks is
         // fine for typical season/show sizes. Skip on unwatched
@@ -93,8 +89,14 @@ pub async fn set_watched(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    queries::set_watched(&state.pool, user.id, req.item_id, req.episode_id, req.watched)
-        .await?;
+    queries::set_watched(
+        &state.pool,
+        user.id,
+        req.item_id,
+        req.episode_id,
+        req.watched,
+    )
+    .await?;
     // Fire-and-forget Trakt push when marking watched. Unwatch sync is
     // intentionally one-way for now — the symmetric remove endpoint
     // exists in the Trakt client but isn't wired here yet to avoid
@@ -165,14 +167,10 @@ pub async fn event(
 ) -> Result<StatusCode, ApiError> {
     let kind = req.kind.trim();
     if !matches!(kind, "pause" | "resume") {
-        return Err(ApiError::validation(
-            "kind must be one of: pause, resume",
-        ));
+        return Err(ApiError::validation("kind must be one of: pause, resume"));
     }
     if req.item_id.is_none() && req.episode_id.is_none() {
-        return Err(ApiError::validation(
-            "event requires item_id or episode_id",
-        ));
+        return Err(ApiError::validation("event requires item_id or episode_id"));
     }
     if req.item_id.is_some() && req.episode_id.is_some() {
         return Err(ApiError::validation(
@@ -253,7 +251,10 @@ fn push_watched_to_trakt(
                 watched_at: now_iso,
             }
         } else if let Some(id) = episode_id {
-            let coords = trakt_sync::episode_trakt_coords(&state.pool, id).await.ok().flatten();
+            let coords = trakt_sync::episode_trakt_coords(&state.pool, id)
+                .await
+                .ok()
+                .flatten();
             let Some((tmdb_show_id, season, episode)) = coords else {
                 return;
             };

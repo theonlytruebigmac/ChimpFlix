@@ -15,7 +15,11 @@
 pub mod ffmpeg;
 
 use anyhow::{Context, Result};
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
+use std::fs::File;
+use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
@@ -23,8 +27,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
-use std::fs::File;
-use std::path::Path;
 
 use crate::Config;
 
@@ -61,7 +63,14 @@ pub fn decode_region(
     start_secs: f64,
     end_secs: f64,
 ) -> Result<AudioRegion> {
-    decode_region_internal(path, config, RegionSpec::Absolute { start_secs, end_secs })
+    decode_region_internal(
+        path,
+        config,
+        RegionSpec::Absolute {
+            start_secs,
+            end_secs,
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -71,11 +80,7 @@ enum RegionSpec {
     Absolute { start_secs: f64, end_secs: f64 },
 }
 
-fn decode_region_internal(
-    path: &Path,
-    config: &Config,
-    spec: RegionSpec,
-) -> Result<AudioRegion> {
+fn decode_region_internal(path: &Path, config: &Config, spec: RegionSpec) -> Result<AudioRegion> {
     match decode_with_symphonia(path, config, spec) {
         Ok(region) => Ok(region),
         Err(symphonia_err) => {
@@ -110,16 +115,15 @@ fn decode_with_ffmpeg_fallback(
             let start = (duration - config.credits_scan_minutes as f64 * 60.0).max(0.0);
             (start, Some(duration))
         }
-        RegionSpec::Absolute { start_secs, end_secs } => (start_secs, Some(end_secs)),
+        RegionSpec::Absolute {
+            start_secs,
+            end_secs,
+        } => (start_secs, Some(end_secs)),
     };
     ffmpeg::decode_region(path, config, start, end)
 }
 
-fn decode_with_symphonia(
-    path: &Path,
-    config: &Config,
-    spec: RegionSpec,
-) -> Result<AudioRegion> {
+fn decode_with_symphonia(path: &Path, config: &Config, spec: RegionSpec) -> Result<AudioRegion> {
     let file = File::open(path).context("Failed to open media file")?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -129,7 +133,12 @@ fn decode_with_symphonia(
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .context("Unsupported audio format")?;
 
     let mut format = probed.format;
@@ -151,7 +160,10 @@ fn decode_with_symphonia(
             let start = (duration - config.credits_scan_minutes as f64 * 60.0).max(0.0);
             (start, duration)
         }
-        RegionSpec::Absolute { start_secs, end_secs } => (start_secs, end_secs),
+        RegionSpec::Absolute {
+            start_secs,
+            end_secs,
+        } => (start_secs, end_secs),
     };
 
     let mut decoder = symphonia::default::get_codecs()
@@ -227,7 +239,10 @@ fn decode_with_symphonia(
 /// for all channels) but some demuxers (notably Matroska) populate it in
 /// time-base units instead. Always prefer `n_frames * time_base` when both are
 /// available; fall back to `n_frames / sample_rate` otherwise.
-fn track_duration_seconds(track: &symphonia::core::formats::Track, native_rate: u32) -> Option<f64> {
+fn track_duration_seconds(
+    track: &symphonia::core::formats::Track,
+    native_rate: u32,
+) -> Option<f64> {
     let n = track.codec_params.n_frames?;
     if let Some(tb) = track.codec_params.time_base {
         return Some(n as f64 * tb.numer as f64 / tb.denom as f64);
@@ -266,11 +281,7 @@ fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
     let ratio = to_rate as f64 / from_rate as f64;
     let chunk_size = 1024;
     let mut resampler = SincFixedIn::<f32>::new(
-        ratio,
-        2.0,
-        params,
-        chunk_size,
-        1, // mono
+        ratio, 2.0, params, chunk_size, 1, // mono
     )?;
 
     let expected_output_len = (input.len() as f64 * ratio).round() as usize;

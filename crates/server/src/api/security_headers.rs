@@ -132,11 +132,7 @@ pub async fn layer(
     resp
 }
 
-fn set_if_absent(
-    headers: &mut axum::http::HeaderMap,
-    name: HeaderName,
-    value: HeaderValue,
-) {
+fn set_if_absent(headers: &mut axum::http::HeaderMap, name: HeaderName, value: HeaderValue) {
     if !headers.contains_key(&name) {
         headers.insert(name, value);
     }

@@ -24,13 +24,12 @@ pub async fn fetch_one_for_item(
     language: &str,
     base_dir: &std::path::Path,
 ) -> Result<bool> {
-    let existing = sqlx::query(
-        "SELECT 1 FROM external_subtitles WHERE item_id = ? AND language = ? LIMIT 1",
-    )
-    .bind(item_id)
-    .bind(language)
-    .fetch_optional(&state.pool)
-    .await?;
+    let existing =
+        sqlx::query("SELECT 1 FROM external_subtitles WHERE item_id = ? AND language = ? LIMIT 1")
+            .bind(item_id)
+            .bind(language)
+            .fetch_optional(&state.pool)
+            .await?;
     if existing.is_some() {
         return Ok(false);
     }
@@ -68,6 +67,7 @@ pub async fn fetch_one_for_item(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_one_for_episode(
     state: &AppState,
     client: &OpenSubtitlesClient,

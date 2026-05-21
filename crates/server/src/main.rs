@@ -370,9 +370,7 @@ async fn main() -> anyhow::Result<()> {
         library_scans_in_progress: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashSet::new(),
         )),
-        trakt_refresh_locks: Arc::new(tokio::sync::RwLock::new(
-            std::collections::HashMap::new(),
-        )),
+        trakt_refresh_locks: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         task_metrics: crate::tasks::metrics::LiveMetrics::new(),
         worker_pool: Arc::new(tokio::sync::RwLock::new(None)),
     };
@@ -397,8 +395,19 @@ async fn main() -> anyhow::Result<()> {
     // — bump it on hosts with CPU headroom to let more pipeline
     // kinds run in parallel; lower it on small boxes where live
     // transcodes need the cores.
-    let worker_pool =
-        jobs::start(state.clone(), jobs::build_router(), job_workers).await;
+    let worker_pool = jobs::start(state.clone(), jobs::build_router(), job_workers).await;
+    // Apply per-kind concurrency overrides from settings before the
+    // pool starts claiming jobs. Empty or malformed JSON falls back
+    // silently to registry defaults — the admin UI is the right place
+    // to surface a parse error, not a panic at startup.
+    {
+        let snap = state.settings.read().await;
+        if let Ok(overrides) = serde_json::from_str::<std::collections::HashMap<String, usize>>(
+            &snap.job_kind_concurrency,
+        ) {
+            worker_pool.apply_kind_concurrency(&overrides).await;
+        }
+    }
     *state.worker_pool.write().await = Some(worker_pool);
     webhooks::spawn(state.clone());
     session_watcher::spawn(state.hub.clone(), state.transcoder.clone());
@@ -519,11 +528,7 @@ fn load_vault() -> Vault {
 /// row; without this helper the first `?` propagation would panic the
 /// whole boot, leaving the operator with a server stuck in a restart
 /// loop instead of one that's up-but-with-broken-integrations.
-async fn vault_get_or_warn(
-    pool: &SqlitePool,
-    vault: &Vault,
-    slot: &'static str,
-) -> Option<String> {
+async fn vault_get_or_warn(pool: &SqlitePool, vault: &Vault, slot: &'static str) -> Option<String> {
     match queries::vault_get(pool, vault, slot).await {
         Ok(value) => value,
         Err(e) => {

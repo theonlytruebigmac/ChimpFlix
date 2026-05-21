@@ -3,12 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  REGISTRY: ghcr.io
+  # Image base path. Final names become:
+  #   ghcr.io/<owner>/chimpflix/server
+  #   ghcr.io/<owner>/chimpflix/web
+  IMAGE_BASE: ${{ github.repository_owner }}/chimpflix
 
 jobs:
   rust:
@@ -19,7 +25,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -40,8 +46,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -53,28 +59,93 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
-  docker:
-    name: Docker
+  image:
+    name: Image (${{ matrix.target }})
     runs-on: ubuntu-latest
     needs: [rust, web]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [server, web]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
       - uses: docker/setup-buildx-action@v3
-      - name: Build server image
+
+      # Authenticate only when we're going to push. Pull-request runs
+      # build to verify but don't publish, so they don't need creds.
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generate the right tag list for the event:
+      #   push to main         → :latest, :main-<short-sha>
+      #   push to a v* tag     → :1.2.3, :1.2, :latest
+      #   pull_request         → no push tags (build verify only)
+      - name: Compute tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.target }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=main-,format=short,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build${{ github.event_name == 'push' && ' and push' || '' }}
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          target: server
-          push: false
-          cache-from: type=gha,scope=server
-          cache-to: type=gha,scope=server,mode=max
-      - name: Build web image
-        uses: docker/build-push-action@v6
+          target: ${{ matrix.target }}
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,scope=${{ matrix.target }},mode=max
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
         with:
-          context: .
-          file: docker/Dockerfile
-          target: web
-          push: false
-          cache-from: type=gha,scope=web
-          cache-to: type=gha,scope=web,mode=max
+          fetch-depth: 0
+
+      # GitHub auto-generates release notes from the commits since the
+      # previous tag. Body references the published images so the
+      # Release page is a one-stop "what shipped + how to pull it".
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          IMAGE_SERVER: ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/server
+          IMAGE_WEB: ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/web
+        run: |
+          VERSION="${TAG#v}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            --notes "## Images
+
+          \`\`\`
+          docker pull $IMAGE_SERVER:$VERSION
+          docker pull $IMAGE_WEB:$VERSION
+          \`\`\`
+
+          Also published as \`:latest\` and \`:${VERSION%.*}\`.
+          "

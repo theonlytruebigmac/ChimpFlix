@@ -76,10 +76,7 @@ pub async fn link_start(
             "Trakt is not configured on the server — set client_id/client_secret in /admin/server/credentials first",
         ));
     };
-    let resp: DeviceCodeResponse = client
-        .device_code()
-        .await
-        .map_err(ApiError::Internal)?;
+    let resp: DeviceCodeResponse = client.device_code().await.map_err(ApiError::Internal)?;
     let expires_at = Instant::now() + Duration::from_secs(resp.expires_in.max(0) as u64);
     {
         let mut guard = device_cache().lock().await;

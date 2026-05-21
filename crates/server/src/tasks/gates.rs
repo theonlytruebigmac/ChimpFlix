@@ -144,7 +144,10 @@ mod tests {
     fn gated_kind_blocked_when_setting_false() {
         let mut gates = HashMap::new();
         gates.insert("loudness_analysis_enabled", false);
-        assert_eq!(check("analyze_loudness", &gates), GateState::DisabledByAdmin);
+        assert_eq!(
+            check("analyze_loudness", &gates),
+            GateState::DisabledByAdmin
+        );
     }
 
     #[test]
@@ -162,8 +165,14 @@ mod tests {
         // on-add path and the safety-net cron stop together.
         let mut off = HashMap::new();
         off.insert("chapter_thumbs_enabled", false);
-        assert_eq!(check("build_chapter_thumbs", &off), GateState::DisabledByAdmin);
-        assert_eq!(check("generate_chapter_thumbs", &off), GateState::DisabledByAdmin);
+        assert_eq!(
+            check("build_chapter_thumbs", &off),
+            GateState::DisabledByAdmin
+        );
+        assert_eq!(
+            check("generate_chapter_thumbs", &off),
+            GateState::DisabledByAdmin
+        );
 
         let mut on = HashMap::new();
         on.insert("chapter_thumbs_enabled", true);
@@ -177,7 +186,10 @@ mod tests {
         // still dispatch — we shouldn't accidentally break their
         // scheduled tasks by being too strict.
         let gates: HashMap<&str, bool> = HashMap::new();
-        assert_eq!(check("operator_custom_kind", &gates), GateState::UnknownKind);
+        assert_eq!(
+            check("operator_custom_kind", &gates),
+            GateState::UnknownKind
+        );
         assert!(GateState::UnknownKind.is_allowed());
     }
 
@@ -190,7 +202,10 @@ mod tests {
         let gates: HashMap<&str, bool> = HashMap::new();
         // analyze_loudness is Gated with key "loudness_analysis_enabled".
         // No entry in `gates` → closure returns None → gate denies.
-        assert_eq!(check("analyze_loudness", &gates), GateState::DisabledByAdmin);
+        assert_eq!(
+            check("analyze_loudness", &gates),
+            GateState::DisabledByAdmin
+        );
     }
 
     /// Coupling guard: every Gated kind in the registry must have
@@ -272,16 +287,12 @@ mod tests {
                 assert_eq!(
                     check(sweep, &off),
                     GateState::DisabledByAdmin,
-                    "sweep_kind `{}` should be Disabled when `{}` is off",
-                    sweep,
-                    key,
+                    "sweep_kind `{sweep}` should be Disabled when `{key}` is off"
                 );
                 assert_eq!(
                     check(sweep, &on),
                     GateState::Allowed,
-                    "sweep_kind `{}` should be Allowed when `{}` is on",
-                    sweep,
-                    key,
+                    "sweep_kind `{sweep}` should be Allowed when `{key}` is on"
                 );
             }
         }

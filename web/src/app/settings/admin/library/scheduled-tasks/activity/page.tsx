@@ -6,9 +6,10 @@ import { AdminTasksActivityClient } from "@/components/admin/AdminTasksActivityC
 /// dead-letter failure log. Powered by `/admin/tasks/activity` with
 /// 5-second polling.
 export default async function AdminTasksActivityPage() {
-  const [activity, summary] = await Promise.all([
+  const [activity, summary, settingsRes] = await Promise.all([
     adminApi.tasks.activity(),
     adminApi.tasks.summary(),
+    adminApi.settings.get(),
   ]);
   // Server component renders once per request — see scheduled-
   // tasks/page.tsx for the impurity-rule rationale.
@@ -25,6 +26,7 @@ export default async function AdminTasksActivityPage() {
         initialActivity={activity}
         initialSummary={summary}
         initialNowMs={initialNowMs}
+        initialKindConcurrency={settingsRes.settings.job_kind_concurrency}
       />
     </div>
   );

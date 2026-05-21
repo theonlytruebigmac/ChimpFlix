@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chimpflix_library::{db, queries, ServerSettingsUpdate};
+use chimpflix_library::{ServerSettingsUpdate, db, queries};
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 
@@ -220,8 +220,7 @@ async fn phase36_rebuild_preserves_item_collection_links() {
     let phase36_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("migrations")
         .join("20260518120000_phase36_manual_collections.sql");
-    let phase36_sql = std::fs::read_to_string(&phase36_path)
-        .expect("read phase 36 migration file");
+    let phase36_sql = std::fs::read_to_string(&phase36_path).expect("read phase 36 migration file");
     sqlx::query(&phase36_sql)
         .execute(&pool)
         .await
@@ -245,8 +244,7 @@ async fn phase36_rebuild_preserves_item_collection_links() {
     let phase41_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("migrations")
         .join("20260518170000_phase41_smart_collections.sql");
-    let phase41_sql = std::fs::read_to_string(&phase41_path)
-        .expect("read phase 41 migration file");
+    let phase41_sql = std::fs::read_to_string(&phase41_path).expect("read phase 41 migration file");
     sqlx::query(&phase41_sql)
         .execute(&pool)
         .await

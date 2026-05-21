@@ -25,11 +25,7 @@ use crate::auth::password::fill_random;
 const VAULT_KEY: &str = "session_hmac";
 const LEGACY_FILE_NAME: &str = "session-secret";
 
-pub async fn load_or_migrate(
-    pool: &SqlitePool,
-    vault: &Vault,
-    data_dir: &Path,
-) -> Result<Vec<u8>> {
+pub async fn load_or_migrate(pool: &SqlitePool, vault: &Vault, data_dir: &Path) -> Result<Vec<u8>> {
     if let Some(hex_str) = queries::vault_get(pool, vault, VAULT_KEY).await? {
         let bytes = decode_secret_hex(hex_str.trim())?;
         info!("session secret loaded from credential vault");
@@ -51,8 +47,7 @@ pub async fn load_or_migrate(
         let content = std::fs::read_to_string(&legacy)
             .with_context(|| format!("read {}", legacy.display()))?;
         let trimmed = content.trim();
-        let bytes = decode_secret_hex(trimmed)
-            .with_context(|| format!("{}", legacy.display()))?;
+        let bytes = decode_secret_hex(trimmed).with_context(|| format!("{}", legacy.display()))?;
         queries::vault_set(pool, vault, VAULT_KEY, trimmed, None).await?;
         match std::fs::remove_file(&legacy) {
             Ok(()) => info!(

@@ -3,8 +3,8 @@
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Multipart, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chimpflix_library::{NewAuditEntry, ServerSettingsUpdate, queries};
 use serde::Serialize;
@@ -139,7 +139,10 @@ pub async fn upload(
     Ok(Json(PrerollStatus {
         enabled: updated.preroll_enabled,
         configured: true,
-        url: Some(format!("/api/v1/preroll/blob?v={}", chimpflix_common::now_ms())),
+        url: Some(format!(
+            "/api/v1/preroll/blob?v={}",
+            chimpflix_common::now_ms()
+        )),
         size_bytes: Some(bytes.len() as u64),
         volume: updated.preroll_volume,
     }))

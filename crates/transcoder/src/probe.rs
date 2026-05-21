@@ -94,11 +94,7 @@ impl GopProbe {
 /// `-read_intervals` so the probe stays fast even on large files
 /// (typical run: under 250ms). Returns `None` if ffprobe doesn't
 /// surface packet-level data for the container.
-pub async fn probe_gop(
-    cfg: &FfmpegConfig,
-    path: &Path,
-    read_seconds: f64,
-) -> Result<GopProbe> {
+pub async fn probe_gop(cfg: &FfmpegConfig, path: &Path, read_seconds: f64) -> Result<GopProbe> {
     let interval = format!("%+#{}", read_seconds.max(2.0));
     let output = Command::new(&cfg.ffprobe)
         .args([
@@ -284,13 +280,7 @@ pub struct Chapter {
 /// the same reason the GOP probe is its own function.
 pub async fn probe_chapters(cfg: &FfmpegConfig, path: &Path) -> Result<Vec<Chapter>> {
     let output = Command::new(&cfg.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_chapters",
-        ])
+        .args(["-v", "error", "-print_format", "json", "-show_chapters"])
         // file: prefix prevents leading-`-` filenames from being parsed
         // as ffprobe flags (see crate::safe_ffmpeg_input).
         .arg(crate::safe_ffmpeg_input(path))

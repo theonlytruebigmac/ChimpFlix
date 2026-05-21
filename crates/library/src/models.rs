@@ -271,7 +271,10 @@ impl ScheduledTask {
                 .try_get::<Option<String>, _>("last_status")
                 .ok()
                 .flatten(),
-            last_error: row.try_get::<Option<String>, _>("last_error").ok().flatten(),
+            last_error: row
+                .try_get::<Option<String>, _>("last_error")
+                .ok()
+                .flatten(),
             last_duration_ms: row
                 .try_get::<Option<i64>, _>("last_duration_ms")
                 .ok()
@@ -425,11 +428,15 @@ impl Webhook {
         row: &SqliteRow,
         vault: &chimpflix_common::Vault,
     ) -> anyhow::Result<Self> {
-        let enc_bytes: Option<Vec<u8>> =
-            row.try_get::<Option<Vec<u8>>, _>("secret_enc").ok().flatten();
+        let enc_bytes: Option<Vec<u8>> = row
+            .try_get::<Option<Vec<u8>>, _>("secret_enc")
+            .ok()
+            .flatten();
         let secret = if let Some(value) = enc_bytes {
-            let nonce: Option<Vec<u8>> =
-                row.try_get::<Option<Vec<u8>>, _>("secret_nonce").ok().flatten();
+            let nonce: Option<Vec<u8>> = row
+                .try_get::<Option<Vec<u8>>, _>("secret_nonce")
+                .ok()
+                .flatten();
             let blob = chimpflix_common::EncryptedBlob { value, nonce };
             Some(vault.decrypt_str(&blob)?)
         } else {
@@ -517,7 +524,10 @@ impl WebhookDelivery {
                 .flatten(),
             error: row.try_get::<Option<String>, _>("error").ok().flatten(),
             attempts: row.try_get("attempts")?,
-            next_retry_at: row.try_get::<Option<i64>, _>("next_retry_at").ok().flatten(),
+            next_retry_at: row
+                .try_get::<Option<i64>, _>("next_retry_at")
+                .ok()
+                .flatten(),
             delivered_at: row.try_get::<Option<i64>, _>("delivered_at").ok().flatten(),
             created_at: row.try_get("created_at")?,
         })
@@ -755,7 +765,10 @@ impl Item {
                 .flatten()
                 .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
                 .unwrap_or_default(),
-            collection_id: row.try_get::<Option<i64>, _>("collection_id").ok().flatten(),
+            collection_id: row
+                .try_get::<Option<i64>, _>("collection_id")
+                .ok()
+                .flatten(),
             // Tolerant fallback for pre-migration rows: missing
             // column reads as true (legacy behaviour — every item
             // before phase 68 was auto-matched).
@@ -1150,7 +1163,6 @@ pub struct ItemEdit {
     pub unlock: Vec<String>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Play state input / output
 // ---------------------------------------------------------------------------
@@ -1304,12 +1316,11 @@ impl User {
                 .try_get::<Option<String>, _>("default_subtitle_lang")
                 .ok()
                 .flatten(),
-            notify_via_email: row
-                .try_get::<i64, _>("notify_via_email")
+            notify_via_email: row.try_get::<i64, _>("notify_via_email").ok().unwrap_or(0) != 0,
+            last_login_at: row
+                .try_get::<Option<i64>, _>("last_login_at")
                 .ok()
-                .unwrap_or(0)
-                != 0,
-            last_login_at: row.try_get::<Option<i64>, _>("last_login_at").ok().flatten(),
+                .flatten(),
             last_login_ip: row
                 .try_get::<Option<String>, _>("last_login_ip")
                 .ok()
@@ -1617,11 +1628,19 @@ pub struct ServerSettings {
     pub transcoder_max_background_concurrent: i64,
     /// Number of background-job worker tasks spawned at startup.
     /// Default 2; valid range [1, 16]. Each worker can claim any
-    /// kind subject to per-kind permits (see KIND_LIMITS), so raising
-    /// this is the lever to run more pipeline kinds in parallel when
-    /// you have CPU headroom. Read once at startup — changes require
-    /// a server restart, surfaced via the "restart pending" badge.
+    /// kind subject to per-kind permits, so raising this is the
+    /// lever to run more pipeline kinds in parallel when you have
+    /// CPU headroom. Hot-reloadable: the settings PATCH path resizes
+    /// the running worker pool live (see `WorkerPoolHandle::resize`).
     pub job_workers: i64,
+    /// JSON object overriding per-kind concurrency caps. Shape:
+    /// `{ "detect_markers_file": 4, "generate_preview_sprite": 4 }`.
+    /// Empty object = use the registry defaults shipped in
+    /// `crates/server/src/tasks/registry.rs`. Hot-reloadable: the
+    /// settings PATCH path calls `KindLimiter::resize(name, cap)`
+    /// for each changed kind so live jobs are unaffected and the
+    /// next acquire on that kind sees the new ceiling.
+    pub job_kind_concurrency: String,
     // ---- HDR tone mapping (phase 30) -----------------------------------
     /// When true (default), HDR sources are tone-mapped to SDR via
     /// zscale + tonemap. When false the filter is skipped — saves
@@ -1804,7 +1823,10 @@ impl ServerSettings {
     pub(crate) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
         Ok(Self {
             server_name: row.try_get("server_name")?,
-            public_url: row.try_get::<Option<String>, _>("public_url").ok().flatten(),
+            public_url: row
+                .try_get::<Option<String>, _>("public_url")
+                .ok()
+                .flatten(),
             cors_origins: row.try_get("cors_origins")?,
             secure_connections: row.try_get("secure_connections")?,
             telemetry_opt_in: row.try_get::<i64, _>("telemetry_opt_in")? != 0,
@@ -1838,6 +1860,11 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(2),
+            job_kind_concurrency: row
+                .try_get::<Option<String>, _>("job_kind_concurrency")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "{}".to_string()),
             transcoder_hdr_tonemap_enabled: row
                 .try_get::<Option<i64>, _>("transcoder_hdr_tonemap_enabled")
                 .ok()
@@ -2081,6 +2108,8 @@ pub struct ServerSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_workers: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_kind_concurrency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hdr_tonemap_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hdr_tonemap_algo: Option<String>,
@@ -2222,7 +2251,10 @@ impl AuditLogEntry {
                 .ok()
                 .flatten(),
             action: row.try_get("action")?,
-            target_kind: row.try_get::<Option<String>, _>("target_kind").ok().flatten(),
+            target_kind: row
+                .try_get::<Option<String>, _>("target_kind")
+                .ok()
+                .flatten(),
             target_id: row.try_get::<Option<String>, _>("target_id").ok().flatten(),
             payload_json: row
                 .try_get::<Option<String>, _>("payload_json")

@@ -77,7 +77,7 @@ impl Mailer {
             other => bail!("unknown email_smtp_security: {other}"),
         };
 
-        let resolved_port = port.unwrap_or_else(|| match security.as_str() {
+        let resolved_port = port.unwrap_or(match security.as_str() {
             "tls" => DEFAULT_PORT_TLS,
             "starttls" => DEFAULT_PORT_STARTTLS,
             _ => DEFAULT_PORT_PLAIN,
@@ -95,10 +95,7 @@ impl Mailer {
                     .await
                     .context("load SMTP password from vault")?
                     .context("SMTP username is set but no password in the vault")?;
-                builder = builder.credentials(Credentials::new(
-                    username.to_string(),
-                    password,
-                ));
+                builder = builder.credentials(Credentials::new(username.to_string(), password));
             }
         }
 

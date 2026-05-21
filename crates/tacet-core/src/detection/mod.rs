@@ -86,10 +86,14 @@ pub fn detect_season(season: &Season, config: &Config) -> Result<DetectionResult
 }
 
 fn match_analyses(prints: Vec<EpisodeAnalysis>, config: &Config) -> DetectionResult {
-    let intro_fps: Vec<&Fingerprint> =
-        prints.iter().filter_map(|p| p.intro.as_ref().map(|w| &w.fp)).collect();
-    let credits_fps: Vec<&Fingerprint> =
-        prints.iter().filter_map(|p| p.credits.as_ref().map(|w| &w.fp)).collect();
+    let intro_fps: Vec<&Fingerprint> = prints
+        .iter()
+        .filter_map(|p| p.intro.as_ref().map(|w| &w.fp))
+        .collect();
+    let credits_fps: Vec<&Fingerprint> = prints
+        .iter()
+        .filter_map(|p| p.credits.as_ref().map(|w| &w.fp))
+        .collect();
 
     let intro_refs = adaptive_bootstrap(&intro_fps, config, "intro");
     let credits_refs = adaptive_bootstrap(&credits_fps, config, "credits");
@@ -202,10 +206,14 @@ pub fn bootstrap_season(paths: &[&Path], config: &Config) -> Result<SeasonRefere
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let intro_fps: Vec<&Fingerprint> =
-        prints.iter().filter_map(|p| p.intro.as_ref().map(|w| &w.fp)).collect();
-    let credits_fps: Vec<&Fingerprint> =
-        prints.iter().filter_map(|p| p.credits.as_ref().map(|w| &w.fp)).collect();
+    let intro_fps: Vec<&Fingerprint> = prints
+        .iter()
+        .filter_map(|p| p.intro.as_ref().map(|w| &w.fp))
+        .collect();
+    let credits_fps: Vec<&Fingerprint> = prints
+        .iter()
+        .filter_map(|p| p.credits.as_ref().map(|w| &w.fp))
+        .collect();
 
     Ok(SeasonReferences {
         intro: adaptive_bootstrap(&intro_fps, config, "intro"),
@@ -449,7 +457,10 @@ fn credits_blackframe_fallback(
             }
         }
         Err(e) => {
-            debug!(error = format!("{e:#}"), "blackframe scan failed; skipping fallback");
+            debug!(
+                error = format!("{e:#}"),
+                "blackframe scan failed; skipping fallback"
+            );
             return None;
         }
     };
@@ -500,10 +511,7 @@ fn match_to_segment(
         if let Some(total) = window.region.total_duration {
             let tail_gap = total - end;
             if tail_gap > config.max_credits_tail_gap as f64 {
-                tracing::debug!(
-                    tail_gap,
-                    "rejecting credits match too far from file end"
-                );
+                tracing::debug!(tail_gap, "rejecting credits match too far from file end");
                 return None;
             }
         }

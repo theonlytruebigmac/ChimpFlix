@@ -76,46 +76,6 @@ fn mask_sensitive_json_in_place(v: &mut serde_json::Value) {
     }
 }
 
-#[cfg(test)]
-mod mask_tests {
-    use super::mask_sensitive_json_in_place;
-    use serde_json::json;
-
-    #[test]
-    fn masks_top_level_token() {
-        let mut v = json!({"id": 7, "token": "abc"});
-        mask_sensitive_json_in_place(&mut v);
-        assert_eq!(v["id"], 7);
-        assert_eq!(v["token"], "***");
-    }
-
-    #[test]
-    fn masks_nested_secrets() {
-        let mut v = json!({
-            "data": { "user": { "api_key": "k", "name": "alice" } }
-        });
-        mask_sensitive_json_in_place(&mut v);
-        assert_eq!(v["data"]["user"]["api_key"], "***");
-        assert_eq!(v["data"]["user"]["name"], "alice");
-    }
-
-    #[test]
-    fn masks_inside_arrays() {
-        let mut v = json!({ "creds": [ {"refresh_token": "x"}, {"keep": 1} ] });
-        mask_sensitive_json_in_place(&mut v);
-        assert_eq!(v["creds"][0]["refresh_token"], "***");
-        assert_eq!(v["creds"][1]["keep"], 1);
-    }
-
-    #[test]
-    fn case_insensitive_match() {
-        let mut v = json!({ "API_KEY": "x", "AccessToken": "y" });
-        mask_sensitive_json_in_place(&mut v);
-        assert_eq!(v["API_KEY"], "***");
-        assert_eq!(v["AccessToken"], "***");
-    }
-}
-
 pub fn spawn(state: AppState) {
     // Bus subscriber: fan out to matching webhooks.
     let dispatch_state = state.clone();
@@ -180,20 +140,16 @@ async fn deliver_async(state: AppState, hook: Webhook, evt: WebhookEvent) {
     // into a DB column.
     mask_sensitive_json_in_place(&mut payload);
     let stored_payload = payload.to_string();
-    let delivery_id = match queries::create_webhook_delivery(
-        &state.pool,
-        hook.id,
-        &evt.name,
-        &stored_payload,
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), webhook_id = hook.id, "could not record delivery");
-            return;
-        }
-    };
+    let delivery_id =
+        match queries::create_webhook_delivery(&state.pool, hook.id, &evt.name, &stored_payload)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), webhook_id = hook.id, "could not record delivery");
+                return;
+            }
+        };
     tokio::spawn(async move {
         deliver_with_retries(state, hook, delivery_id, payload_str, 0).await;
     });
@@ -235,8 +191,7 @@ async fn deliver_with_retries(
                     );
                     return;
                 }
-                let base_backoff =
-                    BACKOFF_MS.get(attempt_idx).copied().unwrap_or(1_800_000);
+                let base_backoff = BACKOFF_MS.get(attempt_idx).copied().unwrap_or(1_800_000);
                 let backoff = jittered_backoff_ms(base_backoff);
                 let next_at = now_ms() + backoff;
                 let _ = queries::record_webhook_attempt(
@@ -407,8 +362,8 @@ async fn retry_pending(state: &AppState) -> anyhow::Result<()> {
 
 fn sign(payload: &str, secret: &str) -> String {
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("hmac accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
     mac.update(payload.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -427,4 +382,44 @@ pub fn event_catalog() -> Vec<&'static str> {
         "marker.detected",
         "user.created",
     ]
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_sensitive_json_in_place;
+    use serde_json::json;
+
+    #[test]
+    fn masks_top_level_token() {
+        let mut v = json!({"id": 7, "token": "abc"});
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["token"], "***");
+    }
+
+    #[test]
+    fn masks_nested_secrets() {
+        let mut v = json!({
+            "data": { "user": { "api_key": "k", "name": "alice" } }
+        });
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["data"]["user"]["api_key"], "***");
+        assert_eq!(v["data"]["user"]["name"], "alice");
+    }
+
+    #[test]
+    fn masks_inside_arrays() {
+        let mut v = json!({ "creds": [ {"refresh_token": "x"}, {"keep": 1} ] });
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["creds"][0]["refresh_token"], "***");
+        assert_eq!(v["creds"][1]["keep"], 1);
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        let mut v = json!({ "API_KEY": "x", "AccessToken": "y" });
+        mask_sensitive_json_in_place(&mut v);
+        assert_eq!(v["API_KEY"], "***");
+        assert_eq!(v["AccessToken"], "***");
+    }
 }

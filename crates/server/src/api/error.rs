@@ -49,9 +49,11 @@ impl IntoResponse for ApiError {
             ),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "forbidden".to_string()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone()),
-            ApiError::TooManyRequests(m) => {
-                (StatusCode::TOO_MANY_REQUESTS, "too_many_requests", m.clone())
-            }
+            ApiError::TooManyRequests(m) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+                m.clone(),
+            ),
             ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, "bad_upstream", m.clone()),
             ApiError::Internal(e) => {
                 error!(error = %format!("{e:#}"), "internal error");

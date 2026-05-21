@@ -11,7 +11,7 @@
 //! credits scan window. The caller treats that as `credits_start`; the segment
 //! end is the file end.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -160,7 +160,9 @@ fn parse_blackdetect(log: &str, seek_offset: f64) -> Vec<BlackSegment> {
 fn extract_field(s: &str, key: &str) -> Option<f64> {
     let idx = s.find(key)?;
     let after = &s[idx + key.len()..];
-    let end = after.find(|c: char| c != '.' && !c.is_ascii_digit()).unwrap_or(after.len());
+    let end = after
+        .find(|c: char| c != '.' && !c.is_ascii_digit())
+        .unwrap_or(after.len());
     after[..end].parse().ok()
 }
 
@@ -170,14 +172,15 @@ fn extract_field(s: &str, key: &str) -> Option<f64> {
 /// scan window, typically a continuous 5-30s of dark frames before the text
 /// fades in. We pick the longest segment that's at least
 /// `min_significant_seconds` long. If none qualify, return `None`.
-pub fn pick_credits_start(
-    segments: &[BlackSegment],
-    min_significant_seconds: f64,
-) -> Option<f64> {
+pub fn pick_credits_start(segments: &[BlackSegment], min_significant_seconds: f64) -> Option<f64> {
     segments
         .iter()
         .filter(|s| s.duration >= min_significant_seconds)
-        .max_by(|a, b| a.duration.partial_cmp(&b.duration).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.duration
+                .partial_cmp(&b.duration)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|s| s.start)
 }
 
@@ -202,9 +205,21 @@ frame= 2964 fps=1482 q=-0.0 size=N/A
     #[test]
     fn pick_credits_start_returns_longest_above_threshold() {
         let segs = vec![
-            BlackSegment { start: 100.0, end: 101.0, duration: 1.0 },
-            BlackSegment { start: 200.0, end: 226.5, duration: 26.5 },
-            BlackSegment { start: 250.0, end: 252.0, duration: 2.0 },
+            BlackSegment {
+                start: 100.0,
+                end: 101.0,
+                duration: 1.0,
+            },
+            BlackSegment {
+                start: 200.0,
+                end: 226.5,
+                duration: 26.5,
+            },
+            BlackSegment {
+                start: 250.0,
+                end: 252.0,
+                duration: 2.0,
+            },
         ];
         assert_eq!(pick_credits_start(&segs, 3.0), Some(200.0));
         // None qualify when the threshold is too high.
@@ -214,8 +229,16 @@ frame= 2964 fps=1482 q=-0.0 size=N/A
     #[test]
     fn pick_credits_start_ignores_short_segments() {
         let segs = vec![
-            BlackSegment { start: 100.0, end: 100.5, duration: 0.5 },
-            BlackSegment { start: 200.0, end: 200.5, duration: 0.5 },
+            BlackSegment {
+                start: 100.0,
+                end: 100.5,
+                duration: 0.5,
+            },
+            BlackSegment {
+                start: 200.0,
+                end: 200.5,
+                duration: 0.5,
+            },
         ];
         assert_eq!(pick_credits_start(&segs, 3.0), None);
     }

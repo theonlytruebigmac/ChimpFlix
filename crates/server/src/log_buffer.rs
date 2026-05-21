@@ -9,8 +9,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
-use tracing::{Event, Subscriber};
 use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
@@ -132,12 +132,14 @@ impl Visit for MessageVisitor {
             if !self.message.is_empty() {
                 self.message.push(' ');
             }
-            self.message.push_str(&format!("{value:?}").trim_matches('"'));
+            self.message
+                .push_str(format!("{value:?}").trim_matches('"'));
         } else {
             if !self.message.is_empty() {
                 self.message.push(' ');
             }
-            self.message.push_str(&format!("{}={:?}", field.name(), value));
+            self.message
+                .push_str(&format!("{}={:?}", field.name(), value));
         }
     }
 }

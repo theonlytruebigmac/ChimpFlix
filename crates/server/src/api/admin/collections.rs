@@ -6,8 +6,8 @@
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chimpflix_library::{
     NewAuditEntry, queries,
@@ -59,7 +59,15 @@ pub async fn create(
         .await
         .map_err(ApiError::Internal)?;
 
-    audit(&state, actor.id, &headers, "collection.create", id, &normalized).await;
+    audit(
+        &state,
+        actor.id,
+        &headers,
+        "collection.create",
+        id,
+        &normalized,
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(CreateResponse { id })))
 }
 
@@ -131,8 +139,7 @@ pub async fn create_smart(
     // time rather than at the first browse-of-collection request.
     let parsed: SmartRule = serde_json::from_str(&input.rule_json)
         .map_err(|e| ApiError::validation(format!("invalid rule JSON: {e}")))?;
-    compile_to_sql(&parsed)
-        .map_err(|e| ApiError::validation(format!("rule rejected: {e:#}")))?;
+    compile_to_sql(&parsed).map_err(|e| ApiError::validation(format!("rule rejected: {e:#}")))?;
 
     let normalized = NewSmartCollection {
         name: trimmed_name,
@@ -174,8 +181,7 @@ pub async fn update_smart_rule(
 ) -> Result<StatusCode, ApiError> {
     let parsed: SmartRule = serde_json::from_str(&input.rule_json)
         .map_err(|e| ApiError::validation(format!("invalid rule JSON: {e}")))?;
-    compile_to_sql(&parsed)
-        .map_err(|e| ApiError::validation(format!("rule rejected: {e:#}")))?;
+    compile_to_sql(&parsed).map_err(|e| ApiError::validation(format!("rule rejected: {e:#}")))?;
     let ok = queries::update_smart_collection_rule(&state.pool, id, &input.rule_json)
         .await
         .map_err(ApiError::Internal)?;
@@ -229,7 +235,15 @@ pub async fn add_items(
     let inserted = queries::add_items_to_manual_collection(&state.pool, id, &input.item_ids)
         .await
         .map_err(ApiError::Internal)?;
-    audit(&state, actor.id, &headers, "collection.add_items", id, &input).await;
+    audit(
+        &state,
+        actor.id,
+        &headers,
+        "collection.add_items",
+        id,
+        &input,
+    )
+    .await;
     Ok(Json(AddItemsResponse { inserted }))
 }
 
@@ -516,11 +530,7 @@ pub async fn get_backdrop_blob(
     serve_art_blob(&state, id, ArtKind::Backdrop).await
 }
 
-async fn serve_art_blob(
-    state: &AppState,
-    id: i64,
-    kind: ArtKind,
-) -> Result<Response, ApiError> {
+async fn serve_art_blob(state: &AppState, id: i64, kind: ArtKind) -> Result<Response, ApiError> {
     let dir = state.data_dir.join(kind.dir());
     let (path, content_type) = ["jpg", "png", "webp"]
         .iter()

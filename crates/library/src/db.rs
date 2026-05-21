@@ -45,10 +45,7 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<SqlitePool> {
 /// that's a Postgres-only feature). The connection-level pragma, set
 /// at pool startup *before* any transaction begins, is the only knob
 /// that actually disables enforcement during the migration body.
-pub async fn open_with(
-    data_dir: &Path,
-    cache_size_mb: Option<i64>,
-) -> anyhow::Result<SqlitePool> {
+pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::Result<SqlitePool> {
     tokio::fs::create_dir_all(data_dir)
         .await
         .with_context(|| format!("create data dir {}", data_dir.display()))?;

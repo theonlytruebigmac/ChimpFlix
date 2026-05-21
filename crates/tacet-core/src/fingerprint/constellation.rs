@@ -9,8 +9,8 @@
 //! matching at the cost of storage. For intro detection, we want dense
 //! fingerprints since we're matching short segments.
 
-use super::peaks::SpectralPeak;
 use super::FpHash;
+use super::peaks::SpectralPeak;
 use crate::Config;
 
 /// A complete fingerprint: a set of hashes with timing info.

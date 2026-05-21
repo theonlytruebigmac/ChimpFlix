@@ -7,8 +7,8 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use chimpflix_library::{
     NewAuditEntry, NewTranscoderPreset, TranscoderPreset, TranscoderPresetUpdate, queries,
 };
@@ -79,7 +79,15 @@ pub async fn create_preset(
                 ApiError::Internal(e)
             }
         })?;
-    audit(&state, actor.id, &headers, "preset.create", preset.id, &input).await;
+    audit(
+        &state,
+        actor.id,
+        &headers,
+        "preset.create",
+        preset.id,
+        &input,
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(PresetResponse { preset })))
 }
 

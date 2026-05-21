@@ -35,7 +35,8 @@ pub async fn handler(
         warn!(user_id = user.id, "ws upgrade rejected: foreign Origin");
         return (StatusCode::FORBIDDEN, "origin not permitted").into_response();
     }
-    ws.on_upgrade(move |socket| run(state, user, socket)).into_response()
+    ws.on_upgrade(move |socket| run(state, user, socket))
+        .into_response()
 }
 
 async fn run(state: AppState, user: AuthUser, mut socket: WebSocket) {
@@ -170,9 +171,7 @@ fn serialize_for(event: &Event, user: &AuthUser) -> anyhow::Result<Option<String
                 active: s
                     .active
                     .iter()
-                    .filter(|snap| {
-                        user.role.is_admin_or_owner() || snap.user_id == user.id
-                    })
+                    .filter(|snap| user.role.is_admin_or_owner() || snap.user_id == user.id)
                     .cloned()
                     .collect(),
             };

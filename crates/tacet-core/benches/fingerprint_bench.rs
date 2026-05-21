@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use tacet::fingerprint;
+use criterion::{Criterion, criterion_group, criterion_main};
 use tacet::Config;
+use tacet::fingerprint;
 
 fn bench_stft(c: &mut Criterion) {
     let config = Config::default();

@@ -361,6 +361,10 @@ export interface ActivityKindHealth {
   jobs_per_minute: number;
   p95_duration_ms: number | null;
   recent_errors: number;
+  /// Registry-shipped concurrency baseline. Surfaced so the
+  /// activity page's per-kind cap editor can render "default N"
+  /// hints alongside an editable override.
+  default_concurrency: number;
 }
 
 export interface ActivityRecentRun {
@@ -1260,6 +1264,9 @@ export interface ServerSettings {
   transcoder_max_background_concurrent: number;
   /** Worker count for the durable job queue (markers/sprites/thumbs/loudness). */
   job_workers: number;
+  /** JSON object mapping job_kind → concurrency cap. Empty `{}` =
+   *  registry defaults for every kind. Hot-reloadable. */
+  job_kind_concurrency: string;
   /** When true (default), HDR sources are tone-mapped to SDR. */
   transcoder_hdr_tonemap_enabled: boolean;
   /** Algorithm passed to ffmpeg's tonemap filter. */
@@ -1374,6 +1381,7 @@ export interface ServerSettingsUpdate {
   transcoder_background_preset?: TranscoderBackgroundPreset;
   transcoder_max_background_concurrent?: number;
   job_workers?: number;
+  job_kind_concurrency?: string;
   transcoder_hdr_tonemap_enabled?: boolean;
   transcoder_hdr_tonemap_algo?: TonemapAlgorithm;
   transcoder_hevc_encoding_mode?: HevcMode;

@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 
-use crate::fingerprint::{FpHash, Fingerprint};
 use crate::Config;
+use crate::fingerprint::{Fingerprint, FpHash};
 
 /// Compact reference fingerprint: each hash maps to its frame in the canonical timeline.
 ///
@@ -138,7 +138,10 @@ pub fn match_against_references(
 const MAX_GAP_FRAMES: u32 = 10;
 
 fn longest_run(frames: &[u32], max_gap: u32) -> (u32, u32) {
-    debug_assert!(!frames.is_empty(), "longest_run requires at least one frame");
+    debug_assert!(
+        !frames.is_empty(),
+        "longest_run requires at least one frame"
+    );
     let mut best = (frames[0], frames[0], 1usize);
     let mut current_start = frames[0];
     let mut current_count = 1usize;
@@ -308,9 +311,7 @@ mod tests {
     #[test]
     fn match_finds_offset_and_span() {
         let reference = ReferenceFingerprint {
-            hash_to_frame: [(10, 0), (20, 5), (30, 10), (40, 15)]
-                .into_iter()
-                .collect(),
+            hash_to_frame: [(10, 0), (20, 5), (30, 10), (40, 15)].into_iter().collect(),
             frame_duration: 0.1,
             support: 3,
         };
@@ -348,7 +349,11 @@ mod tests {
 
         let m = match_against_reference(&reference, &query, &config).unwrap();
         assert_eq!(m.offset_frames, 100);
-        assert!(m.end_seconds < 20.0, "end={} should be near the contiguous run", m.end_seconds);
+        assert!(
+            m.end_seconds < 20.0,
+            "end={} should be near the contiguous run",
+            m.end_seconds
+        );
     }
 
     #[test]

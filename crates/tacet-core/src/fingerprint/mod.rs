@@ -6,8 +6,8 @@
 use num_complex::Complex;
 use rustfft::FftPlanner;
 
-use crate::audio::AudioRegion;
 use crate::Config;
+use crate::audio::AudioRegion;
 
 pub mod constellation;
 pub mod peaks;

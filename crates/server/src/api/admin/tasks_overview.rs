@@ -21,9 +21,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chimpflix_common::now_ms;
-use chimpflix_library::{
-    NewAuditEntry, ScheduledTaskUpdate, ServerSettingsUpdate, queries,
-};
+use chimpflix_library::{NewAuditEntry, ScheduledTaskUpdate, ServerSettingsUpdate, queries};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -79,6 +77,12 @@ pub struct KindCard {
     pub gate: GateInfo,
     pub schedule: Option<ScheduleInfo>,
     pub live: LiveInfo,
+    /// Registry-shipped concurrency default for this kind. Used by
+    /// the admin "Per-kind concurrency" editor to render the
+    /// "default" hint next to the editable override field. Always
+    /// surfaced (not flagged as a private setting) so the UI can
+    /// dim/show "default" when no override exists.
+    pub default_concurrency: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,7 +168,10 @@ pub async fn overview(
         .await
         .map_err(ApiError::Internal)?;
     let schedules: std::collections::HashMap<String, chimpflix_library::ScheduledTask> =
-        scheduled_rows.into_iter().map(|r| (r.kind.clone(), r)).collect();
+        scheduled_rows
+            .into_iter()
+            .map(|r| (r.kind.clone(), r))
+            .collect();
 
     // Pre-snapshot in-flight counts so we read the lock once.
     let in_flight_snap = state.task_metrics.in_flight_snapshot();
@@ -269,7 +276,9 @@ async fn build_card(
 
     // Schedule row: prefer sweep_kind, then fall back to job_kind
     // (some periodic kinds reuse the job_kind name as their cron).
-    let schedule_row = k.sweep_kind.and_then(|n| schedules.get(n))
+    let schedule_row = k
+        .sweep_kind
+        .and_then(|n| schedules.get(n))
         .or_else(|| schedules.get(k.job_kind));
     let schedule = schedule_row.map(|r| ScheduleInfo {
         frequency: r.frequency.clone(),
@@ -299,6 +308,7 @@ async fn build_card(
             queued: *queued.get(k.job_kind).unwrap_or(&0),
             last_success_at_ms,
         },
+        default_concurrency: k.concurrency,
     }
 }
 
@@ -330,6 +340,11 @@ fn card_from_legacy_scheduled(
             queued: *queued.get(row.kind.as_str()).unwrap_or(&0),
             last_success_at_ms: None, // legacy kinds don't push into LiveMetrics
         },
+        // Legacy custom-cron rows don't carry a registry concurrency.
+        // Surface 1 so the UI's editor (if it ever renders them) shows
+        // a safe placeholder; in practice these rows are filtered out
+        // of the per-kind cap UI which only iterates registry kinds.
+        default_concurrency: 1,
     }
 }
 
@@ -414,8 +429,7 @@ pub async fn summary(
 
     let running: u32 = state.task_metrics.in_flight_snapshot().values().sum();
 
-    let next_maintenance_window_ms =
-        next_window_open_ms(&state, now).await.unwrap_or(None);
+    let next_maintenance_window_ms = next_window_open_ms(&state, now).await.unwrap_or(None);
 
     Ok(Json(SummaryResponse {
         running,
@@ -457,7 +471,9 @@ async fn next_window_open_ms(state: &AppState, now: i64) -> Option<Option<i64>> 
     let wraps = end_t <= start_t;
     let end_today_or_tomorrow = if wraps {
         let tomorrow = today.succ_opt()?;
-        Local.from_local_datetime(&tomorrow.and_time(end_t)).single()?
+        Local
+            .from_local_datetime(&tomorrow.and_time(end_t))
+            .single()?
     } else {
         Local.from_local_datetime(&today.and_time(end_t)).single()?
     };
@@ -474,7 +490,9 @@ async fn next_window_open_ms(state: &AppState, now: i64) -> Option<Option<i64>> 
             Local.from_local_datetime(&today.and_time(end_t)).single(),
         ) {
             if let (Some(start_y), Some(end_y)) = (
-                Local.from_local_datetime(&yesterday.and_time(start_t)).single(),
+                Local
+                    .from_local_datetime(&yesterday.and_time(start_t))
+                    .single(),
                 end_today,
             ) {
                 if now_local >= start_y && now_local < end_y {
@@ -490,7 +508,9 @@ async fn next_window_open_ms(state: &AppState, now: i64) -> Option<Option<i64>> 
         start_today
     } else {
         let tomorrow = today.succ_opt()?;
-        Local.from_local_datetime(&tomorrow.and_time(start_t)).single()?
+        Local
+            .from_local_datetime(&tomorrow.and_time(start_t))
+            .single()?
     };
     Some(Some(next_open.timestamp_millis()))
 }
@@ -596,13 +616,12 @@ pub async fn kind_detail(
     });
 
     // Queue depth: one COUNT query scoped to this kind.
-    let queued: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'",
-    )
-    .bind(meta.job_kind)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'")
+            .bind(meta.job_kind)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
 
     let in_flight = state.task_metrics.in_flight(meta.job_kind);
     let recent_records = state.task_metrics.recent(meta.job_kind);
@@ -618,7 +637,11 @@ pub async fn kind_detail(
         .map(|r| r.duration_ms)
         .collect();
     durations.sort_unstable();
-    let p95 = if durations.len() >= 5 { pct95(&durations) } else { None };
+    let p95 = if durations.len() >= 5 {
+        pct95(&durations)
+    } else {
+        None
+    };
 
     let recent_runs: Vec<RecentRun> = recent_records
         .into_iter()
@@ -699,13 +722,12 @@ async fn legacy_kind_detail(
     state: &AppState,
     row: &chimpflix_library::ScheduledTask,
 ) -> Result<KindDetailResponse, ApiError> {
-    let queued: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'",
-    )
-    .bind(&row.kind)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'")
+            .bind(&row.kind)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
 
     let now = chimpflix_common::now_ms();
     let day_ms: i64 = 24 * 60 * 60 * 1000;
@@ -800,6 +822,10 @@ pub struct KindHealth {
     pub p95_duration_ms: Option<i64>,
     /// Count of error_class != null entries in the recent ring.
     pub recent_errors: u32,
+    /// Concurrency default shipped by the registry. Surfaced so the
+    /// admin "Per-kind concurrency" editor on the activity page can
+    /// label the editable override with its baseline.
+    pub default_concurrency: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -827,12 +853,11 @@ pub async fn activity(
     let in_flight_snap = state.task_metrics.in_flight_snapshot();
 
     // Per-kind queue depth.
-    let queued_rows = sqlx::query(
-        "SELECT kind, COUNT(*) AS n FROM jobs WHERE status = 'queued' GROUP BY kind",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
+    let queued_rows =
+        sqlx::query("SELECT kind, COUNT(*) AS n FROM jobs WHERE status = 'queued' GROUP BY kind")
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
     let queued: std::collections::HashMap<String, i64> = queued_rows
         .iter()
         .filter_map(|r| {
@@ -865,17 +890,22 @@ pub async fn activity(
         let recent = state.task_metrics.recent(kind);
         let success_count = recent.iter().filter(|r| r.success).count() as u32;
         let error_count = recent.iter().filter(|r| !r.success).count() as u32;
-        let mut durations: Vec<i64> =
-            recent.iter().filter(|r| r.success).map(|r| r.duration_ms).collect();
+        let mut durations: Vec<i64> = recent
+            .iter()
+            .filter(|r| r.success)
+            .map(|r| r.duration_ms)
+            .collect();
         durations.sort_unstable();
         let p95 = if durations.len() >= 5 {
             pct95(&durations)
         } else {
             None
         };
-        let display_name = registry::find_kind(kind)
+        let meta = registry::find_kind(kind);
+        let display_name = meta
             .map(|k| k.display_name.to_string())
             .unwrap_or_else(|| kind.clone());
+        let default_concurrency = meta.map(|k| k.concurrency).unwrap_or(1);
         per_kind.push(KindHealth {
             kind: kind.clone(),
             display_name,
@@ -884,6 +914,7 @@ pub async fn activity(
             jobs_per_minute: (success_count as f32 / elapsed_minutes * 10.0).round() / 10.0,
             p95_duration_ms: p95,
             recent_errors: error_count,
+            default_concurrency,
         });
         for r in recent {
             all_recent.push(RecentRun {
@@ -1001,10 +1032,9 @@ pub async fn update_gate(
         ))
     })?;
 
-    let updated =
-        queries::update_server_settings(&state.pool, Some(admin.0.id), patch.clone())
-            .await
-            .map_err(ApiError::Internal)?;
+    let updated = queries::update_server_settings(&state.pool, Some(admin.0.id), patch.clone())
+        .await
+        .map_err(ApiError::Internal)?;
     {
         let mut guard = state.settings.write().await;
         *guard = updated;
@@ -1089,7 +1119,10 @@ async fn find_kind_schedule_row(
     }
 
     for candidate in &candidate_kinds {
-        if let Some(idx) = rows.iter().position(|r| &r.kind == candidate && is_global(r)) {
+        if let Some(idx) = rows
+            .iter()
+            .position(|r| &r.kind == candidate && is_global(r))
+        {
             return Ok(rows.swap_remove(idx));
         }
     }
@@ -1142,9 +1175,8 @@ pub async fn update_kind_schedule(
         validate_frequency_value(freq)?;
     }
     if let Some(ref params) = update.params_json {
-        let parsed: serde_json::Value = serde_json::from_str(params).map_err(|e| {
-            ApiError::validation(format!("params_json must be JSON: {e}"))
-        })?;
+        let parsed: serde_json::Value = serde_json::from_str(params)
+            .map_err(|e| ApiError::validation(format!("params_json must be JSON: {e}")))?;
         if !parsed.is_object() {
             return Err(ApiError::validation("params_json must be a JSON object"));
         }
@@ -1152,8 +1184,8 @@ pub async fn update_kind_schedule(
 
     // Recompute next_run_at only when a schedule-affecting field
     // moved. enabled/params alone keep the existing tick.
-    let schedule_changed = update.frequency.is_some()
-        || update.requires_maintenance_window.is_some();
+    let schedule_changed =
+        update.frequency.is_some() || update.requires_maintenance_window.is_some();
     let recomputed_next = if schedule_changed {
         let freq = update.frequency.as_deref().unwrap_or(&existing.frequency);
         let requires = update

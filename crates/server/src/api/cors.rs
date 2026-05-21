@@ -28,11 +28,7 @@ const PREFLIGHT_MAX_AGE_SECS: &str = "600";
 const DEFAULT_ALLOWED_HEADERS: &str = "content-type, authorization, x-requested-with";
 const DEFAULT_ALLOWED_METHODS: &str = "GET, POST, PATCH, PUT, DELETE, OPTIONS";
 
-pub async fn layer(
-    State(state): State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn layer(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     let origin = req
         .headers()
         .get(header::ORIGIN)
@@ -86,11 +82,7 @@ async fn origin_allowed(state: &AppState, origin: &str) -> bool {
     })
 }
 
-fn write_cors_headers(
-    headers: &mut HeaderMap,
-    origin: &str,
-    is_preflight: bool,
-) {
+fn write_cors_headers(headers: &mut HeaderMap, origin: &str, is_preflight: bool) {
     if let Ok(v) = HeaderValue::from_str(origin) {
         headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
     }

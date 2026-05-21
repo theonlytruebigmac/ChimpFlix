@@ -198,10 +198,7 @@ async fn flush_pipeline_batch(state: &AppState, buf: &mut Vec<i64>) {
 /// does NOT retry. Acquiring the write lock upfront converts that
 /// into a plain BUSY that `busy_timeout` *does* poll on. Same
 /// trick used by `merge_items` in the library crate.
-pub async fn enqueue_pipeline_batch(
-    state: &AppState,
-    file_ids: &[i64],
-) -> anyhow::Result<()> {
+pub async fn enqueue_pipeline_batch(state: &AppState, file_ids: &[i64]) -> anyhow::Result<()> {
     use anyhow::Context;
     if file_ids.is_empty() {
         return Ok(());
@@ -271,7 +268,6 @@ pub struct SweepCounts {
     pub loudness: usize,
 }
 
-
 /// Retroactively run the discovery pipeline against the existing
 /// library: query for every file lacking each artifact, enqueue
 /// the corresponding kind. Dedup means a re-trigger while jobs are
@@ -303,8 +299,7 @@ pub async fn enqueue_full_sweep(state: &AppState) -> anyhow::Result<SweepCounts>
         for lib in queries::list_libraries(pool, None).await? {
             let rows = queries::list_media_files_needing_markers(pool, lib.id, CAP).await?;
             let ids: Vec<i64> = rows.into_iter().map(|(id, _, _)| id).collect();
-            counts.markers +=
-                handlers::detect_markers_file::enqueue_for_files(pool, &ids).await?;
+            counts.markers += handlers::detect_markers_file::enqueue_for_files(pool, &ids).await?;
         }
     }
 
@@ -324,8 +319,7 @@ pub async fn enqueue_full_sweep(state: &AppState) -> anyhow::Result<SweepCounts>
         .await
         .is_allowed()
     {
-        let thumbs =
-            queries::list_media_files_needing_chapter_thumbs(pool, None, CAP).await?;
+        let thumbs = queries::list_media_files_needing_chapter_thumbs(pool, None, CAP).await?;
         let thumb_ids: Vec<i64> = thumbs.iter().map(|c| c.id).collect();
         counts.chapter_thumbs =
             handlers::build_chapter_thumbs::enqueue_for_files(pool, &thumb_ids).await?;
@@ -338,8 +332,7 @@ pub async fn enqueue_full_sweep(state: &AppState) -> anyhow::Result<SweepCounts>
     {
         let loud = queries::list_media_files_needing_loudness(pool, None, CAP).await?;
         let loud_ids: Vec<i64> = loud.iter().map(|c| c.id).collect();
-        counts.loudness =
-            handlers::analyze_loudness::enqueue_for_files(pool, &loud_ids).await?;
+        counts.loudness = handlers::analyze_loudness::enqueue_for_files(pool, &loud_ids).await?;
     }
 
     Ok(counts)

@@ -346,7 +346,10 @@ impl HwAccel {
             };
             cmd.args(["-vaapi_device", path]);
         }
-        if matches!(self, Self::Nvenc) && device.chars().all(|c| c.is_ascii_digit()) && !device.is_empty() {
+        if matches!(self, Self::Nvenc)
+            && device.chars().all(|c| c.is_ascii_digit())
+            && !device.is_empty()
+        {
             // NVENC selects the device via -gpu <index>. Has to land
             // before -i. Skipped when device is "auto" (NVENC picks
             // the first usable card).
@@ -422,12 +425,7 @@ impl HwAccel {
     /// latency between input and segment-on-disk. Quality presets
     /// lean on the fast side because real-time encoding is the goal,
     /// not archival.
-    pub fn apply_encoder(
-        self,
-        cmd: &mut Command,
-        bitrate_bps: u64,
-        preset: EncoderPreset,
-    ) {
+    pub fn apply_encoder(self, cmd: &mut Command, bitrate_bps: u64, preset: EncoderPreset) {
         let target = bitrate_bps.to_string();
         let maxrate = (bitrate_bps + bitrate_bps / 16).to_string();
         let bufsize = (bitrate_bps * 2).to_string();

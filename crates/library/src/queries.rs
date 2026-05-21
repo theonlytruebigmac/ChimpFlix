@@ -22,15 +22,15 @@ use sqlx::{Row, SqlitePool};
 use crate::models::{
     AccessGroup, AccessGroupDetail, AccessGroupUpdate, AuditLogEntry, Credit, Episode,
     EpisodeDetail, EpisodeListed, ExternalSubtitle, Extra, Invite, Item, ItemDetail, ItemEdit,
-    ItemFilter, ItemKind, ItemPage, Library, LibraryAgent, LibraryUpdate, ListedItem, Marker,
-    MediaFileLocator, MediaFileSummary, MediaStreamSummary, NewAccessGroup, NewAuditEntry,
-    NewExternalSubtitle, NewLibrary, NewOptimizedVersion, NewScheduledTask, NewTranscoderPreset,
-    NewWebhook, Notification, OnDeckEntry, OnDeckResponse, OptimizedVersion, Person,
-    JobRow, JobStatus, JobSummary, PlayStateBatch, PlayStateForItem, Review, ReviewsSummary,
-    ScanJob, ScheduledTask, ScheduledTaskUpdate, Season, SeasonDetail, SeasonSummary,
-    SecretMetadata, ServerSettings, ShowWatchStats,
-    ServerSettingsUpdate, SessionRow, TaskRun, TranscoderPreset, TranscoderPresetUpdate, User,
-    UserRole, UserWithSecret, Webhook, WebhookDelivery, WebhookUpdate, make_sort_title,
+    ItemFilter, ItemKind, ItemPage, JobRow, JobStatus, JobSummary, Library, LibraryAgent,
+    LibraryUpdate, ListedItem, Marker, MediaFileLocator, MediaFileSummary, MediaStreamSummary,
+    NewAccessGroup, NewAuditEntry, NewExternalSubtitle, NewLibrary, NewOptimizedVersion,
+    NewScheduledTask, NewTranscoderPreset, NewWebhook, Notification, OnDeckEntry, OnDeckResponse,
+    OptimizedVersion, Person, PlayStateBatch, PlayStateForItem, Review, ReviewsSummary, ScanJob,
+    ScheduledTask, ScheduledTaskUpdate, Season, SeasonDetail, SeasonSummary, SecretMetadata,
+    ServerSettings, ServerSettingsUpdate, SessionRow, ShowWatchStats, TaskRun, TranscoderPreset,
+    TranscoderPresetUpdate, User, UserRole, UserWithSecret, Webhook, WebhookDelivery,
+    WebhookUpdate, make_sort_title,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,14 +141,9 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
         .context("library disappeared after insert")
 }
 
-pub async fn list_libraries(
-    pool: &SqlitePool,
-    accessible: Option<&[i64]>,
-) -> Result<Vec<Library>> {
+pub async fn list_libraries(pool: &SqlitePool, accessible: Option<&[i64]>) -> Result<Vec<Library>> {
     let filter = library_filter_sql("id", accessible);
-    let sql = format!(
-        "SELECT * FROM libraries WHERE {filter} ORDER BY created_at ASC",
-    );
+    let sql = format!("SELECT * FROM libraries WHERE {filter} ORDER BY created_at ASC",);
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
 
     // Pull every library_paths row in a single query and group in
@@ -281,10 +276,7 @@ pub async fn update_library(
 
 // ─── Library agents ────────────────────────────────────────────────────────
 
-pub async fn list_library_agents(
-    pool: &SqlitePool,
-    library_id: i64,
-) -> Result<Vec<LibraryAgent>> {
+pub async fn list_library_agents(pool: &SqlitePool, library_id: i64) -> Result<Vec<LibraryAgent>> {
     let rows = sqlx::query(
         "SELECT agent_name, priority, enabled, config_json
          FROM library_agents WHERE library_id = ?
@@ -558,9 +550,8 @@ pub async fn list_items(
     if filter.q.is_some() {
         // Full-text via items_fts. The MATCH query is built below from the
         // user input with each token quoted to defang FTS5 operators.
-        where_clauses.push(
-            "i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".to_string(),
-        );
+        where_clauses
+            .push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".to_string());
     }
     if let Some(matched) = filter.auto_matched {
         where_clauses.push(format!(
@@ -573,8 +564,7 @@ pub async fn list_items(
 
     let order_by = filter.sort.unwrap_or_default().order_by();
     let count_sql = format!("SELECT COUNT(*) AS n FROM items i {where_sql}");
-    let list_sql =
-        format!("{ITEM_SELECT} {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?");
+    let list_sql = format!("{ITEM_SELECT} {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?");
 
     let fts_query = filter.q.as_ref().and_then(|s| fts_match_query(s));
 
@@ -706,7 +696,7 @@ pub async fn user_library_filter(
 fn library_filter_sql(column: &str, accessible: Option<&[i64]>) -> String {
     match accessible {
         None => "1=1".to_string(),
-        Some(ids) if ids.is_empty() => format!("{column} = 0"),
+        Some([]) => format!("{column} = 0"),
         Some(ids) => {
             let list = ids
                 .iter()
@@ -722,10 +712,7 @@ fn library_filter_sql(column: &str, accessible: Option<&[i64]>) -> String {
 /// movie path (item_id → items.library_id) and the episode path
 /// (episode_id → seasons → items(show).library_id). Returns None if
 /// the file id doesn't exist.
-pub async fn media_file_library_id(
-    pool: &SqlitePool,
-    file_id: i64,
-) -> Result<Option<i64>> {
+pub async fn media_file_library_id(pool: &SqlitePool, file_id: i64) -> Result<Option<i64>> {
     let row = sqlx::query(
         "SELECT COALESCE(
              (SELECT library_id FROM items WHERE id = mf.item_id),
@@ -753,10 +740,7 @@ pub async fn item_library_id(pool: &SqlitePool, item_id: i64) -> Result<Option<i
 }
 
 /// Owning library for an episode — walks episode → season → show → library.
-pub async fn episode_library_id(
-    pool: &SqlitePool,
-    episode_id: i64,
-) -> Result<Option<i64>> {
+pub async fn episode_library_id(pool: &SqlitePool, episode_id: i64) -> Result<Option<i64>> {
     let row = sqlx::query(
         "SELECT i.library_id AS library_id
            FROM episodes e
@@ -772,10 +756,7 @@ pub async fn episode_library_id(
 
 /// Owning library for an external subtitle row — derived from whichever
 /// of item_id / episode_id is set on the row.
-pub async fn external_subtitle_library_id(
-    pool: &SqlitePool,
-    sub_id: i64,
-) -> Result<Option<i64>> {
+pub async fn external_subtitle_library_id(pool: &SqlitePool, sub_id: i64) -> Result<Option<i64>> {
     let row = sqlx::query(
         "SELECT COALESCE(
              (SELECT library_id FROM items WHERE id = es.item_id),
@@ -793,16 +774,12 @@ pub async fn external_subtitle_library_id(
 }
 
 /// User IDs that currently have access to the given library.
-pub async fn list_library_user_ids(
-    pool: &SqlitePool,
-    library_id: i64,
-) -> Result<Vec<i64>> {
-    let rows = sqlx::query(
-        "SELECT user_id FROM library_access WHERE library_id = ? ORDER BY user_id",
-    )
-    .bind(library_id)
-    .fetch_all(pool)
-    .await?;
+pub async fn list_library_user_ids(pool: &SqlitePool, library_id: i64) -> Result<Vec<i64>> {
+    let rows =
+        sqlx::query("SELECT user_id FROM library_access WHERE library_id = ? ORDER BY user_id")
+            .bind(library_id)
+            .fetch_all(pool)
+            .await?;
     rows.iter()
         .map(|r| Ok(r.try_get::<i64, _>("user_id")?))
         .collect()
@@ -822,13 +799,12 @@ pub async fn set_library_user_ids(
         .execute(&mut *tx)
         .await?;
     // Always include all owners. Compute the union.
-    let owners: Vec<i64> =
-        sqlx::query("SELECT id FROM users WHERE role = 'owner'")
-            .fetch_all(&mut *tx)
-            .await?
-            .iter()
-            .map(|r| r.try_get::<i64, _>("id"))
-            .collect::<std::result::Result<_, _>>()?;
+    let owners: Vec<i64> = sqlx::query("SELECT id FROM users WHERE role = 'owner'")
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|r| r.try_get::<i64, _>("id"))
+        .collect::<std::result::Result<_, _>>()?;
     let mut seen = std::collections::HashSet::new();
     for uid in user_ids.iter().chain(owners.iter()) {
         if !seen.insert(*uid) {
@@ -851,10 +827,7 @@ pub async fn set_library_user_ids(
 // User prefs: hidden libraries
 // ---------------------------------------------------------------------------
 
-pub async fn list_hidden_libraries(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Vec<i64>> {
+pub async fn list_hidden_libraries(pool: &SqlitePool, user_id: i64) -> Result<Vec<i64>> {
     let rows = sqlx::query(
         "SELECT library_id FROM user_hidden_libraries WHERE user_id = ? ORDER BY library_id",
     )
@@ -923,11 +896,7 @@ pub async fn list_my_list(
         .collect()
 }
 
-pub async fn add_to_my_list(
-    pool: &SqlitePool,
-    user_id: i64,
-    item_id: i64,
-) -> Result<()> {
+pub async fn add_to_my_list(pool: &SqlitePool, user_id: i64, item_id: i64) -> Result<()> {
     sqlx::query(
         "INSERT INTO user_my_list (user_id, item_id, added_at) VALUES (?, ?, ?) \
          ON CONFLICT DO NOTHING",
@@ -940,17 +909,12 @@ pub async fn add_to_my_list(
     Ok(())
 }
 
-pub async fn remove_from_my_list(
-    pool: &SqlitePool,
-    user_id: i64,
-    item_id: i64,
-) -> Result<bool> {
-    let res =
-        sqlx::query("DELETE FROM user_my_list WHERE user_id = ? AND item_id = ?")
-            .bind(user_id)
-            .bind(item_id)
-            .execute(pool)
-            .await?;
+pub async fn remove_from_my_list(pool: &SqlitePool, user_id: i64, item_id: i64) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM user_my_list WHERE user_id = ? AND item_id = ?")
+        .bind(user_id)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -969,8 +933,7 @@ pub async fn find_listed_items_by_tmdb_ids(
     }
     // Build (?, ?, ...) for the IN clause. sqlx-sqlite doesn't bind slices
     // natively, so we render placeholders and bind one-by-one.
-    let placeholders = std::iter::repeat("?")
-        .take(tmdb_ids.len())
+    let placeholders = std::iter::repeat_n("?", tmdb_ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let lib_filter = library_filter_sql("i.library_id", accessible);
@@ -1073,9 +1036,9 @@ pub async fn list_trending_in_library(
          LIMIT ?",
     );
     let rows = sqlx::query(&sql)
-        .bind(kind.as_str())   // tc.media_kind
-        .bind(user_id)         // ps.user_id
-        .bind(kind.as_str())   // i.kind
+        .bind(kind.as_str()) // tc.media_kind
+        .bind(user_id) // ps.user_id
+        .bind(kind.as_str()) // i.kind
         .bind(limit)
         .fetch_all(pool)
         .await?;
@@ -1142,9 +1105,7 @@ pub async fn get_item_detail(
     };
     let credits = list_credits_for_item(pool, id).await.unwrap_or_default();
     let extras = list_extras_for_item(pool, id).await.unwrap_or_default();
-    let reviews = reviews_summary_for_item(pool, id)
-        .await
-        .unwrap_or_default();
+    let reviews = reviews_summary_for_item(pool, id).await.unwrap_or_default();
     let watch_stats = match item.kind {
         ItemKind::Show => Some(show_watch_stats(pool, id, user_id).await?),
         ItemKind::Movie => None,
@@ -1166,11 +1127,7 @@ pub async fn get_item_detail(
 /// Returns total + watched episode counts for a show, for the given
 /// user. Used by the show-level Mark-watched toggle to decide which
 /// action label to render.
-async fn show_watch_stats(
-    pool: &SqlitePool,
-    show_id: i64,
-    user_id: i64,
-) -> Result<ShowWatchStats> {
+async fn show_watch_stats(pool: &SqlitePool, show_id: i64, user_id: i64) -> Result<ShowWatchStats> {
     let row = sqlx::query(
         "SELECT
             COUNT(*) AS total,
@@ -1332,11 +1289,7 @@ pub async fn get_season_detail(
          JOIN items i ON i.id = s.show_id \
          WHERE s.id = ? AND {filter}",
     );
-    let Some(row) = sqlx::query(&sql)
-        .bind(id)
-        .fetch_optional(pool)
-        .await?
-    else {
+    let Some(row) = sqlx::query(&sql).bind(id).fetch_optional(pool).await? else {
         return Ok(None);
     };
     let season = Season {
@@ -1407,10 +1360,10 @@ pub async fn get_episode_detail(
          WHERE e.id = ? AND {filter}",
     );
     let Some(r) = sqlx::query(&sql)
-    .bind(user_id)
-    .bind(id)
-    .fetch_optional(pool)
-    .await?
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
     else {
         return Ok(None);
     };
@@ -1507,10 +1460,7 @@ async fn media_file_summary(pool: &SqlitePool, row: &SqliteRow) -> Result<MediaF
     })
 }
 
-pub async fn list_markers_for_file(
-    pool: &SqlitePool,
-    media_file_id: i64,
-) -> Result<Vec<Marker>> {
+pub async fn list_markers_for_file(pool: &SqlitePool, media_file_id: i64) -> Result<Vec<Marker>> {
     let rows = sqlx::query(
         "SELECT kind, start_ms, end_ms, label, source FROM markers \
          WHERE media_file_id = ? ORDER BY start_ms ASC",
@@ -1539,12 +1489,10 @@ pub async fn replace_auto_markers(
     new_markers: &[(String, i64, i64)],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "DELETE FROM markers WHERE media_file_id = ? AND source = 'auto'",
-    )
-    .bind(media_file_id)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("DELETE FROM markers WHERE media_file_id = ? AND source = 'auto'")
+        .bind(media_file_id)
+        .execute(&mut *tx)
+        .await?;
     for (kind, start_ms, end_ms) in new_markers {
         sqlx::query(
             "INSERT INTO markers (media_file_id, kind, start_ms, end_ms, source) \
@@ -1576,10 +1524,7 @@ pub struct MarkerRow {
 
 /// List every marker on a media file with row ids + source. Sorted by
 /// start_ms so the editor renders them in playback order.
-pub async fn list_markers_full(
-    pool: &SqlitePool,
-    media_file_id: i64,
-) -> Result<Vec<MarkerRow>> {
+pub async fn list_markers_full(pool: &SqlitePool, media_file_id: i64) -> Result<Vec<MarkerRow>> {
     let rows = sqlx::query(
         "SELECT id, kind, start_ms, end_ms, label, source FROM markers \
          WHERE media_file_id = ? ORDER BY start_ms",
@@ -1606,10 +1551,7 @@ pub async fn list_markers_full(
 /// linked episode / season can't be found. Used by the
 /// detect_markers + capture pipelines to scope fingerprints to a
 /// show.
-pub async fn show_id_for_media_file(
-    pool: &SqlitePool,
-    media_file_id: i64,
-) -> Result<Option<i64>> {
+pub async fn show_id_for_media_file(pool: &SqlitePool, media_file_id: i64) -> Result<Option<i64>> {
     let row = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT s.show_id
          FROM media_files mf
@@ -1656,12 +1598,10 @@ pub async fn replace_manual_markers(
     new_markers: &[(String, i64, i64, Option<String>)],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "DELETE FROM markers WHERE media_file_id = ? AND source = 'manual'",
-    )
-    .bind(media_file_id)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("DELETE FROM markers WHERE media_file_id = ? AND source = 'manual'")
+        .bind(media_file_id)
+        .execute(&mut *tx)
+        .await?;
     for (kind, start_ms, end_ms, label) in new_markers {
         sqlx::query(
             "INSERT INTO markers (media_file_id, kind, start_ms, end_ms, label, source) \
@@ -1915,29 +1855,21 @@ pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn set_user_role(
-    pool: &SqlitePool,
-    id: i64,
-    role: UserRole,
-) -> Result<Option<User>> {
+pub async fn set_user_role(pool: &SqlitePool, id: i64, role: UserRole) -> Result<Option<User>> {
     // Same last-owner guard for demotion. Promoting to owner has no
     // such constraint — extra owners are fine.
     if !matches!(role, UserRole::Owner) {
         let current = current_user_role(pool, id).await?;
         if matches!(current, Some(UserRole::Owner)) && count_owners(pool).await? <= 1 {
-            anyhow::bail!(
-                "cannot demote the last owner — promote another user to owner first"
-            );
+            anyhow::bail!("cannot demote the last owner — promote another user to owner first");
         }
     }
-    let res = sqlx::query(
-        "UPDATE users SET role = ?, updated_at = ? WHERE id = ? RETURNING *",
-    )
-    .bind(role.as_str())
-    .bind(chimpflix_common::now_ms())
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let res = sqlx::query("UPDATE users SET role = ?, updated_at = ? WHERE id = ? RETURNING *")
+        .bind(role.as_str())
+        .bind(chimpflix_common::now_ms())
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     res.as_ref().map(User::from_row).transpose()
 }
 
@@ -2130,13 +2062,11 @@ pub async fn consume_email_change(
     }
     // Snapshot the previous email BEFORE the UPDATE so the caller can
     // notify that address.
-    let prior: Option<String> = sqlx::query_scalar(
-        "SELECT email FROM users WHERE id = ?",
-    )
-    .bind(user_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .flatten();
+    let prior: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
     sqlx::query("UPDATE users SET email = ?, updated_at = ? WHERE id = ?")
         .bind(new_email)
         .bind(now)
@@ -2161,20 +2091,14 @@ pub async fn consume_email_change(
 /// the plaintext (via the argon2 helper) and for any session-rotation
 /// that should follow. We bump `updated_at` so the touch_audit pattern
 /// still works.
-pub async fn update_user_password(
-    pool: &SqlitePool,
-    user_id: i64,
-    new_hash: &str,
-) -> Result<bool> {
+pub async fn update_user_password(pool: &SqlitePool, user_id: i64, new_hash: &str) -> Result<bool> {
     let now = now_ms();
-    let res = sqlx::query(
-        "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(new_hash)
-    .bind(now)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    let res = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(new_hash)
+        .bind(now)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -2182,10 +2106,7 @@ pub async fn update_user_password(
 /// resolve the user before issuing a token. Returns None for unknown
 /// emails — the caller MUST treat that identically to "user found,
 /// token issued" to avoid leaking which addresses are registered.
-pub async fn find_user_by_email(
-    pool: &SqlitePool,
-    email: &str,
-) -> Result<Option<User>> {
+pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option<User>> {
     let Some(row) = sqlx::query("SELECT * FROM users WHERE email = ? COLLATE NOCASE")
         .bind(email)
         .fetch_optional(pool)
@@ -2213,10 +2134,9 @@ pub async fn find_user_by_id(pool: &SqlitePool, id: i64) -> Result<Option<User>>
 /// setup flow guarantees an owner — but callers should still handle
 /// it gracefully rather than panic.
 pub async fn find_first_owner(pool: &SqlitePool) -> Result<Option<User>> {
-    let Some(row) =
-        sqlx::query("SELECT * FROM users WHERE role = 'owner' ORDER BY id ASC LIMIT 1")
-            .fetch_optional(pool)
-            .await?
+    let Some(row) = sqlx::query("SELECT * FROM users WHERE role = 'owner' ORDER BY id ASC LIMIT 1")
+        .fetch_optional(pool)
+        .await?
     else {
         return Ok(None);
     };
@@ -2529,10 +2449,7 @@ pub async fn cleanup_expired_email_change_tokens(pool: &SqlitePool) -> Result<u6
 
 /// Trim audit_log to a retention window. Defaults applied at the
 /// caller (currently 90 days). Returns the row count removed.
-pub async fn cleanup_old_audit_log(
-    pool: &SqlitePool,
-    older_than_ms: i64,
-) -> Result<u64> {
+pub async fn cleanup_old_audit_log(pool: &SqlitePool, older_than_ms: i64) -> Result<u64> {
     let res = sqlx::query("DELETE FROM audit_log WHERE created_at < ?")
         .bind(older_than_ms)
         .execute(pool)
@@ -2597,10 +2514,7 @@ pub async fn mark_user_totp_verified(pool: &SqlitePool, user_id: i64) -> Result<
     Ok(())
 }
 
-pub async fn get_user_totp(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Option<UserTotpRecord>> {
+pub async fn get_user_totp(pool: &SqlitePool, user_id: i64) -> Result<Option<UserTotpRecord>> {
     let Some(row) = sqlx::query("SELECT * FROM user_totp WHERE user_id = ?")
         .bind(user_id)
         .fetch_optional(pool)
@@ -2611,7 +2525,10 @@ pub async fn get_user_totp(
     Ok(Some(UserTotpRecord {
         user_id: row.try_get("user_id")?,
         secret_enc: row.try_get("secret_enc")?,
-        secret_nonce: row.try_get::<Option<Vec<u8>>, _>("secret_nonce").ok().flatten(),
+        secret_nonce: row
+            .try_get::<Option<Vec<u8>>, _>("secret_nonce")
+            .ok()
+            .flatten(),
         verified_at: row.try_get::<Option<i64>, _>("verified_at").ok().flatten(),
         created_at: row.try_get("created_at")?,
     }))
@@ -2782,11 +2699,7 @@ pub async fn mark_notification_read(
 /// `previous_login_*` and overwrites with the new value, so the
 /// post-login screen can show "Last signed in <previous> from <ip>".
 /// Best-effort: callers log on failure but never fail the login.
-pub async fn record_user_login(
-    pool: &SqlitePool,
-    user_id: i64,
-    ip: Option<&str>,
-) -> Result<()> {
+pub async fn record_user_login(pool: &SqlitePool, user_id: i64, ip: Option<&str>) -> Result<()> {
     let now = now_ms();
     sqlx::query(
         "UPDATE users
@@ -2804,18 +2717,14 @@ pub async fn record_user_login(
     Ok(())
 }
 
-pub async fn mark_all_notifications_read(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<u64> {
+pub async fn mark_all_notifications_read(pool: &SqlitePool, user_id: i64) -> Result<u64> {
     let now = now_ms();
-    let res = sqlx::query(
-        "UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL",
-    )
-    .bind(now)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL")
+            .bind(now)
+            .bind(user_id)
+            .execute(pool)
+            .await?;
     Ok(res.rows_affected())
 }
 
@@ -2868,8 +2777,8 @@ pub async fn list_all_sessions_filtered(
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let role_str: String = r.try_get("user_role")?;
-        let user_role = crate::models::UserRole::from_db(&role_str)
-            .unwrap_or(crate::models::UserRole::User);
+        let user_role =
+            crate::models::UserRole::from_db(&role_str).unwrap_or(crate::models::UserRole::User);
         out.push(SessionSummary {
             id: r.try_get("id")?,
             user_id: r.try_get("user_id")?,
@@ -2885,10 +2794,7 @@ pub async fn list_all_sessions_filtered(
     Ok(out)
 }
 
-pub async fn list_user_sessions(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Vec<SessionSummary>> {
+pub async fn list_user_sessions(pool: &SqlitePool, user_id: i64) -> Result<Vec<SessionSummary>> {
     let now = now_ms();
     let rows = sqlx::query(
         "SELECT s.id, s.user_id, u.username, u.role AS user_role,
@@ -2906,8 +2812,8 @@ pub async fn list_user_sessions(
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let role_str: String = r.try_get("user_role")?;
-        let user_role = crate::models::UserRole::from_db(&role_str)
-            .unwrap_or(crate::models::UserRole::User);
+        let user_role =
+            crate::models::UserRole::from_db(&role_str).unwrap_or(crate::models::UserRole::User);
         out.push(SessionSummary {
             id: r.try_get("id")?,
             user_id: r.try_get("user_id")?,
@@ -3018,15 +2924,15 @@ pub async fn list_access_groups(pool: &SqlitePool) -> Result<Vec<AccessGroup>> {
     rows.iter().map(AccessGroup::from_row_with_counts).collect()
 }
 
-pub async fn create_access_group(
-    pool: &SqlitePool,
-    input: NewAccessGroup,
-) -> Result<AccessGroup> {
+pub async fn create_access_group(pool: &SqlitePool, input: NewAccessGroup) -> Result<AccessGroup> {
     let name = input.name.trim().to_string();
     if name.is_empty() {
         anyhow::bail!("name must not be empty");
     }
-    let description = input.description.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let description = input
+        .description
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let now = now_ms();
     sqlx::query(
         "INSERT INTO access_groups (name, description, created_at, updated_at)
@@ -3053,12 +2959,11 @@ pub async fn get_access_group_detail(
     };
     let group = AccessGroup::from_row_with_counts(&row)?;
 
-    let member_rows = sqlx::query(
-        "SELECT user_id FROM user_access_groups WHERE group_id = ? ORDER BY user_id",
-    )
-    .bind(id)
-    .fetch_all(pool)
-    .await?;
+    let member_rows =
+        sqlx::query("SELECT user_id FROM user_access_groups WHERE group_id = ? ORDER BY user_id")
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
     let member_ids: Result<Vec<i64>> = member_rows
         .iter()
         .map(|r| Ok(r.try_get::<i64, _>("user_id")?))
@@ -3097,7 +3002,10 @@ pub async fn update_access_group(
     if sets.is_empty() {
         let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.id = ?");
         let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
-        return row.as_ref().map(AccessGroup::from_row_with_counts).transpose();
+        return row
+            .as_ref()
+            .map(AccessGroup::from_row_with_counts)
+            .transpose();
     }
     sets.push("updated_at = ?");
     let sql = format!("UPDATE access_groups SET {} WHERE id = ?", sets.join(", "));
@@ -3138,13 +3046,11 @@ pub async fn set_access_group_libraries(
         .execute(&mut *tx)
         .await?;
     for lib in library_ids {
-        sqlx::query(
-            "INSERT INTO access_group_libraries (group_id, library_id) VALUES (?, ?)",
-        )
-        .bind(group_id)
-        .bind(lib)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO access_group_libraries (group_id, library_id) VALUES (?, ?)")
+            .bind(group_id)
+            .bind(lib)
+            .execute(&mut *tx)
+            .await?;
     }
     sqlx::query("UPDATE access_groups SET updated_at = ? WHERE id = ?")
         .bind(now_ms())
@@ -3167,13 +3073,11 @@ pub async fn set_access_group_members(
         .execute(&mut *tx)
         .await?;
     for uid in user_ids {
-        sqlx::query(
-            "INSERT INTO user_access_groups (user_id, group_id) VALUES (?, ?)",
-        )
-        .bind(uid)
-        .bind(group_id)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO user_access_groups (user_id, group_id) VALUES (?, ?)")
+            .bind(uid)
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
     }
     sqlx::query("UPDATE access_groups SET updated_at = ? WHERE id = ?")
         .bind(now_ms())
@@ -3187,12 +3091,11 @@ pub async fn set_access_group_members(
 /// Groups this user is a member of. Useful for the user-detail view in
 /// the admin UI and for displaying "you're in groups: X, Y" to the user.
 pub async fn list_user_group_ids(pool: &SqlitePool, user_id: i64) -> Result<Vec<i64>> {
-    let rows = sqlx::query(
-        "SELECT group_id FROM user_access_groups WHERE user_id = ? ORDER BY group_id",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT group_id FROM user_access_groups WHERE user_id = ? ORDER BY group_id")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
     rows.iter()
         .map(|r| Ok(r.try_get::<i64, _>("group_id")?))
         .collect()
@@ -3201,24 +3104,18 @@ pub async fn list_user_group_ids(pool: &SqlitePool, user_id: i64) -> Result<Vec<
 /// Replace the user's group memberships atomically. Mirror of
 /// [`set_access_group_members`] from the other direction so the admin
 /// can manage from either side.
-pub async fn set_user_groups(
-    pool: &SqlitePool,
-    user_id: i64,
-    group_ids: &[i64],
-) -> Result<()> {
+pub async fn set_user_groups(pool: &SqlitePool, user_id: i64, group_ids: &[i64]) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM user_access_groups WHERE user_id = ?")
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
     for gid in group_ids {
-        sqlx::query(
-            "INSERT INTO user_access_groups (user_id, group_id) VALUES (?, ?)",
-        )
-        .bind(user_id)
-        .bind(gid)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO user_access_groups (user_id, group_id) VALUES (?, ?)")
+            .bind(user_id)
+            .bind(gid)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -3227,10 +3124,7 @@ pub async fn set_user_groups(
 /// Library IDs this user has access to through groups only (excluding
 /// direct `library_access` grants). Used by the admin user-detail view
 /// to distinguish "granted directly" vs "via group X".
-pub async fn list_user_group_library_ids(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Vec<i64>> {
+pub async fn list_user_group_library_ids(pool: &SqlitePool, user_id: i64) -> Result<Vec<i64>> {
     let rows = sqlx::query(
         "SELECT DISTINCT agl.library_id
            FROM access_group_libraries agl
@@ -3298,12 +3192,11 @@ pub async fn create_invite(
 
 /// Group IDs pre-bound to the invite. Mirror of [`invite_library_ids`].
 pub async fn invite_group_ids(pool: &SqlitePool, invite_id: i64) -> Result<Vec<i64>> {
-    let rows = sqlx::query(
-        "SELECT group_id FROM invite_groups WHERE invite_id = ? ORDER BY group_id",
-    )
-    .bind(invite_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT group_id FROM invite_groups WHERE invite_id = ? ORDER BY group_id")
+            .bind(invite_id)
+            .fetch_all(pool)
+            .await?;
     rows.iter()
         .map(|r| Ok(r.try_get::<i64, _>("group_id")?))
         .collect()
@@ -3346,11 +3239,7 @@ pub async fn find_invite_by_code_hash(
 /// Consume the invite + grant any pre-bound library access in a single
 /// transaction. The invite is identified by its `code_hash`; the plain-
 /// text token is hashed at the API edge and never reaches this layer.
-pub async fn consume_invite(
-    pool: &SqlitePool,
-    code_hash: &str,
-    user_id: i64,
-) -> Result<()> {
+pub async fn consume_invite(pool: &SqlitePool, code_hash: &str, user_id: i64) -> Result<()> {
     let now = now_ms();
     let mut tx = pool.begin().await?;
     let res = sqlx::query(
@@ -3785,10 +3674,7 @@ pub async fn on_deck(
 /// S1 and skipped S2 + S3 sees S2E1 as their next premiere — not
 /// S4E1 — matching the "missed it, here's where you left off
 /// chronologically" intent.
-async fn list_user_show_premieres(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Vec<(i64, i64)>> {
+async fn list_user_show_premieres(pool: &SqlitePool, user_id: i64) -> Result<Vec<(i64, i64)>> {
     // Two CTEs because SQLite rejects aggregate functions inside a
     // correlated subquery's WHERE — `... AND s2.season_number = MIN(s.season_number)`
     // surfaces as "misuse of aggregate function". We compute the
@@ -3933,8 +3819,7 @@ pub async fn mark_media_files_removed(pool: &SqlitePool, ids: &[i64]) -> Result<
         return Ok(0);
     }
     let now = now_ms();
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
+    let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
@@ -3974,10 +3859,7 @@ pub struct VerifyReport {
 /// the row stays around with `removed_at` set so a purge pass can
 /// reap it after a grace window (defends against transient mount
 /// failures eating an entire library).
-pub async fn verify_library(
-    pool: &SqlitePool,
-    library_id: i64,
-) -> Result<VerifyReport> {
+pub async fn verify_library(pool: &SqlitePool, library_id: i64) -> Result<VerifyReport> {
     let rows = list_media_files_for_verify(pool, library_id).await?;
     let mut report = VerifyReport {
         library_id,
@@ -4025,6 +3907,7 @@ pub async fn verify_library(
 ///   * Seasons with zero episodes
 ///   * Items (movies) with zero media_files
 ///   * Items (shows) with zero seasons
+///
 /// Each parent delete also cascades to its own children.
 ///
 /// Returns the count of each tier removed so the admin UI can
@@ -4062,12 +3945,10 @@ pub async fn purge_removed_media_files(
     report.purged_paths = path_rows;
 
     // Hard-delete the soft-deleted files past the grace window.
-    let r = sqlx::query(
-        "DELETE FROM media_files WHERE removed_at IS NOT NULL AND removed_at < ?",
-    )
-    .bind(older_than_ms)
-    .execute(pool)
-    .await?;
+    let r = sqlx::query("DELETE FROM media_files WHERE removed_at IS NOT NULL AND removed_at < ?")
+        .bind(older_than_ms)
+        .execute(pool)
+        .await?;
     report.files_purged = r.rows_affected();
 
     // Now sweep orphaned parents. Order matters: episodes first,
@@ -4116,16 +3997,12 @@ pub async fn purge_removed_media_files(
 /// admin UI / API consumer can show the same summary. `purged_paths`
 /// includes preview sprite paths in addition to the source file paths
 /// — both need on-disk cleanup by the caller.
-pub async fn delete_media_files_force(
-    pool: &SqlitePool,
-    file_ids: &[i64],
-) -> Result<PurgeReport> {
+pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Result<PurgeReport> {
     let mut report = PurgeReport::default();
     if file_ids.is_empty() {
         return Ok(report);
     }
-    let placeholders = std::iter::repeat("?")
-        .take(file_ids.len())
+    let placeholders = std::iter::repeat_n("?", file_ids.len())
         .collect::<Vec<_>>()
         .join(",");
 
@@ -4133,9 +4010,8 @@ pub async fn delete_media_files_force(
     // DELETE: the source file path itself, and the preview sprite path
     // (when present). FK cascade drops media_streams / markers /
     // optimized_versions rows but doesn't touch the filesystem.
-    let select_sql = format!(
-        "SELECT path, preview_sprite_path FROM media_files WHERE id IN ({placeholders})"
-    );
+    let select_sql =
+        format!("SELECT path, preview_sprite_path FROM media_files WHERE id IN ({placeholders})");
     let mut q = sqlx::query(&select_sql);
     for id in file_ids {
         q = q.bind(*id);
@@ -4340,13 +4216,11 @@ pub async fn upsert_item_with_match(
 /// the "Unmatched" surface.
 pub async fn mark_item_auto_matched(pool: &SqlitePool, item_id: i64) -> Result<()> {
     let now = now_ms();
-    sqlx::query(
-        "UPDATE items SET auto_matched = 1, updated_at = ? WHERE id = ?",
-    )
-    .bind(now)
-    .bind(item_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE items SET auto_matched = 1, updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -4604,7 +4478,9 @@ async fn fetch_locked_fields(pool: &SqlitePool, item_id: i64) -> Result<Vec<Stri
         .bind(item_id)
         .fetch_optional(pool)
         .await?;
-    let Some(row) = row else { return Ok(Vec::new()) };
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
     let raw: String = row.try_get("locked_fields").unwrap_or_default();
     Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
 }
@@ -4617,7 +4493,11 @@ fn is_locked(locked: &[String], field: &str) -> bool {
 /// Bind sites use `COALESCE(?, existing_column)` so a `None` keeps the
 /// current value untouched.
 fn pick<T>(locked: &[String], field: &str, value: T) -> Option<T> {
-    if is_locked(locked, field) { None } else { Some(value) }
+    if is_locked(locked, field) {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMovie) -> Result<()> {
@@ -4643,10 +4523,7 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
     // so the frontend doesn't need to know the TMDB image base. `w500`
     // is plenty for the modal hero — most title-treatment logos are
     // ≤ 1500px wide at original; w500 keeps payload light.
-    let logo_url = meta
-        .logo_path
-        .as_deref()
-        .map(|p| tmdb_image_url(p, "w500"));
+    let logo_url = meta.logo_path.as_deref().map(|p| tmdb_image_url(p, "w500"));
 
     // `title_present` is the gate for the "title-derived fields"
     // (original_title / summary / tagline) — if TMDB returned no title
@@ -4733,10 +4610,7 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
     let original_title = pick(&locked, "original_title", meta.original_title.clone()).flatten();
     let summary = pick(&locked, "summary", meta.summary.clone()).flatten();
     let year = pick(&locked, "year", meta.year).flatten();
-    let logo_url = meta
-        .logo_path
-        .as_deref()
-        .map(|p| tmdb_image_url(p, "w500"));
+    let logo_url = meta.logo_path.as_deref().map(|p| tmdb_image_url(p, "w500"));
 
     let title_present = title.is_some();
     sqlx::query(
@@ -4806,13 +4680,16 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
 /// `overview` may be None — the `belongs_to_collection` stub doesn't
 /// include it; the full /collection/{id} fetch does. We update fields
 /// COALESCE-style so a follow-up call enriches the row.
-pub async fn upsert_collection_stub(
-    pool: &SqlitePool,
-    stub: &TmdbCollectionStub,
-) -> Result<i64> {
+pub async fn upsert_collection_stub(pool: &SqlitePool, stub: &TmdbCollectionStub) -> Result<i64> {
     let now = now_ms();
-    let poster = stub.poster_path.as_deref().map(|p| tmdb_image_url(p, "w500"));
-    let backdrop = stub.backdrop_path.as_deref().map(|p| tmdb_image_url(p, "w1280"));
+    let poster = stub
+        .poster_path
+        .as_deref()
+        .map(|p| tmdb_image_url(p, "w500"));
+    let backdrop = stub
+        .backdrop_path
+        .as_deref()
+        .map(|p| tmdb_image_url(p, "w1280"));
     let row = sqlx::query(
         "INSERT INTO collections (tmdb_id, name, poster_path, backdrop_path, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -4873,15 +4750,14 @@ pub async fn assign_item_collection(
 /// Lookup an existing collection by TMDB id; returns the local id when
 /// already known. Used by the scanner to avoid re-fetching /collection
 /// detail on every movie ingest.
-pub async fn find_collection_by_tmdb(
-    pool: &SqlitePool,
-    tmdb_id: i64,
-) -> Result<Option<i64>> {
+pub async fn find_collection_by_tmdb(pool: &SqlitePool, tmdb_id: i64) -> Result<Option<i64>> {
     let row = sqlx::query("SELECT id FROM collections WHERE tmdb_id = ?")
         .bind(tmdb_id)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| r.try_get::<i64, _>("id").unwrap_or(0)).filter(|v| *v > 0))
+    Ok(row
+        .map(|r| r.try_get::<i64, _>("id").unwrap_or(0))
+        .filter(|v| *v > 0))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -5028,7 +4904,8 @@ pub async fn get_collection(
                     c.created_by_user_id, c.rule_json,
                     0 AS item_count
              FROM collections c
-             WHERE c.id = ?".to_string()
+             WHERE c.id = ?"
+                .to_string()
         }
         _ => format!(
             "SELECT c.id, c.tmdb_id, c.kind, c.name, c.sort_title, c.overview,
@@ -5070,7 +4947,9 @@ pub async fn list_items_in_collection(
         .bind(collection_id)
         .fetch_optional(pool)
         .await?;
-    let Some(kr) = kind_row else { return Ok(Vec::new()) };
+    let Some(kr) = kind_row else {
+        return Ok(Vec::new());
+    };
     let kind: String = kr.try_get("kind")?;
 
     if kind == "smart" {
@@ -5245,21 +5124,16 @@ pub async fn update_smart_collection_rule(
         return Ok(false);
     }
     let now = now_ms();
-    sqlx::query(
-        "UPDATE collections SET rule_json = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(rule_json)
-    .bind(now)
-    .bind(collection_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE collections SET rule_json = ?, updated_at = ? WHERE id = ?")
+        .bind(rule_json)
+        .bind(now)
+        .bind(collection_id)
+        .execute(pool)
+        .await?;
     Ok(true)
 }
 
-pub async fn delete_smart_collection(
-    pool: &SqlitePool,
-    collection_id: i64,
-) -> Result<bool> {
+pub async fn delete_smart_collection(pool: &SqlitePool, collection_id: i64) -> Result<bool> {
     let res = sqlx::query("DELETE FROM collections WHERE id = ? AND kind = 'smart'")
         .bind(collection_id)
         .execute(pool)
@@ -5311,10 +5185,7 @@ pub async fn update_manual_collection(
     }
     parts.push("updated_at = ?");
 
-    let sql = format!(
-        "UPDATE collections SET {} WHERE id = ?",
-        parts.join(", ")
-    );
+    let sql = format!("UPDATE collections SET {} WHERE id = ?", parts.join(", "));
     let mut q = sqlx::query(&sql);
     if let Some(v) = patch.name {
         q = q.bind(v);
@@ -5338,10 +5209,7 @@ pub async fn update_manual_collection(
 
 /// Drop a manual collection (and via ON DELETE CASCADE, its junction
 /// rows). Returns false for unknown ids and auto collections.
-pub async fn delete_manual_collection(
-    pool: &SqlitePool,
-    collection_id: i64,
-) -> Result<bool> {
+pub async fn delete_manual_collection(pool: &SqlitePool, collection_id: i64) -> Result<bool> {
     let res = sqlx::query("DELETE FROM collections WHERE id = ? AND kind = 'manual'")
         .bind(collection_id)
         .execute(pool)
@@ -5520,8 +5388,7 @@ pub async fn apply_show_metadata_tvmaze(
     }
     if !is_locked(&locked, "backdrop") {
         if let Some(p) = &meta.backdrop_url {
-            store_image_if_missing(pool, Some(item_id), None, "backdrop", "tvmaze", p)
-                .await?;
+            store_image_if_missing(pool, Some(item_id), None, "backdrop", "tvmaze", p).await?;
         }
     }
 
@@ -5726,11 +5593,7 @@ pub async fn apply_movie_metadata_tvdb(
     Ok(())
 }
 
-async fn apply_genres_additive(
-    pool: &SqlitePool,
-    item_id: i64,
-    genres: &[String],
-) -> Result<()> {
+async fn apply_genres_additive(pool: &SqlitePool, item_id: i64, genres: &[String]) -> Result<()> {
     for g in genres {
         let row = sqlx::query(
             "INSERT INTO genres (name) VALUES (?)
@@ -5837,11 +5700,7 @@ pub async fn apply_item_credits(
     Ok(())
 }
 
-async fn insert_credit_cast(
-    pool: &SqlitePool,
-    item_id: i64,
-    m: &TmdbCastMember,
-) -> Result<()> {
+async fn insert_credit_cast(pool: &SqlitePool, item_id: i64, m: &TmdbCastMember) -> Result<()> {
     let person_id = upsert_person_by_tmdb(
         pool,
         m.tmdb_person_id,
@@ -5932,13 +5791,12 @@ pub async fn replace_item_credits(
         let person_id = match edit.person_id {
             Some(id) => id,
             None => {
-                let row = sqlx::query(
-                    "INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id",
-                )
-                .bind(trimmed_name)
-                .bind(edit.photo_url.as_deref())
-                .fetch_one(&mut *tx)
-                .await?;
+                let row =
+                    sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+                        .bind(trimmed_name)
+                        .bind(edit.photo_url.as_deref())
+                        .fetch_one(&mut *tx)
+                        .await?;
                 row.try_get("id")?
             }
         };
@@ -6033,9 +5891,6 @@ pub async fn apply_item_extras(
     Ok(())
 }
 
-/// Parse ISO 8601 timestamps (TMDB's `published_at` is e.g.
-/// `2024-03-15T12:00:00.000Z`) to epoch ms. Returns None on any parse
-/// failure so callers just skip the field.
 // ─── Edit metadata & reviews ───────────────────────────────────────────────
 
 /// Apply a user-issued Edit Metadata patch. Each field with `Some(_)` is
@@ -6272,7 +6127,7 @@ pub async fn enqueue_job_unique(
     let mut tx = pool.begin().await?;
     // `&mut *tx` derefs through Transaction to the underlying
     // SqliteConnection — matches the new tx-helper signatures.
-    let inserted = enqueue_job_unique_tx(&mut *tx, input, dedup_field, dedup_value).await?;
+    let inserted = enqueue_job_unique_tx(&mut tx, input, dedup_field, dedup_value).await?;
     tx.commit().await?;
     Ok(inserted)
 }
@@ -6322,10 +6177,7 @@ pub async fn enqueue_job_unique_tx(
 /// Connection-scoped variant of `enqueue_job` — pairs with
 /// `enqueue_job_unique_tx` for the batched-pipeline path. Caller
 /// owns the surrounding transaction.
-pub async fn enqueue_job_tx(
-    conn: &mut sqlx::SqliteConnection,
-    input: JobInput,
-) -> Result<i64> {
+pub async fn enqueue_job_tx(conn: &mut sqlx::SqliteConnection, input: JobInput) -> Result<i64> {
     let now = now_ms();
     let run_after = input.run_after.unwrap_or(now);
     let payload = serde_json::to_string(&input.payload)?;
@@ -6433,8 +6285,7 @@ pub async fn claim_next_job_excluding_kinds(
     // Build the IN-list of placeholders dynamically. `exclude_kinds`
     // is small (≤ number of registered job kinds) so the SQL stays
     // short. Bind each kind separately so sqlx escapes correctly.
-    let placeholders = std::iter::repeat("?")
-        .take(exclude_kinds.len())
+    let placeholders = std::iter::repeat_n("?", exclude_kinds.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
@@ -6723,11 +6574,7 @@ pub struct MergeReport {
 /// the operator must remove one before retrying.
 ///
 /// Transactional: any error rolls back the whole operation.
-pub async fn merge_items(
-    pool: &SqlitePool,
-    source_id: i64,
-    target_id: i64,
-) -> Result<MergeReport> {
+pub async fn merge_items(pool: &SqlitePool, source_id: i64, target_id: i64) -> Result<MergeReport> {
     if source_id == target_id {
         anyhow::bail!("source and target are the same item");
     }
@@ -6770,18 +6617,16 @@ async fn merge_items_inner(
         library_id: i64,
         kind: String,
     }
-    let source: ItemHeader =
-        sqlx::query_as("SELECT library_id, kind FROM items WHERE id = ?")
-            .bind(source_id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("source item {source_id} not found"))?;
-    let target: ItemHeader =
-        sqlx::query_as("SELECT library_id, kind FROM items WHERE id = ?")
-            .bind(target_id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("target item {target_id} not found"))?;
+    let source: ItemHeader = sqlx::query_as("SELECT library_id, kind FROM items WHERE id = ?")
+        .bind(source_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("source item {source_id} not found"))?;
+    let target: ItemHeader = sqlx::query_as("SELECT library_id, kind FROM items WHERE id = ?")
+        .bind(target_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("target item {target_id} not found"))?;
     if source.library_id != target.library_id {
         anyhow::bail!("source and target are in different libraries");
     }
@@ -6953,10 +6798,7 @@ pub async fn clear_dead_jobs(pool: &SqlitePool) -> Result<u64> {
 /// Optional `kind_filter`: when set, only wipes that kind. Useful
 /// when the operator regrets only one type of pending work (e.g.
 /// "cancel all queued loudness jobs but keep the markers ones").
-pub async fn wipe_queued_jobs(
-    pool: &SqlitePool,
-    kind_filter: Option<&str>,
-) -> Result<u64> {
+pub async fn wipe_queued_jobs(pool: &SqlitePool, kind_filter: Option<&str>) -> Result<u64> {
     let res = if let Some(k) = kind_filter {
         sqlx::query("DELETE FROM jobs WHERE status = 'queued' AND kind = ?")
             .bind(k)
@@ -7111,6 +6953,9 @@ pub async fn apply_tmdb_reviews(
     Ok(())
 }
 
+/// Parse ISO 8601 timestamps (TMDB's `published_at` is e.g.
+/// `2024-03-15T12:00:00.000Z`) to epoch ms. Returns None on any parse
+/// failure so callers just skip the field.
 fn parse_iso8601_ms(s: &str) -> Option<i64> {
     // Minimal parse: split on 'T', then 'Z'/'+', take date YYYY-MM-DD and
     // time HH:MM:SS. We don't depend on chrono since the metadata crate
@@ -7227,11 +7072,7 @@ pub async fn replace_primary_image(
 ) -> Result<()> {
     store_image(pool, Some(item_id), None, kind, source, url).await?;
     // Lock the corresponding field so re-enrichment leaves it alone.
-    let lock_field = match kind {
-        "poster" => "poster",
-        "backdrop" => "backdrop",
-        other => other,
-    };
+    let lock_field = kind;
     let mut locked = fetch_locked_fields(pool, item_id).await?;
     if !locked.iter().any(|f| f == lock_field) {
         locked.push(lock_field.to_string());
@@ -7320,12 +7161,11 @@ pub async fn library_stats(pool: &SqlitePool) -> Result<Vec<LibraryStats>> {
 
     let mut out = Vec::with_capacity(libraries.len());
     for (id, name, kind) in libraries {
-        let item_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE library_id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(0);
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE library_id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
         let row = sqlx::query(
             "SELECT COUNT(*) AS c, COALESCE(SUM(size_bytes), 0) AS b
              FROM media_files mf
@@ -7344,8 +7184,14 @@ pub async fn library_stats(pool: &SqlitePool) -> Result<Vec<LibraryStats>> {
         .fetch_all(pool)
         .await
         .unwrap_or_default();
-        let file_count: i64 = row.iter().map(|r| r.try_get::<i64, _>("c").unwrap_or(0)).sum();
-        let total_bytes: i64 = row.iter().map(|r| r.try_get::<i64, _>("b").unwrap_or(0)).sum();
+        let file_count: i64 = row
+            .iter()
+            .map(|r| r.try_get::<i64, _>("c").unwrap_or(0))
+            .sum();
+        let total_bytes: i64 = row
+            .iter()
+            .map(|r| r.try_get::<i64, _>("b").unwrap_or(0))
+            .sum();
 
         out.push(LibraryStats {
             library_id: id,
@@ -7362,12 +7208,10 @@ pub async fn library_stats(pool: &SqlitePool) -> Result<Vec<LibraryStats>> {
 /// Recent scan jobs across all libraries. Order: newest first by `created_at`.
 pub async fn recent_scan_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<ScanJob>> {
     let limit = limit.clamp(1, 200);
-    let rows = sqlx::query(
-        "SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query("SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT ?")
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(ScanJob::from_row).collect()
 }
 
@@ -7476,13 +7320,17 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.job_kind_concurrency {
+        sqlx::query("UPDATE server_settings SET job_kind_concurrency = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.transcoder_hdr_tonemap_enabled {
-        sqlx::query(
-            "UPDATE server_settings SET transcoder_hdr_tonemap_enabled = ? WHERE id = 1",
-        )
-        .bind(i64::from(v))
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE server_settings SET transcoder_hdr_tonemap_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(v) = patch.transcoder_hdr_tonemap_algo {
         sqlx::query("UPDATE server_settings SET transcoder_hdr_tonemap_algo = ? WHERE id = 1")
@@ -7557,12 +7405,10 @@ pub async fn update_server_settings(
             .await?;
     }
     if let Some(v) = patch.continue_watching_max_age_weeks {
-        sqlx::query(
-            "UPDATE server_settings SET continue_watching_max_age_weeks = ? WHERE id = 1",
-        )
-        .bind(v)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE server_settings SET continue_watching_max_age_weeks = ? WHERE id = 1")
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(v) = patch.continue_watching_include_premieres {
         sqlx::query(
@@ -7697,9 +7543,7 @@ pub async fn update_server_settings(
         // garbage that'll fail to parse at next startup.
         let trimmed = v.trim();
         if !trimmed.is_empty() && trimmed.parse::<std::net::SocketAddr>().is_err() {
-            anyhow::bail!(
-                "bind_interface must be empty or a SocketAddr (e.g. 192.168.1.50:8080)"
-            );
+            anyhow::bail!("bind_interface must be empty or a SocketAddr (e.g. 192.168.1.50:8080)");
         }
         sqlx::query("UPDATE server_settings SET bind_interface = ? WHERE id = 1")
             .bind(trimmed)
@@ -7714,17 +7558,13 @@ pub async fn update_server_settings(
         // just no localisation).
         let trimmed = v.trim();
         if trimmed.is_empty() || trimmed.len() > 12 {
-            anyhow::bail!(
-                "metadata_language must be a 1–12 char BCP-47 tag (e.g. en-US, ja-JP)"
-            );
+            anyhow::bail!("metadata_language must be a 1–12 char BCP-47 tag (e.g. en-US, ja-JP)");
         }
         if !trimmed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
-            anyhow::bail!(
-                "metadata_language must contain only ASCII letters, digits, and dashes"
-            );
+            anyhow::bail!("metadata_language must contain only ASCII letters, digits, and dashes");
         }
         sqlx::query("UPDATE server_settings SET metadata_language = ? WHERE id = 1")
             .bind(trimmed)
@@ -7733,9 +7573,7 @@ pub async fn update_server_settings(
     }
     if let Some(v) = patch.recently_added_days {
         if !(0..=365).contains(&v) {
-            anyhow::bail!(
-                "recently_added_days must be between 0 and 365 (0 disables the badge)"
-            );
+            anyhow::bail!("recently_added_days must be between 0 and 365 (0 disables the badge)");
         }
         sqlx::query("UPDATE server_settings SET recently_added_days = ? WHERE id = 1")
             .bind(v)
@@ -7761,20 +7599,16 @@ pub async fn update_server_settings(
             .await?;
     }
     if let Some(v) = patch.embedded_subs_extract_enabled {
-        sqlx::query(
-            "UPDATE server_settings SET embedded_subs_extract_enabled = ? WHERE id = 1",
-        )
-        .bind(i64::from(v))
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE server_settings SET embedded_subs_extract_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(v) = patch.external_ratings_enabled {
-        sqlx::query(
-            "UPDATE server_settings SET external_ratings_enabled = ? WHERE id = 1",
-        )
-        .bind(i64::from(v))
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE server_settings SET external_ratings_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(v) = patch.extras_json {
         sqlx::query("UPDATE server_settings SET extras_json = ? WHERE id = 1")
@@ -7826,13 +7660,11 @@ pub async fn list_audit(
     // Cursor pagination by descending id. `before_id` is exclusive.
     let limit = limit.clamp(1, 200);
     let rows = if let Some(before) = before_id {
-        sqlx::query(
-            "SELECT * FROM audit_log WHERE id < ? ORDER BY id DESC LIMIT ?",
-        )
-        .bind(before)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
+        sqlx::query("SELECT * FROM audit_log WHERE id < ? ORDER BY id DESC LIMIT ?")
+            .bind(before)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
     } else {
         sqlx::query("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?")
             .bind(limit)
@@ -7844,8 +7676,8 @@ pub async fn list_audit(
 
 /// Offset/limit variant for the admin UI's paged audit table.
 /// Cursor-based [`list_audit`] is kept for any future API consumer
-/// that wants O(1) deep-scroll; the admin page wants jump-to-page
-/// + total-count, which means we pay an OFFSET (acceptable here —
+/// that wants O(1) deep-scroll; the admin page wants jump-to-page and
+/// total-count, which means we pay an OFFSET (acceptable here:
 /// audit_log is bounded by retention, typically <100k rows).
 pub async fn list_audit_paged(
     pool: &SqlitePool,
@@ -7854,13 +7686,11 @@ pub async fn list_audit_paged(
 ) -> Result<Vec<AuditLogEntry>> {
     let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
-    let rows = sqlx::query(
-        "SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query("SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?")
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(AuditLogEntry::from_row).collect()
 }
 
@@ -7966,18 +7796,12 @@ pub async fn claim_queued_optimized(
     rows.iter().map(OptimizedVersion::from_row).collect()
 }
 
-pub async fn mark_optimized_running(
-    pool: &SqlitePool,
-    id: i64,
-    output_path: &str,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE optimized_versions SET status = 'running', output_path = ? WHERE id = ?",
-    )
-    .bind(output_path)
-    .bind(id)
-    .execute(pool)
-    .await?;
+pub async fn mark_optimized_running(pool: &SqlitePool, id: i64, output_path: &str) -> Result<()> {
+    sqlx::query("UPDATE optimized_versions SET status = 'running', output_path = ? WHERE id = ?")
+        .bind(output_path)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -8037,7 +7861,9 @@ pub async fn list_webhooks(
     let rows = sqlx::query("SELECT * FROM webhooks ORDER BY id ASC")
         .fetch_all(pool)
         .await?;
-    rows.iter().map(|row| Webhook::from_row(row, vault)).collect()
+    rows.iter()
+        .map(|row| Webhook::from_row(row, vault))
+        .collect()
 }
 
 pub async fn get_webhook(
@@ -8241,18 +8067,13 @@ pub async fn list_webhook_deliveries(
 // ---------------------------------------------------------------------------
 
 pub async fn list_transcoder_presets(pool: &SqlitePool) -> Result<Vec<TranscoderPreset>> {
-    let rows = sqlx::query(
-        "SELECT * FROM transcoder_presets ORDER BY sort_order ASC, id ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query("SELECT * FROM transcoder_presets ORDER BY sort_order ASC, id ASC")
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(TranscoderPreset::from_row).collect()
 }
 
-pub async fn get_transcoder_preset(
-    pool: &SqlitePool,
-    id: i64,
-) -> Result<Option<TranscoderPreset>> {
+pub async fn get_transcoder_preset(pool: &SqlitePool, id: i64) -> Result<Option<TranscoderPreset>> {
     let row = sqlx::query("SELECT * FROM transcoder_presets WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
@@ -8299,12 +8120,16 @@ pub async fn update_transcoder_preset(
     macro_rules! upd {
         ($col:literal, $val:expr) => {
             if let Some(v) = $val {
-                sqlx::query(concat!("UPDATE transcoder_presets SET ", $col, " = ?, updated_at = ? WHERE id = ?"))
-                    .bind(v)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(concat!(
+                    "UPDATE transcoder_presets SET ",
+                    $col,
+                    " = ?, updated_at = ? WHERE id = ?"
+                ))
+                .bind(v)
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             }
         };
     }
@@ -8339,11 +8164,10 @@ pub async fn delete_transcoder_preset(pool: &SqlitePool, id: i64) -> Result<bool
 // ---------------------------------------------------------------------------
 
 pub async fn list_scheduled_tasks(pool: &SqlitePool) -> Result<Vec<ScheduledTask>> {
-    let rows = sqlx::query(
-        "SELECT * FROM scheduled_tasks ORDER BY enabled DESC, next_run_at ASC, id ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT * FROM scheduled_tasks ORDER BY enabled DESC, next_run_at ASC, id ASC")
+            .fetch_all(pool)
+            .await?;
     rows.iter().map(ScheduledTask::from_row).collect()
 }
 
@@ -8517,6 +8341,7 @@ pub async fn mark_task_running(pool: &SqlitePool, task_id: i64, started_at: i64)
     Ok(run_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn mark_task_finished(
     pool: &SqlitePool,
     task_id: i64,
@@ -8584,19 +8409,14 @@ pub async fn mark_interrupted_tasks(pool: &SqlitePool) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
-pub async fn list_task_runs(
-    pool: &SqlitePool,
-    task_id: i64,
-    limit: i64,
-) -> Result<Vec<TaskRun>> {
+pub async fn list_task_runs(pool: &SqlitePool, task_id: i64, limit: i64) -> Result<Vec<TaskRun>> {
     let limit = limit.clamp(1, 200);
-    let rows = sqlx::query(
-        "SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT ?",
-    )
-    .bind(task_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT ?")
+            .bind(task_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
     rows.iter().map(TaskRun::from_row).collect()
 }
 
@@ -8606,10 +8426,7 @@ pub async fn list_task_runs(
 /// failure 2, and so on. The result is bounded by SQLite's count
 /// itself (always finite) but the caller should cap the exponent it
 /// derives from it to avoid `2^N` overflow.
-pub async fn count_consecutive_task_failures(
-    pool: &SqlitePool,
-    task_id: i64,
-) -> Result<i64> {
+pub async fn count_consecutive_task_failures(pool: &SqlitePool, task_id: i64) -> Result<i64> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_runs
          WHERE task_id = ?
@@ -8677,8 +8494,12 @@ pub async fn upsert_trakt_tokens(
     // Encrypt before insert. The plaintext columns are explicitly set
     // to NULL on upsert so a refresh-token rotation never leaves the
     // old plaintext value behind.
-    let access_blob = vault.encrypt_str(access_token).context("encrypt trakt access_token")?;
-    let refresh_blob = vault.encrypt_str(refresh_token).context("encrypt trakt refresh_token")?;
+    let access_blob = vault
+        .encrypt_str(access_token)
+        .context("encrypt trakt access_token")?;
+    let refresh_blob = vault
+        .encrypt_str(refresh_token)
+        .context("encrypt trakt refresh_token")?;
     sqlx::query(
         "INSERT INTO user_trakt_tokens
             (user_id, access_token, refresh_token,
@@ -8714,32 +8535,46 @@ pub async fn get_trakt_tokens(
     vault: &chimpflix_common::Vault,
     user_id: i64,
 ) -> Result<Option<TraktTokensRow>> {
-    let row = sqlx::query(
-        "SELECT * FROM user_trakt_tokens WHERE user_id = ?",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT * FROM user_trakt_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
     let Some(row) = row else { return Ok(None) };
     // Prefer the encrypted column. Fall back to the legacy plaintext
     // column for rows that haven't been migrated by the boot backfill
     // yet — same pattern Webhook.from_row uses.
     let access_token = decrypt_or_plaintext(
         vault,
-        row.try_get::<Option<Vec<u8>>, _>("access_token_enc").ok().flatten(),
-        row.try_get::<Option<Vec<u8>>, _>("access_token_nonce").ok().flatten(),
-        row.try_get::<Option<String>, _>("access_token").ok().flatten(),
+        row.try_get::<Option<Vec<u8>>, _>("access_token_enc")
+            .ok()
+            .flatten(),
+        row.try_get::<Option<Vec<u8>>, _>("access_token_nonce")
+            .ok()
+            .flatten(),
+        row.try_get::<Option<String>, _>("access_token")
+            .ok()
+            .flatten(),
     )
     .context("decrypt trakt access_token")?
-    .ok_or_else(|| anyhow::anyhow!("trakt access_token row has neither plaintext nor ciphertext"))?;
+    .ok_or_else(|| {
+        anyhow::anyhow!("trakt access_token row has neither plaintext nor ciphertext")
+    })?;
     let refresh_token = decrypt_or_plaintext(
         vault,
-        row.try_get::<Option<Vec<u8>>, _>("refresh_token_enc").ok().flatten(),
-        row.try_get::<Option<Vec<u8>>, _>("refresh_token_nonce").ok().flatten(),
-        row.try_get::<Option<String>, _>("refresh_token").ok().flatten(),
+        row.try_get::<Option<Vec<u8>>, _>("refresh_token_enc")
+            .ok()
+            .flatten(),
+        row.try_get::<Option<Vec<u8>>, _>("refresh_token_nonce")
+            .ok()
+            .flatten(),
+        row.try_get::<Option<String>, _>("refresh_token")
+            .ok()
+            .flatten(),
     )
     .context("decrypt trakt refresh_token")?
-    .ok_or_else(|| anyhow::anyhow!("trakt refresh_token row has neither plaintext nor ciphertext"))?;
+    .ok_or_else(|| {
+        anyhow::anyhow!("trakt refresh_token row has neither plaintext nor ciphertext")
+    })?;
     Ok(Some(TraktTokensRow {
         user_id: row.try_get("user_id")?,
         access_token,
@@ -8747,7 +8582,10 @@ pub async fn get_trakt_tokens(
         scope: row.try_get::<Option<String>, _>("scope").ok().flatten(),
         expires_at: row.try_get("expires_at")?,
         linked_at: row.try_get("linked_at")?,
-        last_synced_at: row.try_get::<Option<i64>, _>("last_synced_at").ok().flatten(),
+        last_synced_at: row
+            .try_get::<Option<i64>, _>("last_synced_at")
+            .ok()
+            .flatten(),
     }))
 }
 
@@ -8771,17 +8609,29 @@ pub async fn backfill_trakt_tokens(
     let mut count = 0;
     for row in rows {
         let user_id: i64 = row.try_get("user_id")?;
-        let access_token: Option<String> =
-            row.try_get::<Option<String>, _>("access_token").ok().flatten();
-        let refresh_token: Option<String> =
-            row.try_get::<Option<String>, _>("refresh_token").ok().flatten();
+        let access_token: Option<String> = row
+            .try_get::<Option<String>, _>("access_token")
+            .ok()
+            .flatten();
+        let refresh_token: Option<String> = row
+            .try_get::<Option<String>, _>("refresh_token")
+            .ok()
+            .flatten();
 
         let access_blob = match access_token.as_deref() {
-            Some(p) => Some(vault.encrypt_str(p).context("encrypt access_token backfill")?),
+            Some(p) => Some(
+                vault
+                    .encrypt_str(p)
+                    .context("encrypt access_token backfill")?,
+            ),
             None => None,
         };
         let refresh_blob = match refresh_token.as_deref() {
-            Some(p) => Some(vault.encrypt_str(p).context("encrypt refresh_token backfill")?),
+            Some(p) => Some(
+                vault
+                    .encrypt_str(p)
+                    .context("encrypt refresh_token backfill")?,
+            ),
             None => None,
         };
 
@@ -8817,7 +8667,10 @@ fn decrypt_or_plaintext(
     plaintext: Option<String>,
 ) -> Result<Option<String>> {
     if let Some(value) = enc_value {
-        let blob = chimpflix_common::EncryptedBlob { value, nonce: enc_nonce };
+        let blob = chimpflix_common::EncryptedBlob {
+            value,
+            nonce: enc_nonce,
+        };
         return Ok(Some(vault.decrypt_str(&blob)?));
     }
     Ok(plaintext)
@@ -8831,11 +8684,7 @@ pub async fn delete_trakt_tokens(pool: &SqlitePool, user_id: i64) -> Result<bool
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn update_trakt_last_synced(
-    pool: &SqlitePool,
-    user_id: i64,
-    when_ms: i64,
-) -> Result<()> {
+pub async fn update_trakt_last_synced(pool: &SqlitePool, user_id: i64, when_ms: i64) -> Result<()> {
     sqlx::query("UPDATE user_trakt_tokens SET last_synced_at = ? WHERE user_id = ?")
         .bind(when_ms)
         .bind(user_id)
@@ -8848,7 +8697,10 @@ pub async fn list_trakt_linked_user_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
     let rows = sqlx::query("SELECT user_id FROM user_trakt_tokens")
         .fetch_all(pool)
         .await?;
-    Ok(rows.iter().filter_map(|r| r.try_get("user_id").ok()).collect())
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get("user_id").ok())
+        .collect())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -8955,13 +8807,11 @@ pub async fn get_user_rating_for_item(
     user_id: i64,
     item_id: i64,
 ) -> Result<Option<i32>> {
-    let row = sqlx::query(
-        "SELECT rating FROM user_ratings WHERE user_id = ? AND item_id = ?",
-    )
-    .bind(user_id)
-    .bind(item_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT rating FROM user_ratings WHERE user_id = ? AND item_id = ?")
+        .bind(user_id)
+        .bind(item_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.try_get::<i32, _>("rating").unwrap_or(0)))
 }
 
@@ -8970,13 +8820,11 @@ pub async fn get_user_rating_for_episode(
     user_id: i64,
     episode_id: i64,
 ) -> Result<Option<i32>> {
-    let row = sqlx::query(
-        "SELECT rating FROM user_ratings WHERE user_id = ? AND episode_id = ?",
-    )
-    .bind(user_id)
-    .bind(episode_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT rating FROM user_ratings WHERE user_id = ? AND episode_id = ?")
+        .bind(user_id)
+        .bind(episode_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.try_get::<i32, _>("rating").unwrap_or(0)))
 }
 
@@ -9027,11 +8875,7 @@ pub async fn list_tags_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<T
         .collect()
 }
 
-pub async fn add_tag_to_item(
-    pool: &SqlitePool,
-    item_id: i64,
-    name: &str,
-) -> Result<Tag> {
+pub async fn add_tag_to_item(pool: &SqlitePool, item_id: i64, name: &str) -> Result<Tag> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         anyhow::bail!("tag name must not be empty");
@@ -9069,19 +8913,18 @@ pub async fn remove_tag_from_item_by_name(
     if trimmed.is_empty() {
         return Ok(false);
     }
-    let tag_id: Option<i64> = sqlx::query_scalar("SELECT id FROM tags WHERE name = ? COLLATE NOCASE")
-        .bind(trimmed)
-        .fetch_optional(pool)
-        .await?;
-    let Some(tag_id) = tag_id else { return Ok(false) };
+    let tag_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM tags WHERE name = ? COLLATE NOCASE")
+            .bind(trimmed)
+            .fetch_optional(pool)
+            .await?;
+    let Some(tag_id) = tag_id else {
+        return Ok(false);
+    };
     remove_tag_from_item(pool, item_id, tag_id).await
 }
 
-pub async fn remove_tag_from_item(
-    pool: &SqlitePool,
-    item_id: i64,
-    tag_id: i64,
-) -> Result<bool> {
+pub async fn remove_tag_from_item(pool: &SqlitePool, item_id: i64, tag_id: i64) -> Result<bool> {
     let res = sqlx::query("DELETE FROM item_tags WHERE item_id = ? AND tag_id = ?")
         .bind(item_id)
         .bind(tag_id)
@@ -9168,10 +9011,7 @@ pub async fn list_media_files_needing_previews(
         .collect()
 }
 
-pub async fn record_preview_sprite(
-    pool: &SqlitePool,
-    record: PreviewSpriteRecord,
-) -> Result<()> {
+pub async fn record_preview_sprite(pool: &SqlitePool, record: PreviewSpriteRecord) -> Result<()> {
     sqlx::query(
         "UPDATE media_files SET
             preview_sprite_path = ?,
@@ -9315,16 +9155,15 @@ pub async fn get_chapter_thumbs_status(
         row.try_get::<Option<i64>, _>("chapter_thumbs_generated_at")
             .ok()
             .flatten(),
-        row.try_get::<Option<i64>, _>("chapter_count").ok().flatten(),
+        row.try_get::<Option<i64>, _>("chapter_count")
+            .ok()
+            .flatten(),
     )))
 }
 
 /// Resolve the disk path for a media_file. Used by the chapter-thumb
 /// API to feed `probe_chapters` without rehydrating the full row.
-pub async fn get_media_file_path(
-    pool: &SqlitePool,
-    media_file_id: i64,
-) -> Result<Option<String>> {
+pub async fn get_media_file_path(pool: &SqlitePool, media_file_id: i64) -> Result<Option<String>> {
     let row = sqlx::query("SELECT path FROM media_files WHERE id = ?")
         .bind(media_file_id)
         .fetch_optional(pool)
@@ -9427,13 +9266,11 @@ pub async fn record_loudness_measurement(
             .await?;
         }
         None => {
-            sqlx::query(
-                "UPDATE media_files SET loudnorm_analyzed_at = ? WHERE id = ?",
-            )
-            .bind(now)
-            .bind(media_file_id)
-            .execute(pool)
-            .await?;
+            sqlx::query("UPDATE media_files SET loudnorm_analyzed_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(media_file_id)
+                .execute(pool)
+                .await?;
         }
     }
     Ok(())
@@ -9463,10 +9300,7 @@ pub async fn get_loudness_measurement(
         .try_get::<Option<f64>, _>("loudnorm_true_peak")
         .ok()
         .flatten();
-    let lra: Option<f64> = row
-        .try_get::<Option<f64>, _>("loudnorm_lra")
-        .ok()
-        .flatten();
+    let lra: Option<f64> = row.try_get::<Option<f64>, _>("loudnorm_lra").ok().flatten();
     let threshold: Option<f64> = row
         .try_get::<Option<f64>, _>("loudnorm_threshold")
         .ok()
@@ -9496,7 +9330,10 @@ fn row_to_external_subtitle(row: &SqliteRow) -> Result<ExternalSubtitle> {
         episode_id: row.try_get::<Option<i64>, _>("episode_id").ok().flatten(),
         language: row.try_get("language")?,
         source: row.try_get("source")?,
-        source_file_id: row.try_get::<Option<String>, _>("source_file_id").ok().flatten(),
+        source_file_id: row
+            .try_get::<Option<String>, _>("source_file_id")
+            .ok()
+            .flatten(),
         file_path: row.try_get("file_path")?,
         forced: row.try_get::<i64, _>("forced")? != 0,
         sdh: row.try_get::<i64, _>("sdh")? != 0,
@@ -9569,10 +9406,7 @@ pub async fn list_external_subtitles_for_episode(
     rows.iter().map(row_to_external_subtitle).collect()
 }
 
-pub async fn get_external_subtitle(
-    pool: &SqlitePool,
-    id: i64,
-) -> Result<Option<ExternalSubtitle>> {
+pub async fn get_external_subtitle(pool: &SqlitePool, id: i64) -> Result<Option<ExternalSubtitle>> {
     let row = sqlx::query("SELECT * FROM external_subtitles WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
@@ -9712,16 +9546,14 @@ pub async fn upgrade_plaintext_secrets(
         let name: String = row.try_get("name")?;
         let plaintext: Vec<u8> = row.try_get("value_enc")?;
         let blob = vault.encrypt(&plaintext)?;
-        sqlx::query(
-            "UPDATE secrets SET value_enc = ?, nonce = ?, updated_at = ? WHERE name = ?",
-        )
-        .bind(blob.value)
-        .bind(blob.nonce)
-        .bind(now_ms())
-        .bind(&name)
-        .execute(pool)
-        .await
-        .with_context(|| format!("re-encrypt secret {name}"))?;
+        sqlx::query("UPDATE secrets SET value_enc = ?, nonce = ?, updated_at = ? WHERE name = ?")
+            .bind(blob.value)
+            .bind(blob.nonce)
+            .bind(now_ms())
+            .bind(&name)
+            .execute(pool)
+            .await
+            .with_context(|| format!("re-encrypt secret {name}"))?;
         named += 1;
     }
 
@@ -9737,15 +9569,13 @@ pub async fn upgrade_plaintext_secrets(
         let id: i64 = row.try_get("id")?;
         let plaintext: Vec<u8> = row.try_get("secret_enc")?;
         let blob = vault.encrypt(&plaintext)?;
-        sqlx::query(
-            "UPDATE webhooks SET secret_enc = ?, secret_nonce = ? WHERE id = ?",
-        )
-        .bind(blob.value)
-        .bind(blob.nonce)
-        .bind(id)
-        .execute(pool)
-        .await
-        .with_context(|| format!("re-encrypt webhook secret id={id}"))?;
+        sqlx::query("UPDATE webhooks SET secret_enc = ?, secret_nonce = ? WHERE id = ?")
+            .bind(blob.value)
+            .bind(blob.nonce)
+            .bind(id)
+            .execute(pool)
+            .await
+            .with_context(|| format!("re-encrypt webhook secret id={id}"))?;
         hooks += 1;
     }
 
@@ -9863,10 +9693,7 @@ impl<'a> PlaybackEventInput<'a> {
 /// Append a playback event. Fire-and-forget — failures are logged at
 /// the call site, never bubble up to the user's request. Stats are
 /// observability, not load-bearing for playback.
-pub async fn record_playback_event(
-    pool: &SqlitePool,
-    ev: PlaybackEventInput<'_>,
-) -> Result<()> {
+pub async fn record_playback_event(pool: &SqlitePool, ev: PlaybackEventInput<'_>) -> Result<()> {
     sqlx::query(
         "INSERT INTO playback_events (
             user_id, item_id, episode_id, media_file_id, event_type,
@@ -10027,7 +9854,10 @@ pub async fn top_users_by_plays(
             Ok(StatsTopUserRow {
                 user_id: r.try_get("user_id")?,
                 username: r.try_get("username")?,
-                display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten(),
+                display_name: r
+                    .try_get::<Option<String>, _>("display_name")
+                    .ok()
+                    .flatten(),
                 play_count: r.try_get("play_count")?,
                 completions: r.try_get("completions")?,
                 last_seen_at: r.try_get::<Option<i64>, _>("last_seen_at").ok().flatten(),
@@ -10129,9 +9959,21 @@ pub async fn stats_overview(pool: &SqlitePool, since_ms: i64) -> Result<StatsOve
     .fetch_one(pool)
     .await?;
     Ok(StatsOverview {
-        total_plays: row.try_get::<Option<i64>, _>("total_plays").ok().flatten().unwrap_or(0),
-        completions: row.try_get::<Option<i64>, _>("completions").ok().flatten().unwrap_or(0),
-        direct_plays: row.try_get::<Option<i64>, _>("direct_plays").ok().flatten().unwrap_or(0),
+        total_plays: row
+            .try_get::<Option<i64>, _>("total_plays")
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+        completions: row
+            .try_get::<Option<i64>, _>("completions")
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+        direct_plays: row
+            .try_get::<Option<i64>, _>("direct_plays")
+            .ok()
+            .flatten()
+            .unwrap_or(0),
         transcoded_plays: row
             .try_get::<Option<i64>, _>("transcoded_plays")
             .ok()
@@ -10154,10 +9996,7 @@ pub struct StatsDailyBucket {
 /// Per-day play counts for the activity chart. Window is the last N
 /// days inclusive of today. Empty buckets are filled in so the chart
 /// stays gap-free even on a quiet server.
-pub async fn plays_per_day(
-    pool: &SqlitePool,
-    days: i64,
-) -> Result<Vec<StatsDailyBucket>> {
+pub async fn plays_per_day(pool: &SqlitePool, days: i64) -> Result<Vec<StatsDailyBucket>> {
     let days = days.clamp(1, 365);
     let now = now_ms();
     let since_ms_value = now - days * 86_400_000;
@@ -10420,6 +10259,7 @@ pub async fn list_finished_jobs_in_window(
 /// key. Re-running the rollup for the same day overwrites — which
 /// is the intent (the previous-day computation is deterministic
 /// modulo what's still in the `jobs` table).
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_task_metrics_daily(
     pool: &SqlitePool,
     day: i64,
@@ -10558,8 +10398,12 @@ pub async fn load_season_refs_blobs(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| SeasonRefsBlobs {
-        intro: r.try_get::<Vec<u8>, _>("intro_refs_blob").unwrap_or_default(),
-        credits: r.try_get::<Vec<u8>, _>("credits_refs_blob").unwrap_or_default(),
+        intro: r
+            .try_get::<Vec<u8>, _>("intro_refs_blob")
+            .unwrap_or_default(),
+        credits: r
+            .try_get::<Vec<u8>, _>("credits_refs_blob")
+            .unwrap_or_default(),
         built_at: r.try_get::<i64, _>("refs_built_at").unwrap_or(0),
     }))
 }
@@ -10631,12 +10475,11 @@ mod tests {
         mark_job_failed(&pool, b, "boom", 1000).await.unwrap();
 
         // `b` should be `failed` with run_after in the future.
-        let row =
-            sqlx::query("SELECT status, run_after FROM jobs WHERE id = ?")
-                .bind(b)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let row = sqlx::query("SELECT status, run_after FROM jobs WHERE id = ?")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let status: String = row.try_get("status").unwrap();
         assert_eq!(status, "failed");
         let run_after: i64 = row.try_get("run_after").unwrap();
@@ -10662,24 +10505,20 @@ mod tests {
         let claimed = claim_next_job(&pool).await.unwrap().unwrap();
         assert_eq!(claimed.attempts, 3);
         mark_job_failed(&pool, b, "boom3", 1000).await.unwrap();
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
-                .bind(b)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(status, "dead");
     }
 
     #[tokio::test]
     async fn job_queue_reclaim_orphans() {
         let pool = test_pool().await;
-        let id = enqueue_job(
-            &pool,
-            JobInput::new("test_kind", serde_json::json!({})),
-        )
-        .await
-        .unwrap();
+        let id = enqueue_job(&pool, JobInput::new("test_kind", serde_json::json!({})))
+            .await
+            .unwrap();
         let _ = claim_next_job(&pool).await.unwrap().unwrap();
         // Backdate the lock so reclaim treats it as orphaned.
         sqlx::query("UPDATE jobs SET locked_at = 0 WHERE id = ?")
@@ -10757,7 +10596,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(dup.is_none(), "second subs enqueue for same item should dedup");
+        assert!(
+            dup.is_none(),
+            "second subs enqueue for same item should dedup"
+        );
         assert!(id_421 > 0);
     }
 

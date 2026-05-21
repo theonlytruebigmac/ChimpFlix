@@ -51,9 +51,9 @@
 pub mod audio;
 pub mod blackframe;
 pub mod boundary;
+pub mod detection;
 pub mod fingerprint;
 pub mod matching;
-pub mod detection;
 
 #[cfg(feature = "store")]
 pub mod storage;

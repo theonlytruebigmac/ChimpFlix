@@ -129,8 +129,10 @@ pub fn render_user_registered(
     let display = payload.display_name.unwrap_or(payload.username);
     let subject = format!("New user joined: {display}");
     // ── Plain text ──
-    let mut text_body = format!("{display} (@{u}) accepted their invite and finished signup.\n",
-        u = payload.username);
+    let mut text_body = format!(
+        "{display} (@{u}) accepted their invite and finished signup.\n",
+        u = payload.username
+    );
     if let Some(email) = payload.email {
         text_body.push_str(&format!("Their email is {email}.\n"));
     }
@@ -153,9 +155,7 @@ pub fn render_user_registered(
         "<strong>{display_safe}</strong> (@{user_safe}) accepted their invite and finished signup. \
          They don't have access to any libraries yet — grant them access from the admin panel."
     )));
-    let mut rows: Vec<(&str, &str)> = vec![
-        ("Username", payload.username),
-    ];
+    let mut rows: Vec<(&str, &str)> = vec![("Username", payload.username)];
     if let Some(email) = payload.email {
         rows.push(("Email", email));
     }
@@ -360,4 +360,3 @@ pub async fn notify_two_factor_reset(state: &AppState, actor: &User, target_user
     )
     .await;
 }
-

@@ -153,11 +153,7 @@ impl AttemptTracker {
         let entry = guard.get(key)?;
         let until = entry.locked_until?;
         let now = Instant::now();
-        if until > now {
-            Some(until - now)
-        } else {
-            None
-        }
+        if until > now { Some(until - now) } else { None }
     }
 
     pub async fn record_failure(&self, key: &str) {

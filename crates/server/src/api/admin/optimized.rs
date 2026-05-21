@@ -2,8 +2,8 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use chimpflix_library::{NewAuditEntry, NewOptimizedVersion, OptimizedVersion, queries};
 use serde::Serialize;
 

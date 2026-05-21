@@ -171,7 +171,10 @@ impl TmdbClient {
     /// we take the first page since the Top 10 rail only needs 10.
     pub async fn trending_movies(&self) -> Result<Vec<TmdbTrendingEntry>> {
         let raw: SearchPage<RawTrendingEntry> = self
-            .get("/trending/movie/week", &[("language", self.language.clone())])
+            .get(
+                "/trending/movie/week",
+                &[("language", self.language.clone())],
+            )
             .await?;
         Ok(raw
             .results
@@ -278,11 +281,7 @@ impl TmdbClient {
     /// top-level crew roles (director, writer, producer) so the modal
     /// can render Plex-style "Cast & Crew" without splitting on the
     /// frontend.
-    pub async fn fetch_credits(
-        &self,
-        kind: TmdbKind,
-        tmdb_id: i64,
-    ) -> Result<TmdbCredits> {
+    pub async fn fetch_credits(&self, kind: TmdbKind, tmdb_id: i64) -> Result<TmdbCredits> {
         let path = match kind {
             TmdbKind::Movie => format!("/movie/{tmdb_id}/credits"),
             TmdbKind::Show => format!("/tv/{tmdb_id}/credits"),
@@ -354,11 +353,7 @@ impl TmdbClient {
     /// reviews) since the modal's Reviews section caps display anyway.
     /// `rating` is a 1-10 scale on TMDB when the author chose to rate,
     /// or `None` when they only left a text review.
-    pub async fn fetch_reviews(
-        &self,
-        kind: TmdbKind,
-        tmdb_id: i64,
-    ) -> Result<Vec<TmdbReview>> {
+    pub async fn fetch_reviews(&self, kind: TmdbKind, tmdb_id: i64) -> Result<Vec<TmdbReview>> {
         let path = match kind {
             TmdbKind::Movie => format!("/movie/{tmdb_id}/reviews"),
             TmdbKind::Show => format!("/tv/{tmdb_id}/reviews"),
@@ -392,11 +387,7 @@ impl TmdbClient {
     /// All videos (trailers, teasers, featurettes, behind-the-scenes,
     /// clips) for the movie/show, filtered to YouTube since that's the
     /// only source we currently surface in the player.
-    pub async fn fetch_videos(
-        &self,
-        kind: TmdbKind,
-        tmdb_id: i64,
-    ) -> Result<Vec<TmdbVideo>> {
+    pub async fn fetch_videos(&self, kind: TmdbKind, tmdb_id: i64) -> Result<Vec<TmdbVideo>> {
         let path = match kind {
             TmdbKind::Movie => format!("/movie/{tmdb_id}/videos"),
             TmdbKind::Show => format!("/tv/{tmdb_id}/videos"),
@@ -423,11 +414,7 @@ impl TmdbClient {
     /// only — 20 candidates is plenty for the modal's rail. The caller is
     /// expected to intersect with the local library so we never surface
     /// titles the user doesn't have.
-    pub async fn lookup_similar(
-        &self,
-        tmdb_id: i64,
-        is_show: bool,
-    ) -> Result<Vec<i64>> {
+    pub async fn lookup_similar(&self, tmdb_id: i64, is_show: bool) -> Result<Vec<i64>> {
         let path = if is_show {
             format!("/tv/{tmdb_id}/similar")
         } else {
@@ -443,11 +430,7 @@ impl TmdbClient {
     /// TMDB has no trailer or the entry has none on YouTube. Picks an
     /// official trailer when one exists, otherwise the first trailer-typed
     /// entry.
-    pub async fn lookup_trailer(
-        &self,
-        tmdb_id: i64,
-        is_show: bool,
-    ) -> Result<Option<String>> {
+    pub async fn lookup_trailer(&self, tmdb_id: i64, is_show: bool) -> Result<Option<String>> {
         let path = if is_show {
             format!("/tv/{tmdb_id}/videos")
         } else {
@@ -471,11 +454,7 @@ impl TmdbClient {
     /// the Plex parity here is that users want to *see* every poster TMDB
     /// has and pick one. TMDB returns posters in roughly preference order;
     /// we pass them through unchanged so the highest-vote ones land first.
-    pub async fn fetch_posters(
-        &self,
-        kind: TmdbKind,
-        tmdb_id: i64,
-    ) -> Result<Vec<TmdbPoster>> {
+    pub async fn fetch_posters(&self, kind: TmdbKind, tmdb_id: i64) -> Result<Vec<TmdbPoster>> {
         let path = match kind {
             TmdbKind::Movie => format!("/movie/{tmdb_id}/images"),
             TmdbKind::Show => format!("/tv/{tmdb_id}/images"),
@@ -485,9 +464,7 @@ impl TmdbClient {
         let raw: RawImages = self
             .get(
                 &path,
-                &[
-                    ("include_image_language", self.image_lang_filter()),
-                ],
+                &[("include_image_language", self.image_lang_filter())],
             )
             .await?;
         Ok(raw
@@ -795,9 +772,9 @@ pub struct TmdbCrewMember {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmdbVideo {
-    pub key: String,    // YouTube video id
+    pub key: String, // YouTube video id
     pub name: String,
-    pub kind: String,   // "Trailer" | "Teaser" | "Featurette" | "Behind the Scenes" | "Clip"
+    pub kind: String, // "Trailer" | "Teaser" | "Featurette" | "Behind the Scenes" | "Clip"
     pub official: bool,
     pub published_at: Option<String>, // ISO 8601, e.g. "2024-03-15T12:00:00.000Z"
 }
@@ -981,10 +958,7 @@ impl TmdbMovie {
             poster_path: nonempty(c.poster_path),
             backdrop_path: nonempty(c.backdrop_path),
         });
-        let logo_path = raw
-            .images
-            .as_ref()
-            .and_then(|i| pick_logo(&i.logos));
+        let logo_path = raw.images.as_ref().and_then(|i| pick_logo(&i.logos));
         Self {
             tmdb_id: raw.id,
             imdb_id: nonempty(imdb_id),
@@ -1008,10 +982,7 @@ impl TmdbShow {
     fn from_raw(raw: RawShowDetail) -> Self {
         let year = raw.first_air_date.as_deref().and_then(parse_year);
         let imdb_id = raw.external_ids.and_then(|e| e.imdb_id);
-        let logo_path = raw
-            .images
-            .as_ref()
-            .and_then(|i| pick_logo(&i.logos));
+        let logo_path = raw.images.as_ref().and_then(|i| pick_logo(&i.logos));
         Self {
             tmdb_id: raw.id,
             imdb_id: nonempty(imdb_id),
@@ -1056,9 +1027,11 @@ fn pick_logo(logos: &[RawImage]) -> Option<String> {
             };
             votes + width_bonus + ar_bonus
         };
-        lang_rank(a)
-            .cmp(&lang_rank(b))
-            .then_with(|| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal))
+        lang_rank(a).cmp(&lang_rank(b)).then_with(|| {
+            score(b)
+                .partial_cmp(&score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
     ranked.first().map(|i| i.file_path.clone())
 }
@@ -1133,14 +1106,8 @@ struct RawCandidate {
 impl RawCandidate {
     fn into_candidate(self, kind: TmdbKind) -> TmdbCandidate {
         let (title, date) = match kind {
-            TmdbKind::Movie => (
-                self.title.unwrap_or_default(),
-                self.release_date,
-            ),
-            TmdbKind::Show => (
-                self.name.unwrap_or_default(),
-                self.first_air_date,
-            ),
+            TmdbKind::Movie => (self.title.unwrap_or_default(), self.release_date),
+            TmdbKind::Show => (self.name.unwrap_or_default(), self.first_air_date),
         };
         TmdbCandidate {
             tmdb_id: self.id,

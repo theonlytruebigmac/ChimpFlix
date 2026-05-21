@@ -323,6 +323,7 @@ pub async fn create_session(
 /// the insert happens in the background.
 ///
 /// `ip` is the trusted-proxy-resolved effective client IP.
+#[allow(clippy::too_many_arguments)]
 fn record_start_event(
     state: &AppState,
     user_id: i64,
@@ -398,9 +399,8 @@ async fn create_session_impl(
     // catches these too, but inline detection at session-start is
     // cheaper than tens of seconds of spinner before the user gives
     // up.
-    if !tokio::fs::metadata(&locator.path).await.is_ok() {
-        let _ = queries::mark_media_files_removed(&state.pool, &[req.media_file_id])
-            .await;
+    if tokio::fs::metadata(&locator.path).await.is_err() {
+        let _ = queries::mark_media_files_removed(&state.pool, &[req.media_file_id]).await;
         warn!(
             media_file_id = req.media_file_id,
             path = %locator.path,
@@ -431,13 +431,12 @@ async fn create_session_impl(
         .flatten();
     let source_height: Option<i64> = files.try_get("height").ok();
 
-    let streams = sqlx::query(
-        "SELECT kind, codec, pix_fmt FROM media_streams WHERE media_file_id = ?",
-    )
-    .bind(req.media_file_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
+    let streams =
+        sqlx::query("SELECT kind, codec, pix_fmt FROM media_streams WHERE media_file_id = ?")
+            .bind(req.media_file_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
 
     let stream_pairs: Vec<(String, Option<String>)> = streams
         .iter()
@@ -539,7 +538,9 @@ async fn create_session_impl(
     // pinned to Reencode for another reason (subs/HDR/quality) gains
     // nothing from probing.
     if matches!(mode, PlayMode::Transcode) && video_treatment == VideoTreatment::Copy {
-        match chimpflix_transcoder::probe_gop(&state.ffmpeg, StdPath::new(&locator.path), 12.0).await {
+        match chimpflix_transcoder::probe_gop(&state.ffmpeg, StdPath::new(&locator.path), 12.0)
+            .await
+        {
             Ok(gop) => {
                 let seg = chimpflix_transcoder::HLS_SEGMENT_DURATION_S as f64;
                 if gop.copy_unsafe(seg) {
@@ -586,10 +587,7 @@ async fn create_session_impl(
                     session: SessionInfo {
                         id: "direct".into(),
                         mode: "direct",
-                        direct_url: Some(format!(
-                            "/api/v1/stream/{}/direct",
-                            req.media_file_id,
-                        )),
+                        direct_url: Some(format!("/api/v1/stream/{}/direct", req.media_file_id,)),
                         hls_master_url: None,
                         media_file_id: req.media_file_id,
                         start_position_ms: req.start_position_ms,
@@ -772,8 +770,7 @@ async fn create_session_impl(
             // fallback-to-software encodes from starving a parallel
             // GPU session.
             if matches!(hwaccel, chimpflix_transcoder::HwAccel::None) {
-                let max_cpu_concurrent =
-                    settings_snapshot.transcoder_max_cpu_concurrent;
+                let max_cpu_concurrent = settings_snapshot.transcoder_max_cpu_concurrent;
                 let current_cpu = state
                     .transcoder
                     .list_sessions()
@@ -846,9 +843,7 @@ async fn create_session_impl(
                 .or_else(|| auto_quality_for_source(source_height.unwrap_or(0)));
             let resolved_quality = resolved_quality.map(|(h, bps)| {
                 let bps = match settings_snapshot.transcoder_quality_ceiling_kbps {
-                    Some(ceiling_kbps) if ceiling_kbps > 0 => {
-                        bps.min((ceiling_kbps as u64) * 1000)
-                    }
+                    Some(ceiling_kbps) if ceiling_kbps > 0 => bps.min((ceiling_kbps as u64) * 1000),
                     _ => bps,
                 };
                 (h, bps)
@@ -895,9 +890,7 @@ async fn create_session_impl(
             // Defaults for the lookup match the transcoder's own
             // defaults so a not-yet-resolved quality_target hits the
             // same key the session was registered with.
-            let (lookup_height, lookup_bitrate) = resolved_quality
-                .map(|(h, b)| (h, b))
-                .unwrap_or((720, 2_500_000));
+            let (lookup_height, lookup_bitrate) = resolved_quality.unwrap_or((720, 2_500_000));
             if let Some(existing) = state.transcoder.find_compatible(
                 user.id,
                 req.media_file_id,
@@ -915,8 +908,7 @@ async fn create_session_impl(
                 // see new segments.
                 let _ = existing.resume();
                 existing.touch();
-                let master_url =
-                    format!("/api/v1/stream/sessions/{}/master.m3u8", existing.id);
+                let master_url = format!("/api/v1/stream/sessions/{}/master.m3u8", existing.id);
                 let video_treatment_str = match existing.video_treatment {
                     chimpflix_transcoder::VideoTreatment::Copy => "copy",
                     chimpflix_transcoder::VideoTreatment::Reencode => "reencode",
@@ -937,9 +929,7 @@ async fn create_session_impl(
                             start_position_ms: existing.start_position_ms,
                             duration_ms: existing.duration_ms,
                             resolved_height: Some(existing.target_height),
-                            resolved_video_bitrate_bps: Some(
-                                existing.target_video_bitrate_bps,
-                            ),
+                            resolved_video_bitrate_bps: Some(existing.target_video_bitrate_bps),
                             source_height: existing.source_height,
                             encoder: Some(existing.hwaccel.label().to_string()),
                             video_treatment: Some(video_treatment_str),
@@ -970,15 +960,11 @@ async fn create_session_impl(
                     encoder_preset,
                     match video_treatment {
                         VideoTreatment::Copy => chimpflix_transcoder::VideoTreatment::Copy,
-                        VideoTreatment::Reencode => {
-                            chimpflix_transcoder::VideoTreatment::Reencode
-                        }
+                        VideoTreatment::Reencode => chimpflix_transcoder::VideoTreatment::Reencode,
                     },
                     match audio_treatment {
                         AudioTreatment::Copy => chimpflix_transcoder::AudioTreatment::Copy,
-                        AudioTreatment::Reencode => {
-                            chimpflix_transcoder::AudioTreatment::Reencode
-                        }
+                        AudioTreatment::Reencode => chimpflix_transcoder::AudioTreatment::Reencode,
                     },
                     audio_bitrate_bps,
                     req.audio_normalize,
@@ -1356,9 +1342,9 @@ pub enum AudioTreatment {
 /// the surround mix.
 pub fn pick_audio_bitrate(source_channels: Option<i32>) -> u64 {
     match source_channels {
-        Some(1) => 96_000,           // mono → stereo (duplicate); 96k plenty.
+        Some(1) => 96_000,            // mono → stereo (duplicate); 96k plenty.
         Some(n) if n >= 6 => 256_000, // 5.1/7.1 downmix; preserve nuance.
-        _ => 192_000,                // typical stereo, AAC LC sweet spot.
+        _ => 192_000,                 // typical stereo, AAC LC sweet spot.
     }
 }
 
@@ -1423,7 +1409,10 @@ pub fn pick_audio_treatment(
 /// HLS playback. Keeping those two off the carriable list
 /// forces them to re-encode to AAC, which the mp4 muxer handles
 /// cleanly. AC-3 / E-AC-3 are unaffected by the same bug.
-fn audio_carriable(normalized_codec: &str, container: chimpflix_transcoder::ContainerFormat) -> bool {
+fn audio_carriable(
+    normalized_codec: &str,
+    container: chimpflix_transcoder::ContainerFormat,
+) -> bool {
     use chimpflix_transcoder::ContainerFormat;
     match container {
         ContainerFormat::Ts => matches!(normalized_codec, "aac" | "mp3" | "ac3" | "eac3"),
@@ -1474,10 +1463,8 @@ pub fn assess_hw_coverage(
     // they pass the decode check unconditionally.
     if matches!(video_treatment, VideoTreatment::Reencode) {
         let decoder_ok = match hwaccel.paired_decoder() {
-            Some(name) => source_video_codec.is_some_and(|c| {
-                caps.decoders
-                    .supports(name, &normalize_video_codec(c))
-            }),
+            Some(name) => source_video_codec
+                .is_some_and(|c| caps.decoders.supports(name, &normalize_video_codec(c))),
             None => false,
         };
         if !decoder_ok {
@@ -1519,20 +1506,24 @@ pub fn pick_container(
     }
     let vc = source_video_codec.map(normalize_video_codec);
     let ac = source_audio_codec.map(normalize_audio_codec);
-    let browser_supports_video = vc
-        .as_deref()
-        .is_some_and(|c| client.supported_video_codecs.iter().any(|x| normalize_video_codec(x) == c));
-    let browser_supports_audio = ac
-        .as_deref()
-        .is_some_and(|c| client.supported_audio_codecs.iter().any(|x| normalize_audio_codec(x) == c));
-    let video_needs_fmp4 = vc
-        .as_deref()
-        .is_some_and(|c| !video_carriable(c, ContainerFormat::Ts) && video_carriable(c, ContainerFormat::Fmp4))
-        && browser_supports_video;
-    let audio_needs_fmp4 = ac
-        .as_deref()
-        .is_some_and(|c| !audio_carriable(c, ContainerFormat::Ts) && audio_carriable(c, ContainerFormat::Fmp4))
-        && browser_supports_audio;
+    let browser_supports_video = vc.as_deref().is_some_and(|c| {
+        client
+            .supported_video_codecs
+            .iter()
+            .any(|x| normalize_video_codec(x) == c)
+    });
+    let browser_supports_audio = ac.as_deref().is_some_and(|c| {
+        client
+            .supported_audio_codecs
+            .iter()
+            .any(|x| normalize_audio_codec(x) == c)
+    });
+    let video_needs_fmp4 = vc.as_deref().is_some_and(|c| {
+        !video_carriable(c, ContainerFormat::Ts) && video_carriable(c, ContainerFormat::Fmp4)
+    }) && browser_supports_video;
+    let audio_needs_fmp4 = ac.as_deref().is_some_and(|c| {
+        !audio_carriable(c, ContainerFormat::Ts) && audio_carriable(c, ContainerFormat::Fmp4)
+    }) && browser_supports_audio;
     if video_needs_fmp4 || audio_needs_fmp4 {
         ContainerFormat::Fmp4
     } else {
@@ -1672,7 +1663,10 @@ fn is_10bit_pix_fmt(pix_fmt: &str) -> bool {
 /// have used it for HEVC since 2017. It carries everything browsers
 /// can decode (h264 / hevc / av1 / vp9), plus the wider audio set
 /// (opus / flac) in [`audio_carriable`].
-fn video_carriable(normalized_codec: &str, container: chimpflix_transcoder::ContainerFormat) -> bool {
+fn video_carriable(
+    normalized_codec: &str,
+    container: chimpflix_transcoder::ContainerFormat,
+) -> bool {
     use chimpflix_transcoder::ContainerFormat;
     match container {
         ContainerFormat::Ts => matches!(normalized_codec, "h264"),
@@ -1824,10 +1818,9 @@ async fn resolve_rating_key(
         let Ok(ep_id) = rest.parse::<i64>() else {
             return Ok(None);
         };
-        let Some(detail) =
-            queries::get_episode_detail(&state.pool, ep_id, user.id, accessible_ref)
-                .await
-                .map_err(ApiError::Internal)?
+        let Some(detail) = queries::get_episode_detail(&state.pool, ep_id, user.id, accessible_ref)
+            .await
+            .map_err(ApiError::Internal)?
         else {
             return Ok(None);
         };
@@ -1941,10 +1934,12 @@ fn client_supports_codec(caps: &ClientCapabilities, codec: &str) -> bool {
     let aliases: &[&str] = match want.as_str() {
         "hevc" | "h265" => &["hevc", "h265"],
         "h264" | "avc" => &["h264", "avc"],
-        _ => return caps
-            .supported_video_codecs
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&want)),
+        _ => {
+            return caps
+                .supported_video_codecs
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&want));
+        }
     };
     caps.supported_video_codecs
         .iter()
@@ -2009,7 +2004,13 @@ mod tests {
         // Picked alt audio track on an h264 source — should copy video.
         let r = req(Some(1), None);
         assert_eq!(
-            pick_video_treatment(&r, Some("h264"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("h264"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Copy,
         );
     }
@@ -2018,7 +2019,13 @@ mod tests {
     fn treatment_reencode_when_subtitle_burn_requested() {
         let r = req(None, Some(0));
         assert_eq!(
-            pick_video_treatment(&r, Some("h264"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("h264"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2031,7 +2038,13 @@ mod tests {
             bitrate_bps: 2_500_000,
         });
         assert_eq!(
-            pick_video_treatment(&r, Some("h264"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("h264"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2040,15 +2053,33 @@ mod tests {
     fn treatment_reencode_when_source_is_hdr() {
         let r = req(Some(1), None);
         assert_eq!(
-            pick_video_treatment(&r, Some("h264"), Some("hdr10"), chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("h264"),
+                Some("hdr10"),
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
         assert_eq!(
-            pick_video_treatment(&r, Some("h264"), Some("hlg"), chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("h264"),
+                Some("hlg"),
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
         assert_eq!(
-            pick_video_treatment(&r, Some("h264"), Some("dovi"), chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("h264"),
+                Some("dovi"),
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2058,7 +2089,13 @@ mod tests {
         let r = req(Some(1), None);
         // VP9 source — client list has only h264/hevc.
         assert_eq!(
-            pick_video_treatment(&r, Some("vp9"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("vp9"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2067,7 +2104,13 @@ mod tests {
     fn treatment_reencode_when_source_codec_missing_from_db() {
         let r = req(Some(1), None);
         assert_eq!(
-            pick_video_treatment(&r, None, None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                None,
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2080,11 +2123,23 @@ mod tests {
         // HEVC is asserted under fMP4 (the correct container for HEVC
         // copy — see `pick_container_bumps_to_fmp4_for_hevc_*`).
         assert_eq!(
-            pick_video_treatment(&r, Some("H264"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("H264"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Copy,
         );
         assert_eq!(
-            pick_video_treatment(&r, Some("HEVC"), None, chimpflix_transcoder::ContainerFormat::Fmp4, None),
+            pick_video_treatment(
+                &r,
+                Some("HEVC"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Fmp4,
+                None
+            ),
             VideoTreatment::Copy,
         );
     }
@@ -2147,7 +2202,13 @@ mod tests {
         let mut r = req(Some(1), None);
         r.client.supported_video_codecs = vec!["h264".into(), "av1".into()];
         assert_eq!(
-            pick_video_treatment(&r, Some("av1"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("av1"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2157,7 +2218,13 @@ mod tests {
         let mut r = req(Some(1), None);
         r.client.supported_video_codecs = vec!["h264".into(), "vp9".into()];
         assert_eq!(
-            pick_video_treatment(&r, Some("vp9"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("vp9"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2169,7 +2236,13 @@ mod tests {
         let mut r = req(Some(1), None);
         r.client.supported_video_codecs = vec!["h264".into(), "mpeg4".into()];
         assert_eq!(
-            pick_video_treatment(&r, Some("mpeg4"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("mpeg4"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2186,7 +2259,13 @@ mod tests {
         let mut r = req(Some(1), None);
         r.client.supported_video_codecs = vec!["h264".into(), "hevc".into()];
         assert_eq!(
-            pick_video_treatment(&r, Some("hevc"), None, chimpflix_transcoder::ContainerFormat::Ts, None),
+            pick_video_treatment(
+                &r,
+                Some("hevc"),
+                None,
+                chimpflix_transcoder::ContainerFormat::Ts,
+                None
+            ),
             VideoTreatment::Reencode,
         );
     }
@@ -2350,11 +2429,7 @@ mod tests {
         let mut r = req(Some(1), Some(0));
         r.client.supported_audio_codecs = vec!["aac".into()];
         assert_eq!(
-            pick_audio_treatment(
-                &r,
-                Some("aac"),
-                chimpflix_transcoder::ContainerFormat::Ts,
-            ),
+            pick_audio_treatment(&r, Some("aac"), chimpflix_transcoder::ContainerFormat::Ts,),
             AudioTreatment::Reencode,
         );
     }

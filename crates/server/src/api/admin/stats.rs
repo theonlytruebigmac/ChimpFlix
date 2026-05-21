@@ -11,8 +11,8 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use chimpflix_library::queries::{
-    self, StatsActivityRow, StatsDailyBucket, StatsHourBucket, StatsLibraryBucket,
-    StatsOverview, StatsPlatformBucket, StatsTopItemRow, StatsTopUserRow,
+    self, StatsActivityRow, StatsDailyBucket, StatsHourBucket, StatsLibraryBucket, StatsOverview,
+    StatsPlatformBucket, StatsTopItemRow, StatsTopUserRow,
 };
 use chimpflix_transcoder::SessionSnapshot;
 use serde::{Deserialize, Serialize};
@@ -114,10 +114,9 @@ pub async fn activity(
     // force the DB to read + serialize the entire playback_events
     // table, stalling SQLite and consuming memory.
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let events =
-        queries::list_playback_activity(&state.pool, limit, q.before, q.user_id)
-            .await
-            .map_err(ApiError::Internal)?;
+    let events = queries::list_playback_activity(&state.pool, limit, q.before, q.user_id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(ActivityResponse { events }))
 }
 

@@ -36,11 +36,9 @@ pub async fn ensure_safe_outbound_url(raw: &str) -> Result<Url, String> {
         .host_str()
         .ok_or_else(|| "url has no host".to_string())?
         .to_string();
-    let port = url.port_or_known_default().unwrap_or(if url.scheme() == "https" {
-        443
-    } else {
-        80
-    });
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
 
     // Literal IP in the host position — verify directly without DNS.
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -152,7 +150,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_private_literal() {
-        let e = ensure_safe_outbound_url("http://10.0.0.1/").await.unwrap_err();
+        let e = ensure_safe_outbound_url("http://10.0.0.1/")
+            .await
+            .unwrap_err();
         assert!(e.contains("blocked"), "{e}");
     }
 

@@ -44,19 +44,17 @@ struct SubStream {
 }
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { file_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { file_id } = serde_json::from_value(payload).context("invalid payload")?;
 
-    let Some((path, embedded_subs_extracted_at)) =
-        sqlx::query_as::<_, (String, Option<i64>)>(
-            "SELECT path, embedded_subs_extracted_at
+    let Some((path, embedded_subs_extracted_at)) = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT path, embedded_subs_extracted_at
              FROM media_files
              WHERE id = ? AND removed_at IS NULL",
-        )
-        .bind(file_id)
-        .fetch_optional(&state.pool)
-        .await
-        .context("media_files lookup")?
+    )
+    .bind(file_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("media_files lookup")?
     else {
         return Ok(());
     };
@@ -127,10 +125,14 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
 async fn probe_subtitle_streams(state: &AppState, path: &Path) -> Result<Vec<SubStream>> {
     let mut cmd = state.ffmpeg.background_ffprobe();
     cmd.args([
-        "-v", "error",
-        "-select_streams", "s",
-        "-show_entries", "stream=index,codec_name:stream_tags=language",
-        "-of", "json",
+        "-v",
+        "error",
+        "-select_streams",
+        "s",
+        "-show_entries",
+        "stream=index,codec_name:stream_tags=language",
+        "-of",
+        "json",
     ])
     .arg(path)
     .stdout(Stdio::piped())
@@ -195,21 +197,12 @@ async fn extract_one(
     dest: &Path,
 ) -> Result<()> {
     let mut cmd = state.ffmpeg.background_ffmpeg();
-    cmd.args([
-        "-y",
-        "-loglevel", "error",
-        "-i",
-    ])
-    .arg(source)
-    .args([
-        "-map",
-        &format!("0:{}", stream.index),
-        "-c:s",
-        "webvtt",
-    ])
-    .arg(dest)
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped());
+    cmd.args(["-y", "-loglevel", "error", "-i"])
+        .arg(source)
+        .args(["-map", &format!("0:{}", stream.index), "-c:s", "webvtt"])
+        .arg(dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
 
     let output = cmd.output().await.context("ffmpeg spawn")?;
     if !output.status.success() {
@@ -227,23 +220,18 @@ async fn extract_one(
 
 async fn stamp_extracted(state: &AppState, file_id: i64) -> Result<()> {
     let now = chimpflix_common::now_ms();
-    sqlx::query(
-        "UPDATE media_files SET embedded_subs_extracted_at = ? WHERE id = ?",
-    )
-    .bind(now)
-    .bind(file_id)
-    .execute(&state.pool)
-    .await
-    .context("media_files embedded_subs_extracted_at update")?;
+    sqlx::query("UPDATE media_files SET embedded_subs_extracted_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(file_id)
+        .execute(&state.pool)
+        .await
+        .context("media_files embedded_subs_extracted_at update")?;
     Ok(())
 }
 
 /// Enqueue one `extract_embedded_subs` job per file. Deduped on
 /// file_id so a re-trigger while jobs are in flight is safe.
-pub async fn enqueue_for_files(
-    pool: &sqlx::SqlitePool,
-    file_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_files(pool: &sqlx::SqlitePool, file_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &file_id in file_ids {
         let payload = serde_json::json!({ "file_id": file_id });

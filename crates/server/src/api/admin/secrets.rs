@@ -163,9 +163,8 @@ pub async fn put(
     headers: HeaderMap,
     Json(input): Json<SetInput>,
 ) -> Result<Json<SlotView>, ApiError> {
-    let spec = lookup_slot(&name).ok_or_else(|| {
-        ApiError::validation(format!("unknown secret slot: {name}"))
-    })?;
+    let spec = lookup_slot(&name)
+        .ok_or_else(|| ApiError::validation(format!("unknown secret slot: {name}")))?;
     if spec.managed {
         return Err(ApiError::validation(format!(
             "secret slot '{}' is system-managed and cannot be set from here",
@@ -174,12 +173,20 @@ pub async fn put(
     }
     let trimmed = input.value.trim();
     if trimmed.is_empty() {
-        return Err(ApiError::validation("value must not be empty — use DELETE to clear"));
+        return Err(ApiError::validation(
+            "value must not be empty — use DELETE to clear",
+        ));
     }
 
-    queries::vault_set(&state.pool, &state.vault, spec.name, trimmed, Some(actor.id))
-        .await
-        .map_err(ApiError::Internal)?;
+    queries::vault_set(
+        &state.pool,
+        &state.vault,
+        spec.name,
+        trimmed,
+        Some(actor.id),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
     refresh_runtime_client(&state, spec.name, Some(trimmed)).await?;
 
     let user_agent = headers
@@ -210,9 +217,8 @@ pub async fn delete(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<SlotView>, ApiError> {
-    let spec = lookup_slot(&name).ok_or_else(|| {
-        ApiError::validation(format!("unknown secret slot: {name}"))
-    })?;
+    let spec = lookup_slot(&name)
+        .ok_or_else(|| ApiError::validation(format!("unknown secret slot: {name}")))?;
     if spec.managed {
         return Err(ApiError::validation(format!(
             "secret slot '{}' is system-managed and cannot be cleared from here",
@@ -266,16 +272,13 @@ pub async fn test(
     Path(name): Path<String>,
     body: Option<Json<TestInput>>,
 ) -> Result<Json<TestResponse>, ApiError> {
-    let spec = lookup_slot(&name).ok_or_else(|| {
-        ApiError::validation(format!("unknown secret slot: {name}"))
-    })?;
+    let spec = lookup_slot(&name)
+        .ok_or_else(|| ApiError::validation(format!("unknown secret slot: {name}")))?;
 
-    let candidate = body
-        .and_then(|Json(input)| input.value)
-        .and_then(|v| {
-            let t = v.trim().to_string();
-            if t.is_empty() { None } else { Some(t) }
-        });
+    let candidate = body.and_then(|Json(input)| input.value).and_then(|v| {
+        let t = v.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    });
 
     let value = match candidate {
         Some(v) => v,
@@ -342,24 +345,24 @@ pub async fn test(
                 detail: format!("AniList client init failed: {e:#}"),
             })),
         },
-        "opensubtitles" => match OpenSubtitlesCreds::parse(&value)
-            .and_then(OpenSubtitlesClient::new)
-        {
-            Ok(client) => match client.validate().await {
-                Ok(()) => Ok(Json(TestResponse {
-                    ok: true,
-                    detail: "OpenSubtitles accepted the credentials".into(),
-                })),
+        "opensubtitles" => {
+            match OpenSubtitlesCreds::parse(&value).and_then(OpenSubtitlesClient::new) {
+                Ok(client) => match client.validate().await {
+                    Ok(()) => Ok(Json(TestResponse {
+                        ok: true,
+                        detail: "OpenSubtitles accepted the credentials".into(),
+                    })),
+                    Err(e) => Ok(Json(TestResponse {
+                        ok: false,
+                        detail: format!("OpenSubtitles rejected: {e:#}"),
+                    })),
+                },
                 Err(e) => Ok(Json(TestResponse {
                     ok: false,
-                    detail: format!("OpenSubtitles rejected: {e:#}"),
+                    detail: format!("OpenSubtitles credentials are not usable: {e:#}"),
                 })),
-            },
-            Err(e) => Ok(Json(TestResponse {
-                ok: false,
-                detail: format!("OpenSubtitles credentials are not usable: {e:#}"),
-            })),
-        },
+            }
+        }
         "trakt" => match TraktCreds::parse(&value).and_then(TraktClient::from_creds) {
             Ok(client) => match client.validate().await {
                 Ok(()) => Ok(Json(TestResponse {
@@ -462,8 +465,8 @@ async fn refresh_runtime_client(
         "trakt" => {
             let client = match new_value {
                 Some(v) => {
-                    let creds = TraktCreds::parse(v)
-                        .map_err(|e| ApiError::validation(format!("{e:#}")))?;
+                    let creds =
+                        TraktCreds::parse(v).map_err(|e| ApiError::validation(format!("{e:#}")))?;
                     Some(TraktClient::from_creds(creds).map_err(ApiError::Internal)?)
                 }
                 None => None,
@@ -473,9 +476,9 @@ async fn refresh_runtime_client(
         }
         "omdb" => {
             let client = match new_value {
-                Some(v) => Some(
-                    chimpflix_metadata::OmdbClient::new(v).map_err(ApiError::Internal)?,
-                ),
+                Some(v) => {
+                    Some(chimpflix_metadata::OmdbClient::new(v).map_err(ApiError::Internal)?)
+                }
                 None => None,
             };
             state.set_omdb(client).await;

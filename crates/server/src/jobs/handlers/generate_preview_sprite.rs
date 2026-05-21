@@ -18,8 +18,7 @@ pub struct Payload {
 }
 
 pub async fn run(state: AppState, payload: Value) -> Result<()> {
-    let Payload { file_id } =
-        serde_json::from_value(payload).context("invalid payload")?;
+    let Payload { file_id } = serde_json::from_value(payload).context("invalid payload")?;
 
     let Some((path, duration_ms, sprite_path)) =
         sqlx::query_as::<_, (String, Option<i64>, Option<String>)>(
@@ -90,10 +89,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
     Ok(())
 }
 
-pub async fn enqueue_for_files(
-    pool: &sqlx::SqlitePool,
-    file_ids: &[i64],
-) -> Result<usize> {
+pub async fn enqueue_for_files(pool: &sqlx::SqlitePool, file_ids: &[i64]) -> Result<usize> {
     let mut queued = 0usize;
     for &file_id in file_ids {
         let payload = serde_json::json!({ "file_id": file_id });

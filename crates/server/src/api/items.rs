@@ -47,7 +47,11 @@ fn restrict_access(acc: Option<Vec<i64>>, requested: Option<Vec<i64>>) -> Option
         (Some(allowed), None) => Some(allowed),
         (Some(allowed), Some(req)) => {
             let allowed_set: std::collections::HashSet<i64> = allowed.into_iter().collect();
-            Some(req.into_iter().filter(|id| allowed_set.contains(id)).collect())
+            Some(
+                req.into_iter()
+                    .filter(|id| allowed_set.contains(id))
+                    .collect(),
+            )
         }
     }
 }
@@ -88,10 +92,7 @@ pub struct TrendingQuery {
     /// Same shape as `ItemFilter::library_ids` — `?library_ids=1,2,3`.
     /// Lets browse surfaces apply the user's visibility prefs without
     /// the trending endpoint needing to know about prefs directly.
-    #[serde(
-        default,
-        deserialize_with = "chimpflix_library::deserialize_csv_i64s"
-    )]
+    #[serde(default, deserialize_with = "chimpflix_library::deserialize_csv_i64s")]
     pub library_ids: Option<Vec<i64>>,
 }
 
@@ -123,14 +124,9 @@ pub async fn trending(
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     let acc = access(&state, &user).await?;
     let effective = restrict_access(acc, q.library_ids);
-    let rows = queries::list_trending_in_library(
-        &state.pool,
-        kind,
-        user.id,
-        limit,
-        effective.as_deref(),
-    )
-    .await?;
+    let rows =
+        queries::list_trending_in_library(&state.pool, kind, user.id, limit, effective.as_deref())
+            .await?;
     let items = rows
         .into_iter()
         .map(|(rank, item)| TrendingItem { rank, item })
@@ -267,12 +263,11 @@ pub async fn delete_episode_media(
 
     ensure_library_allows_delete(&state, library_id).await?;
 
-    let file_ids: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM media_files WHERE episode_id = ?")
-            .bind(id)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(|e| ApiError::Internal(e.into()))?;
+    let file_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM media_files WHERE episode_id = ?")
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
 
     run_force_delete(&state, &user, &headers, "episode", id, &file_ids).await
 }
@@ -332,7 +327,9 @@ async fn run_force_delete(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     tracing::debug!(path = %path, "media artefact already gone");
                 }
-                Err(e) => tracing::warn!(path = %path, error = %e, "failed to unlink media artefact"),
+                Err(e) => {
+                    tracing::warn!(path = %path, error = %e, "failed to unlink media artefact")
+                }
             }
             // Evict the per-file WebVTT cache (best-effort; idempotent).
             let _ = chimpflix_transcoder::evict_text_subs_cache(
@@ -396,10 +393,7 @@ pub async fn trailer(
         return Ok(Json(TrailerResponse { video_id: None }));
     };
     let is_show = matches!(detail.item.kind, ItemKind::Show);
-    let video_id = tmdb
-        .lookup_trailer(tmdb_id, is_show)
-        .await
-        .unwrap_or(None);
+    let video_id = tmdb.lookup_trailer(tmdb_id, is_show).await.unwrap_or(None);
     Ok(Json(TrailerResponse { video_id }))
 }
 
@@ -495,10 +489,14 @@ pub async fn tmdb_posters(
         .ok_or(ApiError::NotFound)?;
     let tmdb_snapshot = state.tmdb_snapshot().await;
     let Some(tmdb) = tmdb_snapshot.as_ref() else {
-        return Ok(Json(TmdbPostersResponse { posters: Vec::new() }));
+        return Ok(Json(TmdbPostersResponse {
+            posters: Vec::new(),
+        }));
     };
     let Some(tmdb_id) = detail.item.tmdb_id else {
-        return Ok(Json(TmdbPostersResponse { posters: Vec::new() }));
+        return Ok(Json(TmdbPostersResponse {
+            posters: Vec::new(),
+        }));
     };
     let kind = match detail.item.kind {
         ItemKind::Movie => TmdbKind::Movie,
@@ -538,14 +536,18 @@ pub async fn apply_tmdb_poster(
         return Err(ApiError::validation("path is required"));
     }
     let normalized = raw.strip_prefix('/').unwrap_or(raw);
-    if !normalized.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
-    }) {
+    if !normalized
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
         return Err(ApiError::validation(
             "path must look like a TMDB file path (alphanumerics, dots, dashes, underscores)",
         ));
     }
-    if !(normalized.ends_with(".jpg") || normalized.ends_with(".png") || normalized.ends_with(".webp")) {
+    if !(normalized.ends_with(".jpg")
+        || normalized.ends_with(".png")
+        || normalized.ends_with(".webp"))
+    {
         return Err(ApiError::validation(
             "path must end with .jpg, .png, or .webp",
         ));
@@ -649,8 +651,8 @@ pub async fn refresh(
         id,
         None,
     )
-        .await
-        .map_err(map_tmdb_error)?;
+    .await
+    .map_err(map_tmdb_error)?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -1109,18 +1111,20 @@ async fn upload_image_impl(
     // Extract the single "file" field. Other fields are ignored.
     let mut bytes: Option<Vec<u8>> = None;
     let mut content_type: Option<String> = None;
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        ApiError::validation(format!("multipart error: {e}"))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::validation(format!("multipart error: {e}")))?
+    {
         if field.name() == Some("file") {
             content_type = field.content_type().map(str::to_owned);
-            let data = field.bytes().await.map_err(|e| {
-                ApiError::validation(format!("read field: {e}"))
-            })?;
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| ApiError::validation(format!("read field: {e}")))?;
             if data.len() > MAX_POSTER_BYTES {
                 return Err(ApiError::validation(format!(
-                    "image must be ≤ {} bytes",
-                    MAX_POSTER_BYTES
+                    "image must be ≤ {MAX_POSTER_BYTES} bytes"
                 )));
             }
             bytes = Some(data.to_vec());
@@ -1194,8 +1198,8 @@ async fn upload_image_impl(
         kind.url_suffix(),
         chimpflix_common::now_ms()
     );
-    if let Err(e) = queries::replace_primary_image(&state.pool, id, kind.db_kind(), "local", &url)
-        .await
+    if let Err(e) =
+        queries::replace_primary_image(&state.pool, id, kind.db_kind(), "local", &url).await
     {
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(ApiError::Internal(e));
@@ -1259,8 +1263,7 @@ fn sanitize_image(
     raw: &[u8],
     format: image::ImageFormat,
 ) -> Result<(Vec<u8>, &'static str), String> {
-    let decoded = image::load_from_memory(raw)
-        .map_err(|e| format!("image decode failed: {e}"))?;
+    let decoded = image::load_from_memory(raw).map_err(|e| format!("image decode failed: {e}"))?;
     if decoded.width() > MAX_IMAGE_DIMENSION || decoded.height() > MAX_IMAGE_DIMENSION {
         return Err(format!(
             "image is too large ({}×{}); max is {MAX_IMAGE_DIMENSION}px per side",
