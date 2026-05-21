@@ -1,0 +1,15 @@
+-- Phase 67: add the missing `markers_detected_at` watermark.
+--
+-- `detect_markers_file` (and bootstrap_season_refs which clears the
+-- column on re-detection) was shipped without a matching migration —
+-- the handler queries / writes `media_files.markers_detected_at` but
+-- no prior migration adds the column. Result on a fresh install:
+-- every detect_markers_file job hits `(code: 1) no such column:
+-- markers_detected_at` in the lookup, fails after ~0ms, gets
+-- classified as `transient` and retried. 100% failure rate.
+--
+-- Stamps the epoch-ms time the per-file detector last ran. NULL
+-- means "needs detection"; non-NULL gates the idempotent skip in
+-- detect_markers_file::run. Matches the pattern used by the
+-- chapter_thumbs / loudness / embedded_subs columns added earlier.
+ALTER TABLE media_files ADD COLUMN markers_detected_at INTEGER;

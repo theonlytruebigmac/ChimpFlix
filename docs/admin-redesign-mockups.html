@@ -1,0 +1,2199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ChimpFlix — Admin redesign mockups</title>
+<style>
+  /* ─── Brand tokens (mirror web/src/app/globals.css) ───────────────────── */
+  :root {
+    color-scheme: dark;
+    --bg:          #0d0d0d;
+    --surface:     #141414;
+    --surface-2:   #1f1f1f;
+    --surface-3:   #2a2a2a;
+    --fg:          #ffffff;
+    --fg-muted:    #b3b3b3;
+    --fg-subtle:   #808080;
+    --accent:      #e50914;
+    --accent-hov:  #f6121d;
+    --line:        rgba(255,255,255,0.08);
+    --line-strong: rgba(255,255,255,0.15);
+    --ok:          #22c55e;
+    --warn:        #f59e0b;
+    --danger:      #ef4444;
+    --info:        #3b82f6;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  a { color: inherit; text-decoration: none; }
+  code, .mono { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+
+  /* ─── Review-page chrome (not part of the mocks) ──────────────────────── */
+  .review {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 40px 24px 16px;
+  }
+  .review h1 {
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin: 0 0 6px;
+  }
+  .review p.lede {
+    color: var(--fg-subtle);
+    max-width: 760px;
+    margin: 0 0 18px;
+  }
+  .toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .toc a {
+    padding: 7px 12px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--fg-muted);
+    transition: all .15s;
+  }
+  .toc a:hover {
+    background: var(--surface-2);
+    color: var(--fg);
+    border-color: var(--line-strong);
+  }
+  .toc a.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+  .review-note {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    padding: 12px 14px;
+    border-radius: 6px;
+    color: var(--fg-muted);
+    font-size: 13px;
+    margin: 16px 0 24px;
+  }
+  .review-note strong { color: var(--fg); font-weight: 600; }
+
+  .mock-frame {
+    max-width: 1280px;
+    margin: 0 auto 48px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+  }
+  .mock-caption {
+    max-width: 1280px;
+    margin: 0 auto 8px;
+    padding: 0 4px;
+    color: var(--fg-subtle);
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .mock-caption .label {
+    color: var(--fg);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 11px;
+  }
+
+  /* ─── Mock app chrome ─────────────────────────────────────────────────── */
+  .app {
+    display: grid;
+    grid-template-columns: 232px 1fr;
+    grid-template-rows: 52px 1fr;
+    min-height: 760px;
+    background: var(--bg);
+  }
+  .topbar {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    gap: 16px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    color: var(--fg);
+    width: 200px;
+    flex-shrink: 0;
+  }
+  .brand-mark {
+    width: 24px; height: 24px;
+    border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), #ff3b47);
+    display: grid; place-items: center;
+    font-weight: 900; font-size: 13px;
+    color: white;
+  }
+  .crumbs {
+    color: var(--fg-subtle);
+    font-size: 13px;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .crumbs a { color: var(--fg-muted); }
+  .crumbs a:hover { color: var(--fg); }
+  .crumbs .sep { color: var(--fg-subtle); }
+  .crumbs .current { color: var(--fg); font-weight: 500; }
+
+  .topbar-search {
+    flex: 0 0 320px;
+    position: relative;
+  }
+  .topbar-search input {
+    width: 100%;
+    height: 32px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0 12px 0 32px;
+    color: var(--fg);
+    font: inherit;
+    font-size: 13px;
+  }
+  .topbar-search input::placeholder { color: var(--fg-subtle); }
+  .topbar-search .icn { position: absolute; left: 9px; top: 8px; color: var(--fg-subtle); }
+  .topbar-search kbd {
+    position: absolute; right: 8px; top: 6px;
+    font-size: 10px;
+    background: var(--surface-2);
+    color: var(--fg-subtle);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 2px 5px;
+  }
+
+  .topbar-actions {
+    display: flex; align-items: center; gap: 6px;
+  }
+  .icon-btn {
+    width: 32px; height: 32px;
+    display: grid; place-items: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--fg-muted);
+    transition: all .15s;
+    position: relative;
+  }
+  .icon-btn:hover { background: var(--surface-2); color: var(--fg); }
+  .icon-btn .dot {
+    position: absolute;
+    top: 6px; right: 6px;
+    width: 6px; height: 6px;
+    background: var(--accent);
+    border-radius: 50%;
+  }
+  .avatar {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    display: grid; place-items: center;
+    font-size: 11px; font-weight: 700;
+    color: white;
+    margin-left: 4px;
+  }
+
+  /* ─── Sidebar ─────────────────────────────────────────────────────────── */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    overflow-y: auto;
+    padding: 16px 0 24px;
+  }
+  .nav-group { padding: 0 8px; margin-bottom: 14px; }
+  .nav-group-title {
+    color: var(--fg-subtle);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    padding: 4px 10px 6px;
+  }
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    color: var(--fg-muted);
+    font-size: 13px;
+    transition: all .12s;
+    position: relative;
+  }
+  .nav-item:hover {
+    background: var(--surface-2);
+    color: var(--fg);
+  }
+  .nav-item.active {
+    background: rgba(229, 9, 20, 0.12);
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .nav-item.active::before {
+    content: "";
+    position: absolute;
+    left: -8px; top: 6px; bottom: 6px;
+    width: 3px;
+    background: var(--accent);
+    border-radius: 0 2px 2px 0;
+  }
+  .nav-item .badge {
+    margin-left: auto;
+    font-size: 10.5px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--fg-muted);
+  }
+  .nav-item.active .badge { background: var(--accent); color: white; }
+
+  /* ─── Main content ────────────────────────────────────────────────────── */
+  .main {
+    overflow-y: auto;
+    background: var(--bg);
+  }
+  .page-head {
+    padding: 22px 28px 18px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+  }
+  .page-head h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 4px;
+  }
+  .page-head .subtitle {
+    color: var(--fg-subtle);
+    font-size: 13px;
+    margin: 0;
+    max-width: 640px;
+  }
+  .page-actions { display: flex; gap: 8px; }
+
+  .content { padding: 22px 28px; }
+
+  /* ─── Buttons ─────────────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 13px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all .12s;
+    background: var(--surface-2);
+    color: var(--fg);
+    border-color: var(--line-strong);
+    white-space: nowrap;
+  }
+  .btn:hover { background: var(--surface-3); }
+  .btn.primary {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .btn.primary:hover { background: var(--accent-hov); border-color: var(--accent-hov); }
+  .btn.ghost {
+    background: transparent;
+    border-color: transparent;
+    color: var(--fg-muted);
+  }
+  .btn.ghost:hover { background: var(--surface-2); color: var(--fg); }
+  .btn.danger {
+    background: transparent;
+    color: var(--danger);
+    border-color: rgba(239,68,68,0.3);
+  }
+  .btn.danger:hover { background: rgba(239,68,68,0.1); }
+  .btn.sm { padding: 4px 9px; font-size: 12px; }
+
+  /* ─── Cards ───────────────────────────────────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .card-head {
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .card-title { font-size: 13.5px; font-weight: 600; letter-spacing: -0.005em; }
+  .card-subtitle { color: var(--fg-subtle); font-size: 12px; }
+  .card-body { padding: 16px; }
+
+  /* ─── Status pills + dots ─────────────────────────────────────────────── */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 9px 2px 8px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 500;
+    background: var(--surface-3);
+    color: var(--fg-muted);
+    line-height: 18px;
+    white-space: nowrap;
+  }
+  .pill.ok    { background: rgba(34,197,94,0.13);  color: #86efac; }
+  .pill.warn  { background: rgba(245,158,11,0.13); color: #fcd34d; }
+  .pill.bad   { background: rgba(239,68,68,0.14);  color: #fca5a5; }
+  .pill.info  { background: rgba(59,130,246,0.13); color: #93c5fd; }
+  .pill.muted { background: var(--surface-3); color: var(--fg-muted); }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* ─── Sticky save bar ─────────────────────────────────────────────────── */
+  .save-bar {
+    position: sticky;
+    bottom: 0;
+    background: var(--surface-2);
+    border-top: 1px solid var(--line-strong);
+    margin: 24px -28px -22px;
+    padding: 12px 28px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    backdrop-filter: blur(8px);
+  }
+  .save-bar .dirty {
+    color: var(--warn);
+    font-size: 13px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .save-bar .dirty .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+
+  /* ─── Mock-specific styles ────────────────────────────────────────────── */
+
+  /* Dashboard */
+  .hero-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .hero {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .hero .label {
+    color: var(--fg-subtle);
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .hero .value {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 2px 0 6px;
+  }
+  .hero .meta { font-size: 12px; color: var(--fg-subtle); }
+  .hero .trend.up { color: #86efac; }
+  .hero .trend.dn { color: #fca5a5; }
+  .hero .accent-bar {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  }
+  .hero.ok    .accent-bar { background: var(--ok); }
+  .hero.warn  .accent-bar { background: var(--warn); }
+  .hero.bad   .accent-bar { background: var(--danger); }
+  .hero.info  .accent-bar { background: var(--info); }
+
+  .spark {
+    margin-top: 8px;
+    height: 32px;
+    width: 100%;
+  }
+  .split-2 {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+
+  .feed-item {
+    display: grid;
+    grid-template-columns: 28px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .feed-item:last-child { border-bottom: 0; }
+  .feed-item .icon-circle {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--surface-3);
+    color: var(--fg-muted);
+  }
+  .feed-item .text { font-size: 13px; }
+  .feed-item .text .who { color: var(--fg); font-weight: 500; }
+  .feed-item .text .what { color: var(--fg-muted); }
+  .feed-item .when {
+    color: var(--fg-subtle);
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+
+  .alert-row {
+    display: grid;
+    grid-template-columns: 24px 1fr auto;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .alert-row:last-child { border-bottom: 0; }
+  .alert-row .indicator {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    margin-top: 6px;
+  }
+  .alert-row .indicator.warn   { background: var(--warn); }
+  .alert-row .indicator.bad    { background: var(--danger); }
+  .alert-row .indicator.info   { background: var(--info); }
+  .alert-row .title { font-size: 13px; color: var(--fg); margin: 0 0 2px; font-weight: 500; }
+  .alert-row .meta  { font-size: 11.5px; color: var(--fg-subtle); }
+  .alert-row .when  { color: var(--fg-subtle); font-size: 11.5px; }
+
+  .quick-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+  }
+  .quick {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px;
+    text-align: left;
+    transition: all .12s;
+  }
+  .quick:hover {
+    background: var(--surface-2);
+    border-color: var(--line-strong);
+    transform: translateY(-1px);
+  }
+  .quick .icn {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: rgba(229,9,20,0.12);
+    color: #fca5a5;
+    display: grid; place-items: center;
+    margin-bottom: 10px;
+  }
+  .quick .title { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .quick .sub { font-size: 11.5px; color: var(--fg-subtle); }
+
+  /* Library cards grid */
+  .lib-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 14px;
+  }
+  .lib-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: grid;
+    grid-template-columns: 56px 1fr auto;
+    gap: 14px;
+    align-items: center;
+    transition: all .12s;
+    cursor: pointer;
+  }
+  .lib-card:hover { background: var(--surface-2); border-color: var(--line-strong); }
+  .lib-card.selected {
+    background: rgba(229,9,20,0.07);
+    border-color: rgba(229,9,20,0.4);
+  }
+  .lib-thumb {
+    width: 56px; height: 56px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #1f1f1f, #0a0a0a);
+    display: grid; place-items: center;
+    color: var(--fg-muted);
+    border: 1px solid var(--line);
+  }
+  .lib-name { font-size: 14.5px; font-weight: 600; margin: 0 0 3px; }
+  .lib-meta { font-size: 12px; color: var(--fg-subtle); display: flex; gap: 8px; flex-wrap: wrap; }
+  .lib-meta .sep { color: var(--line-strong); }
+
+  /* Tables */
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .table thead th {
+    text-align: left;
+    color: var(--fg-subtle);
+    font-weight: 600;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .table thead th:first-child { padding-left: 16px; }
+  .table thead th:last-child  { padding-right: 16px; }
+  .table tbody td {
+    padding: 12px 12px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: middle;
+  }
+  .table tbody td:first-child { padding-left: 16px; }
+  .table tbody td:last-child  { padding-right: 16px; }
+  .table tbody tr:hover td { background: rgba(255,255,255,0.02); }
+  .table tbody tr.selected td { background: rgba(229,9,20,0.06); }
+  .table tbody tr:last-child td { border-bottom: 0; }
+  .table .ck { width: 32px; }
+  .table .actions { width: 56px; text-align: right; }
+  .table td.nowrap, .table th.nowrap { white-space: nowrap; }
+  .table .compact { font-size: 12.5px; color: var(--fg-muted); }
+  .table .compact .stack { line-height: 1.45; }
+  .table .compact .stack .sub { color: var(--fg-subtle); font-size: 11.5px; }
+
+  .row-avatar {
+    display: flex; align-items: center; gap: 10px;
+  }
+  .row-avatar .av {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 11px; font-weight: 700;
+    color: white;
+  }
+  .row-avatar .av.a { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+  .row-avatar .av.b { background: linear-gradient(135deg, #f59e0b, #ef4444); }
+  .row-avatar .av.c { background: linear-gradient(135deg, #10b981, #06b6d4); }
+  .row-avatar .av.d { background: linear-gradient(135deg, #ec4899, #f43f5e); }
+  .row-avatar .av.e { background: linear-gradient(135deg, #8b5cf6, #ec4899); }
+  .row-avatar .av.f { background: linear-gradient(135deg, #06b6d4, #6366f1); }
+  .row-avatar { min-width: 0; }
+  .row-avatar > div:not(.av) { min-width: 0; flex: 1; }
+  .row-avatar .name { font-weight: 500; }
+  .row-avatar .email {
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+
+  .filter-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px 10px 0 0;
+    border-bottom: none;
+    flex-wrap: wrap;
+  }
+  .filter-bar input.search-input {
+    flex: 1; min-width: 200px; max-width: 280px;
+    height: 30px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 0 10px; color: var(--fg); font-size: 13px;
+  }
+  .filter-bar .chip {
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 12px;
+    color: var(--fg-muted);
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .filter-bar .chip:hover { color: var(--fg); border-color: var(--line-strong); }
+  .filter-bar .chip.active { background: rgba(229,9,20,0.12); color: #fca5a5; border-color: rgba(229,9,20,0.3); }
+  .filter-bar .chip .count {
+    color: var(--fg-subtle);
+    font-size: 11px;
+    padding: 0 5px;
+    background: var(--bg);
+    border-radius: 999px;
+    min-width: 18px;
+    text-align: center;
+  }
+  .filter-bar .chip.active .count { background: rgba(229,9,20,0.2); color: #fca5a5; }
+
+  /* Drawer */
+  .with-drawer {
+    display: grid;
+    grid-template-columns: 1fr 420px;
+    gap: 16px;
+  }
+  .drawer {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    align-self: start;
+    position: sticky;
+    top: 14px;
+  }
+  .drawer-head {
+    padding: 20px 20px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .drawer-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--line);
+    padding: 0 8px;
+  }
+  .drawer-tabs button {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    color: var(--fg-muted);
+    padding: 11px 8px;
+    font-size: 12.5px;
+    font-weight: 500;
+    border-bottom: 2px solid transparent;
+    transition: all .12s;
+    white-space: nowrap;
+  }
+  .drawer-tabs button.active {
+    color: var(--fg);
+    border-bottom-color: var(--accent);
+  }
+  .drawer-body { padding: 18px 20px; }
+
+  .kv {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 6px 12px;
+    font-size: 12.5px;
+  }
+  .kv dt { color: var(--fg-subtle); }
+  .kv dd { margin: 0; color: var(--fg); }
+
+  /* Settings form */
+  .settings-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    margin-bottom: 14px;
+    overflow: hidden;
+  }
+  .settings-card-head {
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .settings-card-head h3 {
+    margin: 0 0 3px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .settings-card-head p {
+    margin: 0;
+    color: var(--fg-subtle);
+    font-size: 12.5px;
+  }
+  .settings-rows { padding: 4px 0; }
+  .settings-row {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 24px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .settings-row:last-child { border-bottom: 0; }
+  .settings-row .label {
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .settings-row .help {
+    color: var(--fg-subtle);
+    font-size: 11.5px;
+    margin-top: 3px;
+    line-height: 1.5;
+  }
+  .input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: var(--fg);
+    font: inherit;
+    font-size: 13px;
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(229,9,20,0.15);
+  }
+  .input.changed { border-color: var(--warn); }
+
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .toggle .switch {
+    width: 32px; height: 18px;
+    background: var(--surface-3);
+    border-radius: 999px;
+    position: relative;
+    transition: background .15s;
+  }
+  .toggle .switch::after {
+    content: "";
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 14px; height: 14px;
+    background: var(--fg);
+    border-radius: 50%;
+    transition: transform .15s;
+  }
+  .toggle.on .switch { background: var(--accent); }
+  .toggle.on .switch::after { transform: translateX(14px); }
+  .toggle .lbl { font-size: 13px; }
+
+  .seg {
+    display: inline-flex;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 2px;
+  }
+  .seg button {
+    background: transparent;
+    border: 0;
+    color: var(--fg-muted);
+    padding: 5px 12px;
+    font-size: 12.5px;
+    font-weight: 500;
+    border-radius: 4px;
+    transition: all .12s;
+  }
+  .seg button.active {
+    background: var(--surface-2);
+    color: var(--fg);
+  }
+
+  /* Scheduled tasks — Plex simple list */
+  .task-list .task-row {
+    display: grid;
+    grid-template-columns: 24px 1fr auto auto auto;
+    gap: 14px;
+    align-items: center;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .task-list .task-row:last-child { border-bottom: 0; }
+  .task-row .name { font-size: 13.5px; font-weight: 500; }
+  .task-row .desc { font-size: 11.5px; color: var(--fg-subtle); margin-top: 1px; }
+  .task-row .freq { font-size: 12px; color: var(--fg-muted); }
+  .task-row .last { font-size: 11.5px; color: var(--fg-subtle); }
+  .check {
+    appearance: none;
+    width: 16px; height: 16px;
+    border: 1.5px solid var(--line-strong);
+    border-radius: 4px;
+    background: var(--bg);
+    position: relative;
+    cursor: pointer;
+  }
+  .check:checked {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .check:checked::after {
+    content: "";
+    position: absolute;
+    top: 1px; left: 4px;
+    width: 4px; height: 8px;
+    border: solid white;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+
+  /* Tabs (page-level) */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .tabs .tab {
+    background: transparent;
+    border: 0;
+    color: var(--fg-muted);
+    padding: 9px 14px;
+    border-bottom: 2px solid transparent;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all .12s;
+    margin-bottom: -1px;
+  }
+  .tabs .tab.active {
+    color: var(--fg);
+    border-bottom-color: var(--accent);
+  }
+  .tabs .tab:hover:not(.active) { color: var(--fg); }
+  .tabs .tab .badge {
+    margin-left: 6px;
+    font-size: 10.5px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--fg-muted);
+  }
+</style>
+</head>
+<body>
+
+<div class="review">
+  <h1>ChimpFlix — Admin redesign mockups</h1>
+  <p class="lede">
+    A unified pass over the admin surface, anchored on the four UX
+    observations from the round-3 review: status sprawl, raw <code>window.confirm</code>,
+    1k-line monoliths, and per-form save UX drift. Brand tokens
+    (<code>#0d0d0d</code> / <code>#141414</code> / <code>#e50914</code>) carry over from the viewer side so the
+    admin reads as part of the same product, not a separate console.
+  </p>
+
+  <nav class="toc">
+    <a href="#mock-home" class="active">1. Home</a>
+    <a href="#mock-libraries">2. Libraries</a>
+    <a href="#mock-users">3. Users</a>
+    <a href="#mock-settings">4. Server settings</a>
+    <a href="#mock-tasks">5. Scheduled tasks</a>
+  </nav>
+
+  <div class="review-note">
+    <strong>How to read these</strong> — every mock uses the same chrome (top
+    bar, sidebar, page head, content) and the same primitives (cards,
+    pills, tables, drawer, save bar). Anything that would be a one-off
+    component today is collapsed into a shared primitive on purpose,
+    because the value of this redesign is in the system, not the
+    individual screens.
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     MOCK 1 — HOME
+     ──────────────────────────────────────────────────────────────────────
+     Replaces: Dashboard + Alerts + Stats + Maintenance Overview +
+     Library Health (5 pages) with one Home that links into each as a
+     deep view. Top: 3 hero cards. Middle: activity + alerts. Bottom:
+     quick actions. The point is "is the server healthy?" gets answered
+     above the fold.
+══════════════════════════════════════════════════════════════════════════ -->
+
+<div class="mock-caption">
+  <span><span class="label">Mock 1</span> &nbsp;Home — unified status surface</span>
+  <span>Replaces 5 separate landings · ~1 click → any detail view</span>
+</div>
+<section id="mock-home" class="mock-frame">
+  <div class="app">
+    <!-- Top bar -->
+    <div class="topbar">
+      <div class="brand">
+        <div class="brand-mark">C</div>
+        <span>ChimpFlix</span>
+      </div>
+      <div class="crumbs">
+        <a>Admin</a>
+        <span class="sep">/</span>
+        <span class="current">Home</span>
+      </div>
+      <div class="topbar-search">
+        <span class="icn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        </span>
+        <input placeholder="Jump to library, user, task…" />
+        <kbd>⌘K</kbd>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" title="Notifications">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+          <span class="dot"></span>
+        </button>
+        <button class="icon-btn" title="Activity"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></button>
+        <div class="avatar">ZF</div>
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-item active">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg>
+          Home
+        </div>
+        <div class="nav-item">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+          Libraries
+          <span class="badge">7</span>
+        </div>
+        <div class="nav-item">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          Users
+          <span class="badge">12</span>
+        </div>
+        <div class="nav-item">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          Server
+        </div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Library</div>
+        <div class="nav-item">Collections</div>
+        <div class="nav-item">Scheduled tasks</div>
+        <div class="nav-item">Optimized versions</div>
+        <div class="nav-item">Metadata agents</div>
+        <div class="nav-item">Bulk operations</div>
+        <div class="nav-item">Pre-roll</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Server</div>
+        <div class="nav-item">General</div>
+        <div class="nav-item">Network</div>
+        <div class="nav-item">Transcoder</div>
+        <div class="nav-item">Credentials</div>
+        <div class="nav-item">Email</div>
+        <div class="nav-item">Webhooks</div>
+        <div class="nav-item">Privacy</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Maintenance</div>
+        <div class="nav-item">Audit log</div>
+        <div class="nav-item">Backups</div>
+        <div class="nav-item">Logs</div>
+        <div class="nav-item">Library health <span class="badge">2</span></div>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <div class="page-head">
+        <div>
+          <h1>Server is healthy</h1>
+          <p class="subtitle">All scheduled tasks ran in their windows · 3 active sessions · last backup 4h ago</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn ghost">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.2-8.55"/><path d="M21 3v6h-6"/></svg>
+            Refresh
+          </button>
+          <button class="btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            Run health check
+          </button>
+        </div>
+      </div>
+
+      <div class="content">
+        <!-- Hero cards -->
+        <div class="hero-grid">
+          <div class="hero ok">
+            <div class="accent-bar"></div>
+            <div class="label">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg>
+              System
+            </div>
+            <div class="value">Healthy</div>
+            <div class="meta">CPU 14% · RAM 3.1 / 16 GB · disk 47%</div>
+            <svg class="spark" viewBox="0 0 200 32" preserveAspectRatio="none">
+              <polyline fill="none" stroke="#22c55e" stroke-width="1.5" points="0,24 20,22 40,18 60,20 80,16 100,14 120,16 140,12 160,15 180,11 200,13"/>
+            </svg>
+          </div>
+          <div class="hero info">
+            <div class="accent-bar"></div>
+            <div class="label">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Active sessions
+            </div>
+            <div class="value">3 <span style="font-size:13px;color:var(--fg-subtle);font-weight:400;">/ 12 users online</span></div>
+            <div class="meta">2 direct play · 1 transcode (NVENC h264 1080p)</div>
+            <svg class="spark" viewBox="0 0 200 32" preserveAspectRatio="none">
+              <polyline fill="none" stroke="#3b82f6" stroke-width="1.5" points="0,28 20,26 40,22 60,18 80,14 100,16 120,12 140,10 160,12 180,8 200,11"/>
+            </svg>
+          </div>
+          <div class="hero warn">
+            <div class="accent-bar"></div>
+            <div class="label">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              Library health
+            </div>
+            <div class="value">2 issues</div>
+            <div class="meta">1 missing file · 1 watch-history mismatch</div>
+            <svg class="spark" viewBox="0 0 200 32" preserveAspectRatio="none">
+              <polyline fill="none" stroke="#f59e0b" stroke-width="1.5" points="0,28 20,28 40,28 60,28 80,28 100,22 120,22 140,22 160,18 180,18 200,18"/>
+            </svg>
+          </div>
+        </div>
+
+        <!-- Activity + Alerts -->
+        <div class="split-2">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">Recent activity</div>
+                <div class="card-subtitle">Last 12 events across the server</div>
+              </div>
+              <a class="btn ghost sm">View all →</a>
+            </div>
+            <div>
+              <div class="feed-item">
+                <div class="icon-circle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>
+                <div class="text"><span class="who">Andrea</span> <span class="what">started streaming</span> <span class="who">The Bear · S02E08</span></div>
+                <div class="when">just now</div>
+              </div>
+              <div class="feed-item">
+                <div class="icon-circle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+                <div class="text"><span class="who">Scan</span> <span class="what">completed on</span> <span class="who">Movies (4K)</span> <span class="what">— 18 added, 2 updated</span></div>
+                <div class="when">3m ago</div>
+              </div>
+              <div class="feed-item">
+                <div class="icon-circle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+                <div class="text"><span class="who">Backup</span> <span class="what">snapshot written</span> <span class="who">chimpflix-2026-05-19-0400.db.zst</span></div>
+                <div class="when">4h ago</div>
+              </div>
+              <div class="feed-item">
+                <div class="icon-circle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div>
+                <div class="text"><span class="who">Pat</span> <span class="what">accepted invite from</span> <span class="who">znfrazier@…</span></div>
+                <div class="when">6h ago</div>
+              </div>
+              <div class="feed-item">
+                <div class="icon-circle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82M4.6 9a1.65 1.65 0 0 0-.33-1.82"/></svg></div>
+                <div class="text"><span class="who">znfrazier</span> <span class="what">updated transcoder concurrency</span> <span class="who">4 → 6</span></div>
+                <div class="when">1d ago</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">Alerts</div>
+                <div class="card-subtitle">Surfaced from health, audit, scheduler</div>
+              </div>
+              <span class="pill warn"><span class="dot"></span> 2 open</span>
+            </div>
+            <div>
+              <div class="alert-row">
+                <div class="indicator warn"></div>
+                <div>
+                  <div class="title">Missing file: Inception (2010).mkv</div>
+                  <div class="meta">Movies (4K) · was at /media/movies-4k/… · last seen 2d ago</div>
+                </div>
+                <div class="when">2d</div>
+              </div>
+              <div class="alert-row">
+                <div class="indicator warn"></div>
+                <div>
+                  <div class="title">Watch-history row references deleted episode</div>
+                  <div class="meta">user_id 4 · episode_id 12834 · cleanup task can dedupe</div>
+                </div>
+                <div class="when">5d</div>
+              </div>
+              <div class="alert-row">
+                <div class="indicator info"></div>
+                <div>
+                  <div class="title">Trakt token expires in 7 days</div>
+                  <div class="meta">User: andrea · scheduled refresh will run before expiry</div>
+                </div>
+                <div class="when">—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick actions -->
+        <div class="quick-grid">
+          <button class="quick">
+            <div class="icn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+            <div class="title">Scan all libraries</div>
+            <div class="sub">Detect new files across 7 libraries</div>
+          </button>
+          <button class="quick">
+            <div class="icn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+            <div class="title">Run backup now</div>
+            <div class="sub">VACUUM INTO + verify</div>
+          </button>
+          <button class="quick">
+            <div class="icn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></div>
+            <div class="title">Open audit log</div>
+            <div class="sub">Last 24h: 142 entries</div>
+          </button>
+          <button class="quick">
+            <div class="icn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6"/><path d="M22 11h-6"/></svg></div>
+            <div class="title">Invite a user</div>
+            <div class="sub">Email or one-time link</div>
+          </button>
+        </div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     MOCK 2 — LIBRARIES
+     ──────────────────────────────────────────────────────────────────────
+     Library cards on the left, detail drawer on the right when one is
+     selected. Replaces the 844-line monolith with: cards (list state) +
+     drawer (detail/edit state) + tabs (per-library facets). Scan,
+     bulk ops, smart collections all flow off the drawer.
+══════════════════════════════════════════════════════════════════════════ -->
+
+<div class="mock-caption">
+  <span><span class="label">Mock 2</span> &nbsp;Libraries — list + detail drawer</span>
+  <span>Replaces 844-line monolith · select → drawer, no full nav</span>
+</div>
+<section id="mock-libraries" class="mock-frame">
+  <div class="app">
+    <div class="topbar">
+      <div class="brand"><div class="brand-mark">C</div><span>ChimpFlix</span></div>
+      <div class="crumbs">
+        <a>Admin</a><span class="sep">/</span>
+        <a>Library</a><span class="sep">/</span>
+        <span class="current">Libraries</span>
+      </div>
+      <div class="topbar-search">
+        <span class="icn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+        <input placeholder="Jump to…" /><kbd>⌘K</kbd>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/></svg></button>
+        <div class="avatar">ZF</div>
+      </div>
+    </div>
+
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-item">Home</div>
+        <div class="nav-item active">Libraries <span class="badge">7</span></div>
+        <div class="nav-item">Users <span class="badge">12</span></div>
+        <div class="nav-item">Server</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Library</div>
+        <div class="nav-item">Collections</div>
+        <div class="nav-item">Scheduled tasks</div>
+        <div class="nav-item">Optimized versions</div>
+        <div class="nav-item">Metadata agents</div>
+        <div class="nav-item">Bulk operations</div>
+        <div class="nav-item">Pre-roll</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Server</div>
+        <div class="nav-item">General</div>
+        <div class="nav-item">Network</div>
+        <div class="nav-item">Transcoder</div>
+        <div class="nav-item">Credentials</div>
+        <div class="nav-item">Email</div>
+        <div class="nav-item">Webhooks</div>
+        <div class="nav-item">Privacy</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Maintenance</div>
+        <div class="nav-item">Audit log</div>
+        <div class="nav-item">Backups</div>
+        <div class="nav-item">Logs</div>
+        <div class="nav-item">Library health</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="page-head">
+        <div>
+          <h1>Libraries</h1>
+          <p class="subtitle">7 libraries · 24,103 items · 41.7 TB on disk</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            Scan all
+          </button>
+          <button class="btn primary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            New library
+          </button>
+        </div>
+      </div>
+
+      <div class="content">
+        <div class="with-drawer">
+          <div>
+            <div class="lib-grid">
+              <div class="lib-card">
+                <div class="lib-thumb"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
+                <div>
+                  <div class="lib-name">Movies</div>
+                  <div class="lib-meta">
+                    <span>6,184 items</span><span class="sep">·</span>
+                    <span>12.4 TB</span><span class="sep">·</span>
+                    <span>last scan 12m ago</span>
+                  </div>
+                </div>
+                <span class="pill ok"><span class="dot"></span> healthy</span>
+              </div>
+
+              <div class="lib-card selected">
+                <div class="lib-thumb"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
+                <div>
+                  <div class="lib-name">Movies (4K)</div>
+                  <div class="lib-meta">
+                    <span>892 items</span><span class="sep">·</span>
+                    <span>18.1 TB</span><span class="sep">·</span>
+                    <span>last scan 3m ago</span>
+                  </div>
+                </div>
+                <span class="pill warn"><span class="dot"></span> 1 issue</span>
+              </div>
+
+              <div class="lib-card">
+                <div class="lib-thumb"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></div>
+                <div>
+                  <div class="lib-name">TV Shows</div>
+                  <div class="lib-meta">
+                    <span>724 shows · 14,891 episodes</span><span class="sep">·</span>
+                    <span>9.8 TB</span>
+                  </div>
+                </div>
+                <span class="pill ok"><span class="dot"></span> healthy</span>
+              </div>
+
+              <div class="lib-card">
+                <div class="lib-thumb"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div>
+                <div>
+                  <div class="lib-name">Anime</div>
+                  <div class="lib-meta">
+                    <span>284 series · 4,012 episodes</span><span class="sep">·</span>
+                    <span>1.4 TB</span>
+                  </div>
+                </div>
+                <span class="pill warn"><span class="dot"></span> 1 issue</span>
+              </div>
+
+              <div class="lib-card">
+                <div class="lib-thumb"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
+                <div>
+                  <div class="lib-name">Music</div>
+                  <div class="lib-meta">
+                    <span>2 albums · 24 tracks</span><span class="sep">·</span>
+                    <span>340 MB</span><span class="sep">·</span>
+                    <span class="pill muted" style="font-size:10.5px;padding:1px 7px;">paused</span>
+                  </div>
+                </div>
+                <span class="pill muted"><span class="dot"></span> idle</span>
+              </div>
+
+              <div class="lib-card">
+                <div class="lib-thumb"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><polyline points="17 2 12 7 7 2"/></svg></div>
+                <div>
+                  <div class="lib-name">Kids' shows</div>
+                  <div class="lib-meta">
+                    <span>52 shows · 1,304 episodes</span><span class="sep">·</span>
+                    <span>720 GB</span>
+                  </div>
+                </div>
+                <span class="pill ok"><span class="dot"></span> healthy</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Drawer (selected library) -->
+          <aside class="drawer">
+            <div class="drawer-head">
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom: 8px;">
+                <div style="font-size:11px;text-transform:uppercase;color:var(--fg-subtle);letter-spacing:0.06em;font-weight:600;">Movies library</div>
+                <button class="icon-btn" title="Close drawer">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                <div class="lib-thumb" style="width:36px;height:36px;border-radius:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/></svg></div>
+                <div>
+                  <div style="font-size:16px;font-weight:700;letter-spacing:-0.01em;">Movies (4K)</div>
+                  <div style="font-size:11.5px;color:var(--fg-subtle);">/media/movies-4k</div>
+                </div>
+              </div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <span class="pill warn"><span class="dot"></span> 1 issue</span>
+                <span class="pill muted">scan every 6h</span>
+                <span class="pill muted">HDR tonemap on</span>
+              </div>
+            </div>
+            <div class="drawer-tabs">
+              <button class="active">Overview</button>
+              <button>Items <span style="font-size:10px;color:var(--fg-subtle);">892</span></button>
+              <button>Health <span style="font-size:10px;color:var(--warn);">1</span></button>
+              <button>Settings</button>
+            </div>
+            <div class="drawer-body">
+              <dl class="kv" style="margin-bottom:14px;">
+                <dt>Path</dt><dd class="mono">/media/movies-4k</dd>
+                <dt>Items</dt><dd>892 (18.1 TB)</dd>
+                <dt>Last scan</dt><dd>3m ago — added 0, updated 2</dd>
+                <dt>Next scan</dt><dd>in 5h 57m</dd>
+                <dt>Type</dt><dd>movies</dd>
+                <dt>Agent</dt><dd>TMDB → TVDB</dd>
+              </dl>
+
+              <div style="font-size:11.5px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:8px;">Quick actions</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:14px;">
+                <button class="btn sm"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Scan</button>
+                <button class="btn sm">Refresh metadata</button>
+                <button class="btn sm">Detect markers</button>
+                <button class="btn sm">Optimize all</button>
+              </div>
+
+              <div style="font-size:11.5px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:8px;">Scan history</div>
+              <div style="font-size:12px;">
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+                  <span>3m ago · success</span>
+                  <span style="color:var(--fg-subtle);">+0 / ~2 / -0</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+                  <span>6h ago · success</span>
+                  <span style="color:var(--fg-subtle);">+12 / ~0 / -0</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;">
+                  <span>12h ago · success</span>
+                  <span style="color:var(--fg-subtle);">+3 / ~1 / -0</span>
+                </div>
+              </div>
+
+              <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line);">
+                <button class="btn danger sm" style="width:100%;justify-content:center;">Delete library…</button>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     MOCK 3 — USERS
+     ──────────────────────────────────────────────────────────────────────
+     Replaces 5 separate user-side pages (Users / Invites / Access /
+     Groups / Devices) with one table + tabbed drawer. Tabs in the
+     drawer carry the access/devices/sessions views per-user.
+══════════════════════════════════════════════════════════════════════════ -->
+
+<div class="mock-caption">
+  <span><span class="label">Mock 3</span> &nbsp;Users — table + drawer (collapses 5 pages into 1)</span>
+  <span>Tabs in the drawer: Profile · Access · Devices · Sessions · Audit</span>
+</div>
+<section id="mock-users" class="mock-frame">
+  <div class="app">
+    <div class="topbar">
+      <div class="brand"><div class="brand-mark">C</div><span>ChimpFlix</span></div>
+      <div class="crumbs">
+        <a>Admin</a><span class="sep">/</span>
+        <a>Users</a><span class="sep">/</span>
+        <span class="current">All users</span>
+      </div>
+      <div class="topbar-search">
+        <span class="icn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+        <input placeholder="Jump to…" /><kbd>⌘K</kbd>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/></svg></button>
+        <div class="avatar">ZF</div>
+      </div>
+    </div>
+
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-item">Home</div>
+        <div class="nav-item">Libraries <span class="badge">7</span></div>
+        <div class="nav-item active">Users <span class="badge">12</span></div>
+        <div class="nav-item">Server</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Users</div>
+        <div class="nav-item active" style="background:rgba(229,9,20,0.18);">All users</div>
+        <div class="nav-item">Invites <span class="badge">3</span></div>
+        <div class="nav-item">Groups <span class="badge">4</span></div>
+        <div class="nav-item">Active sessions <span class="badge">3</span></div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Library</div>
+        <div class="nav-item">Collections</div>
+        <div class="nav-item">Scheduled tasks</div>
+        <div class="nav-item">Optimized versions</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Server</div>
+        <div class="nav-item">General</div>
+        <div class="nav-item">Network</div>
+        <div class="nav-item">Transcoder</div>
+        <div class="nav-item">Credentials</div>
+        <div class="nav-item">Email</div>
+        <div class="nav-item">Webhooks</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Maintenance</div>
+        <div class="nav-item">Audit log</div>
+        <div class="nav-item">Backups</div>
+        <div class="nav-item">Logs</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="page-head">
+        <div>
+          <h1>Users</h1>
+          <p class="subtitle">12 users · 1 owner, 2 admins, 9 users · 3 currently online</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Export
+          </button>
+          <button class="btn primary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="17" y1="11" x2="23" y2="11"/></svg>
+            Invite user
+          </button>
+        </div>
+      </div>
+
+      <div class="content">
+        <div class="with-drawer">
+          <div>
+            <div class="filter-bar">
+              <input class="search-input" placeholder="Search by name or email…" />
+              <button class="chip active">All <span class="count">12</span></button>
+              <button class="chip">Owners <span class="count">1</span></button>
+              <button class="chip">Admins <span class="count">2</span></button>
+              <button class="chip">Online <span class="count">3</span></button>
+              <button class="chip">Locked <span class="count">0</span></button>
+              <div style="flex:1;"></div>
+              <button class="btn ghost sm" title="Columns">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="3" y2="18"/></svg>
+              </button>
+            </div>
+            <div class="card" style="border-radius:0 0 10px 10px; border-top:0;">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th class="ck"><input type="checkbox" class="check" /></th>
+                    <th>User</th>
+                    <th class="nowrap">Role</th>
+                    <th class="nowrap">Last seen</th>
+                    <th class="nowrap">Status</th>
+                    <th class="actions"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="ck"><input type="checkbox" class="check" /></td>
+                    <td>
+                      <div class="row-avatar">
+                        <div class="av a">ZF</div>
+                        <div class="stack">
+                          <div class="name">znfrazier</div>
+                          <div class="email">znfrazier@gmail.com · all libraries</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="nowrap"><span class="pill bad">Owner</span></td>
+                    <td class="nowrap compact">now</td>
+                    <td class="nowrap"><span class="pill ok"><span class="dot"></span> online</span></td>
+                    <td class="actions"><button class="icon-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button></td>
+                  </tr>
+                  <tr class="selected">
+                    <td class="ck"><input type="checkbox" class="check" checked /></td>
+                    <td>
+                      <div class="row-avatar">
+                        <div class="av b">AN</div>
+                        <div class="stack">
+                          <div class="name">andrea</div>
+                          <div class="email">andrea@example.com · 5 libraries · 2 groups</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="nowrap"><span class="pill info">Admin</span></td>
+                    <td class="nowrap compact">2m ago</td>
+                    <td class="nowrap"><span class="pill ok"><span class="dot"></span> online</span></td>
+                    <td class="actions"><button class="icon-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button></td>
+                  </tr>
+                  <tr>
+                    <td class="ck"><input type="checkbox" class="check" /></td>
+                    <td>
+                      <div class="row-avatar">
+                        <div class="av c">PR</div>
+                        <div class="stack">
+                          <div class="name">priya</div>
+                          <div class="email">priya@example.com · 5 libraries · 1 group</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="nowrap"><span class="pill info">Admin</span></td>
+                    <td class="nowrap compact">1h ago</td>
+                    <td class="nowrap"><span class="pill muted"><span class="dot"></span> offline</span></td>
+                    <td class="actions"><button class="icon-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button></td>
+                  </tr>
+                  <tr>
+                    <td class="ck"><input type="checkbox" class="check" /></td>
+                    <td>
+                      <div class="row-avatar">
+                        <div class="av d">PT</div>
+                        <div class="stack">
+                          <div class="name">pat</div>
+                          <div class="email">pat@example.com · 3 libraries · Family group</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="nowrap"><span class="pill muted">User</span></td>
+                    <td class="nowrap compact">just now</td>
+                    <td class="nowrap"><span class="pill ok"><span class="dot"></span> streaming</span></td>
+                    <td class="actions"><button class="icon-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button></td>
+                  </tr>
+                  <tr>
+                    <td class="ck"><input type="checkbox" class="check" /></td>
+                    <td>
+                      <div class="row-avatar">
+                        <div class="av e">JM</div>
+                        <div class="stack">
+                          <div class="name">jordan</div>
+                          <div class="email">jordan@example.com · 2 libraries</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="nowrap"><span class="pill muted">User</span></td>
+                    <td class="nowrap compact">3d ago</td>
+                    <td class="nowrap"><span class="pill muted"><span class="dot"></span> offline</span></td>
+                    <td class="actions"><button class="icon-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button></td>
+                  </tr>
+                  <tr>
+                    <td class="ck"><input type="checkbox" class="check" /></td>
+                    <td>
+                      <div class="row-avatar">
+                        <div class="av f">SK</div>
+                        <div class="stack">
+                          <div class="name">sam</div>
+                          <div class="email">sam@example.com · 1 library · Kids group</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="nowrap"><span class="pill muted">User</span></td>
+                    <td class="nowrap compact">5d ago</td>
+                    <td class="nowrap"><span class="pill muted"><span class="dot"></span> offline</span></td>
+                    <td class="actions"><button class="icon-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- User drawer -->
+          <aside class="drawer">
+            <div class="drawer-head">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+                <div style="display:flex;align-items:center;gap:12px;min-width:0;">
+                  <div class="av b" style="width:44px;height:44px;border-radius:50%;display:grid;place-items:center;font-size:15px;font-weight:700;color:white;flex-shrink:0;">AN</div>
+                  <div style="min-width:0;">
+                    <div style="font-size:16px;font-weight:700;letter-spacing:-0.01em;">andrea</div>
+                    <div style="font-size:11.5px;color:var(--fg-subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">andrea@example.com</div>
+                  </div>
+                </div>
+                <button class="icon-btn" title="Close drawer" style="flex-shrink:0;">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              </div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <span class="pill info">Admin</span>
+                <span class="pill ok"><span class="dot"></span> online</span>
+                <span class="pill muted">2FA on</span>
+              </div>
+            </div>
+            <div class="drawer-tabs">
+              <button class="active">Profile</button>
+              <button>Access</button>
+              <button>Devices</button>
+              <button>Audit</button>
+            </div>
+            <div class="drawer-body">
+              <dl class="kv" style="margin-bottom:18px;grid-template-columns:120px 1fr;">
+                <dt>Display name</dt><dd>Andrea</dd>
+                <dt>Joined</dt><dd>2026-01-12</dd>
+                <dt>Last login</dt><dd>2m ago · LAN</dd>
+                <dt>2FA</dt><dd>TOTP · since 2026-02-04</dd>
+                <dt>Login attempts</dt><dd>0 failed in 7d</dd>
+                <dt>Active sessions</dt><dd>1 — Chrome · macOS</dd>
+              </dl>
+
+              <div style="font-size:11.5px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:10px;">Quick actions</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;">
+                <button class="btn sm" style="justify-content:center;">Send reset</button>
+                <button class="btn sm" style="justify-content:center;">Reset 2FA</button>
+                <button class="btn sm" style="justify-content:center;">Unlock</button>
+                <button class="btn sm" style="justify-content:center;">Kick sessions</button>
+              </div>
+
+              <div style="font-size:11.5px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:10px;display:flex;justify-content:space-between;align-items:baseline;">
+                <span>Library access</span>
+                <a style="color:var(--fg-muted);font-size:11px;text-transform:none;letter-spacing:0;font-weight:500;">Edit →</a>
+              </div>
+              <div style="font-size:12.5px;">
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+                  <span>Movies</span>
+                  <span class="pill muted" style="font-size:10.5px;padding:1px 7px;">direct</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+                  <span>Movies (4K)</span>
+                  <span class="pill muted" style="font-size:10.5px;padding:1px 7px;">via Family</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+                  <span>TV Shows</span>
+                  <span class="pill muted" style="font-size:10.5px;padding:1px 7px;">direct</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+                  <span>Anime</span>
+                  <span class="pill muted" style="font-size:10.5px;padding:1px 7px;">via Family</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;">
+                  <span>Kids' shows</span>
+                  <span class="pill muted" style="font-size:10.5px;padding:1px 7px;">via Family</span>
+                </div>
+              </div>
+
+              <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:8px;">
+                <button class="btn sm" style="flex:1;justify-content:center;">Change role…</button>
+                <button class="btn danger sm" style="justify-content:center;">Delete…</button>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     MOCK 4 — SERVER SETTINGS (Transcoder)
+     ──────────────────────────────────────────────────────────────────────
+     Settings form pattern. One SettingsCard primitive — every form
+     becomes a stack of these. Sticky save bar shows dirty state.
+     Two-column rows: label + help on the left, control on the right.
+══════════════════════════════════════════════════════════════════════════ -->
+
+<div class="mock-caption">
+  <span><span class="label">Mock 4</span> &nbsp;Server → Transcoder — standardized settings form</span>
+  <span>SettingsCard primitive · sticky save bar · dirty-state outline on inputs</span>
+</div>
+<section id="mock-settings" class="mock-frame">
+  <div class="app">
+    <div class="topbar">
+      <div class="brand"><div class="brand-mark">C</div><span>ChimpFlix</span></div>
+      <div class="crumbs">
+        <a>Admin</a><span class="sep">/</span>
+        <a>Server</a><span class="sep">/</span>
+        <span class="current">Transcoder</span>
+      </div>
+      <div class="topbar-search">
+        <span class="icn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+        <input placeholder="Jump to…" /><kbd>⌘K</kbd>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/></svg></button>
+        <div class="avatar">ZF</div>
+      </div>
+    </div>
+
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-item">Home</div>
+        <div class="nav-item">Libraries</div>
+        <div class="nav-item">Users</div>
+        <div class="nav-item active">Server</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Server</div>
+        <div class="nav-item">General</div>
+        <div class="nav-item">Network</div>
+        <div class="nav-item active" style="background:rgba(229,9,20,0.18);">Transcoder</div>
+        <div class="nav-item">Credentials</div>
+        <div class="nav-item">Email</div>
+        <div class="nav-item">Webhooks</div>
+        <div class="nav-item">Privacy</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Library</div>
+        <div class="nav-item">Libraries</div>
+        <div class="nav-item">Collections</div>
+        <div class="nav-item">Scheduled tasks</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Maintenance</div>
+        <div class="nav-item">Audit log</div>
+        <div class="nav-item">Backups</div>
+        <div class="nav-item">Logs</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="page-head">
+        <div>
+          <h1>Transcoder</h1>
+          <p class="subtitle">ffmpeg pipeline, GPU acceleration, ABR ladders, and HDR tonemap. Detected: NVENC h264 + hevc, libx264, libx265.</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn ghost">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+            Reset to defaults
+          </button>
+          <button class="btn">View capabilities</button>
+        </div>
+      </div>
+
+      <div class="content" style="max-width:920px;">
+        <!-- Concurrency card -->
+        <div class="settings-card">
+          <div class="settings-card-head">
+            <h3>Concurrency</h3>
+            <p>How many ffmpeg processes can run at once across live transcodes and background tasks.</p>
+          </div>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <div>
+                <div class="label">Live transcode slots</div>
+                <div class="help">Max concurrent player sessions that hit ffmpeg. Direct-play and copy-streams don't count.</div>
+              </div>
+              <div>
+                <div style="display:flex;align-items:center;gap:8px;max-width:260px;">
+                  <input class="input changed" type="number" value="6" style="width:80px;" />
+                  <span class="pill warn" style="font-size:11px;">changed from 4</span>
+                </div>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div>
+                <div class="label">Background tasks</div>
+                <div class="help">Cap on parallel scheduled work (markers, previews, chapter thumbs, loudness). Increase if scans run long.</div>
+              </div>
+              <div>
+                <input class="input" type="number" value="3" style="width:80px;" />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div>
+                <div class="label">Per-user remote stream cap</div>
+                <div class="help">Outside the LAN bypass-network list, no single user can run more than N concurrent streams.</div>
+              </div>
+              <div>
+                <input class="input" type="number" value="2" style="width:80px;" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- GPU card -->
+        <div class="settings-card">
+          <div class="settings-card-head">
+            <h3>GPU acceleration</h3>
+            <p>NVENC encoder pinning + h.265 ladder. Disable if hardware is unstable.</p>
+          </div>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <div>
+                <div class="label">Use GPU for live transcodes</div>
+                <div class="help">NVIDIA NVENC detected: GPU 0 (RTX 4070). Falls back to libx264 if the encoder rejects the session.</div>
+              </div>
+              <div>
+                <div class="toggle on">
+                  <span class="switch"></span>
+                  <span class="lbl">On</span>
+                </div>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div>
+                <div class="label">GPU device</div>
+                <div class="help">Pin to a specific GPU when multiple are present. <code>auto</code> lets ffmpeg choose.</div>
+              </div>
+              <div>
+                <select class="input" style="max-width:280px;">
+                  <option>auto — first available</option>
+                  <option selected>GPU 0 — RTX 4070</option>
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div>
+                <div class="label">HEVC encoder</div>
+                <div class="help">Use hevc_nvenc for 4K HDR sources. Falls back to libx265 if NVENC is busy.</div>
+              </div>
+              <div>
+                <div class="seg">
+                  <button class="active">NVENC</button>
+                  <button>libx265</button>
+                  <button>Off</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- HDR card -->
+        <div class="settings-card">
+          <div class="settings-card-head">
+            <h3>HDR &amp; tonemap</h3>
+            <p>Apply tonemapping when a client requests SDR for an HDR source.</p>
+          </div>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <div>
+                <div class="label">Tonemap algorithm</div>
+                <div class="help">Hable is the safe default. Reinhard is brighter, Mobius retains more detail in the highlights.</div>
+              </div>
+              <div>
+                <div class="seg">
+                  <button class="active">Hable</button>
+                  <button>Reinhard</button>
+                  <button>Mobius</button>
+                </div>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div>
+                <div class="label">Peak luminance (nits)</div>
+                <div class="help">Override the source <code>master-display</code> metadata. 0 = trust the metadata.</div>
+              </div>
+              <div>
+                <input class="input" type="number" value="0" style="width:120px;" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sticky save bar -->
+        <div class="save-bar">
+          <div class="dirty">
+            <span class="dot"></span>
+            <span><strong>2 unsaved changes</strong> · Live slots, Concurrency</span>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn ghost">Discard</button>
+            <button class="btn primary">Save changes</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     MOCK 5 — SCHEDULED TASKS
+     ──────────────────────────────────────────────────────────────────────
+     Plex-style simple list, with a clear path to Advanced for the
+     cron/window editor. Per-row run-now and last-run status. The
+     "Advanced" toggle slides in a richer editor for the selected task.
+══════════════════════════════════════════════════════════════════════════ -->
+
+<div class="mock-caption">
+  <span><span class="label">Mock 5</span> &nbsp;Scheduled tasks — Plex-style simple list (1k-line monolith → flat checkbox list)</span>
+  <span>Per-row inline state · "Advanced" toggle reveals cron + window editor</span>
+</div>
+<section id="mock-tasks" class="mock-frame">
+  <div class="app">
+    <div class="topbar">
+      <div class="brand"><div class="brand-mark">C</div><span>ChimpFlix</span></div>
+      <div class="crumbs">
+        <a>Admin</a><span class="sep">/</span>
+        <a>Library</a><span class="sep">/</span>
+        <span class="current">Scheduled tasks</span>
+      </div>
+      <div class="topbar-search">
+        <span class="icn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+        <input placeholder="Jump to…" /><kbd>⌘K</kbd>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/></svg></button>
+        <div class="avatar">ZF</div>
+      </div>
+    </div>
+
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-item">Home</div>
+        <div class="nav-item">Libraries</div>
+        <div class="nav-item">Users</div>
+        <div class="nav-item">Server</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Library</div>
+        <div class="nav-item">Libraries</div>
+        <div class="nav-item">Collections</div>
+        <div class="nav-item active" style="background:rgba(229,9,20,0.18);">Scheduled tasks</div>
+        <div class="nav-item">Optimized versions</div>
+        <div class="nav-item">Metadata agents</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Server</div>
+        <div class="nav-item">General</div>
+        <div class="nav-item">Transcoder</div>
+        <div class="nav-item">Credentials</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Maintenance</div>
+        <div class="nav-item">Audit log</div>
+        <div class="nav-item">Backups</div>
+        <div class="nav-item">Logs</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="page-head">
+        <div>
+          <h1>Scheduled tasks</h1>
+          <p class="subtitle">Maintenance window: <strong>02:00 – 06:00 local</strong> · 14 enabled, 3 disabled · next run in 5h 41m</p>
+        </div>
+        <div class="page-actions">
+          <div class="seg">
+            <button class="active">Simple</button>
+            <button>Advanced</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="content">
+        <div class="tabs">
+          <button class="tab active">All <span class="badge">17</span></button>
+          <button class="tab">Library <span class="badge">6</span></button>
+          <button class="tab">Transcoder <span class="badge">4</span></button>
+          <button class="tab">Integrations <span class="badge">4</span></button>
+          <button class="tab">Maintenance <span class="badge">3</span></button>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">Tasks</div>
+              <div class="card-subtitle">Toggle to enable · click "Run now" for one-off execution</div>
+            </div>
+            <button class="btn sm">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+              Run all enabled
+            </button>
+          </div>
+          <div class="task-list">
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Scan libraries</div>
+                <div class="desc">Detect new and changed files across every enabled library.</div>
+              </div>
+              <div class="freq">every 6h</div>
+              <div class="last">last: 3m ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Refresh metadata</div>
+                <div class="desc">Re-fetch posters, episode summaries, and external IDs.</div>
+              </div>
+              <div class="freq">daily</div>
+              <div class="last">last: yesterday · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Detect intro &amp; credit markers</div>
+                <div class="desc">Chapter probe + blackdetect merge across episodes.</div>
+              </div>
+              <div class="freq">weekly</div>
+              <div class="last">last: 2d ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Generate chapter thumbnails</div>
+                <div class="desc">Frame extracts at every chapter boundary for the chapter menu.</div>
+              </div>
+              <div class="freq">weekly</div>
+              <div class="last">last: 2d ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Generate hover previews (BIF)</div>
+                <div class="desc">Sprite sheets for the seek-bar preview.</div>
+              </div>
+              <div class="freq">weekly</div>
+              <div class="last">last: 2d ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Analyze loudness (EBU R128)</div>
+                <div class="desc">Two-pass loudnorm to compute the per-item gain for replaygain.</div>
+              </div>
+              <div class="freq">weekly</div>
+              <div class="last">last: 6d ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Build optimized versions</div>
+                <div class="desc">Pre-encode the standard ABR ladder for items flagged in the queue.</div>
+              </div>
+              <div class="freq">every 12h</div>
+              <div class="last">last: 4h ago · 12 built</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Backup database</div>
+                <div class="desc">VACUUM INTO snapshot + verify checksum. Retains 14 newest.</div>
+              </div>
+              <div class="freq">daily</div>
+              <div class="last">last: 4h ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Sync from Trakt</div>
+                <div class="desc">Pull history + playback + ratings for every linked user.</div>
+              </div>
+              <div class="freq">every 4h</div>
+              <div class="last">last: 1h ago · 3 users</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" />
+              <div>
+                <div class="name">Fetch external subtitles</div>
+                <div class="desc">OpenSubtitles fetch for items missing a subtitle in the user's preferred language.</div>
+              </div>
+              <div class="freq">daily</div>
+              <div class="last">disabled · no API key set</div>
+              <button class="btn sm" disabled style="opacity:0.4;">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Reap orphaned optimized versions</div>
+                <div class="desc">Delete cache files whose source item was removed more than <code>reap_threshold</code> days ago.</div>
+              </div>
+              <div class="freq">weekly</div>
+              <div class="last">last: 4d ago · 0 reaped</div>
+              <button class="btn sm">Run now</button>
+            </div>
+            <div class="task-row">
+              <input type="checkbox" class="check" checked />
+              <div>
+                <div class="name">Verify backup integrity</div>
+                <div class="desc">Open each retained snapshot read-only and verify schema + a sample query.</div>
+              </div>
+              <div class="freq">weekly</div>
+              <div class="last">last: 6d ago · ok</div>
+              <button class="btn sm">Run now</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<div class="review" style="padding-top:8px;">
+  <div class="review-note">
+    <strong>Open questions for review:</strong>
+    <ol style="margin: 8px 0 0; padding-left: 20px; line-height: 1.7;">
+      <li>Does the unified <strong>Home</strong> collapse the right pages, or are Stats / Library Health pulling enough weight to deserve their own landings?</li>
+      <li>Is the <strong>list + drawer</strong> pattern (Libraries &amp; Users) preferred over the current full-page detail navigation, or does it hide too much behind a click?</li>
+      <li>For settings forms: <strong>sticky save bar with explicit dirty count</strong> vs. inline per-section save buttons (today)?</li>
+      <li>Should <strong>Simple</strong> be the Scheduled-Tasks default, or keep Advanced as the landing for operators who know what they want?</li>
+      <li>Color palette: the accent-red is already in <code>--color-accent</code>; should we shift to a less Netflix-coded admin accent (e.g. cyan / amber) so the viewer / admin halves read as distinct contexts?</li>
+    </ol>
+  </div>
+</div>
+
+<script>
+  // TOC active state + smooth-scroll
+  const tocLinks = document.querySelectorAll('.toc a');
+  const sections = Array.from(document.querySelectorAll('.mock-frame'));
+  tocLinks.forEach(a => a.addEventListener('click', e => {
+    tocLinks.forEach(b => b.classList.remove('active'));
+    a.classList.add('active');
+  }));
+  const setActiveOnScroll = () => {
+    const y = window.scrollY + 200;
+    for (let i = sections.length - 1; i >= 0; i--) {
+      if (sections[i].offsetTop <= y) {
+        tocLinks.forEach(b => b.classList.toggle('active', b.getAttribute('href') === '#' + sections[i].id));
+        break;
+      }
+    }
+  };
+  window.addEventListener('scroll', setActiveOnScroll, { passive: true });
+</script>
+</body>
+</html>

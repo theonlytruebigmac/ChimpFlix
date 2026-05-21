@@ -1,68 +1,167 @@
-# ChimpFlix — single-service compose example.
+# ChimpFlix — two-service compose.
 #
 # Quick start:
-#   1. `cp .env.example .env.local` and fill in PLEX_CLIENT_IDENTIFIER +
-#      SESSION_SECRET (see generation commands in the example file).
-#   2. `mkdir -p ./.app-state && sudo chown -R 1000:1000 ./.app-state`
-#      The container runs as uid 1000, so the bind mount must be
-#      writable by it.
-#   3. `docker compose up -d --build`
+#   cp .env.example .env.local            # then fill in values
+#   mkdir -p ./data
+#   docker compose up -d --build
+#   open http://localhost:3000
 #
-# To run alongside a Plex container on the same host, uncomment the
-# networks: block at the bottom. To put ChimpFlix behind a reverse proxy
-# with HTTPS, uncomment the Traefik labels and set APP_PUBLIC_ORIGIN in
-# .env.local.
+# The `server` container is the Rust backend (API + WebSocket + transcoder).
+# The `web` container is the Next.js UI. They communicate over the
+# default compose network and both read `./.env.local` via `env_file:`.
 
 services:
-  chimpflix:
-    build: .
-    image: chimpflix:local
-    container_name: chimpflix
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: server
+    image: chimpflix-server:local
+    container_name: chimpflix-server
     restart: unless-stopped
-    # `.env.local` is the same file `npm run dev` reads — single source
-    # of truth for SESSION_SECRET, PLEX_CLIENT_IDENTIFIER, etc.
-    env_file: .env.local
-    ports:
-      - "3000:3000"
-    # Persists the bootstrap auth file across container restarts.
-    # Without this, every restart pays a "first request cold" penalty.
-    # The host directory must be writable by uid 1000 — see step 2 above.
-    # Skipping this volume is fine; the app still works, just with one
-    # slow page load after each restart.
-    volumes:
-      - ./.app-state:/app/state
+    env_file:
+      - path: ./.env.local
+        required: false
     environment:
-      APP_STATE_DIR: /app/state
+      TZ: America/Kentucky/Louisville
+      BIND_ADDR: 0.0.0.0:8080
+      DATA_DIR: /data
+      RUST_LOG: info,sqlx=warn
+      # NVIDIA Container Toolkit hints. `video` enables NVENC, `compute`
+      # is required for the libcuda init the encoder does internally,
+      # `utility` lets ffmpeg call into nvidia-smi for capability probing.
+      # Without these, the NVENC libraries are installed in the container
+      # but can't find the host driver and fail at session start.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    volumes:
+      - "/etc/localtime:/etc/localtime:ro"
+      - "/etc/timezone:/etc/timezone:ro"
+      - ./data:/data
+      # Mount your media here (read-only is recommended).
+      - /mnt/archive:/media
+    # IMPORTANT — choose the right bind for your topology:
+    #
+    #   * Same-host Traefik (shared docker network): remove the `ports:`
+    #     block entirely. Traefik reaches the container via the compose
+    #     network (`http://server:8080`); no host port needed.
+    #
+    #   * Same-host Traefik with a host-port shim: bind to loopback to
+    #     keep the port off the public interface:
+    #         ports: ["127.0.0.1:8080:8080"]
+    #
+    #   * Cross-host Traefik (CURRENT SETUP): keep the wide bind so the
+    #     Traefik machine can reach this host's LAN IP at :8080. **You
+    #     MUST restrict :8080 with a host firewall** (ufw / iptables /
+    #     nftables) to only accept connections from the Traefik host's
+    #     LAN IP — otherwise the origin is reachable from any device on
+    #     the LAN that knows this machine's address, bypassing
+    #     Cloudflare entirely. Example ufw rule:
+    #         sudo ufw allow from <traefik-host-ip> to any port 8080 proto tcp
+    #         sudo ufw deny  in to any port 8080 proto tcp
+    ports:
+      - "8080:8080"
+    # Container hardening. None of these break NVENC/VAAPI; ffmpeg only
+    # needs `cap_sys_nice` for `nice -n` (we use the `nice` binary
+    # already, which doesn't need elevated caps).
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Process/thread ceiling. Bumped from 512 → 4096 because the
+    # media workload is fundamentally thread-heavy: each ffmpeg
+    # invocation spawns a stderr-capture thread, tacet's rayon
+    # pool defaults to `num_cpus`, and 4 concurrent job workers
+    # each running `detect_markers_file` + an in-flight
+    # `bootstrap_season_refs` (which decodes every episode of a
+    # season in parallel) easily blow through 512 — surfacing as
+    # "task panicked: failed to spawn thread: Resource temporarily
+    # unavailable (os error 11 / EAGAIN)" in the job queue. 4096
+    # still bounds fork-bomb risk but matches the real workload's
+    # peak demand on a 4–8 core host.
+    pids_limit: 4096
+    # Disable kernel-mediated mount/CHROOT etc. Apparmor profile
+    # `docker-default` is implicit on Ubuntu/Debian hosts.
+    # GPU passthrough. Pick one (or both — different runtime keys,
+    # they coexist) depending on the host hardware:
+    #
+    # ── NVIDIA (NVENC / NVDEC) ──────────────────────────────────
+    # Requires `nvidia-container-toolkit` on the host + the docker
+    # daemon configured to know about the `nvidia` runtime
+    # (`nvidia-ctk runtime configure --runtime=docker` + restart).
+    # Without those host-side prerequisites the deploy block below
+    # is a no-op and the container falls back to CPU encoding —
+    # the in-process smoke test detects this at startup and drops
+    # NVENC from the admin UI's encoder list automatically.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+    #
+    # ── AMD / Intel (VAAPI + Quick Sync) ────────────────────────
+    # Mount the DRI render node from the host. The `mesa-va-drivers`
+    # and `intel-media-va-driver-non-free` packages baked into the
+    # image provide the userspace; the kernel side comes from the
+    # host (amdgpu / i915). Uncomment to enable. `card0` is for
+    # render-node-less older drivers; `renderD128` is the modern
+    # path and what our VAAPI hint uses.
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
+    #   - /dev/dri/card0:/dev/dri/card0
+    # group_add:
+    #   - "video"   # operator host's `video` group GID, usually 44
+    #   - "render"  # newer distros split out renderD* into a 'render' group, usually 109
     healthcheck:
-      # The home route redirects to /login when there's no session,
-      # which still counts as "Node is up and answering".
-      # Use 127.0.0.1 (not localhost) — inside Alpine, `localhost`
-      # resolves to ::1 first but Node binds 0.0.0.0 only, so wget would
-      # get "Connection refused" and flag the container unhealthy.
-      test: ["CMD-SHELL", "wget --quiet --spider --tries=1 http://127.0.0.1:3000/ || exit 1"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 10s
       retries: 3
 
-#     # ── Plex on the same Docker host ──────────────────────────────────
-#     # Plex in bridge mode advertises its container IP as "local", which
-#     # is unreachable from other containers. Sharing Plex's network fixes
-#     # it — find the name with `docker network ls`.
-#     networks:
-#       - t3_proxy
-
-#     # ── Traefik (or another reverse proxy) ────────────────────────────
-#     # Uncomment if you're terminating TLS upstream. Replace the domain.
-#     # Also set `APP_PUBLIC_ORIGIN=https://chimpflix.example.com` and
-#     # `APP_TRUST_PROXY=1` in .env.local.
-#     labels:
-#       - "traefik.enable=true"
-#       - "traefik.http.routers.chimpflix.rule=Host(`flix.syschimp.com`)"
-#       - "traefik.http.routers.chimpflix.entrypoints=websecure"
-#       - "traefik.http.routers.chimpflix.tls.certresolver=letsencrypt"
-#       - "traefik.http.services.chimpflix.loadbalancer.server.port=3000"
-
-# networks:
-#   t3_proxy:
-#     external: true
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: web
+      # Build-time args. NEXT_PUBLIC_* + APP_PUBLIC_ORIGIN are baked into
+      # the client bundle; runtime changes via env_file won't take effect
+      # until the image is rebuilt (`docker compose build web`).
+      args:
+        CHIMPFLIX_API_URL: http://server:8080
+        NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-ChimpFlix}
+        NEXT_PUBLIC_BRAND_NAME_UPPER: ${NEXT_PUBLIC_BRAND_NAME_UPPER:-}
+        APP_PUBLIC_ORIGIN: ${APP_PUBLIC_ORIGIN:-}
+    image: chimpflix-web:local
+    container_name: chimpflix-web
+    restart: unless-stopped
+    volumes:
+      - "/etc/localtime:/etc/localtime:ro"
+      - "/etc/timezone:/etc/timezone:ro"
+    depends_on:
+      - server
+    env_file:
+      - path: ./.env.local
+        required: false
+    environment:
+      # Runtime endpoint for /api/v1/* rewrites in next.config.ts.
+      CHIMPFLIX_API_URL: http://server:8080
+      TZ: America/Kentucky/Louisville
+    # See the matching comment on the `server` service. For the
+    # cross-host setup (Traefik on another machine), keep the wide
+    # bind so Traefik can reach this host's LAN IP at :3000, and add
+    # a host firewall rule to restrict :3000 to the Traefik host IP.
+    # For same-host Traefik, switch to 127.0.0.1:3000:3000 (or remove
+    # the block entirely and let the compose network handle it).
+    ports:
+      - "3000:3000"
+    init: true            # docker-managed tini equivalent so Next.js
+                          # (PID 1) sees SIGTERM and reaps any child
+                          # processes the Next runtime spawns.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256

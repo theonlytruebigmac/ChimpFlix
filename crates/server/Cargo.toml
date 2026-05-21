@@ -1,0 +1,57 @@
+[package]
+name = "chimpflix-server"
+description = "ChimpFlix HTTP + WebSocket server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "chimpflix-server"
+path = "src/main.rs"
+
+[dependencies]
+chimpflix-common = { path = "../common" }
+chimpflix-library = { path = "../library" }
+chimpflix-metadata = { path = "../metadata" }
+chimpflix-transcoder = { path = "../transcoder" }
+tacet-core = { workspace = true }
+# bincode is used to serialize tacet's ReferenceFingerprint values into
+# the `show_season_intro_refs` table. Schema-versioned by tacet itself
+# (its Config + Fingerprint structs are #[serde(default)] for new
+# fields), so a tacet upgrade that adds a field still loads old refs.
+bincode = "1.3"
+
+anyhow = { workspace = true }
+argon2 = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+cron = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+image = { workspace = true }
+ipnet = { workspace = true }
+lettre = { workspace = true }
+libc = { workspace = true }
+notify = { workspace = true }
+rand_core = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+qrcode = { workspace = true }
+totp-rs = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

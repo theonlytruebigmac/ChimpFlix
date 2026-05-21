@@ -1,13 +1,55 @@
-node_modules
-.next
-.git
+# Top-level .dockerignore. Without this, `docker build` sends the
+# entire repo as build context — including .env.local (live secrets),
+# data/ (the live SQLite DB with hashed passwords and the vault),
+# .git/ (history + remote URLs), and target/ (compile artifacts up to
+# several gigs). A stray `COPY . /opt/` in any future Dockerfile, or
+# a leaked build cache layer, would smuggle all of that into the
+# published image.
+
+# Secrets — never bake these into an image.
 .env
-.env.local
-.env.*.local
-.app-admin-token
-.app-state
-npm-debug.log*
-README.md
-Dockerfile
-docker-compose.yml
-.dockerignore
+.env.*
+!.env.example
+
+# Live runtime state. The image bakes nothing from /data; the host
+# bind-mounts ./data:/data at run time.
+data/
+backups/
+.app-state/
+
+# VCS metadata.
+.git/
+.gitignore
+.github/
+
+# Local build / cache directories.
+target/
+**/target/
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+
+# IDE / editor noise.
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs.
+*.log
+logs/
+
+# Test artifacts.
+coverage/
+**/coverage/
+
+# Backups, ad-hoc archives.
+*.tar
+*.tar.gz
+*.zip
+*.bak
+*.db
+*.db-wal
+*.db-shm

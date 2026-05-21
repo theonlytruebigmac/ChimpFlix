@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>System tasks — ChimpFlix pipelines</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="pipelines.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;600&family=Patrick+Hand&display=swap" rel="stylesheet">
+</head>
+<body>
+  <header class="page">
+    <h1>System tasks</h1>
+    <div class="subtitle">Database backup + verification, and the background optimized-version transcoder. Heavy I/O — both pipelines are tied to the maintenance window.</div>
+  </header>
+
+  <nav class="crumbs">
+    <a href="index.html">Overview</a>
+    <a href="media.html">Media ingest + maintenance</a>
+    <a href="watch-state.html">Watch state &amp; housekeeping</a>
+    <a href="system.html" class="active">System tasks</a>
+  </nav>
+
+  <div class="legend">
+    <div class="legend-item"><span class="legend-swatch trigger"></span> trigger</div>
+    <div class="legend-item"><span class="legend-swatch event"></span> data / artifact</div>
+    <div class="legend-item"><span class="legend-swatch auto"></span> automatic</div>
+    <div class="legend-item"><span class="legend-swatch gated"></span> gated</div>
+    <div class="legend-item"><span class="legend-swatch safety"></span> scheduled</div>
+    <div class="legend-item"><span class="legend-swatch terminal"></span> destructive</div>
+  </div>
+
+  <main>
+
+    <!-- =============================================== STAGE 1: BACKUP CHAIN -->
+    <section class="stage">
+      <h2>1. Backup → verify chain</h2>
+      <div class="stage-desc">Daily snapshot via SQLite <code>VACUUM INTO</code>; weekly integrity sweep across the backup directory. Verification failures surface as task errors so they reach operator alerts.</div>
+
+      <div class="row">
+
+        <div class="col">
+          <div class="node safety wide">
+            <div class="title">backup_db</div>
+            <div class="meta"><span class="label">Cadence</span><span class="val">daily · maint window</span></div>
+            <div class="meta"><span class="label">Gate</span><span class="val">none</span></div>
+            <div class="meta"><span class="label">Action</span><span class="val"><code>VACUUM INTO &lt;data&gt;/backups/auto/chimpflix-{ts}.db</code></span></div>
+            <div class="meta"><span class="label">Note</span><span class="val">VACUUM INTO is atomic + creates a self-consistent snapshot under a live writer</span></div>
+            <div class="ref">scheduler/mod.rs:582</div>
+          </div>
+
+          <div class="arrow">↓ writes</div>
+
+          <div class="node event narrow">
+            <div class="title">backups/auto/*.db</div>
+            <div class="meta"><span class="label">Retention</span><span class="val">no auto-prune today</span></div>
+          </div>
+        </div>
+
+        <div class="col" style="justify-content: center;">
+          <div class="arrow" style="font-size:22px;">→</div>
+          <div class="arrow" style="font-size:11px; color:var(--muted); margin-top:4px;">weekly sweep</div>
+        </div>
+
+        <div class="col">
+          <div class="node safety wide">
+            <div class="title">verify_backups</div>
+            <div class="meta"><span class="label">Cadence</span><span class="val">weekly · maint window</span></div>
+            <div class="meta"><span class="label">Gate</span><span class="val">none</span></div>
+            <div class="meta"><span class="label">Steps</span><span class="val">open each backup read-only → <code>PRAGMA integrity_check</code> → <code>PRAGMA foreign_key_check</code></span></div>
+            <div class="meta"><span class="label">Failure</span><span class="val">surfaces as task error (alertable)</span></div>
+            <div class="ref">scheduler/mod.rs:1291</div>
+          </div>
+
+          <div class="arrow">↓</div>
+
+          <div class="node event narrow">
+            <div class="title">backup health report</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =============================================== STAGE 2: OPTIMIZED VERSIONS -->
+    <section class="stage">
+      <h2>2. Optimized-version transcoder</h2>
+      <div class="stage-desc">Background re-encodes to operator-chosen presets. Pull-based: operators add items to a queue from the admin UI; the scheduled task drains the queue under a strict concurrency cap so it never starves live transcodes.</div>
+
+      <div class="row">
+        <div class="node trigger wide">
+          <div class="title">Operator queues item <span class="kind-chip">admin</span></div>
+          <div class="meta"><span class="label">Source</span><span class="val">admin "Optimize" UI</span></div>
+          <div class="meta"><span class="label">Picks</span><span class="val">preset (defined in <code>server_settings.transcoder_background_preset</code>)</span></div>
+          <div class="meta"><span class="label">Writes</span><span class="val">queue row → optimized_versions table</span></div>
+        </div>
+      </div>
+
+      <div class="arrow">↓ drains</div>
+
+      <div class="row">
+        <div class="node safety wide">
+          <div class="title">optimize_versions</div>
+          <div class="meta"><span class="label">Cadence</span><span class="val">daily · maint window</span></div>
+          <div class="meta"><span class="label">Batch</span><span class="val">2 items / run (default)</span></div>
+          <div class="meta"><span class="label">Concur. cap</span><span class="val"><code>transcoder_max_background_concurrent</code></span></div>
+          <div class="meta"><span class="label">Why cap</span><span class="val">never compete with live playback transcodes</span></div>
+          <div class="ref">scheduler/mod.rs:804 (dispatch) · :856 (encode)</div>
+        </div>
+      </div>
+
+      <div class="arrow">↓ ffmpeg</div>
+
+      <div class="row">
+        <div class="col">
+          <div class="node auto">
+            <div class="title">Encode</div>
+            <div class="meta"><span class="label">Codec</span><span class="val">libx264 / libx265 (operator preset)</span></div>
+            <div class="meta"><span class="label">HW</span><span class="val">GPU device pin if configured (phase 44)</span></div>
+            <div class="meta"><span class="label">HDR</span><span class="val">tonemap config from server_settings</span></div>
+          </div>
+
+          <div class="arrow">↓</div>
+
+          <div class="node event">
+            <div class="title">optimized/{src}-{preset}.mp4</div>
+            <div class="meta"><span class="label">Surfaces</span><span class="val">player picks optimized when available + bandwidth allows</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =============================================== NOTES -->
+    <div class="notes">
+      <h3>Design notes</h3>
+      <ul>
+        <li><strong>Backup retention is unmanaged today.</strong> <code>backup_db</code> creates a new file each day; nothing prunes the directory. <code>verify_backups</code> walks the whole dir every week, so cost grows linearly. Worth deciding: keep N days, or keep last+weekly+monthly?</li>
+        <li><strong>Verify is sufficient signal but not a real restore drill.</strong> <code>PRAGMA integrity_check</code> catches corruption but doesn't prove a restored DB starts up under the current schema. A periodic restore-into-test-instance would be the real check.</li>
+        <li><strong>Optimize_versions concurrency cap is global, not per-GPU.</strong> If we add GPU device pinning per item, the cap probably becomes per-device rather than global so a multi-GPU host can run N encodes per card without operator math.</li>
+        <li><strong>VACUUM INTO holds a read lock for the duration.</strong> Long enough on large DBs to delay writes. Maintenance window helps but doesn't eliminate the spike — could move to <code>BACKUP API</code> for incremental snapshots if it becomes noticeable.</li>
+        <li><strong>Both system tasks share the same maintenance window as media ingest.</strong> If <code>backup_db</code> + <code>optimize_versions</code> + <code>analyze_loudness</code> + <code>refresh_metadata</code> all fire on the same night, they serialize through the scheduler. Splitting the window or assigning priorities is the lever if contention shows up.</li>
+      </ul>
+    </div>
+
+  </main>
+</body>
+</html>

@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ChimpFlix — Email mockups</title>
+<style>
+  /* ─── Page chrome (review surface, not part of the emails) ─────────── */
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0a0a0a;
+    color: #e5e5e5;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .page {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+  }
+  .page > h1 {
+    font-size: 28px;
+    font-weight: 800;
+    margin: 0 0 8px;
+    letter-spacing: -0.02em;
+  }
+  .page > .lede {
+    font-size: 15px;
+    color: #888;
+    margin: 0 0 12px;
+    max-width: 720px;
+    line-height: 1.6;
+  }
+  .toc {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 6px;
+    margin: 24px 0 64px;
+    padding: 16px 18px;
+    background: #141414;
+    border: 1px solid #262626;
+    border-radius: 8px;
+  }
+  .toc a {
+    color: #cfcfcf;
+    text-decoration: none;
+    font-size: 13px;
+    padding: 4px 0;
+  }
+  .toc a:hover { color: #e50914; }
+  .toc strong {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #888;
+    display: block;
+    margin: 4px 0 2px;
+  }
+
+  /* ─── "Inbox" card chrome (mimics an email client preview) ─────────── */
+  .mock {
+    margin: 56px 0 0;
+    padding: 0;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #ffffff;          /* mimic Gmail's light pane */
+    color: #202124;
+    box-shadow: 0 24px 48px rgba(0,0,0,0.5);
+  }
+  .mock h2 { /* This is just the inbox subject row */
+    margin: 0;
+    padding: 18px 24px;
+    background: #ffffff;
+    color: #202124;
+    font-size: 16px;
+    font-weight: 500;
+    border-bottom: 1px solid #e8eaed;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .mock h2 .pill {
+    font-size: 11px;
+    font-weight: 400;
+    background: #e8eaed;
+    color: #5f6368;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  .mock .meta {
+    padding: 12px 24px;
+    border-bottom: 1px solid #e8eaed;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    color: #5f6368;
+    font-size: 13px;
+  }
+  .mock .meta .from {
+    color: #202124;
+    font-weight: 600;
+  }
+  .mock .meta .addr {
+    color: #5f6368;
+    font-size: 12px;
+  }
+  .mock .meta .ts {
+    margin-left: auto;
+    font-size: 12px;
+  }
+  /* This wrapper places the actual rendered email inside the inbox pane */
+  .render-stage {
+    background: #f5f5f5;
+    padding: 24px;
+  }
+  .label-strip {
+    display: inline-block;
+    margin: 0 0 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #777;
+  }
+
+  /* ─── ChimpFlix email base (this is the part we'd actually generate) ── */
+  /* Email bodies use inline styles in production (Gmail strips <style>);
+     here we use a scoped class for readability — when we port to Rust,
+     each rule below gets flattened to inline `style=""` on its element. */
+  .cfm-body {
+    background: #000000;
+    margin: 0 auto;
+    padding: 0;
+    max-width: 600px;
+    color: #ffffff;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  .cfm-header {
+    background: #000000;
+    padding: 28px 32px 24px;
+    text-align: left;
+    border-bottom: 4px solid #e50914;
+  }
+  .cfm-brand {
+    color: #e50914;
+    font-size: 28px;
+    font-weight: 900;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    text-decoration: none;
+    display: inline-block;
+    line-height: 1;
+  }
+  .cfm-eyebrow {
+    color: #b3b3b3;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    margin: 0 0 12px;
+    padding-top: 4px;
+  }
+  .cfm-content {
+    background: #141414;
+    padding: 36px 32px;
+  }
+  .cfm-h1 {
+    color: #ffffff;
+    font-size: 26px;
+    font-weight: 800;
+    line-height: 1.2;
+    margin: 0 0 16px;
+    letter-spacing: -0.01em;
+  }
+  .cfm-p {
+    color: #d2d2d2;
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0 0 18px;
+  }
+  .cfm-small {
+    color: #8c8c8c;
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 0 0 12px;
+  }
+  .cfm-cta-wrap {
+    margin: 28px 0 32px;
+  }
+  .cfm-cta {
+    display: inline-block;
+    background: #e50914;
+    color: #ffffff !important;
+    font-weight: 700;
+    font-size: 15px;
+    padding: 14px 28px;
+    border-radius: 4px;
+    text-decoration: none;
+    letter-spacing: 0.02em;
+  }
+  .cfm-cta:hover { background: #f6121d; }
+  .cfm-link {
+    color: #ffffff;
+    word-break: break-all;
+    text-decoration: underline;
+  }
+  .cfm-code {
+    display: block;
+    background: #1f1f1f;
+    border: 1px solid #2b2b2b;
+    color: #ffffff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    padding: 14px 16px;
+    border-radius: 6px;
+    word-break: break-all;
+  }
+  .cfm-callout {
+    background: #1c1c1c;
+    border-left: 3px solid #e50914;
+    padding: 14px 18px;
+    margin: 18px 0;
+    color: #d2d2d2;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .cfm-callout.warn { border-left-color: #f5a623; }
+  .cfm-callout.info { border-left-color: #4f8cff; }
+  .cfm-quote {
+    background: #1c1c1c;
+    border-left: 3px solid #404040;
+    padding: 14px 18px;
+    margin: 14px 0 22px;
+    color: #d2d2d2;
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+  }
+  .cfm-kv {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0 24px;
+  }
+  .cfm-kv td {
+    padding: 10px 0;
+    border-bottom: 1px solid #2a2a2a;
+    color: #d2d2d2;
+    font-size: 14px;
+    vertical-align: top;
+  }
+  .cfm-kv td.k {
+    color: #8c8c8c;
+    width: 130px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding-right: 16px;
+  }
+  .cfm-footer {
+    background: #000000;
+    padding: 28px 32px;
+    color: #6e6e6e;
+    font-size: 12px;
+    line-height: 1.6;
+    border-top: 1px solid #1f1f1f;
+  }
+  .cfm-footer a { color: #8c8c8c; text-decoration: underline; }
+  .cfm-footer .legal {
+    color: #4a4a4a;
+    font-size: 11px;
+    margin-top: 10px;
+  }
+
+  /* Status pip used in the "issue reported" mockup */
+  .cfm-pip {
+    display: inline-block;
+    background: #2a2a2a;
+    color: #ffffff;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 4px 9px;
+    border-radius: 99px;
+    vertical-align: middle;
+  }
+  .cfm-pip.warn { background: #f5a623; color: #000; }
+  .cfm-pip.danger { background: #e50914; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>ChimpFlix — Email mockups</h1>
+  <p class="lede">
+    Design review for every email the server can send. The wrapper around each preview
+    mimics a Gmail-style inbox row so the subject line + sender are evaluated alongside
+    the body itself. The email bodies themselves use inline-style-equivalent CSS so
+    porting back to the Rust template builders is a 1:1 translation of selectors → inline
+    <code>style=""</code> attributes.
+  </p>
+
+  <nav class="toc">
+    <div>
+      <strong>User-facing</strong>
+      <a href="#invite">Invitation</a><br/>
+      <a href="#email-change">Confirm new email</a><br/>
+      <a href="#password-reset">Password reset</a>
+    </div>
+    <div>
+      <strong>Admin alerts</strong>
+      <a href="#new-user">New user joined</a><br/>
+      <a href="#issue">Issue reported</a><br/>
+      <a href="#twofa-disabled">2FA turned off</a><br/>
+      <a href="#twofa-reset">2FA reset by admin</a>
+    </div>
+    <div>
+      <strong>Operational</strong>
+      <a href="#smtp-test">SMTP test</a>
+    </div>
+  </nav>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  1. Invite                                                          -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip">User-facing</span>
+  <div id="invite" class="mock">
+    <h2>Your ChimpFlix invitation <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">8:09 PM (just now)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">You're invited</p>
+          <h1 class="cfm-h1">Get ready to start streaming.</h1>
+          <p class="cfm-p">
+            You've been invited to join <strong>ChimpFlix</strong> — a private library of
+            movies, shows, and anime hosted by the server owner. Tap below to set up your
+            account and start watching.
+          </p>
+          <div class="cfm-cta-wrap">
+            <a class="cfm-cta" href="https://flix.syschimp.com/login?invite=b78b…87d">Accept invitation</a>
+          </div>
+          <p class="cfm-small">
+            Or paste this link into your browser:<br/>
+            <a class="cfm-link" href="#">https://flix.syschimp.com/login?invite=b78be46d5995e53f49633e4a657cb0aa243096f909c36fc054e61493e8acb87d</a>
+          </p>
+          <p class="cfm-small" style="margin-top:22px">
+            If the button or link doesn't work, your invite code is:
+          </p>
+          <code class="cfm-code">b78be46d5995e53f49633e4a657cb0aa243096f909c36fc054e61493e8acb87d</code>
+          <div class="cfm-callout" style="margin-top:22px">
+            This invitation expires on <strong>Sat, May 25 2026 at 8:09 PM</strong>
+            (in 7 days).
+          </div>
+        </div>
+        <div class="cfm-footer">
+          You're receiving this because someone on a ChimpFlix server invited you. If you
+          weren't expecting this, you can safely ignore the email — no account is created
+          until you accept.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  2. Email change confirmation                                       -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">User-facing</span>
+  <div id="email-change" class="mock">
+    <h2>Confirm your new ChimpFlix email <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">8:11 PM (2 minutes ago)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">Verify email change</p>
+          <h1 class="cfm-h1">Is this still you?</h1>
+          <p class="cfm-p">
+            Someone (hopefully you) asked to change the email address on a ChimpFlix
+            account to <strong>this address</strong>. Confirm below to finish the change.
+          </p>
+          <div class="cfm-cta-wrap">
+            <a class="cfm-cta" href="#">Confirm email change</a>
+          </div>
+          <p class="cfm-small">
+            Or paste this link into your browser:<br/>
+            <a class="cfm-link" href="#">https://flix.syschimp.com/login/email-change?token=…</a>
+          </p>
+          <p class="cfm-small" style="margin-top:22px">
+            If the button or link doesn't work, your confirmation token is:
+          </p>
+          <code class="cfm-code">7c0e44a9b1ef34c2e5a89db7a40c218c9d8e6f3a2b1c0d</code>
+          <div class="cfm-callout info" style="margin-top:22px">
+            This link expires in <strong>1 hour</strong>.
+          </div>
+        </div>
+        <div class="cfm-footer">
+          If you didn't request this change, you can ignore this email — your account
+          email won't be touched.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  3. Password reset                                                  -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">User-facing</span>
+  <div id="password-reset" class="mock">
+    <h2>Reset your ChimpFlix password <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">8:14 PM (5 minutes ago)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">Password reset</p>
+          <h1 class="cfm-h1">Forgot your password?</h1>
+          <p class="cfm-p">
+            Someone (hopefully you) asked to reset the password on the ChimpFlix account
+            associated with this email. Choose a new password below.
+          </p>
+          <div class="cfm-cta-wrap">
+            <a class="cfm-cta" href="#">Choose a new password</a>
+          </div>
+          <p class="cfm-small">
+            Or paste this link into your browser:<br/>
+            <a class="cfm-link" href="#">https://flix.syschimp.com/reset-password?token=…</a>
+          </p>
+          <p class="cfm-small" style="margin-top:22px">
+            If the button or link doesn't work, your reset token is:
+          </p>
+          <code class="cfm-code">a8c731f5b209d4ec1738fea84b920c7c2e6b5d8f1a4c3e</code>
+          <div class="cfm-callout info" style="margin-top:22px">
+            This link expires in <strong>1 hour</strong> and can only be used once.
+          </div>
+        </div>
+        <div class="cfm-footer">
+          If you didn't request this, you can ignore this email — your password hasn't
+          been changed.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  4. New user joined (admin notification)                            -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">Admin alert</span>
+  <div id="new-user" class="mock">
+    <h2>New user joined: Jamie Rivera <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">8:21 PM (12 minutes ago)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">Admin · New signup</p>
+          <h1 class="cfm-h1">Jamie just joined your server.</h1>
+          <p class="cfm-p">
+            <strong>Jamie Rivera</strong> (@jamier) accepted their invite and finished
+            signup. They don't have access to any libraries yet — grant them access from
+            the admin panel.
+          </p>
+          <table class="cfm-kv" role="presentation">
+            <tr><td class="k">Username</td><td>@jamier</td></tr>
+            <tr><td class="k">Email</td><td>jamie@example.com</td></tr>
+            <tr><td class="k">Invited by</td><td>You (owner)</td></tr>
+          </table>
+          <div class="cfm-cta-wrap">
+            <a class="cfm-cta" href="#">Grant library access</a>
+          </div>
+          <p class="cfm-small">
+            Or jump to Settings → Users → Access.
+          </p>
+        </div>
+        <div class="cfm-footer">
+          You're receiving this as a ChimpFlix server owner. You can mute admin alerts
+          per-kind from <a href="#">Settings → Account → Notifications</a>.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  5. Issue reported (admin notification)                             -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">Admin alert</span>
+  <div id="issue" class="mock">
+    <h2>[playback] Mortal Kombat II — issue reported <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">9:02 PM (just now)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">
+            Admin · Issue reported &nbsp;
+            <span class="cfm-pip warn">playback</span>
+          </p>
+          <h1 class="cfm-h1">Someone reported a problem.</h1>
+          <p class="cfm-p">
+            <strong>@jamier</strong> reported a <strong>playback</strong> issue on
+            <em>Mortal Kombat II</em>:
+          </p>
+          <div class="cfm-quote">Video stutters every 8 seconds or so on Chrome 128, hardware accel off. Audio is fine. Tried different qualities, same behavior on 4K and 1080p.</div>
+          <table class="cfm-kv" role="presentation">
+            <tr><td class="k">Title</td><td>Mortal Kombat II (2026)</td></tr>
+            <tr><td class="k">Item ID</td><td>#4127</td></tr>
+            <tr><td class="k">Reporter</td><td>Jamie Rivera (@jamier)</td></tr>
+            <tr><td class="k">Category</td><td>Playback</td></tr>
+          </table>
+          <div class="cfm-cta-wrap">
+            <a class="cfm-cta" href="#">Open in admin</a>
+          </div>
+        </div>
+        <div class="cfm-footer">
+          You're receiving this as a ChimpFlix server owner. Reply directly to follow up
+          with <a href="mailto:jamie@example.com">Jamie Rivera</a>.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  6. 2FA disabled (admin notification)                               -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">Admin alert</span>
+  <div id="twofa-disabled" class="mock">
+    <h2>Jamie Rivera turned off two-factor <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">9:08 PM (just now)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">
+            Admin · Security event &nbsp;
+            <span class="cfm-pip warn">2FA</span>
+          </p>
+          <h1 class="cfm-h1">Two-factor turned off.</h1>
+          <p class="cfm-p">
+            <strong>Jamie Rivera</strong> (@jamier) disabled two-factor authentication on
+            their account.
+          </p>
+          <div class="cfm-callout warn">
+            <strong>Heads up:</strong> their account is now protected by password only.
+            If this wasn't expected, reach out to confirm — and reset their password
+            from the admin panel if you suspect compromise.
+          </div>
+          <table class="cfm-kv" role="presentation">
+            <tr><td class="k">When</td><td>Sat, May 18 2026 at 9:08 PM</td></tr>
+            <tr><td class="k">User</td><td>Jamie Rivera (@jamier)</td></tr>
+            <tr><td class="k">Action</td><td>Disabled their own 2FA</td></tr>
+          </table>
+          <div class="cfm-cta-wrap">
+            <a class="cfm-cta" href="#">Review user</a>
+          </div>
+        </div>
+        <div class="cfm-footer">
+          You're receiving this as a ChimpFlix server owner. Security events can't be
+          muted.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  7. 2FA reset by admin (admin notification)                         -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">Admin alert</span>
+  <div id="twofa-reset" class="mock">
+    <h2>You reset 2FA for Jamie Rivera <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">9:15 PM (just now)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">
+            Admin · Security event &nbsp;
+            <span class="cfm-pip">2FA reset</span>
+          </p>
+          <h1 class="cfm-h1">Two-factor reset.</h1>
+          <p class="cfm-p">
+            <strong>You</strong> (@you) reset two-factor authentication for
+            <strong>Jamie Rivera</strong> (@jamier). Their account will prompt to enroll
+            a new TOTP authenticator on next login.
+          </p>
+          <div class="cfm-callout info">
+            <strong>Recovery codes have been invalidated.</strong> If Jamie regenerates
+            them after re-enrollment, they'll get a fresh set.
+          </div>
+          <table class="cfm-kv" role="presentation">
+            <tr><td class="k">When</td><td>Sat, May 18 2026 at 9:15 PM</td></tr>
+            <tr><td class="k">Target user</td><td>Jamie Rivera (@jamier)</td></tr>
+            <tr><td class="k">Acted by</td><td>You (@you)</td></tr>
+          </table>
+        </div>
+        <div class="cfm-footer">
+          This notification fans out to every server owner so a second admin can
+          countersign the action if needed.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!--  8. SMTP test                                                       -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <span class="label-strip" style="margin-top:48px;display:inline-block">Operational</span>
+  <div id="smtp-test" class="mock">
+    <h2>ChimpFlix SMTP test <span class="pill">Inbox</span></h2>
+    <div class="meta">
+      <span class="from">ChimpFlix</span>
+      <span class="addr">&lt;noreply@syschimp.com&gt;</span>
+      <span class="ts">9:30 PM (just now)</span>
+    </div>
+    <div class="render-stage">
+      <div class="cfm-body">
+        <div class="cfm-header">
+          <a class="cfm-brand" href="#">CHIMPFLIX</a>
+        </div>
+        <div class="cfm-content">
+          <p class="cfm-eyebrow">SMTP test</p>
+          <h1 class="cfm-h1">Your SMTP delivery is working.</h1>
+          <p class="cfm-p">
+            This is a test email from your ChimpFlix server. If you're reading this, the
+            credentials and host/port combo under <strong>Settings → Server → Email</strong>
+            are valid and outbound mail will reach your users.
+          </p>
+          <table class="cfm-kv" role="presentation">
+            <tr><td class="k">Server</td><td>smtp.example.com:587</td></tr>
+            <tr><td class="k">Security</td><td>STARTTLS</td></tr>
+            <tr><td class="k">From</td><td>noreply@syschimp.com</td></tr>
+            <tr><td class="k">Sent</td><td>Sat, May 18 2026 at 9:30 PM</td></tr>
+          </table>
+          <p class="cfm-small">
+            This message was triggered by the <em>Send test</em> button in the admin
+            panel. No user-visible email was queued.
+          </p>
+        </div>
+        <div class="cfm-footer">
+          You can safely delete this email.
+          <div class="legal">Sent by ChimpFlix · noreply@syschimp.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

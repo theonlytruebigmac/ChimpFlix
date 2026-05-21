@@ -1,0 +1,105 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/library",
+    "crates/metadata",
+    "crates/server",
+    "crates/tacet-core",
+    "crates/transcoder",
+]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/soybigmac/ChimpFlix"
+authors = ["ChimpFlix contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5"
+# tacet — pure-Rust intro/credits detection engine. Reference-based
+# audio fingerprinting (constellation-hash) with a blackframe
+# fallback for live-action shows. Vendored at crates/tacet-core via
+# `git subtree add` from theonlytruebigmac/tacet so we can land
+# ChimpFlix-specific changes locally; push back upstream with
+# `git subtree push --prefix=crates/tacet-core <remote> <branch>`.
+# Default features are off so we don't pull tacet's bundled rusqlite
+# (ChimpFlix has its own SQLite via sqlx).
+tacet-core = { path = "crates/tacet-core", default-features = false }
+# Pure-Rust port of the chromaprint audio-fingerprint algorithm. Was
+# used by the legacy intro detector to anchor a show's intro across
+# episodes via operator-tagged chapter regions. Superseded by tacet's
+# reference-based matching, kept here only for the storage layer that
+# still surfaces older fingerprints (see queries::show_intro_fingerprints).
+rusty-chromaprint = "0.3"
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+cron = "0.12"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+# Tiny IpAddr/CIDR matcher. Used by the network admin to decide whether
+# a request originated on the LAN (for the per-user remote-stream cap)
+# or comes from a bypass-authorised network.
+ipnet = "2"
+# Async SMTP client. Pulled with rustls (no openssl dep) and the tokio1
+# executor so it slots into the existing tokio runtime cleanly.
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1-rustls-tls",
+    "smtp-transport",
+    "builder",
+    "hostname",
+] }
+# User-supplied image uploads (avatars, posters, backdrops) go through
+# `image::load_from_memory` + re-encode so SVG-as-jpeg, EXIF leaks,
+# and ZIP-bomb-style pixel floods can't ride through. Default features
+# enable jpeg/png/webp decoders/encoders — everything we accept.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+libc = "0.2"
+notify = "6"
+rand_core = { version = "0.6", features = ["getrandom"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
+thiserror = "2"
+# Hand-picked tokio feature set. `full` historically pulled the
+# kitchen sink (which inflated build time + binary size); we use only
+# what's actually referenced by the workspace today. Add a feature
+# here when you hit a "this fn is gated by feature X" compile error
+# rather than going back to `full`.
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+# Pure-Rust QR encoder. Used by the 2FA enrollment endpoint to render
+# the otpauth:// URI as an SVG the frontend can drop into an <img> tag.
+# Server-side rendering keeps the web bundle dep-free.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# RFC 6238 TOTP with the standard SHA-1 + 6-digit + 30s defaults that
+# every authenticator app (Google Authenticator, Authy, 1Password, etc.)
+# expects. otpauth:// URI generation comes from the same crate.
+totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "fs", "cors", "compression-gzip", "limit", "timeout"] }
+governor = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"

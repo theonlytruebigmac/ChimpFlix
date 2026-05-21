@@ -1,0 +1,12 @@
+-- Phase 66: track whether first-run onboarding completed.
+--
+-- The `/auth/setup` endpoint creates the owner account but doesn't
+-- walk the operator through adding a library or pasting a TMDB key.
+-- This flag — false on a fresh DB, flipped true when the operator
+-- finishes (or explicitly skips) the wizard — drives the post-login
+-- auto-redirect to `/onboarding` so a new install never lands on
+-- the empty home page with no context for what to do next.
+--
+-- Operator can re-run the wizard later from Admin → Server →
+-- General (the same toggle).
+ALTER TABLE server_settings ADD COLUMN setup_completed INTEGER NOT NULL DEFAULT 0;

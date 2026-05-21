@@ -1,0 +1,17 @@
+[package]
+name = "chimpflix-common"
+description = "Shared types and helpers across ChimpFlix crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hex = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
