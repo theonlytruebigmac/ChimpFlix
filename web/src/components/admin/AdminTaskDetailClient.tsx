@@ -262,8 +262,8 @@ function StatStrip({
   );
   const histTotal = histTotals.success + histTotals.failure;
 
-  // Ring-buffer fallback. For Automatic kinds (Preview sprite,
-  // chapter thumbs, etc.) there's no `scheduled_tasks` row, so
+  // Ring-buffer fallback. For Automatic kinds (e.g. marker
+  // detection, refresh logos) there's no `scheduled_tasks` row, so
   // `schedule.last_at` is null, and the daily rollup at 02:00
   // hasn't populated `history` yet either — the headline numbers
   // would all dash out even though the kind is actively running.

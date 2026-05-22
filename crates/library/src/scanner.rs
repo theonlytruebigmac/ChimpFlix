@@ -25,7 +25,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
-use chimpflix_metadata::{AniListClient, TmdbClient, TmdbSeason, TvMazeClient, TvdbClient};
+use chimpflix_metadata::{
+    AniListClient, MetadataAgent, OmdbClient, TmdbClient, TmdbSeason, TvMazeClient, TvdbClient,
+};
 use chimpflix_transcoder::{FfmpegConfig, ProbeResult};
 use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
@@ -40,17 +42,51 @@ use crate::queries;
 
 /// How many files the scanner processes concurrently. Each in-flight
 /// task can hold one ffprobe subprocess + a handful of outstanding
-/// HTTP requests against TMDB/TVDB/TVMaze/AniList. 8 keeps the box
-/// usefully busy without saturating either ffprobe spawns or the
-/// metadata APIs' polite-client expectations.
-const SCAN_PARALLELISM: usize = 8;
+/// HTTP requests against TMDB/TVDB/TVMaze/AniList.
+///
+/// Lowered 8 → 4 because the previous value was hitting
+/// `SQLITE_BUSY_SNAPSHOT` under load — eight concurrent `process_file`
+/// tasks each interleaving multiple writes with HTTP calls produced
+/// constant writer-slot contention on the single SQLite writer. Four
+/// is still plenty of parallelism to hide ffprobe latency (ffprobe
+/// runs in its own subprocess, not on the tokio runtime, so the value
+/// is really about HTTP/DB overlap) while halving the writer-queue
+/// depth. The retry layer in `db::with_busy_retry` plus the move to
+/// `BEGIN IMMEDIATE` on the hot job-enqueue path covers the residual
+/// contention.
+const SCAN_PARALLELISM: usize = 4;
 
 /// Per-scan cache of TMDB season fetches. Keyed on
 /// `(show_tmdb_id, season_number)`. Lives only for the duration of a
 /// single scan — we deliberately don't persist this across scans so
 /// freshly-aired episodes show up on the next run without manual
 /// invalidation.
-type SeasonCache = Mutex<HashMap<(i64, i32), Arc<TmdbSeason>>>;
+/// Per-scan TMDB season cache. Stores both successful fetches AND
+/// confirmed-missing (HTTP 404) results so we don't re-hammer TMDB
+/// for a season it definitively says doesn't exist. Common with
+/// anime — file naming often uses release-group season numbering
+/// that doesn't match TMDB's broadcast-season records, so the same
+/// `(show_id, season=N)` 404 fires for every episode of that show.
+type SeasonCache = Mutex<HashMap<(i64, i32), CachedSeason>>;
+
+#[derive(Clone)]
+enum CachedSeason {
+    /// TMDB returned a season payload for this `(show_id, season)`.
+    Found(Arc<TmdbSeason>),
+    /// TMDB confirmed there's no such season for this `(show_id,
+    /// season)` (HTTP 404). Cached so subsequent episodes of the
+    /// same show don't re-trigger the lookup. The negative result
+    /// is scan-scoped — a future scan re-checks in case TMDB has
+    /// since added the season.
+    Missing,
+}
+
+// AniList per-scan caches moved to `chimpflix_metadata::anilist_cache`
+// so `AniListAgent` can hold them directly. Type aliases below keep
+// the scanner's call sites readable.
+type AniListCache = chimpflix_metadata::AniListShowCache;
+type AniListEpisodeCache = chimpflix_metadata::AniListEpisodeListCache;
+type AniListSeasonIdCache = chimpflix_metadata::AniListSeasonIdCache;
 
 /// Process-wide semaphore that bounds how many WebVTT pre-warm
 /// ffmpegs can run at once. Before this cap was added, a fresh scan
@@ -64,40 +100,116 @@ static SUBTITLE_PREWARM_LIMIT: LazyLock<Arc<Semaphore>> =
 
 const PROGRESS_INTERVAL: i64 = 25;
 
-/// The set of metadata agents that should run for a given library, in
-/// owner-configured priority order. Loaded once per scan to avoid querying
+/// The enabled metadata agents for a library, **in owner-configured
+/// priority order**. Loaded once per scan to avoid querying
 /// `library_agents` on every file.
+///
+/// Order is load-bearing: the first agent in the chain is the canonical
+/// source for fields it provides (its writes overwrite empty columns),
+/// while later agents fill remaining nulls without clobbering earlier
+/// writes. See `apply_show_metadata` / `apply_show_metadata_anilist` for
+/// the SQL that implements the two modes via the `is_primary` parameter.
 #[derive(Debug, Clone, Default)]
 struct AgentChain {
-    enabled: std::collections::HashSet<String>,
+    /// Enabled agent names, ordered by ascending priority value as
+    /// returned from `list_library_agents` (which sorts by `priority
+    /// ASC, agent_name ASC`). First element = highest priority = primary.
+    order: Vec<String>,
+    /// Operator-configured `metadata_language` (BCP-47), threaded into
+    /// each agent so they can honor the locale preference. Defaults to
+    /// "en-US" if the settings read fails.
+    language: String,
+}
+
+/// Read the operator's metadata language preference, defaulting to
+/// "en-US" if the settings row is unreadable. Used by the scan path to
+/// thread the same language into every metadata agent — keeps the
+/// AniList agent from writing romaji/native titles when the operator
+/// has set en-US (and analogously for ja-JP).
+async fn metadata_language_or_default(pool: &SqlitePool) -> String {
+    queries::get_server_settings(pool)
+        .await
+        .map(|s| s.metadata_language)
+        .unwrap_or_else(|_| "en-US".to_string())
+}
+
+/// Move `primary` to the front of `order` and put everything else
+/// behind it in its existing relative order. When `primary` isn't in
+/// the list (operator disabled it), the order is returned untouched —
+/// the primary is treated as not-applicable for this library and the
+/// first remaining agent becomes the de-facto primary.
+///
+/// Stable for non-primary entries: their relative order matches the
+/// `library_agents.priority` they were read in with, so the operator's
+/// fallback ordering still matters.
+fn reorder_for_primary(order: Vec<String>, primary: &str) -> Vec<String> {
+    if !order.iter().any(|n| n == primary) {
+        return order;
+    }
+    let mut out = Vec::with_capacity(order.len());
+    out.push(primary.to_string());
+    out.extend(order.into_iter().filter(|n| n != primary));
+    out
 }
 
 impl AgentChain {
     async fn load(pool: &SqlitePool, library_id: i64) -> Self {
+        let language = metadata_language_or_default(pool).await;
+        // Read the per-library primary metadata source. Defaults to
+        // 'tmdb' if the row read fails — same fallback as the migration's
+        // column default — so a missing-libraries-row pathology still
+        // produces a runnable chain.
+        let primary = sqlx::query_scalar::<_, String>(
+            "SELECT primary_metadata_agent FROM libraries WHERE id = ?",
+        )
+        .bind(library_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "tmdb".to_string());
         match queries::list_library_agents(pool, library_id).await {
             Ok(agents) => Self {
-                enabled: agents
-                    .into_iter()
-                    .filter(|a| a.enabled)
-                    .map(|a| a.agent_name)
-                    .collect(),
+                order: reorder_for_primary(
+                    agents
+                        .into_iter()
+                        .filter(|a| a.enabled)
+                        .map(|a| a.agent_name)
+                        .collect(),
+                    &primary,
+                ),
+                language,
             },
             Err(e) => {
                 warn!(error = %format!("{e:#}"), library_id, "failed to load library agents — falling back to defaults");
-                // Defaults match the legacy hardcoded behavior so a
-                // misconfigured table doesn't break enrichment.
-                let mut set = std::collections::HashSet::new();
-                set.insert("tmdb".into());
-                set.insert("tvmaze".into());
-                set.insert("tvdb".into());
-                set.insert("anilist".into());
-                Self { enabled: set }
+                // Default fallback list (any agent that wasn't seeded
+                // for this library still has a chance to run). Same
+                // reorder rule honors the primary even on the fallback.
+                Self {
+                    order: reorder_for_primary(
+                        vec![
+                            "tmdb".into(),
+                            "tvdb".into(),
+                            "tvmaze".into(),
+                            "anilist".into(),
+                            "omdb".into(),
+                        ],
+                        &primary,
+                    ),
+                    language,
+                }
             }
         }
     }
 
-    fn is_enabled(&self, name: &str) -> bool {
-        self.enabled.contains(name)
+    /// Iterate the chain in priority order. First name = primary.
+    fn ordered(&self) -> impl Iterator<Item = &str> {
+        self.order.iter().map(String::as_str)
+    }
+
+    /// Position of `name` in the chain (0 = primary). `None` if not enabled.
+    fn position(&self, name: &str) -> Option<usize> {
+        self.order.iter().position(|s| s == name)
     }
 }
 
@@ -109,6 +221,7 @@ pub async fn run_scan(
     tvdb: Option<TvdbClient>,
     anilist: Option<AniListClient>,
     tvmaze: Option<TvMazeClient>,
+    omdb: Option<OmdbClient>,
     library_id: i64,
     job_id: i64,
     // Transcoder cache root, used to pre-warm the WebVTT subtitle
@@ -134,6 +247,7 @@ pub async fn run_scan(
         tvdb.as_ref(),
         anilist.as_ref(),
         tvmaze.as_ref(),
+        omdb.as_ref(),
         &library.paths,
         library.kind,
         library_id,
@@ -197,6 +311,7 @@ struct Counters {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn scan_inner(
     pool: &SqlitePool,
     ffmpeg: &FfmpegConfig,
@@ -204,6 +319,7 @@ async fn scan_inner(
     tvdb: Option<&TvdbClient>,
     anilist: Option<&AniListClient>,
     tvmaze: Option<&TvMazeClient>,
+    omdb: Option<&OmdbClient>,
     roots: &[String],
     library_kind: LibraryKind,
     library_id: i64,
@@ -214,10 +330,10 @@ async fn scan_inner(
     let existing = queries::existing_media_files(pool, library_id).await?;
     let candidates = collect_candidates(roots).await?;
     let agents = AgentChain::load(pool, library_id).await;
-    debug!(
+    info!(
         library_id,
         count = candidates.len(),
-        enabled_agents = ?agents.enabled,
+        enabled_agents = ?agents.order,
         "scan candidates collected"
     );
 
@@ -225,6 +341,9 @@ async fn scan_inner(
     let agents = Arc::new(agents);
     let cache_root_owned: Option<PathBuf> = cache_root.map(Path::to_path_buf);
     let season_cache: Arc<SeasonCache> = Arc::new(Mutex::new(HashMap::new()));
+    let anilist_cache: Arc<AniListCache> = Arc::new(Mutex::new(HashMap::new()));
+    let anilist_episode_cache: Arc<AniListEpisodeCache> = Arc::new(Mutex::new(HashMap::new()));
+    let anilist_season_id_cache: Arc<AniListSeasonIdCache> = Arc::new(Mutex::new(HashMap::new()));
 
     // Clone the network clients up front so each parallel worker owns
     // its own handle. reqwest::Client is internally Arc'd, so this is
@@ -235,6 +354,7 @@ async fn scan_inner(
     let tvdb_owned = tvdb.cloned();
     let anilist_owned = anilist.cloned();
     let tvmaze_owned = tvmaze.cloned();
+    let omdb_owned = omdb.cloned();
 
     let mut tasks = stream::iter(candidates.into_iter())
         .map(|(root, path)| {
@@ -244,10 +364,14 @@ async fn scan_inner(
             let tvdb = tvdb_owned.clone();
             let anilist = anilist_owned.clone();
             let tvmaze = tvmaze_owned.clone();
+            let omdb = omdb_owned.clone();
             let agents = agents.clone();
             let existing = existing.clone();
             let cache_root = cache_root_owned.clone();
             let season_cache = season_cache.clone();
+            let anilist_cache = anilist_cache.clone();
+            let anilist_episode_cache = anilist_episode_cache.clone();
+            let anilist_season_id_cache = anilist_season_id_cache.clone();
             async move {
                 let res = process_file(
                     &pool,
@@ -256,6 +380,7 @@ async fn scan_inner(
                     tvdb.as_ref(),
                     anilist.as_ref(),
                     tvmaze.as_ref(),
+                    omdb.as_ref(),
                     &agents,
                     &existing,
                     library_id,
@@ -264,6 +389,9 @@ async fn scan_inner(
                     &path,
                     cache_root.as_deref(),
                     &season_cache,
+                    &anilist_cache,
+                    &anilist_episode_cache,
+                    &anilist_season_id_cache,
                 )
                 .await;
                 (path, res)
@@ -305,7 +433,25 @@ async fn scan_inner(
         since_progress += 1;
         if since_progress >= PROGRESS_INTERVAL {
             since_progress = 0;
-            queries::update_scan_counters(
+            // Counter updates are a cosmetic side-effect — they power
+            // the progress bar in the activity feed. A transient write
+            // failure here (SQLITE_BUSY when 8 parallel `process_file`
+            // tasks are contending for the writer slot, or the file
+            // watcher racing on a sibling library) should NOT abort
+            // the entire scan. Propagating the error with `?` was the
+            // root cause of the "scan stops at 775/1090, status=failed,
+            // database is locked" bug observed 2026-05-21 on a fresh
+            // movies library: the periodic update tripped BUSY, the
+            // scan bailed mid-walk, and the remaining 315 files were
+            // never visited.
+            //
+            // Failure here logs at warn and continues; the next interval
+            // will retry, and the terminal `mark_scan_completed` /
+            // `mark_scan_failed` call writes the final tally regardless.
+            // The activity feed just shows a slightly stale count for
+            // a few seconds — acceptable trade vs. losing the rest of
+            // the scan.
+            if let Err(e) = queries::update_scan_counters(
                 pool,
                 job_id,
                 counters.files_seen,
@@ -313,7 +459,16 @@ async fn scan_inner(
                 counters.files_updated,
                 counters.files_removed,
             )
-            .await?;
+            .await
+            {
+                warn!(
+                    job_id,
+                    library_id,
+                    files_seen = counters.files_seen,
+                    error = %format!("{e:#}"),
+                    "scan progress-counter update failed; continuing scan",
+                );
+            }
             emitter(ScanEvent::Progress {
                 job_id,
                 library_id,
@@ -382,6 +537,7 @@ async fn collect_candidates(roots: &[String]) -> Result<Vec<(PathBuf, PathBuf)>>
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn process_file(
     pool: &SqlitePool,
     ffmpeg: &FfmpegConfig,
@@ -389,6 +545,7 @@ async fn process_file(
     tvdb: Option<&TvdbClient>,
     anilist: Option<&AniListClient>,
     tvmaze: Option<&TvMazeClient>,
+    omdb: Option<&OmdbClient>,
     agents: &AgentChain,
     existing: &HashMap<String, i64>,
     library_id: i64,
@@ -397,6 +554,9 @@ async fn process_file(
     path: &Path,
     cache_root: Option<&Path>,
     season_cache: &SeasonCache,
+    anilist_cache: &chimpflix_metadata::AniListShowCacheArc,
+    anilist_episode_cache: &chimpflix_metadata::AniListEpisodeListCacheArc,
+    anilist_season_id_cache: &chimpflix_metadata::AniListSeasonIdCacheArc,
 ) -> Result<(queries::FileOutcome, Option<i64>)> {
     // Non-UTF8 paths used to fail silently up the error chain with
     // only the generic "non-UTF8 path" message in the scan job log.
@@ -518,6 +678,7 @@ async fn process_file(
             season,
             episode,
             title,
+            absolute_number,
         } => {
             let show_id = queries::upsert_item_with_match(
                 pool,
@@ -531,7 +692,14 @@ async fn process_file(
             .await?;
             let season_id = queries::upsert_season(pool, show_id, season).await?;
             let fallback_title = title.unwrap_or_else(|| format!("Episode {episode}"));
-            let ep_id = queries::upsert_episode(pool, season_id, episode, &fallback_title).await?;
+            let ep_id = queries::upsert_episode(
+                pool,
+                season_id,
+                episode,
+                &fallback_title,
+                absolute_number,
+            )
+            .await?;
 
             // Same enrichment-skip rationale as the Movie arm.
             if auto_matched {
@@ -542,6 +710,7 @@ async fn process_file(
                     season_number: season,
                     episode_number: episode,
                     episode_id: ep_id,
+                    absolute_number,
                 });
             }
             item_id = None;
@@ -636,44 +805,485 @@ async fn process_file(
         }
     }
 
+    // Dispatch metadata enrichment in the operator-configured chain
+    // order. Each enabled agent's `fetch_*` is called via the
+    // [`MetadataAgent`] trait; results flow into the polymorphic
+    // [`queries::apply_movie_data`] / [`queries::apply_show_data`]
+    // writers which honor `WriteMode::Primary` for the first agent
+    // (position 0 = overwrites null-or-stale columns) and
+    // `WriteMode::FillNulls` for later agents.
+    //
+    // Provider-specific extras (TMDB collections + credits + extras,
+    // AniList per-episode `streamingEpisodes` enrichment) still run via
+    // legacy helpers below for the agents that have them. Subsequent
+    // slices fold those into the trait too.
     if let Some(hint) = movie_hint {
-        let tmdb = if agents.is_enabled("tmdb") {
-            tmdb
-        } else {
-            None
+        let lookup = chimpflix_metadata::MovieLookup {
+            item_id: hint.id,
+            title: hint.title.clone(),
+            year: hint.year,
+            imdb_id: None,
+            tmdb_id: None,
+            tvdb_id: None,
         };
-        let tvdb = if agents.is_enabled("tvdb") {
-            tvdb
-        } else {
-            None
-        };
-        tmdb_apply_movie(pool, tmdb, tvdb, &hint).await;
-    }
-    if let Some(hint) = show_hint {
-        let tmdb = if agents.is_enabled("tmdb") {
-            tmdb
-        } else {
-            None
-        };
-        let tvdb = if agents.is_enabled("tvdb") {
-            tvdb
-        } else {
-            None
-        };
-        let tvmaze = if agents.is_enabled("tvmaze") {
-            tvmaze
-        } else {
-            None
-        };
-        // For anime libraries, AniList is the canonical primary; it runs
-        // first so its title/summary/year stick, and the show-tail
-        // enrichment treats TMDB/TVMaze/TVDB as null-fillers behind it.
-        // The agent gate still applies — owners can disable AniList per
-        // library if they prefer TMDB primary for a given catalogue.
-        if matches!(library_kind, LibraryKind::Anime) && agents.is_enabled("anilist") {
-            apply_anilist_for_show(pool, anilist, &hint).await;
+        for agent_name in agents.ordered() {
+            let primary = agents.position(agent_name) == Some(0);
+            let mode = if primary {
+                chimpflix_metadata::WriteMode::Primary
+            } else {
+                chimpflix_metadata::WriteMode::FillNulls
+            };
+            let data = match agent_name {
+                "tmdb" => match tmdb {
+                    Some(c) => match chimpflix_metadata::TmdbAgent::new(c.clone())
+                        .fetch_movie(&lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.title, "TMDB movie lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "tvdb" => match tvdb {
+                    Some(c) => match chimpflix_metadata::TvdbAgent::new(c.clone())
+                        .fetch_movie(&lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.title, "TVDB movie lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "omdb" => match omdb {
+                    Some(c) => match chimpflix_metadata::OmdbAgent::new(c.clone())
+                        .fetch_movie(&lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.title, "OMDb movie lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                // tvmaze + anilist not applicable to movies; ignore silently.
+                _ => None,
+            };
+            let Some(data) = data else { continue };
+            if let Err(e) =
+                queries::apply_movie_data(pool, hint.id, &data, mode, agent_name).await
+            {
+                warn!(error = %format!("{e:#}"), agent = %agent_name, "apply movie data");
+            }
+            // Cast + crew, promotional videos, user reviews — all
+            // flow through the common trait now. Source-scoped writes
+            // so two agents contributing cast to the same item don't
+            // clobber each other (item_credits.source / item_extras.source
+            // / item_reviews.source).
+            if !data.people.is_empty()
+                && let Err(e) =
+                    queries::apply_item_credits_for_source(pool, hint.id, &data.people, agent_name)
+                        .await
+            {
+                warn!(error = %format!("{e:#}"), agent = %agent_name, "apply item credits");
+            }
+            if !data.videos.is_empty()
+                && let Err(e) = queries::apply_item_extras(pool, hint.id, &data.videos).await
+            {
+                warn!(error = %format!("{e:#}"), agent = %agent_name, "apply item extras");
+            }
+            if !data.reviews.is_empty()
+                && let Err(e) = queries::apply_item_reviews_for_source(
+                    pool,
+                    hint.id,
+                    &data.reviews,
+                    agent_name,
+                )
+                .await
+            {
+                warn!(error = %format!("{e:#}"), agent = %agent_name, "apply item reviews");
+            }
+            // TMDB collection (franchise) handling. MovieData.tmdb_collection
+            // is the only agent that populates this; the apply layer
+            // upserts the collection row and assigns the item to it,
+            // then optionally fetches the full collection detail when
+            // overview is still NULL (cached upstream so the extra call
+            // is cheap).
+            if let Some(coll) = data.tmdb_collection.as_ref()
+                && let Some(c) = tmdb
+            {
+                apply_collection_ref_for_item(pool, c, hint.id, coll).await;
+            }
         }
-        tmdb_apply_show(pool, tmdb, tvdb, tvmaze, season_cache, &hint).await;
+    }
+    if let Some(mut hint) = show_hint {
+        let mut show_lookup = chimpflix_metadata::ShowLookup {
+            item_id: hint.show_id,
+            title: hint.show_title.clone(),
+            year: hint.show_year,
+            imdb_id: None,
+            tmdb_id: None,
+            tvdb_id: None,
+            anilist_id: None,
+            tvmaze_id: None,
+        };
+        for agent_name in agents.ordered() {
+            let primary = agents.position(agent_name) == Some(0);
+            let mode = if primary {
+                chimpflix_metadata::WriteMode::Primary
+            } else {
+                chimpflix_metadata::WriteMode::FillNulls
+            };
+            // anilist on non-anime libraries is a no-op (seed defaults only put
+            // anilist in anime libraries, but operators can edit the chain).
+            if agent_name == "anilist" && !matches!(library_kind, LibraryKind::Anime) {
+                continue;
+            }
+            let data = match agent_name {
+                "tmdb" => match tmdb {
+                    Some(c) => match chimpflix_metadata::TmdbAgent::new(c.clone())
+                        .fetch_show(&show_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TMDB show lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "tvdb" => match tvdb {
+                    Some(c) => match chimpflix_metadata::TvdbAgent::new(c.clone())
+                        .fetch_show(&show_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVDB show lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "tvmaze" => match tvmaze {
+                    Some(c) => match chimpflix_metadata::TvMazeAgent::new(c.clone())
+                        .fetch_show(&show_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVMaze show lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "anilist" => match anilist {
+                    Some(c) => {
+                        let agent = chimpflix_metadata::AniListAgent::with_language(
+                            c.clone(),
+                            anilist_cache.clone(),
+                            anilist_episode_cache.clone(),
+                            anilist_season_id_cache.clone(),
+                            agents.language.clone(),
+                        );
+                        match agent.fetch_show(&show_lookup).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(error = %format!("{e:#}"), title = %hint.show_title, "AniList show lookup failed");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                },
+                "omdb" => match omdb {
+                    Some(c) => match chimpflix_metadata::OmdbAgent::new(c.clone())
+                        .fetch_show(&show_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), title = %hint.show_title, "OMDb show lookup failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                _ => None,
+            };
+            if let Some(data) = data {
+                if let Err(e) =
+                    queries::apply_show_data(pool, hint.show_id, &data, mode, agent_name).await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent_name, "apply show data");
+                }
+                // Carry the freshly discovered IDs forward so later
+                // agents in the chain can address the same show by id
+                // instead of re-running text search.
+                if data.tmdb_id.is_some() {
+                    show_lookup.tmdb_id = data.tmdb_id;
+                }
+                if data.tvdb_id.is_some() {
+                    show_lookup.tvdb_id = data.tvdb_id;
+                }
+                if data.anilist_id.is_some() {
+                    show_lookup.anilist_id = data.anilist_id;
+                }
+                if data.tvmaze_id.is_some() {
+                    show_lookup.tvmaze_id = data.tvmaze_id;
+                }
+                if data.imdb_id.is_some() {
+                    show_lookup.imdb_id = data.imdb_id.clone();
+                }
+                // Cast + crew, videos, reviews — same flow as the
+                // movie path. Source-scoped writes; no TMDB-specific
+                // branch here anymore (anything an agent populates in
+                // `ShowData` flows through one of these helpers).
+                if !data.people.is_empty()
+                    && let Err(e) = queries::apply_item_credits_for_source(
+                        pool,
+                        hint.show_id,
+                        &data.people,
+                        agent_name,
+                    )
+                    .await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent_name, "apply show credits");
+                }
+                if !data.videos.is_empty()
+                    && let Err(e) =
+                        queries::apply_item_extras(pool, hint.show_id, &data.videos).await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent_name, "apply show extras");
+                }
+                if !data.reviews.is_empty()
+                    && let Err(e) = queries::apply_item_reviews_for_source(
+                        pool,
+                        hint.show_id,
+                        &data.reviews,
+                        agent_name,
+                    )
+                    .await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent_name, "apply show reviews");
+                }
+            }
+        }
+
+        // Absolute-episode resolver. Anime libraries with bare-number
+        // filenames ("Show - 29.mkv") store the episode at
+        // `(season=1, episode=29)` initially because the parser has
+        // no S/E signal. If the operator has TMDB in this library's
+        // chain, walk season counts to find the actual (season,
+        // episode) and relocate the row.
+        //
+        // Gated on `agents.position("tmdb").is_some()` so removing
+        // TMDB from a library's chain genuinely silences all TMDB
+        // network activity — including this resolver. Without that
+        // check the resolver would still fire TMDB calls whenever the
+        // client was globally configured, defeating the chain config.
+        let tmdb_in_chain = agents.position("tmdb").is_some();
+        if tmdb_in_chain
+            && let Some(absolute_number) = hint.absolute_number
+            && let Some(tmdb_id) = show_lookup.tmdb_id
+            && let Some(c) = tmdb
+        {
+            let stored_mode = queries::get_episode_numbering_mode(pool, hint.show_id)
+                .await
+                .unwrap_or_else(|_| "season_relative".to_string());
+            // Skip detection-only work when the show is small enough
+            // that the file number obviously fits in season 1.
+            // Heuristic: if absolute_number > 12 it's worth checking.
+            let already_absolute = stored_mode == "absolute";
+            let worth_checking = already_absolute || absolute_number > 12;
+            if worth_checking
+                && let Some((target_season, target_ep)) = tmdb_resolve_absolute_episode(
+                    season_cache,
+                    c,
+                    tmdb_id,
+                    absolute_number,
+                    50,
+                )
+                .await
+                && (target_season, target_ep) != (hint.season_number, hint.episode_number)
+            {
+                match queries::move_episode_to_season(
+                    pool,
+                    hint.episode_id,
+                    target_season,
+                    target_ep,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        debug!(
+                            show = %hint.show_title,
+                            absolute_number,
+                            from = ?(hint.season_number, hint.episode_number),
+                            to = ?(target_season, target_ep),
+                            "absolute-ep resolver remapped episode"
+                        );
+                        hint.season_number = target_season;
+                        hint.episode_number = target_ep;
+                        if !already_absolute
+                            && let Err(e) = queries::set_episode_numbering_mode(
+                                pool,
+                                hint.show_id,
+                                "absolute",
+                            )
+                            .await
+                        {
+                            warn!(error = %format!("{e:#}"), show_id = hint.show_id, "set numbering mode failed");
+                        }
+                    }
+                    Ok(false) => {
+                        debug!(
+                            show = %hint.show_title,
+                            target_season,
+                            target_ep,
+                            "absolute-ep resolver: target slot already occupied; leaving as-is"
+                        );
+                    }
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        show = %hint.show_title,
+                        "absolute-ep resolver: episode move failed"
+                    ),
+                }
+            }
+        }
+
+        // Episode-fetch dispatch — runs after the show-fetch loop so
+        // each agent's `EpisodeLookup` sees every id the chain has
+        // accumulated. Mode follows chain position the same way
+        // show-level dispatch does.
+        let ep_lookup = chimpflix_metadata::EpisodeLookup {
+            episode_id: hint.episode_id,
+            show: show_lookup.clone(),
+            season_number: hint.season_number,
+            episode_number: hint.episode_number,
+            absolute_number: hint.absolute_number,
+        };
+        for agent_name in agents.ordered() {
+            let primary = agents.position(agent_name) == Some(0);
+            let mode = if primary {
+                chimpflix_metadata::WriteMode::Primary
+            } else {
+                chimpflix_metadata::WriteMode::FillNulls
+            };
+            if agent_name == "anilist" && !matches!(library_kind, LibraryKind::Anime) {
+                continue;
+            }
+            let ep_data = match agent_name {
+                "tmdb" => {
+                    // TMDB episodes are still season-cached at this
+                    // layer — use the existing cache via the legacy
+                    // helper which writes through `apply_episode_metadata`.
+                    // The trait method `TmdbAgent::fetch_episode` doesn't
+                    // hit the cache, so we keep the cached path here
+                    // and skip the trait call to avoid double-fetching.
+                    if let Some(c) = tmdb
+                        && let Some(tmdb_id) = show_lookup.tmdb_id
+                    {
+                        tmdb_apply_episodes_for_show(pool, c, season_cache, &hint, tmdb_id).await;
+                    }
+                    None
+                }
+                "tvdb" => match tvdb {
+                    Some(c) => match chimpflix_metadata::TvdbAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), show = %hint.show_title, "TVDB episode fetch failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "tvmaze" => match tvmaze {
+                    Some(c) => match chimpflix_metadata::TvMazeAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), show = %hint.show_title, "TVMaze episode fetch failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                "anilist" => match anilist {
+                    Some(c) => {
+                        let agent = chimpflix_metadata::AniListAgent::with_language(
+                            c.clone(),
+                            anilist_cache.clone(),
+                            anilist_episode_cache.clone(),
+                            anilist_season_id_cache.clone(),
+                            agents.language.clone(),
+                        );
+                        match agent.fetch_episode(&ep_lookup).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(error = %format!("{e:#}"), show = %hint.show_title, "AniList episode fetch failed");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                },
+                "omdb" => match omdb {
+                    Some(c) => match chimpflix_metadata::OmdbAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), show = %hint.show_title, "OMDb episode fetch failed");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                _ => None,
+            };
+            if let Some(data) = ep_data {
+                if let Err(e) =
+                    queries::apply_episode_data(pool, hint.episode_id, &data, mode, agent_name)
+                        .await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent_name, "apply episode data");
+                }
+                // Multi-source episode cast: any agent that returned a
+                // non-empty `people` Vec lands rows in `episode_credits`
+                // attributed to its source. Today no agent populates
+                // this yet — TVDB v4 has the data via `/episodes/extended`
+                // but the trait impl doesn't fetch it. The wire is in
+                // place so when that lands the writes already work.
+                if !data.people.is_empty()
+                    && let Err(e) = queries::apply_episode_credits_for_source(
+                        pool,
+                        hint.episode_id,
+                        &data.people,
+                        agent_name,
+                    )
+                    .await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent_name, "apply episode credits");
+                }
+            }
+        }
     }
 
     // Return the file_id so the caller can emit a FileAdded event
@@ -705,45 +1315,37 @@ struct ShowHint {
     season_number: i32,
     episode_number: i32,
     episode_id: i64,
+    /// When the parser saw an absolute-numbered anime file (no S/E
+    /// tag), this is the raw on-disk number. The dispatch loop uses
+    /// it to detect/resolve absolute numbering via the TMDB season
+    /// counts and may rewrite `season_number` / `episode_number` to
+    /// the season-relative equivalent before the episode-fetch loop.
+    absolute_number: Option<i32>,
 }
 
-async fn tmdb_apply_movie(
+// Legacy `tmdb_apply_movie` / `apply_tvdb_for_movie` removed in Slice 3.
+// Movie metadata now flows through the [`MetadataAgent`] trait
+// (see `chimpflix_metadata::agents::{TmdbAgent, TvdbAgent}` + the new
+// `queries::apply_movie_data` polymorphic writer). TMDB-only extras
+// (credits / collections) are still invoked inline from the dispatch
+// loop pending Slice 6's cast/crew unification.
+
+/// Trait-friendly wrapper around [`apply_collection_for_item`]. Takes
+/// the common `TmdbCollectionRef` from `MovieData` and forwards into
+/// the existing TmdbCollectionStub-based apply path.
+async fn apply_collection_ref_for_item(
     pool: &SqlitePool,
-    tmdb: Option<&TmdbClient>,
-    tvdb: Option<&TvdbClient>,
-    hint: &MovieHint,
+    client: &TmdbClient,
+    item_id: i64,
+    coll: &chimpflix_metadata::TmdbCollectionRef,
 ) {
-    if let Some(client) = tmdb {
-        match client.lookup_movie(&hint.title, hint.year).await {
-            Ok(Some(meta)) => {
-                let tmdb_id = meta.tmdb_id;
-                let collection = meta.collection.clone();
-                if let Err(e) = queries::apply_movie_metadata(pool, hint.id, &meta).await {
-                    warn!(error = %format!("{e:#}"), "apply movie metadata");
-                }
-                enrich_credits_and_extras(pool, client, hint.id, tmdb_id, false).await;
-                if let Some(stub) = collection {
-                    apply_collection_for_item(pool, client, hint.id, &stub).await;
-                }
-            }
-            Ok(None) => debug!(title = %hint.title, "no TMDB match"),
-            Err(e) => warn!(error = %format!("{e:#}"), title = %hint.title, "TMDB lookup failed"),
-        }
-    }
-    apply_tvdb_for_movie(pool, tvdb, hint).await;
-}
-
-async fn apply_tvdb_for_movie(pool: &SqlitePool, tvdb: Option<&TvdbClient>, hint: &MovieHint) {
-    let Some(client) = tvdb else { return };
-    match client.lookup_movie(&hint.title, hint.year).await {
-        Ok(Some(meta)) => {
-            if let Err(e) = queries::apply_movie_metadata_tvdb(pool, hint.id, &meta).await {
-                warn!(error = %format!("{e:#}"), "apply TVDB movie metadata");
-            }
-        }
-        Ok(None) => debug!(title = %hint.title, "no TVDB match"),
-        Err(e) => warn!(error = %format!("{e:#}"), title = %hint.title, "TVDB movie lookup failed"),
-    }
+    let stub = chimpflix_metadata::tmdb::TmdbCollectionStub {
+        tmdb_id: coll.tmdb_id,
+        name: coll.name.clone(),
+        poster_path: coll.poster_path.clone(),
+        backdrop_path: coll.backdrop_path.clone(),
+    };
+    apply_collection_for_item(pool, client, item_id, &stub).await;
 }
 
 /// Upsert the collection row, assign the item to it, and (once per
@@ -800,24 +1402,103 @@ async fn apply_collection_for_item(
 /// `override_tmdb_id` lets Fix Match force a specific identity. If None we
 /// use whatever tmdb_id the item already carries, falling back to a
 /// title-based search.
+///
+/// **Chain awareness:** when `override_tmdb_id` is None we honor the
+/// item's library agent chain — if TMDB isn't in it, the TMDB path is
+/// skipped entirely and we only run TVDB / TVMaze fallbacks. This
+/// matches the chain semantics scan-time dispatch uses, so removing
+/// TMDB from a library's chain truly silences all TMDB network
+/// activity for that library. Fix Match bypasses this gate because the
+/// operator explicitly chose a TMDB id (the override).
+#[allow(clippy::too_many_arguments)]
 pub async fn refresh_item_metadata(
     pool: &SqlitePool,
-    client: &TmdbClient,
+    tmdb: Option<&TmdbClient>,
     tvdb: Option<&TvdbClient>,
     tvmaze: Option<&TvMazeClient>,
+    anilist: Option<&AniListClient>,
+    omdb: Option<&OmdbClient>,
     item_id: i64,
     override_tmdb_id: Option<i64>,
 ) -> anyhow::Result<()> {
     use crate::models::ItemKind;
-    let row = sqlx::query("SELECT kind, title, year, tmdb_id FROM items WHERE id = ?")
-        .bind(item_id)
-        .fetch_one(pool)
-        .await?;
+    let row = sqlx::query(
+        "SELECT i.kind, i.title, i.year, i.tmdb_id, i.library_id, l.kind AS library_kind
+         FROM items i
+         JOIN libraries l ON l.id = i.library_id
+         WHERE i.id = ?",
+    )
+    .bind(item_id)
+    .fetch_one(pool)
+    .await?;
     let kind = ItemKind::from_db(sqlx::Row::try_get::<&str, _>(&row, "kind")?)?;
     let title: String = sqlx::Row::try_get(&row, "title")?;
     let year: Option<i32> = sqlx::Row::try_get(&row, "year")?;
     let existing_tmdb: Option<i64> = sqlx::Row::try_get(&row, "tmdb_id")?;
+    let library_id: i64 = sqlx::Row::try_get(&row, "library_id")?;
+    let library_kind_str: String = sqlx::Row::try_get(&row, "library_kind")?;
+    let library_kind = crate::models::LibraryKind::from_db(&library_kind_str)?;
     let target_tmdb = override_tmdb_id.or(existing_tmdb);
+
+    // Operator removed TMDB from this library's agent chain → skip
+    // the entire TMDB path. Fix Match (override_tmdb_id set) bypasses
+    // this since the operator explicitly picked a TMDB id.
+    let chain_has_tmdb = override_tmdb_id.is_some()
+        || queries::list_library_agents(pool, library_id)
+            .await
+            .map(|agents| {
+                agents
+                    .iter()
+                    .any(|a| a.enabled && a.agent_name == "tmdb")
+            })
+            .unwrap_or(true);
+
+    // For shows we ALWAYS run the chain-aware refresh (regardless of
+    // TMDB membership), because that's what populates per-episode
+    // titles + summaries + stills + cast from whatever agents the
+    // operator configured. Without it, refreshing an existing show
+    // whose original scan pre-dated trait-based episode dispatch leaves
+    // every episode row at the parser stub it was upserted with.
+    // Chain-aware refresh — runs the full operator-configured agent
+    // chain for shows AND movies. This is the path that picks up
+    // TVDB stills / OMDb summaries / AniList episode titles into
+    // existing rows the original scan upserted without that data.
+    if matches!(kind, ItemKind::Show) {
+        if let Err(e) = refresh_show_through_chain(
+            pool, tmdb, tvdb, tvmaze, anilist, omdb, item_id, &title, year, library_id,
+            library_kind,
+        )
+        .await
+        {
+            warn!(error = %format!("{e:#}"), item_id, "refresh: chain-aware show refresh failed");
+        }
+    } else if matches!(kind, ItemKind::Movie) {
+        if let Err(e) = refresh_movie_through_chain(
+            pool, tmdb, tvdb, tvmaze, omdb, item_id, &title, year, library_id,
+        )
+        .await
+        {
+            warn!(error = %format!("{e:#}"), item_id, "refresh: chain-aware movie refresh failed");
+        }
+    }
+
+    // TMDB legacy path — runs only when TMDB is in the chain (or Fix
+    // Match supplied an override) AND a TMDB client is configured.
+    // The legacy path covers collection-detail backfill and the
+    // movie-specific apply_movie_metadata flow; the chain pass above
+    // covers everything the chain agents can supply directly.
+    if !chain_has_tmdb || tmdb.is_none() {
+        if !chain_has_tmdb {
+            debug!(
+                item_id,
+                library_id,
+                "refresh: TMDB not in library chain; skipping TMDB-specific extras"
+            );
+        }
+        return refresh_item_metadata_non_tmdb(pool, tvdb, tvmaze, item_id, kind, &title, year)
+            .await;
+    }
+    let client = tmdb.unwrap();
 
     let tmdb_id = match kind {
         ItemKind::Movie => {
@@ -830,7 +1511,11 @@ pub async fn refresh_item_metadata(
             };
             let tid = meta.tmdb_id;
             let collection = meta.collection.clone();
-            queries::apply_movie_metadata(pool, item_id, &meta).await?;
+            // Refresh is an operator-driven explicit override — TMDB
+            // is treated as primary here regardless of the library's
+            // agent-chain ordering, because the operator clicked
+            // "refresh from TMDB" and expects TMDB's text to win.
+            queries::apply_movie_metadata(pool, item_id, &meta, true).await?;
             if let Some(stub) = collection {
                 apply_collection_for_item(pool, client, item_id, &stub).await;
             }
@@ -845,14 +1530,7 @@ pub async fn refresh_item_metadata(
                 },
             };
             let tid = meta.tmdb_id;
-            queries::apply_show_metadata(pool, item_id, &meta).await?;
-            // Per-episode enrichment. Without this, episode titles stay
-            // at whatever the parser extracted from the filename
-            // ("Spring Time Bluray-1080p") instead of the TMDB title
-            // ("Spring Time"). Scan-time `tmdb_apply_show` only runs
-            // once per file discovered, but the Refresh button enters
-            // here — so we walk every local season + episode and
-            // overwrite with TMDB's text.
+            queries::apply_show_metadata(pool, item_id, &meta, true).await?;
             refresh_show_episodes(pool, client, item_id, tid).await;
             tid
         }
@@ -867,34 +1545,565 @@ pub async fn refresh_item_metadata(
     )
     .await;
 
-    // Run TVMaze + TVDB after TMDB so they only fill the holes TMDB left.
-    match kind {
-        ItemKind::Show => {
-            if let Some(tv) = tvmaze {
-                if let Ok(Some(meta)) = tv.lookup_show(&title).await {
-                    let _ = queries::apply_show_metadata_tvmaze(pool, item_id, &meta).await;
-                }
+    refresh_item_metadata_non_tmdb(pool, tvdb, tvmaze, item_id, kind, &title, year).await?;
+    Ok(())
+}
+
+/// Chain-aware single-movie refresh. Same pattern as
+/// [`refresh_show_through_chain`] but for movies (no per-episode
+/// loop). Walks the library's enabled agents in order, fetches
+/// movie data through the trait, applies via the polymorphic
+/// helpers. Independent of TMDB — works for libraries whose chain
+/// doesn't include TMDB.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_movie_through_chain(
+    pool: &SqlitePool,
+    tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    tvmaze: Option<&TvMazeClient>,
+    omdb: Option<&OmdbClient>,
+    item_id: i64,
+    title: &str,
+    year: Option<i32>,
+    library_id: i64,
+) -> anyhow::Result<()> {
+    let raw_agents = match queries::list_library_agents(pool, library_id).await {
+        Ok(a) => a.into_iter().filter(|a| a.enabled).collect::<Vec<_>>(),
+        Err(_) => return Ok(()),
+    };
+    let primary = sqlx::query_scalar::<_, String>(
+        "SELECT primary_metadata_agent FROM libraries WHERE id = ?",
+    )
+    .bind(library_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "tmdb".to_string());
+    let agents: Vec<crate::models::LibraryAgent> = {
+        let (mut head, tail): (Vec<_>, Vec<_>) =
+            raw_agents.into_iter().partition(|a| a.agent_name == primary);
+        head.extend(tail);
+        head
+    };
+    let row = sqlx::query(
+        "SELECT tmdb_id, imdb_id, tvdb_id FROM items WHERE id = ?",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await?;
+    let lookup = chimpflix_metadata::MovieLookup {
+        item_id,
+        title: title.to_string(),
+        year,
+        imdb_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<String>, _>(r, "imdb_id").ok().flatten()),
+        tmdb_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<i64>, _>(r, "tmdb_id").ok().flatten()),
+        tvdb_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<i64>, _>(r, "tvdb_id").ok().flatten()),
+    };
+    for (idx, agent) in agents.iter().enumerate() {
+        let mode = if idx == 0 {
+            chimpflix_metadata::WriteMode::Primary
+        } else {
+            chimpflix_metadata::WriteMode::FillNulls
+        };
+        let data: Option<chimpflix_metadata::MovieData> = match agent.agent_name.as_str() {
+            "tmdb" => match tmdb {
+                Some(c) => chimpflix_metadata::TmdbAgent::new(c.clone())
+                    .fetch_movie(&lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            "tvdb" => match tvdb {
+                Some(c) => chimpflix_metadata::TvdbAgent::new(c.clone())
+                    .fetch_movie(&lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            "tvmaze" => match tvmaze {
+                Some(c) => chimpflix_metadata::TvMazeAgent::new(c.clone())
+                    .fetch_movie(&lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            "omdb" => match omdb {
+                Some(c) => chimpflix_metadata::OmdbAgent::new(c.clone())
+                    .fetch_movie(&lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(data) = data {
+            if let Err(e) =
+                queries::apply_movie_data(pool, item_id, &data, mode, &agent.agent_name).await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply_movie_data");
             }
-            if let Some(tv) = tvdb {
-                if let Ok(Some(meta)) = tv.lookup_show(&title, year).await {
-                    let _ = queries::apply_show_metadata_tvdb(pool, item_id, &meta).await;
-                }
+            if !data.people.is_empty()
+                && let Err(e) = queries::apply_item_credits_for_source(
+                    pool,
+                    item_id,
+                    &data.people,
+                    &agent.agent_name,
+                )
+                .await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply movie credits");
             }
-        }
-        ItemKind::Movie => {
-            if let Some(tv) = tvdb {
-                if let Ok(Some(meta)) = tv.lookup_movie(&title, year).await {
-                    let _ = queries::apply_movie_metadata_tvdb(pool, item_id, &meta).await;
-                }
+            if !data.videos.is_empty()
+                && let Err(e) = queries::apply_item_extras(pool, item_id, &data.videos).await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply movie extras");
+            }
+            if !data.reviews.is_empty()
+                && let Err(e) = queries::apply_item_reviews_for_source(
+                    pool,
+                    item_id,
+                    &data.reviews,
+                    &agent.agent_name,
+                )
+                .await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply movie reviews");
+            }
+            if let Some(coll) = data.tmdb_collection.as_ref()
+                && let Some(c) = tmdb
+            {
+                apply_collection_ref_for_item(pool, c, item_id, coll).await;
             }
         }
     }
     Ok(())
 }
 
-/// Backfill cast+crew and YouTube extras (trailers, featurettes, BTS) on
-/// items the scanner just identified. Best-effort: any failure logs and
-/// moves on so the scan still completes.
+/// Run the library's full agent chain over every episode of a show.
+///
+/// This is the "Refresh metadata" equivalent for episode-level
+/// enrichment — without it, the Refresh button only re-runs TMDB
+/// (legacy code path) and leaves TVDB/AniList/OMDb episode data
+/// untouched. Operators who configured TheTVDB as primary then
+/// clicked Refresh expecting TVDB stills + summaries to land got
+/// nothing, because the legacy episode refresh was TMDB-only.
+///
+/// For each agent enabled in the library's chain we:
+///   1. Re-fetch the show row (no-op if the agent already populated
+///      its id; this is how AniList season-aware ids get resolved
+///      for split-cour anime).
+///   2. Carry the agent's freshly-known id forward into the
+///      `ShowLookup` so subsequent agents can look up by id.
+///   3. For each episode in the local DB, run the agent's
+///      `fetch_episode` and apply via the polymorphic
+///      `apply_episode_data` + `apply_episode_credits_for_source`.
+///
+/// Mode follows chain position the same way scan-time dispatch does:
+/// position 0 = `Primary` (overwrites filename-derived titles), every
+/// later agent = `FillNulls`.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_show_through_chain(
+    pool: &SqlitePool,
+    tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    tvmaze: Option<&TvMazeClient>,
+    anilist: Option<&AniListClient>,
+    omdb: Option<&OmdbClient>,
+    show_id: i64,
+    show_title: &str,
+    show_year: Option<i32>,
+    library_id: i64,
+    library_kind: crate::models::LibraryKind,
+) -> anyhow::Result<()> {
+    let raw_agents = match queries::list_library_agents(pool, library_id).await {
+        Ok(a) => a.into_iter().filter(|a| a.enabled).collect::<Vec<_>>(),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), show_id, "refresh: list library agents failed");
+            return Ok(());
+        }
+    };
+    // Read per-library primary and reorder the agent list so it runs
+    // first. Mirrors what AgentChain::load does for the scan path.
+    let primary = sqlx::query_scalar::<_, String>(
+        "SELECT primary_metadata_agent FROM libraries WHERE id = ?",
+    )
+    .bind(library_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "tmdb".to_string());
+    let agents: Vec<crate::models::LibraryAgent> = {
+        let (mut head, tail): (Vec<_>, Vec<_>) =
+            raw_agents.into_iter().partition(|a| a.agent_name == primary);
+        head.extend(tail);
+        head
+    };
+    let chain_names: Vec<&str> = agents.iter().map(|a| a.agent_name.as_str()).collect();
+    let language = metadata_language_or_default(pool).await;
+    info!(
+        show_id,
+        title = %show_title,
+        chain = ?chain_names,
+        language = %language,
+        "refresh: chain start"
+    );
+
+    // Local per-refresh AniList caches. The pool is the same one scan
+    // uses but we don't share its caches — refresh is operator-driven
+    // and infrequent, so cold caches per invocation are fine and we
+    // avoid coupling the two paths.
+    let anilist_cache = chimpflix_metadata::anilist_cache::new_show_cache();
+    let anilist_ep_cache = chimpflix_metadata::anilist_cache::new_episode_list_cache();
+    let anilist_season_id_cache = chimpflix_metadata::anilist_cache::new_season_id_cache();
+    let mut show_hits: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut ep_hits: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    // Read every persisted external id off the show row so each
+    // agent can do id-based lookups when their previous scan left
+    // an id behind.
+    let row = sqlx::query(
+        "SELECT tmdb_id, imdb_id, tvdb_id, anilist_id, tvmaze_id FROM items WHERE id = ?",
+    )
+    .bind(show_id)
+    .fetch_optional(pool)
+    .await?;
+    let mut show_lookup = chimpflix_metadata::ShowLookup {
+        item_id: show_id,
+        title: show_title.to_string(),
+        year: show_year,
+        imdb_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<String>, _>(r, "imdb_id").ok().flatten()),
+        tmdb_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<i64>, _>(r, "tmdb_id").ok().flatten()),
+        tvdb_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<i64>, _>(r, "tvdb_id").ok().flatten()),
+        anilist_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<i64>, _>(r, "anilist_id").ok().flatten()),
+        tvmaze_id: row
+            .as_ref()
+            .and_then(|r| sqlx::Row::try_get::<Option<i64>, _>(r, "tvmaze_id").ok().flatten()),
+    };
+
+    // Pass 1: show-level fetch per agent (carries forward IDs).
+    for (idx, agent) in agents.iter().enumerate() {
+        let primary = idx == 0;
+        let mode = if primary {
+            chimpflix_metadata::WriteMode::Primary
+        } else {
+            chimpflix_metadata::WriteMode::FillNulls
+        };
+        if agent.agent_name == "anilist"
+            && !matches!(library_kind, crate::models::LibraryKind::Anime)
+        {
+            continue;
+        }
+        let show_data: Option<chimpflix_metadata::ShowData> = match agent.agent_name.as_str() {
+            "tmdb" => match tmdb {
+                Some(c) => chimpflix_metadata::TmdbAgent::new(c.clone())
+                    .fetch_show(&show_lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            "tvdb" => match tvdb {
+                Some(c) => chimpflix_metadata::TvdbAgent::new(c.clone())
+                    .fetch_show(&show_lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            "tvmaze" => match tvmaze {
+                Some(c) => chimpflix_metadata::TvMazeAgent::new(c.clone())
+                    .fetch_show(&show_lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            "anilist" => match anilist {
+                Some(c) => chimpflix_metadata::AniListAgent::with_language(
+                    c.clone(),
+                    anilist_cache.clone(),
+                    anilist_ep_cache.clone(),
+                    anilist_season_id_cache.clone(),
+                    language.clone(),
+                )
+                .fetch_show(&show_lookup)
+                .await
+                .ok()
+                .flatten(),
+                None => None,
+            },
+            "omdb" => match omdb {
+                Some(c) => chimpflix_metadata::OmdbAgent::new(c.clone())
+                    .fetch_show(&show_lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+            _ => None,
+        };
+        show_hits.insert(agent.agent_name.clone(), show_data.is_some());
+        if let Some(data) = show_data {
+            if let Err(e) =
+                queries::apply_show_data(pool, show_id, &data, mode, &agent.agent_name).await
+            {
+                warn!(error = %format!("{e:#}"), agent = %agent.agent_name, "refresh: apply_show_data");
+            }
+            if data.tmdb_id.is_some() {
+                show_lookup.tmdb_id = data.tmdb_id;
+            }
+            if data.tvdb_id.is_some() {
+                show_lookup.tvdb_id = data.tvdb_id;
+            }
+            if data.anilist_id.is_some() {
+                show_lookup.anilist_id = data.anilist_id;
+            }
+            if data.tvmaze_id.is_some() {
+                show_lookup.tvmaze_id = data.tvmaze_id;
+            }
+            if data.imdb_id.is_some() {
+                show_lookup.imdb_id = data.imdb_id.clone();
+            }
+            if !data.people.is_empty()
+                && let Err(e) = queries::apply_item_credits_for_source(
+                    pool,
+                    show_id,
+                    &data.people,
+                    &agent.agent_name,
+                )
+                .await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply show credits");
+            }
+            if !data.videos.is_empty()
+                && let Err(e) = queries::apply_item_extras(pool, show_id, &data.videos).await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply show extras");
+            }
+            if !data.reviews.is_empty()
+                && let Err(e) = queries::apply_item_reviews_for_source(
+                    pool,
+                    show_id,
+                    &data.reviews,
+                    &agent.agent_name,
+                )
+                .await
+            {
+                warn!(error = %format!("{e:#}"), "refresh: apply show reviews");
+            }
+        }
+    }
+
+    // Pass 2: per-episode fetch. Walk every persisted episode of
+    // this show and ask each chain agent for its data. Cheap when
+    // the agent already has nothing new (single SELECT + a cached
+    // episode-list HTTP per show), comparable to a cold scan's
+    // episode-level work but limited to one show.
+    let episodes = sqlx::query(
+        "SELECT e.id AS episode_id, s.season_number, e.episode_number, e.absolute_number
+         FROM episodes e
+         JOIN seasons s ON e.season_id = s.id
+         WHERE s.show_id = ?
+         ORDER BY s.season_number, e.episode_number",
+    )
+    .bind(show_id)
+    .fetch_all(pool)
+    .await?;
+
+    for ep_row in episodes {
+        let episode_id: i64 = sqlx::Row::try_get(&ep_row, "episode_id")?;
+        let season_number: i32 = sqlx::Row::try_get(&ep_row, "season_number")?;
+        let episode_number: i32 = sqlx::Row::try_get(&ep_row, "episode_number")?;
+        let absolute_number: Option<i32> =
+            sqlx::Row::try_get(&ep_row, "absolute_number").ok().flatten();
+        let ep_lookup = chimpflix_metadata::EpisodeLookup {
+            episode_id,
+            show: show_lookup.clone(),
+            season_number,
+            episode_number,
+            absolute_number,
+        };
+        for (idx, agent) in agents.iter().enumerate() {
+            let primary = idx == 0;
+            let mode = if primary {
+                chimpflix_metadata::WriteMode::Primary
+            } else {
+                chimpflix_metadata::WriteMode::FillNulls
+            };
+            if agent.agent_name == "anilist"
+                && !matches!(library_kind, crate::models::LibraryKind::Anime)
+            {
+                continue;
+            }
+            let ep_data: Option<chimpflix_metadata::EpisodeData> = match agent.agent_name.as_str()
+            {
+                "tmdb" => match tmdb {
+                    Some(c) => chimpflix_metadata::TmdbAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                },
+                "tvdb" => match tvdb {
+                    Some(c) => chimpflix_metadata::TvdbAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                },
+                "tvmaze" => match tvmaze {
+                    Some(c) => chimpflix_metadata::TvMazeAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                },
+                "anilist" => match anilist {
+                    Some(c) => chimpflix_metadata::AniListAgent::with_language(
+                        c.clone(),
+                        anilist_cache.clone(),
+                        anilist_ep_cache.clone(),
+                        anilist_season_id_cache.clone(),
+                        language.clone(),
+                    )
+                    .fetch_episode(&ep_lookup)
+                    .await
+                    .ok()
+                    .flatten(),
+                    None => None,
+                },
+                "omdb" => match omdb {
+                    Some(c) => chimpflix_metadata::OmdbAgent::new(c.clone())
+                        .fetch_episode(&ep_lookup)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                },
+                _ => None,
+            };
+            if let Some(data) = ep_data {
+                *ep_hits.entry(agent.agent_name.clone()).or_insert(0) += 1;
+                if let Err(e) =
+                    queries::apply_episode_data(pool, episode_id, &data, mode, &agent.agent_name)
+                        .await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent.agent_name, "refresh: apply_episode_data");
+                }
+                if !data.people.is_empty()
+                    && let Err(e) = queries::apply_episode_credits_for_source(
+                        pool,
+                        episode_id,
+                        &data.people,
+                        &agent.agent_name,
+                    )
+                    .await
+                {
+                    warn!(error = %format!("{e:#}"), agent = %agent.agent_name, "refresh: apply episode credits");
+                }
+            }
+        }
+    }
+    let show_hits_str = chain_names
+        .iter()
+        .map(|n| {
+            format!(
+                "{n}={}",
+                if *show_hits.get(*n).unwrap_or(&false) {
+                    "hit"
+                } else {
+                    "miss"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let ep_hits_str = chain_names
+        .iter()
+        .map(|n| format!("{n}={}", ep_hits.get(*n).copied().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(",");
+    info!(
+        show_id,
+        title = %show_title,
+        show = %show_hits_str,
+        episodes = %ep_hits_str,
+        "refresh: chain done"
+    );
+    Ok(())
+}
+
+/// Run the TVDB + TVMaze fallback portion of refresh. Extracted so the
+/// chain-gated `refresh_item_metadata` can call it both as the
+/// post-TMDB fill-nulls pass AND as the TMDB-skipped early-return
+/// path (when TMDB isn't in the library's chain).
+async fn refresh_item_metadata_non_tmdb(
+    pool: &SqlitePool,
+    tvdb: Option<&TvdbClient>,
+    tvmaze: Option<&TvMazeClient>,
+    item_id: i64,
+    kind: crate::models::ItemKind,
+    title: &str,
+    year: Option<i32>,
+) -> anyhow::Result<()> {
+    use crate::models::ItemKind;
+    match kind {
+        ItemKind::Show => {
+            if let Some(tv) = tvmaze
+                && let Ok(Some(meta)) = tv.lookup_show(title).await
+            {
+                let _ = queries::apply_show_metadata_tvmaze(pool, item_id, &meta).await;
+            }
+            if let Some(tv) = tvdb
+                && let Ok(Some(meta)) = tv.lookup_show(title, year).await
+            {
+                let _ = queries::apply_show_metadata_tvdb(pool, item_id, &meta).await;
+            }
+        }
+        ItemKind::Movie => {
+            if let Some(tv) = tvdb
+                && let Ok(Some(meta)) = tv.lookup_movie(title, year).await
+            {
+                let _ = queries::apply_movie_metadata_tvdb(pool, item_id, &meta).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Backfill cast+crew and YouTube extras for items the
+/// `refresh_item_metadata` path just identified. Best-effort: any
+/// failure logs and moves on so the refresh still completes.
+///
+/// Note: scan-time dispatch goes through the trait — `TmdbAgent` and
+/// other agents populate `MovieData.people` / `videos` / `reviews`
+/// directly during `fetch_show` / `fetch_movie`, and the apply helpers
+/// run from the scanner's main loop. This helper exists so the
+/// admin-driven Refresh button (which doesn't go through scan
+/// dispatch) still gets the same cast/videos/reviews behavior.
 async fn enrich_credits_and_extras(
     pool: &SqlitePool,
     client: &TmdbClient,
@@ -907,29 +2116,116 @@ async fn enrich_credits_and_extras(
     } else {
         chimpflix_metadata::TmdbKind::Movie
     };
-    match client.fetch_credits(kind, tmdb_id).await {
-        Ok(credits) => {
-            if let Err(e) = queries::apply_item_credits(pool, item_id, &credits).await {
-                warn!(error = %format!("{e:#}"), "apply credits");
-            }
+    // Run credits / videos / reviews in parallel — three independent
+    // endpoints. Each translates into the common shape, then writes
+    // via the source-scoped apply helpers.
+    let (credits, videos, reviews) = tokio::join!(
+        client.fetch_credits(kind, tmdb_id),
+        client.fetch_videos(kind, tmdb_id),
+        client.fetch_reviews(kind, tmdb_id),
+    );
+    if let Ok(c) = credits {
+        let people = tmdb_credits_to_common(c);
+        if let Err(e) =
+            queries::apply_item_credits_for_source(pool, item_id, &people, "tmdb").await
+        {
+            warn!(error = %format!("{e:#}"), "apply credits");
         }
-        Err(e) => warn!(error = %format!("{e:#}"), tmdb_id, "TMDB credits fetch failed"),
+    } else if let Err(e) = credits {
+        warn!(error = %format!("{e:#}"), tmdb_id, "TMDB credits fetch failed");
     }
-    match client.fetch_videos(kind, tmdb_id).await {
-        Ok(videos) => {
-            if let Err(e) = queries::apply_item_extras(pool, item_id, &videos).await {
-                warn!(error = %format!("{e:#}"), "apply extras");
-            }
+    if let Ok(vs) = videos {
+        let links: Vec<chimpflix_metadata::VideoLink> =
+            vs.into_iter().map(tmdb_video_to_common).collect();
+        if let Err(e) = queries::apply_item_extras(pool, item_id, &links).await {
+            warn!(error = %format!("{e:#}"), "apply extras");
         }
-        Err(e) => warn!(error = %format!("{e:#}"), tmdb_id, "TMDB videos fetch failed"),
+    } else if let Err(e) = videos {
+        warn!(error = %format!("{e:#}"), tmdb_id, "TMDB videos fetch failed");
     }
-    match client.fetch_reviews(kind, tmdb_id).await {
-        Ok(reviews) => {
-            if let Err(e) = queries::apply_tmdb_reviews(pool, item_id, &reviews).await {
-                warn!(error = %format!("{e:#}"), "apply reviews");
-            }
+    if let Ok(rs) = reviews {
+        let entries: Vec<chimpflix_metadata::ReviewEntry> =
+            rs.into_iter().map(tmdb_review_to_common).collect();
+        if let Err(e) =
+            queries::apply_item_reviews_for_source(pool, item_id, &entries, "tmdb").await
+        {
+            warn!(error = %format!("{e:#}"), "apply reviews");
         }
-        Err(e) => warn!(error = %format!("{e:#}"), tmdb_id, "TMDB reviews fetch failed"),
+    } else if let Err(e) = reviews {
+        warn!(error = %format!("{e:#}"), tmdb_id, "TMDB reviews fetch failed");
+    }
+}
+
+/// Local translators mirror the ones in `chimpflix_metadata::agents`.
+/// Duplicated here so the refresh path (which calls TmdbClient directly,
+/// not through TmdbAgent) doesn't need to go through the trait just for
+/// the common-shape conversion.
+fn tmdb_credits_to_common(
+    credits: chimpflix_metadata::TmdbCredits,
+) -> Vec<chimpflix_metadata::PersonCredit> {
+    let mut out = Vec::new();
+    for (idx, m) in credits.cast.into_iter().enumerate() {
+        out.push(chimpflix_metadata::PersonCredit {
+            external_id: Some(format!("tmdb:{}", m.tmdb_person_id)),
+            name: m.name,
+            role: "actor".to_string(),
+            character: m.character,
+            order: if m.order != 0 { m.order } else { idx as i32 },
+            profile_url: m
+                .profile_path
+                .map(|p| chimpflix_metadata::tmdb::tmdb_image_url(&p, "w185")),
+        });
+    }
+    for (idx, m) in credits.crew.into_iter().enumerate() {
+        let role = match m.job.as_str() {
+            "Director" => "director",
+            "Writer" | "Screenplay" => "writer",
+            "Producer" | "Executive Producer" => "producer",
+            _ => "crew",
+        }
+        .to_string();
+        out.push(chimpflix_metadata::PersonCredit {
+            external_id: Some(format!("tmdb:{}", m.tmdb_person_id)),
+            name: m.name,
+            role,
+            character: None,
+            order: idx as i32,
+            profile_url: m
+                .profile_path
+                .map(|p| chimpflix_metadata::tmdb::tmdb_image_url(&p, "w185")),
+        });
+    }
+    out
+}
+
+fn tmdb_video_to_common(v: chimpflix_metadata::TmdbVideo) -> chimpflix_metadata::VideoLink {
+    let kind = match v.kind.as_str() {
+        "Trailer" => "trailer",
+        "Teaser" => "teaser",
+        "Featurette" => "featurette",
+        "Clip" => "clip",
+        "Behind the Scenes" => "behind-the-scenes",
+        _ => "other",
+    }
+    .to_string();
+    chimpflix_metadata::VideoLink {
+        provider_key: v.key,
+        name: v.name,
+        kind,
+        official: v.official,
+        published_at_ms: None, // refresh path doesn't bother parsing; scan-time path does
+    }
+}
+
+fn tmdb_review_to_common(r: chimpflix_metadata::TmdbReview) -> chimpflix_metadata::ReviewEntry {
+    chimpflix_metadata::ReviewEntry {
+        source_id: r.source_id,
+        author: r.author,
+        author_url: r.author_url,
+        avatar_url: r.avatar_url,
+        rating: r.rating,
+        body: r.body,
+        created_at_ms: r.created_at,
     }
 }
 
@@ -968,12 +2264,28 @@ async fn refresh_show_episodes(
         let season_meta = match client.fetch_season(show_tmdb_id, season_number).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(
-                    error = %format!("{e:#}"),
-                    show_id,
-                    season_number,
-                    "refresh: TMDB season fetch failed; episode titles left as-is"
-                );
+                // 404 here is "TMDB doesn't have this season" — extremely
+                // common for split-cour anime (Frieren / JJK / Demon
+                // Slayer S2+) where the user's library has Season 2 but
+                // TMDB tracks it all under Season 1. Demote to debug so
+                // refresh-on-a-multi-season-anime-show doesn't flood the
+                // Logs page with a row per missing season. Other errors
+                // (5xx, network) still warn.
+                let msg = format!("{e:#}");
+                if msg.contains("404") {
+                    debug!(
+                        show_id,
+                        season_number,
+                        "refresh: TMDB has no record of this season; episode titles left as-is"
+                    );
+                } else {
+                    warn!(
+                        error = %msg,
+                        show_id,
+                        season_number,
+                        "refresh: TMDB season fetch failed; episode titles left as-is"
+                    );
+                }
                 continue;
             }
         };
@@ -1024,82 +2336,90 @@ async fn refresh_show_episodes(
     }
 }
 
-async fn tmdb_apply_show(
+/// Walk TMDB's per-season episode counts to convert an absolute
+/// episode number into a season-relative `(season, episode)` pair.
+///
+/// Anime libraries frequently use absolute numbering ("Show - 29.mkv")
+/// that the parser stores as `season=1, episode=29, absolute_number=29`.
+/// When TMDB's S1 has only 12 episodes, that lookup 404s and the
+/// episode row never gets metadata. This helper does the bookkeeping:
+/// walks seasons 1..N, subtracting each season's `episodes.len()` from
+/// the absolute counter until what's left fits inside one season.
+///
+/// Returns `Some((season, episode))` when resolution succeeds, `None`
+/// when the absolute number exceeds the total episode count TMDB has
+/// listed (e.g. a brand-new episode TMDB hasn't catalogued yet, or
+/// the show is genuinely numbered season-relative and the parser
+/// mis-identified it as absolute).
+async fn tmdb_resolve_absolute_episode(
+    season_cache: &SeasonCache,
+    client: &TmdbClient,
+    show_tmdb_id: i64,
+    absolute_number: i32,
+    max_seasons_to_walk: i32,
+) -> Option<(i32, i32)> {
+    // Cap the walk so a misconfigured show with a wildly wrong
+    // absolute number doesn't fan out into a 100-season TMDB hammer.
+    let cap = max_seasons_to_walk.clamp(1, 50);
+    let mut remaining = absolute_number;
+    for season_n in 1..=cap {
+        let season = match fetch_season_cached(season_cache, client, show_tmdb_id, season_n).await {
+            Ok(Some(s)) => s,
+            // Confirmed-missing season — we've exhausted what TMDB
+            // has for this show.
+            Ok(None) => return None,
+            Err(_) => return None,
+        };
+        let count = season.episodes.len() as i32;
+        if count <= 0 {
+            return None;
+        }
+        if remaining <= count {
+            return Some((season_n, remaining));
+        }
+        remaining -= count;
+    }
+    None
+}
+
+/// Episode-only TMDB enrichment. Show-level metadata is written via
+/// the trait dispatch (`TmdbAgent::fetch_show` + `apply_show_data`);
+/// this helper picks up at the per-episode level so the legacy episode
+/// path keeps working until Slice 5 lifts it into the trait too.
+///
+/// Called from the dispatch loop only when TMDB returned a show match
+/// in this scan; the `tmdb_id` argument is taken directly from
+/// `ShowData.tmdb_id` so we avoid an extra `SELECT tmdb_id` round-trip.
+async fn tmdb_apply_episodes_for_show(
     pool: &SqlitePool,
-    tmdb: Option<&TmdbClient>,
-    tvdb: Option<&TvdbClient>,
-    tvmaze: Option<&TvMazeClient>,
+    client: &TmdbClient,
     season_cache: &SeasonCache,
     hint: &ShowHint,
+    show_tmdb_id: i64,
 ) {
-    let Some(client) = tmdb else { return };
-
-    // Enrich the show row only if it doesn't yet have a tmdb_id. Avoids
-    // hammering TMDB once per episode.
-    let row = sqlx::query("SELECT tmdb_id FROM items WHERE id = ?")
-        .bind(hint.show_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    let existing_tmdb_id: Option<i64> = row.and_then(|r| {
-        sqlx::Row::try_get::<Option<i64>, _>(&r, "tmdb_id")
-            .ok()
-            .flatten()
-    });
-
-    let show_tmdb_id = match existing_tmdb_id {
-        Some(id) => Some(id),
-        None => match client.lookup_show(&hint.show_title, hint.show_year).await {
-            Ok(Some(meta)) => {
-                let tid = meta.tmdb_id;
-                if let Err(e) = queries::apply_show_metadata(pool, hint.show_id, &meta).await {
-                    warn!(error = %format!("{e:#}"), "apply show metadata");
-                }
-                enrich_credits_and_extras(pool, client, hint.show_id, tid, true).await;
-                Some(tid)
-            }
-            Ok(None) => {
-                debug!(title = %hint.show_title, "no TMDB show match");
-                None
-            }
-            Err(e) => {
-                warn!(error = %format!("{e:#}"), title = %hint.show_title, "TMDB show lookup failed");
-                None
-            }
-        },
-    };
-
-    // TVMaze fallback / null-filler. Runs whether or not TMDB matched —
-    // when TMDB found nothing it provides primary identification, and
-    // when TMDB matched it fills any remaining nulls (network, status,
-    // imdb/tvdb cross-refs we didn't get from TMDB, etc.) without ever
-    // overwriting.
-    apply_tvmaze_for_show(pool, tvmaze, hint).await;
-    apply_tvdb_for_show(pool, tvdb, hint).await;
-
-    if let Some(show_tmdb_id) = show_tmdb_id {
-        match fetch_season_cached(season_cache, client, show_tmdb_id, hint.season_number).await {
-            Ok(season) => {
-                if let Some(ep_meta) = season
-                    .episodes
-                    .iter()
-                    .find(|e| e.episode_number == hint.episode_number)
+    match fetch_season_cached(season_cache, client, show_tmdb_id, hint.season_number).await {
+        Ok(Some(season)) => {
+            if let Some(ep_meta) = season
+                .episodes
+                .iter()
+                .find(|e| e.episode_number == hint.episode_number)
+            {
+                if let Err(e) =
+                    queries::apply_episode_metadata(pool, hint.episode_id, ep_meta).await
                 {
-                    if let Err(e) =
-                        queries::apply_episode_metadata(pool, hint.episode_id, ep_meta).await
-                    {
-                        warn!(error = %format!("{e:#}"), "apply episode metadata");
-                    }
+                    warn!(error = %format!("{e:#}"), "apply episode metadata");
                 }
             }
-            Err(e) => warn!(
-                error = %format!("{e:#}"),
-                show = %hint.show_title,
-                season = hint.season_number,
-                "TMDB season fetch failed"
-            ),
         }
+        Ok(None) => {
+            // Confirmed-missing season — cached for the rest of the scan.
+        }
+        Err(e) => warn!(
+            error = %format!("{e:#}"),
+            show = %hint.show_title,
+            season = hint.season_number,
+            "TMDB season fetch failed"
+        ),
     }
 }
 
@@ -1115,124 +2435,64 @@ async fn fetch_season_cached(
     client: &TmdbClient,
     show_tmdb_id: i64,
     season_number: i32,
-) -> anyhow::Result<Arc<TmdbSeason>> {
+) -> anyhow::Result<Option<Arc<TmdbSeason>>> {
     let key = (show_tmdb_id, season_number);
     {
         let guard = cache.lock().await;
         if let Some(hit) = guard.get(&key) {
-            return Ok(hit.clone());
+            return Ok(match hit {
+                CachedSeason::Found(season) => Some(season.clone()),
+                CachedSeason::Missing => None,
+            });
         }
     }
-    let season = client.fetch_season(show_tmdb_id, season_number).await?;
-    let arc = Arc::new(season);
-    let mut guard = cache.lock().await;
-    // Two parallel workers can race to populate the same key. Either
-    // wins — they'd have produced equivalent results — but we
-    // deliberately don't overwrite a winner that beat us by handing
-    // back what's already there.
-    Ok(guard.entry(key).or_insert(arc).clone())
-}
-
-async fn apply_tvmaze_for_show(pool: &SqlitePool, tvmaze: Option<&TvMazeClient>, hint: &ShowHint) {
-    let Some(client) = tvmaze else { return };
-    // Only call TVMaze when there's still something for it to contribute:
-    // skip when summary AND year AND imdb_id are all already set.
-    let row = sqlx::query("SELECT title, summary, year, imdb_id, tvdb_id FROM items WHERE id = ?")
-        .bind(hint.show_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    let Some(row) = row else { return };
-    let summary: Option<String> = sqlx::Row::try_get(&row, "summary").ok().flatten();
-    let year: Option<i32> = sqlx::Row::try_get(&row, "year").ok().flatten();
-    let imdb_id: Option<String> = sqlx::Row::try_get(&row, "imdb_id").ok().flatten();
-    let tvdb_id: Option<i64> = sqlx::Row::try_get(&row, "tvdb_id").ok().flatten();
-    if summary.is_some() && year.is_some() && imdb_id.is_some() && tvdb_id.is_some() {
-        return;
-    }
-    match client.lookup_show(&hint.show_title).await {
-        Ok(Some(meta)) => {
-            if let Err(e) = queries::apply_show_metadata_tvmaze(pool, hint.show_id, &meta).await {
-                warn!(error = %format!("{e:#}"), "apply TVMaze metadata");
-            }
+    match client.fetch_season(show_tmdb_id, season_number).await {
+        Ok(season) => {
+            let arc = Arc::new(season);
+            let mut guard = cache.lock().await;
+            // Two parallel workers can race to populate the same
+            // key. Either wins — they'd have produced equivalent
+            // results — so we keep what's already there.
+            let entry = guard
+                .entry(key)
+                .or_insert_with(|| CachedSeason::Found(arc.clone()));
+            Ok(match entry {
+                CachedSeason::Found(season) => Some(season.clone()),
+                CachedSeason::Missing => None,
+            })
         }
-        Ok(None) => debug!(title = %hint.show_title, "no TVMaze match"),
         Err(e) => {
-            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVMaze lookup failed")
-        }
-    }
-}
-
-async fn apply_anilist_for_show(
-    pool: &SqlitePool,
-    anilist: Option<&AniListClient>,
-    hint: &ShowHint,
-) {
-    let Some(client) = anilist else { return };
-    // Skip the API call if we already have an anilist_id stored — re-runs
-    // of the scan shouldn't re-search every episode of every show.
-    let row = sqlx::query("SELECT anilist_id FROM items WHERE id = ?")
-        .bind(hint.show_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    if let Some(row) = row {
-        let existing: Option<i64> = sqlx::Row::try_get(&row, "anilist_id").ok().flatten();
-        if existing.is_some() {
-            return;
-        }
-    }
-    match client.lookup_show(&hint.show_title, hint.show_year).await {
-        Ok(Some(meta)) => {
-            if let Err(e) = queries::apply_show_metadata_anilist(pool, hint.show_id, &meta).await {
-                warn!(error = %format!("{e:#}"), "apply AniList show metadata");
+            // 404 is "this season doesn't exist on TMDB" — cache
+            // the negative result so the rest of the scan doesn't
+            // re-trigger the same lookup for every episode of the
+            // show. Anything else (5xx, network, parse failure) is
+            // transient; propagate without caching so a future
+            // episode might succeed.
+            let msg = format!("{e:#}");
+            if msg.contains("404") {
+                let mut guard = cache.lock().await;
+                guard.entry(key).or_insert(CachedSeason::Missing);
+                // Log the first 404 once so the operator sees it
+                // happened, but as debug — the warn that fires from
+                // the call site (`tmdb_apply_show`) handles the
+                // user-visible surface.
+                tracing::debug!(
+                    show_tmdb_id,
+                    season_number,
+                    "TMDB returned 404 for season; cached negative result for this scan"
+                );
+                return Ok(None);
             }
-        }
-        Ok(None) => debug!(title = %hint.show_title, "no AniList match"),
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), title = %hint.show_title, "AniList lookup failed")
+            Err(e)
         }
     }
 }
 
-async fn apply_tvdb_for_show(pool: &SqlitePool, tvdb: Option<&TvdbClient>, hint: &ShowHint) {
-    let Some(client) = tvdb else { return };
-    // Skip the API call when nothing TVDB can contribute remains. Same
-    // null-check shape as TVMaze; original_title is the one TVDB-only
-    // field we care about over and above what TVMaze can supply.
-    let row = sqlx::query(
-        "SELECT summary, year, imdb_id, tvdb_id, original_title FROM items WHERE id = ?",
-    )
-    .bind(hint.show_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    let Some(row) = row else { return };
-    let summary: Option<String> = sqlx::Row::try_get(&row, "summary").ok().flatten();
-    let year: Option<i32> = sqlx::Row::try_get(&row, "year").ok().flatten();
-    let imdb_id: Option<String> = sqlx::Row::try_get(&row, "imdb_id").ok().flatten();
-    let tvdb_id: Option<i64> = sqlx::Row::try_get(&row, "tvdb_id").ok().flatten();
-    let original_title: Option<String> = sqlx::Row::try_get(&row, "original_title").ok().flatten();
-    if summary.is_some()
-        && year.is_some()
-        && imdb_id.is_some()
-        && tvdb_id.is_some()
-        && original_title.is_some()
-    {
-        return;
-    }
-    match client.lookup_show(&hint.show_title, hint.show_year).await {
-        Ok(Some(meta)) => {
-            if let Err(e) = queries::apply_show_metadata_tvdb(pool, hint.show_id, &meta).await {
-                warn!(error = %format!("{e:#}"), "apply TVDB show metadata");
-            }
-        }
-        Ok(None) => debug!(title = %hint.show_title, "no TVDB show match"),
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), title = %hint.show_title, "TVDB show lookup failed")
-        }
-    }
-}
+
+// `apply_tvdb_for_show` removed in Slice 3 — TVDB show lookups now go
+// through `TvdbAgent::fetch_show` + `queries::apply_show_data` via the
+// trait dispatch loop above.
+
+// ordinal_suffix + season_candidate_queries tests live in
+// `chimpflix_metadata::agents` now (Deferred B moved them when AniList
+// became a fully-trait-driven agent).

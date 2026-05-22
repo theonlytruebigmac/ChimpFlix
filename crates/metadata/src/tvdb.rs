@@ -28,12 +28,25 @@ pub struct TvdbClient {
     /// Cached bearer token. `None` means "not yet fetched" or "invalidated
     /// after a 401". Wrapped so clones of TvdbClient share the same token.
     token: Arc<Mutex<Option<String>>>,
+    /// ISO 639-3 language code used in TVDB v4 episode-list path segment
+    /// and search filter ("eng", "jpn", "spa", ...). Set via
+    /// [`Self::with_language`]; defaults to "eng".
+    language: String,
 }
 
 impl TvdbClient {
     /// Build a client from a TVDB v4 API key. `pin` is the optional
-    /// supporter PIN; pass `None` for free-tier keys.
+    /// supporter PIN; pass `None` for free-tier keys. Language defaults
+    /// to "eng"; use [`Self::with_language`] to override.
     pub fn new(apikey: &str, pin: Option<&str>) -> Result<Self> {
+        Self::with_language(apikey, pin, "en-US")
+    }
+
+    /// Build a client with an explicit BCP-47 metadata language. The
+    /// tag is mapped to TVDB's ISO 639-3 code via [`bcp47_to_iso639_3`];
+    /// unsupported tags fall back to "eng" so the client always points
+    /// at a real TVDB language endpoint.
+    pub fn with_language(apikey: &str, pin: Option<&str>, language_tag: &str) -> Result<Self> {
         if apikey.trim().is_empty() {
             bail!("TVDB API key must not be empty");
         }
@@ -51,6 +64,7 @@ impl TvdbClient {
             apikey: apikey.trim().to_string(),
             pin: pin.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
             token: Arc::new(Mutex::new(None)),
+            language: bcp47_to_iso639_3(language_tag).to_string(),
         })
     }
 
@@ -104,15 +118,64 @@ impl TvdbClient {
     }
 
     pub async fn fetch_show(&self, tvdb_id: i64) -> Result<TvdbShow> {
-        let raw: Envelope<RawSeriesExtended> =
-            self.get(&format!("/series/{tvdb_id}/extended")).await?;
-        Ok(TvdbShow::from_raw(raw.data))
+        // `?meta=translations` pulls the `nameTranslations` +
+        // `overviewTranslations` arrays inline so we can pick the
+        // operator's preferred language instead of TVDB's primary-
+        // language `name` field. Critical for Japanese-origin anime
+        // where the primary `name` is the kanji title.
+        let raw: Envelope<RawSeriesExtended> = self
+            .get(&format!(
+                "/series/{tvdb_id}/extended?meta=translations"
+            ))
+            .await?;
+        Ok(TvdbShow::from_raw(raw.data, &self.language))
     }
 
     pub async fn fetch_movie(&self, tvdb_id: i64) -> Result<TvdbMovie> {
-        let raw: Envelope<RawMovieExtended> =
-            self.get(&format!("/movies/{tvdb_id}/extended")).await?;
-        Ok(TvdbMovie::from_raw(raw.data))
+        let raw: Envelope<RawMovieExtended> = self
+            .get(&format!(
+                "/movies/{tvdb_id}/extended?meta=translations"
+            ))
+            .await?;
+        Ok(TvdbMovie::from_raw(raw.data, &self.language))
+    }
+
+    /// Fetch the full episode list for a series in the "default"
+    /// season-type order (i.e. how TVDB primarily groups episodes).
+    /// The language path segment honors the operator's configured
+    /// `metadata_language` server setting (mapped from BCP-47 to ISO
+    /// 639-3 at client construction time); defaults to "eng" for
+    /// instances that never set the preference.
+    ///
+    /// Returns episodes in the order TVDB lists them. Empty Vec when
+    /// the series exists but has no episode rows (rare but seen on
+    /// upcoming-only series).
+    pub async fn fetch_episodes(&self, tvdb_id: i64) -> Result<Vec<TvdbEpisode>> {
+        let lang = &self.language;
+        let raw: Envelope<RawEpisodesPage> = self
+            .get(&format!("/series/{tvdb_id}/episodes/default/{lang}"))
+            .await?;
+        Ok(raw
+            .data
+            .episodes
+            .into_iter()
+            .map(TvdbEpisode::from_raw)
+            .collect())
+    }
+
+    /// Fetch extended data for a single episode — characters (cast +
+    /// guest stars + crew), the long overview, and director credits.
+    /// One extra HTTP call per episode; the agent only calls it from
+    /// `fetch_episode` so the cost is bounded by how many episodes
+    /// the scanner actually processes (not the full season list).
+    pub async fn fetch_episode_extended(
+        &self,
+        episode_tvdb_id: i64,
+    ) -> Result<TvdbEpisodeExtended> {
+        let raw: Envelope<RawEpisodeExtended> = self
+            .get(&format!("/episodes/{episode_tvdb_id}/extended"))
+            .await?;
+        Ok(TvdbEpisodeExtended::from_raw(raw.data))
     }
 
     async fn search(&self, query: &str, kind: &str, year: Option<i32>) -> Result<Vec<SearchHit>> {
@@ -255,6 +318,83 @@ pub struct TvdbMovie {
     pub genres: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TvdbEpisode {
+    pub tvdb_id: i64,
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub absolute_number: Option<i32>,
+    pub title: String,
+    pub summary: Option<String>,
+    pub runtime_minutes: Option<i32>,
+    /// First-aired date as TVDB returns it (`YYYY-MM-DD`). The library
+    /// crate parses this into ms-epoch via `parse_air_date_to_ms`.
+    pub air_date: Option<String>,
+    /// Episode still image URL (already absolute — TVDB returns full
+    /// URLs in v4's images, no path-resolution needed).
+    pub still_url: Option<String>,
+}
+
+impl TvdbEpisode {
+    fn from_raw(r: RawEpisode) -> Self {
+        Self {
+            tvdb_id: r.id,
+            season_number: r.season_number.unwrap_or(0),
+            episode_number: r.number.unwrap_or(0),
+            absolute_number: r.absolute_number,
+            title: r.name.unwrap_or_default(),
+            summary: r.overview,
+            runtime_minutes: r.runtime,
+            air_date: r.aired,
+            still_url: normalize_tvdb_image(r.image),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TvdbEpisodeExtended {
+    pub tvdb_id: i64,
+    pub characters: Vec<TvdbEpisodeCharacter>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TvdbEpisodeCharacter {
+    /// TVDB person id (canonical person reference across appearances).
+    pub person_id: i64,
+    pub person_name: String,
+    /// Character name — populated for actors / guest stars. None for
+    /// crew (director, writer) where the "name" field is the job title.
+    pub character_name: Option<String>,
+    /// TVDB people-type: "Actor" | "Guest Star" | "Director" | "Writer"
+    /// | "Crew" | ... Normalised at the agent boundary.
+    pub people_type: String,
+    pub profile_url: Option<String>,
+    /// Lower number = earlier in the cast list.
+    pub sort: i32,
+}
+
+impl TvdbEpisodeExtended {
+    fn from_raw(r: RawEpisodeExtended) -> Self {
+        let characters = r
+            .characters
+            .into_iter()
+            .map(|c| TvdbEpisodeCharacter {
+                person_id: c.person_id.unwrap_or(0),
+                person_name: c.person_name.unwrap_or_default(),
+                character_name: c.name,
+                people_type: c.people_type.unwrap_or_default(),
+                profile_url: c.image,
+                sort: c.sort.unwrap_or(0),
+            })
+            .filter(|c| !c.person_name.is_empty())
+            .collect();
+        Self {
+            tvdb_id: r.id,
+            characters,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire types (only fields we use)
 // ---------------------------------------------------------------------------
@@ -262,6 +402,61 @@ pub struct TvdbMovie {
 #[derive(Debug, Deserialize)]
 struct Envelope<T> {
     data: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEpisodesPage {
+    #[serde(default)]
+    episodes: Vec<RawEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEpisode {
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default, rename = "seasonNumber")]
+    season_number: Option<i32>,
+    #[serde(default)]
+    number: Option<i32>,
+    #[serde(default, rename = "absoluteNumber")]
+    absolute_number: Option<i32>,
+    #[serde(default)]
+    runtime: Option<i32>,
+    #[serde(default)]
+    aired: Option<String>,
+    /// TVDB v4 returns absolute image URLs (no `/banners/` prefix
+    /// resolution needed).
+    #[serde(default)]
+    image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEpisodeExtended {
+    id: i64,
+    #[serde(default)]
+    characters: Vec<RawCharacter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCharacter {
+    #[serde(default, rename = "personId")]
+    person_id: Option<i64>,
+    #[serde(default, rename = "personName")]
+    person_name: Option<String>,
+    /// TVDB's `name` on a character row is the *character name* (e.g.
+    /// "Walter White") for actors, or the job title for crew. The
+    /// agent normalises this at translation time.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "peopleType")]
+    people_type: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    sort: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +494,12 @@ struct RawSeriesExtended {
     genres: Vec<RawNamed>,
     #[serde(default)]
     artworks: Vec<RawArtwork>,
+    /// Populated only when the fetch URL includes `?meta=translations`.
+    /// Used by [`TvdbShow::from_raw`] to surface the operator's
+    /// configured language instead of the series' primary-language
+    /// name (e.g. kanji for anime).
+    #[serde(default)]
+    translations: Option<RawTranslations>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +522,35 @@ struct RawMovieExtended {
     genres: Vec<RawNamed>,
     #[serde(default)]
     artworks: Vec<RawArtwork>,
+    #[serde(default)]
+    translations: Option<RawTranslations>,
+}
+
+/// Inline translations block returned by TVDB v4 when the request URL
+/// includes `?meta=translations`. Each entry is the localized name or
+/// overview for one ISO 639-3 language tag.
+#[derive(Debug, Deserialize, Default)]
+struct RawTranslations {
+    #[serde(default, rename = "nameTranslations")]
+    name_translations: Vec<RawNameTranslation>,
+    #[serde(default, rename = "overviewTranslations")]
+    overview_translations: Vec<RawOverviewTranslation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawNameTranslation {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOverviewTranslation {
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,13 +595,20 @@ struct RawArtwork {
 }
 
 impl TvdbShow {
-    fn from_raw(r: RawSeriesExtended) -> Self {
+    fn from_raw(r: RawSeriesExtended, language: &str) -> Self {
+        // Pick the translated title for the operator's configured
+        // language, falling back to the primary-language `name`. This
+        // is what stops kanji titles from leaking through for
+        // English-locale operators with anime libraries.
+        let title = pick_translated_name(&r.translations, language).unwrap_or(r.name.clone());
+        let summary = pick_translated_overview(&r.translations, language)
+            .or_else(|| r.overview.filter(|s| !s.is_empty()));
         Self {
             tvdb_id: r.id,
             imdb_id: imdb_from_remote_ids(&r.remote_ids),
-            original_title: pick_original_alias(&r.aliases, &r.name),
-            title: r.name,
-            summary: r.overview.filter(|s| !s.is_empty()),
+            original_title: pick_original_alias(&r.aliases, &title),
+            title,
+            summary,
             year: r.first_aired.as_deref().and_then(parse_year),
             status: r.status.and_then(|s| s.name),
             network: r.original_network.and_then(|n| n.name),
@@ -383,13 +620,16 @@ impl TvdbShow {
 }
 
 impl TvdbMovie {
-    fn from_raw(r: RawMovieExtended) -> Self {
+    fn from_raw(r: RawMovieExtended, language: &str) -> Self {
+        let title = pick_translated_name(&r.translations, language).unwrap_or(r.name.clone());
+        let summary = pick_translated_overview(&r.translations, language)
+            .or_else(|| r.overview.filter(|s| !s.is_empty()));
         Self {
             tvdb_id: r.id,
             imdb_id: imdb_from_remote_ids(&r.remote_ids),
-            original_title: pick_original_alias(&r.aliases, &r.name),
-            title: r.name,
-            summary: r.overview.filter(|s| !s.is_empty()),
+            original_title: pick_original_alias(&r.aliases, &title),
+            title,
+            summary,
             year: r.year.as_deref().and_then(parse_year),
             runtime_minutes: r.runtime,
             poster_url: pick_artwork(&r.artworks, 14).or(r.image.clone()),
@@ -397,6 +637,26 @@ impl TvdbMovie {
             genres: r.genres.into_iter().filter_map(|g| g.name).collect(),
         }
     }
+}
+
+/// Pick the name translation matching `language` (ISO 639-3, e.g.
+/// "eng") from a `?meta=translations` response. Returns `None` when no
+/// translation block was returned or no matching entry exists.
+fn pick_translated_name(translations: &Option<RawTranslations>, language: &str) -> Option<String> {
+    translations.as_ref()?.name_translations.iter()
+        .find(|t| t.language.as_deref() == Some(language))
+        .and_then(|t| t.name.clone())
+        .filter(|s| !s.is_empty())
+}
+
+fn pick_translated_overview(
+    translations: &Option<RawTranslations>,
+    language: &str,
+) -> Option<String> {
+    translations.as_ref()?.overview_translations.iter()
+        .find(|t| t.language.as_deref() == Some(language))
+        .and_then(|t| t.overview.clone())
+        .filter(|s| !s.is_empty())
 }
 
 fn imdb_from_remote_ids(ids: &[RemoteId]) -> Option<String> {
@@ -433,6 +693,76 @@ fn pick_artwork(artworks: &[RawArtwork], kind: i32) -> Option<String> {
 
 fn parse_year(s: &str) -> Option<i32> {
     s.chars().take(4).collect::<String>().parse().ok()
+}
+
+/// Normalize an image path returned by TVDB v4.
+///
+/// TVDB's behaviour around episode `image` fields is inconsistent in
+/// practice:
+///
+///   * Episodes with proper stills return absolute CDN URLs
+///     (`https://artworks.thetvdb.com/banners/episodes/.../...jpg`).
+///   * Episodes without stills sometimes return `null`, sometimes an
+///     empty string, sometimes whitespace.
+///   * A small subset of older rows return a relative path starting
+///     with `/banners/...` that still needs the CDN host prepended.
+///
+/// Without this normalization the empty-string case ended up in our
+/// `images.source_url` column, which the UI rendered as `<img src="">`
+/// — the browser interprets that as a self-reference to the current
+/// page, returning HTML / 404 and showing a black tile (Plex-style
+/// "no still" thumbnail). The user-visible symptom matched the bug
+/// exactly.
+fn normalize_tvdb_image(raw: Option<String>) -> Option<String> {
+    let url = raw?.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url)
+    } else if let Some(stripped) = url.strip_prefix('/') {
+        Some(format!("https://artworks.thetvdb.com/{stripped}"))
+    } else {
+        Some(format!("https://artworks.thetvdb.com/{url}"))
+    }
+}
+
+/// Translate a BCP-47 metadata language tag (e.g. "en-US", "ja-JP") into
+/// TVDB's ISO 639-3 code (e.g. "eng", "jpn"). Only the language subtag
+/// is consulted; the region is ignored. Unknown languages fall back to
+/// "eng" so episode-list fetches always hit a real endpoint.
+pub fn bcp47_to_iso639_3(tag: &str) -> &'static str {
+    let primary = tag
+        .split(|c: char| c == '-' || c == '_')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match primary.as_str() {
+        "en" | "eng" => "eng",
+        "ja" | "jpn" => "jpn",
+        "ko" | "kor" => "kor",
+        "zh" | "zho" | "chi" => "zho",
+        "es" | "spa" => "spa",
+        "fr" | "fra" | "fre" => "fra",
+        "de" | "deu" | "ger" => "deu",
+        "it" | "ita" => "ita",
+        "pt" | "por" => "por",
+        "ru" | "rus" => "rus",
+        "nl" | "nld" | "dut" => "nld",
+        "pl" | "pol" => "pol",
+        "sv" | "swe" => "swe",
+        "da" | "dan" => "dan",
+        "fi" | "fin" => "fin",
+        "no" | "nor" => "nor",
+        "tr" | "tur" => "tur",
+        "ar" | "ara" => "ara",
+        "he" | "heb" => "heb",
+        "th" | "tha" => "tha",
+        "vi" | "vie" => "vie",
+        "id" | "ind" => "ind",
+        "hi" | "hin" => "hin",
+        _ => "eng",
+    }
 }
 
 #[cfg(test)]

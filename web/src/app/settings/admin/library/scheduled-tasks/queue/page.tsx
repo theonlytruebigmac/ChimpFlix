@@ -24,7 +24,7 @@ export default async function AdminTasksQueuePage() {
       <AdminPageHeader
         eyebrow="Library · Scheduled tasks"
         title="Job queue"
-        description="Durable background pipeline — marker detection, preview sprites, loudness, chapter thumbs. Discovery-triggered: every new media file enqueues the full chain. Scheduled tasks act as safety nets only."
+        description="Durable background pipeline — marker detection, loudness, subtitle fetch, ratings. Discovery-triggered: every new media file enqueues the full chain. Scheduled tasks act as safety nets only."
       />
       <div className="mb-4 flex items-center justify-end gap-2 text-xs text-white/60">
         <Link

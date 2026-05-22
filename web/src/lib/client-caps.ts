@@ -54,12 +54,19 @@ function probe(mime: string): { canPlay: boolean; canPlayStrict: boolean; mseSup
   return { canPlay, canPlayStrict, mseSupported };
 }
 
-/// Detect Safari — the only browser whose HEVC support claims can
-/// be trusted in 2026. Detection uses the WebKit-specific quirk
-/// that the `safari` substring lives in the UA and `chrome` does
-/// not (Chrome on macOS reports "Safari" in its UA *and* "Chrome",
-/// so we have to check both).
-function isSafari(): boolean {
+/// Detect Safari — the only browser whose HEVC support claims AND
+/// native HLS demuxer can be trusted in 2026. Detection uses the
+/// WebKit-specific quirk that the `safari` substring lives in the UA
+/// and `chrome` does not (Chrome on macOS reports "Safari" in its UA
+/// *and* "Chrome", so we have to check both).
+///
+/// Exported because the player needs the same check to decide
+/// between native HLS playback (`<video src=master.m3u8>`) and
+/// hls.js. Android Chrome reports a positive
+/// `canPlayType("application/vnd.apple.mpegurl")` but its actual
+/// demuxer fails with `DEMUXER_ERROR_COULD_NOT_PARSE` — the only
+/// safe signal is "actually Safari".
+export function isSafari(): boolean {
   if (typeof navigator === "undefined") return false;
   const ua = navigator.userAgent.toLowerCase();
   return ua.includes("safari") && !ua.includes("chrome") && !ua.includes("chromium");

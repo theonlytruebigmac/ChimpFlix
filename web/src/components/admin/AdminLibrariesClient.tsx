@@ -12,6 +12,7 @@ import {
   type LibraryStatsResult,
   type LibraryUpdateInput,
   type LibraryVisibility,
+  type PrimaryMetadataAgent,
 } from "@/lib/chimpflix-api";
 import {
   Drawer,
@@ -249,6 +250,7 @@ function LibraryDrawer({
     certification_country: lib.certification_country,
     visibility: lib.visibility,
     allow_media_deletion: lib.allow_media_deletion ?? false,
+    primary_metadata_agent: lib.primary_metadata_agent ?? "tmdb",
   });
   const [sortOrder, setSortOrder] = useState<EpisodeSortOrder>(
     baseline.episode_sort_order,
@@ -260,6 +262,9 @@ function LibraryDrawer({
   );
   const [allowMediaDeletion, setAllowMediaDeletion] = useState(
     baseline.allow_media_deletion,
+  );
+  const [primaryAgent, setPrimaryAgent] = useState<PrimaryMetadataAgent>(
+    baseline.primary_metadata_agent,
   );
 
   useEffect(() => {
@@ -394,6 +399,8 @@ function LibraryDrawer({
 
   // ─── Settings save ─────────────────────────────────────────────
   const dirtyFields: Record<string, boolean> = {
+    "Primary metadata source":
+      primaryAgent !== baseline.primary_metadata_agent,
     "Episode sorting": sortOrder !== baseline.episode_sort_order,
     "Episode naming": naming !== baseline.episode_naming,
     "Certification country": country !== baseline.certification_country,
@@ -408,6 +415,9 @@ function LibraryDrawer({
   async function saveFields() {
     setError(null);
     const patch: LibraryUpdateInput = {};
+    if (dirtyFields["Primary metadata source"]) {
+      patch.primary_metadata_agent = primaryAgent;
+    }
     if (dirtyFields["Episode sorting"]) patch.episode_sort_order = sortOrder;
     if (dirtyFields["Episode naming"]) patch.episode_naming = naming;
     if (dirtyFields["Certification country"]) {
@@ -425,6 +435,7 @@ function LibraryDrawer({
       certification_country: library.certification_country,
       visibility: library.visibility,
       allow_media_deletion: library.allow_media_deletion ?? false,
+      primary_metadata_agent: library.primary_metadata_agent ?? "tmdb",
     });
   }
   function discardFields() {
@@ -433,6 +444,7 @@ function LibraryDrawer({
     setCountry(baseline.certification_country);
     setVisibility(baseline.visibility);
     setAllowMediaDeletion(baseline.allow_media_deletion);
+    setPrimaryAgent(baseline.primary_metadata_agent);
   }
 
   const orphanCount = stats?.orphan_files ?? 0;
@@ -571,6 +583,28 @@ function LibraryDrawer({
               title="Episode & metadata defaults"
               description="Sorting + naming conventions for new and existing items."
             >
+              <SettingsRow
+                stacked
+                flat
+                label="Primary metadata source"
+                help="Which agent runs first for this library. The other still runs after it as a fill-nulls fallback. TMDB is the broadest source for movies and shows; TheTVDB usually has better English titles for anime."
+                changed={dirtyFields["Primary metadata source"]}
+              >
+                <select
+                  value={primaryAgent}
+                  onChange={(e) =>
+                    setPrimaryAgent(e.target.value as PrimaryMetadataAgent)
+                  }
+                  className={
+                    dirtyFields["Primary metadata source"]
+                      ? INPUT_CHANGED_CLASS
+                      : INPUT_CLASS
+                  }
+                >
+                  <option value="tmdb">The Movie Database (TMDB)</option>
+                  <option value="tvdb">TheTVDB</option>
+                </select>
+              </SettingsRow>
               <SettingsRow
                 stacked
                 flat
@@ -923,6 +957,7 @@ function AgentPriorityEditor({
   const addable = available.filter(
     (a) =>
       a.supported_kinds.includes(itemKind) &&
+      a.participates_in_chain &&
       !agents.some((existing) => existing.agent_name === a.name),
   );
 
@@ -947,6 +982,7 @@ function AgentPriorityEditor({
                   {info && !info.configured && (
                     <Pill tone="warn">Not configured</Pill>
                   )}
+                  {info && <AgentCapabilityBadges info={info} />}
                 </div>
               </div>
               <button
@@ -1015,6 +1051,44 @@ function AgentPriorityEditor({
         )}
         {error && <span className="text-[11.5px] text-red-300">{error}</span>}
       </div>
+    </div>
+  );
+}
+
+/// Renders a capability matrix as compact badges plus a hover tooltip
+/// with provider-specific limitations. Mirrors the
+/// `AgentInfo.capabilities` flags one-for-one. The list-of-caps
+/// approach (rather than a single "X / Y / Z" string) keeps the row
+/// scannable and consistent across agents.
+function AgentCapabilityBadges({ info }: { info: AgentInfo }) {
+  const caps: Array<[keyof AgentInfo["capabilities"], string]> = [
+    ["movie", "movies"],
+    ["show", "shows"],
+    ["episode", "episodes"],
+    ["cast", "cast"],
+    ["artwork", "artwork"],
+    ["ratings", "ratings"],
+  ];
+  const active = caps.filter(([k]) => info.capabilities[k]);
+  if (active.length === 0 && info.limitations.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {active.map(([k, label]) => (
+        <span
+          key={k}
+          className="rounded-sm border border-white/15 bg-white/5 px-1 py-px text-[9px] uppercase tracking-wider text-white/60"
+        >
+          {label}
+        </span>
+      ))}
+      {info.limitations.length > 0 && (
+        <span
+          title={info.limitations.join("\n\n")}
+          className="cursor-help rounded-sm border border-amber-500/30 bg-amber-500/10 px-1 py-px text-[9px] font-medium uppercase tracking-wider text-amber-300/80"
+        >
+          info
+        </span>
+      )}
     </div>
   );
 }

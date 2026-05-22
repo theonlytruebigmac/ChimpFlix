@@ -520,11 +520,12 @@ impl Session {
     /// and fMP4 sessions doesn't matter to clients — every modern
     /// player understands v7+.
     pub fn master_playlist(&self) -> String {
-        let codecs = format!(
-            "{},{}",
-            codec_string_for(&self.output_video_codec),
-            codec_string_for(&self.output_audio_codec),
+        let audio_codec = codec_string_for(&self.output_audio_codec);
+        let primary_video = video_codec_string_for_height(
+            &self.output_video_codec,
+            self.target_height,
         );
+        let primary_codecs = format!("{primary_video},{audio_codec}");
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
         // Subtitle sidecar group. Emitted BEFORE the STREAM-INF lines
         // per HLS convention (media groups must be defined before
@@ -548,13 +549,15 @@ impl Session {
         let w = (h as u64 * 16 / 9) as u32;
         let bw = self.target_video_bitrate_bps + 200_000;
         out.push_str(&format!(
-            "#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={w}x{h},CODECS=\"{codecs}\"{subs_attr}\n{VARIANT_NAME}/index.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={w}x{h},CODECS=\"{primary_codecs}\"{subs_attr}\n{VARIANT_NAME}/index.m3u8\n",
         ));
         if let Some((fh, fbps)) = self.fallback_variant {
             let fw = (fh as u64 * 16 / 9) as u32;
             let fbw = fbps + 200_000;
+            let fallback_video = video_codec_string_for_height(&self.output_video_codec, fh);
+            let fallback_codecs = format!("{fallback_video},{audio_codec}");
             out.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={fbw},RESOLUTION={fw}x{fh},CODECS=\"{codecs}\"{subs_attr}\n{FALLBACK_VARIANT_NAME}/index.m3u8\n",
+                "#EXT-X-STREAM-INF:BANDWIDTH={fbw},RESOLUTION={fw}x{fh},CODECS=\"{fallback_codecs}\"{subs_attr}\n{FALLBACK_VARIANT_NAME}/index.m3u8\n",
             ));
         }
         out
@@ -594,6 +597,58 @@ fn codec_string_for(codec: &str) -> String {
         "flac" => "flac".to_string(),
         "mp3" | "mpga" => "mp4a.40.34".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Resolution-aware variant of [`codec_string_for`] for video codecs.
+/// The HLS spec wants the `CODECS=` attribute on each
+/// `#EXT-X-STREAM-INF` line to accurately reflect the profile **and
+/// level** of the segments. The level constraint is critical on
+/// Android: Chrome's MediaCodec backend strictly enforces the
+/// declared level — segments whose SPS reports a higher level than
+/// the manifest claimed get rejected at decode time, producing a
+/// permanent black frame with no error in the JS console.
+///
+/// Mapping (H.264 Main profile + AVC HLS):
+///
+/// | Output height | Level | Codec string         |
+/// |---------------|-------|----------------------|
+/// | ≤ 480p        | 3.0   | `avc1.4d401e`        |
+/// | ≤ 720p        | 3.1   | `avc1.4d401f`        |
+/// | ≤ 1080p       | 4.0   | `avc1.4d4028`        |
+/// | ≤ 1440p       | 5.0   | `avc1.4d4032`        |
+/// | > 1440p (4K)  | 5.1   | `avc1.4d4033`        |
+///
+/// HEVC uses `L93` (level 3.1) up to 1080p ≤ 30fps and `L120` for
+/// higher framerates / 4K. We can't easily tell framerate from the
+/// session struct here, so we conservatively pick L120 for ≥ 1440p
+/// only. Everything else stays at the L93 baseline that Apple's
+/// reference HLS examples use.
+///
+/// For non-video codecs the height is ignored and the result matches
+/// [`codec_string_for`].
+fn video_codec_string_for_height(codec: &str, height: u32) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "x264" => {
+            let level_hex = match height {
+                0..=480 => "1e",   // level 3.0
+                481..=720 => "1f", // level 3.1
+                721..=1080 => "28", // level 4.0
+                1081..=1440 => "32", // level 5.0
+                _ => "33",          // level 5.1 (4K and up)
+            };
+            format!("avc1.4d40{level_hex}")
+        }
+        "hevc" | "h265" | "x265" => {
+            if height > 1440 {
+                "hev1.1.6.L150.B0".to_string()
+            } else if height > 1080 {
+                "hev1.1.6.L120.B0".to_string()
+            } else {
+                "hev1.1.6.L93.B0".to_string()
+            }
+        }
+        other => codec_string_for(other),
     }
 }
 

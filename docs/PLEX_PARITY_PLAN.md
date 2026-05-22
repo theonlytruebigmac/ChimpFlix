@@ -328,7 +328,7 @@ existing capability probe at startup; the probe already returns a
 | Video played threshold | ✅ Phase 31 | `video_played_threshold_pct` (50-99) |
 | Video play completion behaviour | ✅ Phase 46 | `video_completion_behaviour` (threshold_pct / first_credits_marker / earliest_of_both) |
 | Marker generation: "when added" trigger | ✅ Phase 37 | `detect_markers_on_add` setting; file_watcher post-scan hook |
-| Generate chapter thumbnails | ✅ Phase 38 | `generate_chapter_thumbs` task + `/media-files/{id}/chapters[/{i}/thumb]` API |
+| Generate chapter thumbnails | ❌ Removed Phase 71 | Feature dropped 2026-05-21 — user does not use chapter skipping. `build_chapter_thumbs` job + chapter API removed; `probe_chapters` retained for marker-detection fallback. |
 | Loudness analysis | ✅ Phase 39 | `analyze_loudness` task; two-pass loudnorm with stored measurements |
 | Run scanner tasks at lower priority | ✅ Phase 40 | `scanner_nice_level` (0-19) wraps ffmpeg/ffprobe in `nice -n N` |
 | Database cache size | ✅ Phase 31 | `database_cache_size_mb` via `PRAGMA cache_size` |

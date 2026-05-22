@@ -80,6 +80,61 @@ impl TvMazeClient {
             .with_context(|| format!("parse TVMaze JSON from {url}"))?;
         Ok(Some(raw.into()))
     }
+
+    /// Fetch all episodes for a show by its TVMaze id. The endpoint
+    /// returns a flat list ordered by (season, number).
+    pub async fn fetch_episodes(&self, tvmaze_id: i64) -> Result<Vec<TvMazeEpisode>> {
+        let path = format!("/shows/{tvmaze_id}/episodes");
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            debug!(tvmaze_id, "no TVMaze episodes (404)");
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %url, body = %body.chars().take(200).collect::<String>(), "TVMaze episode fetch error");
+            anyhow::bail!("TVMaze {url} returned {status}");
+        }
+        let raws: Vec<RawEpisode> = resp
+            .json()
+            .await
+            .with_context(|| format!("parse TVMaze episodes from {url}"))?;
+        Ok(raws.into_iter().map(TvMazeEpisode::from).collect())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TvMazeEpisode {
+    pub tvmaze_id: i64,
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub title: String,
+    pub summary: Option<String>,
+    pub runtime_minutes: Option<i32>,
+    pub air_date: Option<String>,
+    pub still_url: Option<String>,
+}
+
+impl From<RawEpisode> for TvMazeEpisode {
+    fn from(r: RawEpisode) -> Self {
+        Self {
+            tvmaze_id: r.id,
+            season_number: r.season.unwrap_or(0),
+            episode_number: r.number.unwrap_or(0),
+            title: r.name.unwrap_or_default(),
+            summary: r.summary.as_deref().map(strip_html).filter(|s| !s.is_empty()),
+            runtime_minutes: r.runtime,
+            air_date: r.airdate,
+            still_url: r.image.and_then(|i| i.original.or(i.medium)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +191,25 @@ struct RawImage {
     medium: Option<String>,
     #[serde(default)]
     original: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEpisode {
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    season: Option<i32>,
+    #[serde(default)]
+    number: Option<i32>,
+    #[serde(default)]
+    runtime: Option<i32>,
+    #[serde(default)]
+    airdate: Option<String>,
+    #[serde(default)]
+    image: Option<RawImage>,
 }
 
 #[derive(Debug, Deserialize)]

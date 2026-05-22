@@ -1,11 +1,7 @@
 //! ffmpeg/ffprobe orchestration for probing and HLS transcoding.
 
 pub mod capabilities;
-pub mod chapter_thumbs;
 pub mod hwaccel;
-pub mod loudness;
-pub mod markers;
-pub mod previews;
 pub mod probe;
 pub mod session;
 
@@ -29,8 +25,6 @@ pub fn safe_ffmpeg_input(path: &std::path::Path) -> String {
 
 pub use capabilities::{TranscoderCapabilities, detect_capabilities};
 pub use hwaccel::{EncoderPreset, HwAccel, VideoCodec};
-pub use markers::{DetectedMarker, MarkerKind, MarkerSource, detect_markers};
-pub use previews::{DEFAULT_INTERVAL_S, DEFAULT_TILE_WIDTH, SpriteInfo, generate_sprite};
 pub use probe::{
     Chapter, GopProbe, ProbeResult, ProbeStream, StreamKind, probe, probe_chapters, probe_gop,
     probe_subtitle_codec,
@@ -46,9 +40,9 @@ pub struct FfmpegConfig {
     pub ffmpeg: String,
     pub ffprobe: String,
     /// When set (1..=19), background work — scheduled tasks, scanner
-    /// probes, marker detection, preview/thumb extraction, loudness
-    /// analysis — wraps ffmpeg/ffprobe in `nice -n <level>` so it
-    /// yields to live transcode sessions and the rest of the system.
+    /// probes, marker detection, loudness analysis — wraps
+    /// ffmpeg/ffprobe in `nice -n <level>` so it yields to live
+    /// transcode sessions and the rest of the system.
     /// `None` = run at default priority.
     pub background_nice_level: Option<i32>,
 }

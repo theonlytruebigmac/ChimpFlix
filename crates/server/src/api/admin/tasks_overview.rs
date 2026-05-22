@@ -826,6 +826,21 @@ pub struct KindHealth {
     /// admin "Per-kind concurrency" editor on the activity page can
     /// label the editable override with its baseline.
     pub default_concurrency: u32,
+    /// Rough wall-clock ETA to drain the queue, in seconds. Computed
+    /// as `queue_depth × (p95_duration_ms / 1000) / effective_concurrency`
+    /// where `effective_concurrency` reads the operator override if
+    /// present and falls back to `default_concurrency`. `None` when:
+    ///
+    /// - queue is empty (nothing to drain), or
+    /// - fewer than 5 successful runs are in the ring buffer (no
+    ///   p95 yet — too noisy to estimate honestly).
+    ///
+    /// Refreshed on each activity poll. This is a deliberately coarse
+    /// signal — p95 from the last 100 runs over the requested-but-
+    /// unknown future queue mix isn't predictive to the minute, but
+    /// "~30 min remaining" beats "0.6 jobs/min" for an operator
+    /// trying to decide whether to wait or come back later.
+    pub eta_seconds_remaining: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -884,6 +899,16 @@ pub async fn activity(
         kinds.insert(k.clone());
     }
 
+    // Concurrency override map for the ETA computation — reading
+    // settings once outside the loop. JSON is `{ "kind": cap }`;
+    // anything malformed silently falls back to registry defaults
+    // (already validated at PATCH time).
+    let settings = queries::get_server_settings(&state.pool)
+        .await
+        .map_err(ApiError::Internal)?;
+    let concurrency_overrides: std::collections::HashMap<String, u32> =
+        serde_json::from_str(&settings.job_kind_concurrency).unwrap_or_default();
+
     let mut per_kind: Vec<KindHealth> = Vec::new();
     let mut all_recent: Vec<RecentRun> = Vec::new();
     for kind in &kinds {
@@ -906,15 +931,33 @@ pub async fn activity(
             .map(|k| k.display_name.to_string())
             .unwrap_or_else(|| kind.clone());
         let default_concurrency = meta.map(|k| k.concurrency).unwrap_or(1);
+        let effective_concurrency = concurrency_overrides
+            .get(kind)
+            .copied()
+            .unwrap_or(default_concurrency)
+            .max(1);
+        let queue_depth = *queued.get(kind).unwrap_or(&0);
+        let eta_seconds_remaining = match (queue_depth, p95) {
+            (n, Some(p95_ms)) if n > 0 => {
+                // n × (p95_ms / 1000) / effective_concurrency, in
+                // integer seconds. Use i128 inside the multiply so a
+                // big-queue × long-p95 product can't overflow i64.
+                let secs = (n as i128 * p95_ms as i128)
+                    / (effective_concurrency as i128 * 1000);
+                i64::try_from(secs).ok()
+            }
+            _ => None,
+        };
         per_kind.push(KindHealth {
             kind: kind.clone(),
             display_name,
-            queue_depth: *queued.get(kind).unwrap_or(&0),
+            queue_depth,
             in_flight: *in_flight_snap.get(kind).unwrap_or(&0),
             jobs_per_minute: (success_count as f32 / elapsed_minutes * 10.0).round() / 10.0,
             p95_duration_ms: p95,
             recent_errors: error_count,
             default_concurrency,
+            eta_seconds_remaining,
         });
         for r in recent {
             all_recent.push(RecentRun {
@@ -1069,7 +1112,6 @@ pub async fn update_gate(
 fn build_gate_patch(key: &str, value: bool) -> Option<ServerSettingsUpdate> {
     let mut patch = ServerSettingsUpdate::default();
     match key {
-        "chapter_thumbs_enabled" => patch.chapter_thumbs_enabled = Some(value),
         "loudness_analysis_enabled" => patch.loudness_analysis_enabled = Some(value),
         "subtitle_fetch_enabled" => patch.subtitle_fetch_enabled = Some(value),
         "embedded_subs_extract_enabled" => patch.embedded_subs_extract_enabled = Some(value),
@@ -1280,8 +1322,6 @@ mod tests {
 
     #[test]
     fn gate_patch_known_keys() {
-        let p = build_gate_patch("chapter_thumbs_enabled", true).unwrap();
-        assert_eq!(p.chapter_thumbs_enabled, Some(true));
         let p = build_gate_patch("loudness_analysis_enabled", false).unwrap();
         assert_eq!(p.loudness_analysis_enabled, Some(false));
         let p = build_gate_patch("subtitle_fetch_enabled", true).unwrap();

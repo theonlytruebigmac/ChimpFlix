@@ -312,7 +312,7 @@ async fn run_force_delete(
     )
     .await;
 
-    // Unlink files + sprites + transcoder caches in the background.
+    // Unlink files + transcoder caches in the background.
     // The DB cascade is already committed at this point, so the
     // user-facing response can return immediately and the
     // filesystem cleanup happens off the request path. Failures
@@ -637,17 +637,22 @@ pub async fn refresh(
     if !matches!(user.role, chimpflix_library::UserRole::Owner) {
         return Err(ApiError::Forbidden);
     }
+    // Refresh is chain-aware now — TMDB is optional. Operators with
+    // TMDB removed from a library's chain can still hit Refresh and
+    // get their other agents (TVDB / OMDb / AniList) to repopulate
+    // missing per-episode metadata + cast.
     let tmdb_snapshot = state.tmdb_snapshot().await;
-    let Some(tmdb) = tmdb_snapshot.as_ref() else {
-        return Err(ApiError::validation("TMDB enrichment is disabled"));
-    };
     let tvdb_snapshot = state.tvdb_snapshot().await;
+    let anilist_snapshot = state.anilist_snapshot().await;
+    let omdb_snapshot = state.omdb_snapshot().await;
     let acc = access(&state, &user).await?;
     scanner::refresh_item_metadata(
         &state.pool,
-        tmdb,
+        tmdb_snapshot.as_ref(),
         tvdb_snapshot.as_ref(),
         state.tvmaze.as_ref(),
+        anilist_snapshot.as_ref(),
+        omdb_snapshot.as_ref(),
         id,
         None,
     )
@@ -726,17 +731,25 @@ pub async fn match_apply(
     if !matches!(user.role, chimpflix_library::UserRole::Owner) {
         return Err(ApiError::Forbidden);
     }
+    // Fix Match still requires TMDB — the operator explicitly chose a
+    // TMDB id via the candidate picker, so a missing TMDB config is a
+    // genuine user-facing error here (unlike plain Refresh, which now
+    // works without TMDB).
     let tmdb_snapshot = state.tmdb_snapshot().await;
-    let Some(tmdb) = tmdb_snapshot.as_ref() else {
+    if tmdb_snapshot.is_none() {
         return Err(ApiError::validation("TMDB enrichment is disabled"));
-    };
+    }
     let tvdb_snapshot = state.tvdb_snapshot().await;
+    let anilist_snapshot = state.anilist_snapshot().await;
+    let omdb_snapshot = state.omdb_snapshot().await;
     let acc = access(&state, &user).await?;
     scanner::refresh_item_metadata(
         &state.pool,
-        tmdb,
+        tmdb_snapshot.as_ref(),
         tvdb_snapshot.as_ref(),
         state.tvmaze.as_ref(),
+        anilist_snapshot.as_ref(),
+        omdb_snapshot.as_ref(),
         id,
         Some(input.tmdb_id),
     )

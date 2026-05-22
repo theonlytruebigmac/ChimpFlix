@@ -26,15 +26,6 @@ pub static REGISTRY: LazyLock<Vec<KindMetadata>> = LazyLock::new(|| {
             concurrency: 1,
         },
         KindMetadata {
-            job_kind: "generate_preview_sprite",
-            sweep_kind: Some("generate_previews"),
-            display_name: "Preview sprite",
-            mode: TaskMode::Automatic,
-            scope: TaskScope::PerFile,
-            gate_setting_key: None,
-            concurrency: 1, // ffmpeg sprite tile build
-        },
-        KindMetadata {
             job_kind: "refresh_logos_item",
             sweep_kind: Some("refresh_logos"),
             display_name: "Title-treatment logos",
@@ -59,15 +50,6 @@ pub static REGISTRY: LazyLock<Vec<KindMetadata>> = LazyLock::new(|| {
             concurrency: 2,
         },
         // ─── Discovery pipeline · Gated ───────────────────────────
-        KindMetadata {
-            job_kind: "build_chapter_thumbs",
-            sweep_kind: Some("generate_chapter_thumbs"),
-            display_name: "Chapter thumbnails",
-            mode: TaskMode::Gated,
-            scope: TaskScope::PerFile,
-            gate_setting_key: Some("chapter_thumbs_enabled"),
-            concurrency: 1, // ffmpeg thumb extract
-        },
         KindMetadata {
             job_kind: "analyze_loudness",
             sweep_kind: Some("analyze_loudness"),

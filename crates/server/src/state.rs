@@ -151,6 +151,43 @@ pub struct AppState {
     /// `jobs::start()` — a hard error elsewhere would still log
     /// and continue rather than panic.
     pub worker_pool: Arc<RwLock<Option<crate::jobs::WorkerPoolHandle>>>,
+    /// Per-job live progress store. Workers insert an entry on job
+    /// claim and remove it on completion; handlers update it via
+    /// the `JobContext::current().progress_sink` task-local. The
+    /// admin activity-feed endpoint reads snapshots to render
+    /// "Decoding · 42%" inline for in-flight jobs.
+    pub job_progress: Arc<crate::jobs::progress::JobProgressStore>,
+    /// Library-first-scan exclusivity gate. Use
+    /// [`Self::library_scan_exclusive`] for `acquire`/`release` calls
+    /// from inside the scan trigger; consumers (worker pool,
+    /// scheduler) subscribe via [`crate::jobs::scan_gate::LibraryScanGate::subscribe`].
+    ///
+    /// While at least one first-scan is in progress:
+    ///   * The job worker pool's claim loop awaits a clear before
+    ///     claiming new jobs (lets in-flight ones finish).
+    ///   * The scheduler tick defers periodic-task dispatch.
+    ///
+    /// Cleared when the last in-progress first-scan completes
+    /// (success or failure). Counter semantics correctly handle the
+    /// case where the operator adds two new libraries back-to-back
+    /// — the gate stays active until BOTH scans drain.
+    pub library_scan_exclusive: Arc<crate::jobs::scan_gate::LibraryScanGate>,
+
+    /// Application-level mutex around operations known to do many
+    /// sequential writes (operator-initiated backfill sweep, library
+    /// delete cascade, etc.). Held briefly during the write phase to
+    /// prevent two such operations from racing each other into the
+    /// SQLite writer slot — they'd both succeed eventually thanks to
+    /// the retry helper, but holding the mutex up front means we
+    /// don't burn retry budget against ourselves.
+    ///
+    /// Per-job worker writes (markers, loudness, scan inserts) do NOT
+    /// take this lock — those are inherently parallel and rely on
+    /// `BEGIN IMMEDIATE` + `with_busy_retry` for serialization at the
+    /// SQLite layer. The bulk lock is for *operator-triggered* bulk
+    /// operations that would otherwise blast thousands of writes into
+    /// the queue while regular traffic is also writing.
+    pub bulk_write_lock: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {

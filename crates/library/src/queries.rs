@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chimpflix_common::now_ms;
 use chimpflix_metadata::{
     AniListShow, TmdbCastMember, TmdbCollection, TmdbCollectionStub, TmdbCredits, TmdbCrewMember,
-    TmdbEpisode, TmdbMovie, TmdbShow, TmdbVideo, TvMazeShow, TvdbMovie, TvdbShow, tmdb_image_url,
+    TmdbEpisode, TmdbMovie, TmdbShow, TvMazeShow, TvdbMovie, TvdbShow, tmdb_image_url,
 };
 use chimpflix_transcoder::ProbeStream;
 use serde::Serialize;
@@ -30,7 +30,7 @@ use crate::models::{
     ScheduledTask, ScheduledTaskUpdate, Season, SeasonDetail, SeasonSummary, SecretMetadata,
     ServerSettings, ServerSettingsUpdate, SessionRow, ShowWatchStats, TaskRun, TranscoderPreset,
     TranscoderPresetUpdate, User, UserRole, UserWithSecret, Webhook, WebhookDelivery,
-    WebhookUpdate, make_sort_title,
+    WebhookUpdate, WriteMode, make_sort_title,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,14 +50,23 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
 
     let mut tx = pool.begin().await?;
 
+    // Anime libraries default to TVDB primary; everything else defaults
+    // to TMDB. The operator can flip this via PATCH /libraries/{id}.
+    let primary_agent = if matches!(input.kind, crate::models::LibraryKind::Anime) {
+        "tvdb"
+    } else {
+        "tmdb"
+    };
     let lib_id: i64 = sqlx::query(
-        "INSERT INTO libraries (name, kind, scan_interval_s, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+        "INSERT INTO libraries
+            (name, kind, scan_interval_s, primary_metadata_agent, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(&input.name)
     .bind(input.kind.as_str())
     .bind(scan_interval)
+    .bind(primary_agent)
     .bind(now)
     .bind(now)
     .fetch_one(&mut *tx)
@@ -84,55 +93,45 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
     .execute(&mut *tx)
     .await?;
 
-    // Seed the default metadata agent chain. Movies: TMDB + TVDB.
-    // Shows: TMDB + TVMaze + TVDB. Anime: TMDB + TVDB (TVMaze isn't an
-    // anime catalogue, and the AniList agent will join the chain once it
-    // ships). Owners can reorder/disable later via
-    // /admin/libraries/{id}/agents.
-    sqlx::query(
-        "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
-         VALUES (?, 'tmdb', 0, 1, '{}')",
-    )
-    .bind(lib_id)
-    .execute(&mut *tx)
-    .await?;
-    if matches!(input.kind, crate::models::LibraryKind::Shows) {
-        sqlx::query(
-            "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
-             VALUES (?, 'tvmaze', 1, 1, '{}')",
-        )
-        .bind(lib_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    sqlx::query(
-        "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
-         VALUES (?, 'tvdb', 2, 1, '{}')",
-    )
-    .bind(lib_id)
-    .execute(&mut *tx)
-    .await?;
-    if matches!(input.kind, crate::models::LibraryKind::Anime) {
-        // AniList is the primary metadata source for anime; priority 0
-        // puts it ahead of TMDB so the per-library agent picker reflects
-        // the actual scan order.
-        sqlx::query(
-            "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
-             VALUES (?, 'anilist', 0, 1, '{}')",
-        )
-        .bind(lib_id)
-        .execute(&mut *tx)
-        .await?;
-        // Drop the TMDB priority below AniList so the chain in the UI
-        // matches what the scanner actually does (AniList primary,
-        // TMDB+TVDB backfill).
-        sqlx::query(
-            "UPDATE library_agents SET priority = 1
-             WHERE library_id = ? AND agent_name = 'tmdb'",
-        )
-        .bind(lib_id)
-        .execute(&mut *tx)
-        .await?;
+    // Seed the default metadata agent chain.
+    //   Movies: TMDB primary, then TVDB + OMDb for fill-nulls.
+    //   Shows:  TVDB primary, then TMDB + TVMaze + OMDb.
+    //   Anime:  TVDB primary (English titles), then AniList for
+    //           per-episode coverage + absolute-numbering id, then OMDb.
+    // Putting AniList behind TVDB avoids native-Japanese titles
+    // overwriting English ones in primary-mode writes, while keeping
+    // AniList available for the episodes TVDB doesn't have. Operators
+    // can reorder via /admin/libraries/{id}/agents.
+    match input.kind {
+        crate::models::LibraryKind::Movies => {
+            sqlx::query(
+                "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
+                 VALUES (?, 'tmdb', 0, 1, '{}'), (?, 'tvdb', 1, 1, '{}'), (?, 'omdb', 2, 1, '{}')",
+            )
+            .bind(lib_id).bind(lib_id).bind(lib_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        crate::models::LibraryKind::Shows => {
+            sqlx::query(
+                "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
+                 VALUES (?, 'tvdb', 0, 1, '{}'), (?, 'tmdb', 1, 1, '{}'),
+                        (?, 'tvmaze', 2, 1, '{}'), (?, 'omdb', 3, 1, '{}')",
+            )
+            .bind(lib_id).bind(lib_id).bind(lib_id).bind(lib_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        crate::models::LibraryKind::Anime => {
+            sqlx::query(
+                "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
+                 VALUES (?, 'tvdb', 0, 1, '{}'), (?, 'anilist', 1, 1, '{}'),
+                        (?, 'omdb', 2, 1, '{}')",
+            )
+            .bind(lib_id).bind(lib_id).bind(lib_id)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     tx.commit().await?;
@@ -268,6 +267,19 @@ pub async fn update_library(
             .bind(id)
             .execute(&mut *tx)
             .await?;
+    }
+    if let Some(v) = &update.primary_metadata_agent {
+        if v != "tmdb" && v != "tvdb" {
+            anyhow::bail!("primary_metadata_agent must be 'tmdb' or 'tvdb'");
+        }
+        sqlx::query(
+            "UPDATE libraries SET primary_metadata_agent = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(v)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     tx.commit().await?;
@@ -408,19 +420,26 @@ pub async fn update_scan_counters(
     files_updated: i64,
     files_removed: i64,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE scan_jobs
-         SET files_seen = ?, files_added = ?, files_updated = ?, files_removed = ?
-         WHERE id = ?",
-    )
-    .bind(files_seen)
-    .bind(files_added)
-    .bind(files_updated)
-    .bind(files_removed)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    // Periodic counter update racing 8 concurrent process_file writers
+    // is a textbook BUSY/517 trigger. The retry wrapper absorbs the
+    // common case; the call site in scanner.rs also treats failure as
+    // non-fatal so a worst-case timeout never aborts the scan.
+    crate::db::with_busy_retry(|| async {
+        sqlx::query(
+            "UPDATE scan_jobs
+             SET files_seen = ?, files_added = ?, files_updated = ?, files_removed = ?
+             WHERE id = ?",
+        )
+        .bind(files_seen)
+        .bind(files_added)
+        .bind(files_updated)
+        .bind(files_removed)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+    .await
 }
 
 pub async fn mark_scan_completed(
@@ -619,6 +638,22 @@ pub async fn list_items(
 
 /// Items the user has played, newest-first. Includes finished + in-progress.
 /// Differs from on-deck which surfaces just resume-able items.
+/// Surface items the user has played, ordered most-recent first.
+///
+/// `play_state` is keyed by exactly one of `item_id` (movies) or
+/// `episode_id` (TV/anime episodes) — never both, enforced by a CHECK
+/// constraint. A naïve `JOIN play_state ON ps.item_id = i.id` therefore
+/// only surfaces movies, because for shows the play state lives one
+/// table down (on episodes). The pre-fix history page was empty for
+/// every show the user had watched.
+///
+/// This query unifies both shapes via a CTE: each row in the inner
+/// `played` set is `(item_id, play_state_columns)` where `item_id`
+/// resolves to the *show*'s id for episode-keyed play states (via
+/// `episodes → seasons → show_id`). A window function picks the
+/// most-recent play state per item — for shows, that's the most-recent
+/// episode the user touched, which matches what users expect to see in
+/// a "continue watching" / "recently watched" feed.
 pub async fn list_watch_history(
     pool: &SqlitePool,
     user_id: i64,
@@ -626,14 +661,69 @@ pub async fn list_watch_history(
     accessible: Option<&[i64]>,
 ) -> Result<Vec<ListedItem>> {
     let filter = library_filter_sql("i.library_id", accessible);
+    // Note: `?1` and `?2` bind by position — SQLite's positional
+    // parameters let us reference `user_id` repeatedly without
+    // re-binding. The user_id appears in both branches of the UNION
+    // (movie + show), so the alternative would be three identical
+    // `.bind(user_id)` calls; positional is just less error-prone.
     let sql = format!(
-        "{ITEM_SELECT} \
-         WHERE ps.user_id = ? AND ps.last_played_at IS NOT NULL AND {filter} \
-         ORDER BY ps.last_played_at DESC \
-         LIMIT ?",
+        "WITH effective AS (
+            SELECT
+                src.item_id AS item_id,
+                src.position_ms AS position_ms,
+                src.duration_ms AS duration_ms,
+                src.watched AS watched,
+                src.view_count AS view_count,
+                src.last_played_at AS last_played_at,
+                row_number() OVER (
+                    PARTITION BY src.item_id
+                    ORDER BY src.last_played_at DESC
+                ) AS rn
+            FROM (
+                -- Movie-style: item-level play state. `item_id` already
+                -- points at the movie's items row.
+                SELECT ps.item_id AS item_id,
+                       ps.position_ms, ps.duration_ms, ps.watched,
+                       ps.view_count, ps.last_played_at
+                  FROM play_state ps
+                 WHERE ps.user_id = ?1
+                   AND ps.item_id IS NOT NULL
+                   AND ps.last_played_at IS NOT NULL
+                UNION ALL
+                -- Show-style: episode-level play state, rolled up to the
+                -- show. The position/duration here belong to whichever
+                -- episode this row represents; the window function above
+                -- picks the most-recent one per show.
+                SELECT s.show_id AS item_id,
+                       ps.position_ms, ps.duration_ms, ps.watched,
+                       ps.view_count, ps.last_played_at
+                  FROM play_state ps
+                  JOIN episodes e ON e.id = ps.episode_id
+                  JOIN seasons s ON s.id = e.season_id
+                 WHERE ps.user_id = ?1
+                   AND ps.episode_id IS NOT NULL
+                   AND ps.last_played_at IS NOT NULL
+            ) AS src
+        )
+        SELECT i.*,
+            (SELECT source_url FROM images
+                WHERE item_id = i.id AND kind = 'poster'
+                ORDER BY is_primary DESC, id ASC LIMIT 1) AS poster_path,
+            (SELECT source_url FROM images
+                WHERE item_id = i.id AND kind = 'backdrop'
+                ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path,
+            eff.position_ms     AS ps_position_ms,
+            eff.duration_ms     AS ps_duration_ms,
+            eff.watched         AS ps_watched,
+            eff.view_count      AS ps_view_count,
+            eff.last_played_at  AS ps_last_played_at
+          FROM effective eff
+          JOIN items i ON i.id = eff.item_id
+         WHERE eff.rn = 1 AND {filter}
+         ORDER BY eff.last_played_at DESC
+         LIMIT ?2",
     );
     let rows = sqlx::query(&sql)
-        .bind(user_id)
         .bind(user_id)
         .bind(limit)
         .fetch_all(pool)
@@ -1481,27 +1571,44 @@ pub async fn list_markers_for_file(pool: &SqlitePool, media_file_id: i64) -> Res
         .collect()
 }
 
-/// Replace previously auto-detected markers for this file with `new_markers`.
-/// Manually-edited markers (source != 'auto') are preserved.
-pub async fn replace_auto_markers(
+/// Replace previously auto-detected markers for this file with
+/// `new_markers`. Each row carries its own `source` so the operator
+/// UI can distinguish between detection methods:
+///
+/// * `embedded` — container chapter title matched an intro/credits
+///   pattern (highest confidence, no audio decode ran).
+/// * `tacet` — audio fingerprint match against the season's
+///   reference set.
+/// * `blackframe` — fallback heuristic for credits when no other
+///   signal is available.
+///
+/// Operator-edited rows (`source = 'manual'`) are preserved. The
+/// DELETE clause covers every known auto source plus the legacy
+/// `'auto'` value so historical rows from before phase 71 are
+/// also replaced on the next pass.
+pub async fn replace_detected_markers(
     pool: &SqlitePool,
     media_file_id: i64,
-    new_markers: &[(String, i64, i64)],
+    new_markers: &[(String, i64, i64, String)],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM markers WHERE media_file_id = ? AND source = 'auto'")
-        .bind(media_file_id)
-        .execute(&mut *tx)
-        .await?;
-    for (kind, start_ms, end_ms) in new_markers {
+    sqlx::query(
+        "DELETE FROM markers WHERE media_file_id = ? \
+         AND source IN ('auto', 'embedded', 'tacet', 'blackframe')",
+    )
+    .bind(media_file_id)
+    .execute(&mut *tx)
+    .await?;
+    for (kind, start_ms, end_ms, source) in new_markers {
         sqlx::query(
             "INSERT INTO markers (media_file_id, kind, start_ms, end_ms, source) \
-             VALUES (?, ?, ?, ?, 'auto')",
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(media_file_id)
         .bind(kind)
         .bind(start_ms)
         .bind(end_ms)
+        .bind(source)
         .execute(&mut *tx)
         .await?;
     }
@@ -1589,9 +1696,9 @@ pub async fn show_and_season_for_media_file(
 }
 
 /// Replace every manual marker on a media file with `new_markers`.
-/// Auto-detected rows (source='auto') are preserved so a re-run of
-/// the detection task overlaps cleanly with the operator's edits.
-/// Symmetric to [`replace_auto_markers`].
+/// Auto-detected rows (any non-manual source) are preserved so a
+/// re-run of the detection task overlaps cleanly with the
+/// operator's edits. Symmetric to [`replace_detected_markers`].
 pub async fn replace_manual_markers(
     pool: &SqlitePool,
     media_file_id: i64,
@@ -1652,9 +1759,9 @@ pub async fn list_media_files_in_library(
 /// markers. Used by the scheduled `detect_markers` task to skip
 /// previously-processed files — keeps the maintenance-window run
 /// idempotent on subsequent runs (only new files get the expensive
-/// blackdetect pass). Operator-triggered re-detection still uses
+/// detection pass). Operator-triggered re-detection still uses
 /// `list_media_files_in_library` and overwrites via
-/// `replace_auto_markers`.
+/// `replace_detected_markers`.
 pub async fn list_media_files_needing_markers(
     pool: &SqlitePool,
     library_id: i64,
@@ -1670,7 +1777,7 @@ pub async fn list_media_files_needing_markers(
          WHERE (i.library_id = ? OR shows.library_id = ?)
            AND mf.removed_at IS NULL
            AND NOT EXISTS (
-               SELECT 1 FROM markers WHERE media_file_id = mf.id AND source = 'auto'
+               SELECT 1 FROM markers WHERE media_file_id = mf.id AND source != 'manual'
            )
          ORDER BY mf.id
          LIMIT ?",
@@ -3898,8 +4005,8 @@ pub async fn verify_library(pool: &SqlitePool, library_id: i64) -> Result<Verify
 
 /// Hard-delete media_files whose `removed_at` is older than the
 /// grace window. Cascades via the existing FK chains:
-/// `media_streams`, `markers`, `preview_sprites` rows attached to
-/// these files vanish automatically (`ON DELETE CASCADE`).
+/// `media_streams`, `markers` rows attached to these files vanish
+/// automatically (`ON DELETE CASCADE`).
 ///
 /// After the file delete, sweep parent rows that have been left
 /// childless:
@@ -3994,9 +4101,7 @@ pub async fn purge_removed_media_files(
 /// turned on and that the actor is an owner.
 ///
 /// Returns the same `PurgeReport` shape as the scheduled purge so the
-/// admin UI / API consumer can show the same summary. `purged_paths`
-/// includes preview sprite paths in addition to the source file paths
-/// — both need on-disk cleanup by the caller.
+/// admin UI / API consumer can show the same summary.
 pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Result<PurgeReport> {
     let mut report = PurgeReport::default();
     if file_ids.is_empty() {
@@ -4007,11 +4112,10 @@ pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Re
         .join(",");
 
     // Collect the on-disk artefacts we need to clean up after the row
-    // DELETE: the source file path itself, and the preview sprite path
-    // (when present). FK cascade drops media_streams / markers /
+    // DELETE. FK cascade drops media_streams / markers /
     // optimized_versions rows but doesn't touch the filesystem.
     let select_sql =
-        format!("SELECT path, preview_sprite_path FROM media_files WHERE id IN ({placeholders})");
+        format!("SELECT path FROM media_files WHERE id IN ({placeholders})");
     let mut q = sqlx::query(&select_sql);
     for id in file_ids {
         q = q.bind(*id);
@@ -4020,9 +4124,6 @@ pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Re
     for row in rows {
         let path: String = row.try_get("path")?;
         report.purged_paths.push(path);
-        if let Ok(Some(sprite)) = row.try_get::<Option<String>, _>("preview_sprite_path") {
-            report.purged_paths.push(sprite);
-        }
     }
 
     let delete_sql = format!("DELETE FROM media_files WHERE id IN ({placeholders})");
@@ -4237,28 +4338,263 @@ pub async fn upsert_season(pool: &SqlitePool, show_id: i64, season_number: i32) 
     Ok(row.try_get("id")?)
 }
 
+/// Move an episode row to a different (season_number, episode_number)
+/// under the same show. Used by the absolute-episode resolver after a
+/// metadata agent reports per-season episode counts and we determine
+/// the file's on-disk number maps to a different season-relative
+/// position. Idempotent — if the episode is already at the target
+/// position, no-op.
+///
+/// When a row already exists at the target position (from a prior
+/// scan or a manual edit), the move is refused so we don't double-up
+/// `media_files` pointers. The caller logs and continues.
+pub async fn move_episode_to_season(
+    pool: &SqlitePool,
+    episode_id: i64,
+    target_season_number: i32,
+    target_episode_number: i32,
+) -> Result<bool> {
+    let show_id_row = sqlx::query(
+        "SELECT s.show_id FROM episodes e JOIN seasons s ON e.season_id = s.id WHERE e.id = ?",
+    )
+    .bind(episode_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = show_id_row else {
+        return Ok(false);
+    };
+    let show_id: i64 = row.try_get("show_id")?;
+
+    let target_season_id = upsert_season(pool, show_id, target_season_number).await?;
+
+    // Refuse the move if a different episode already occupies the
+    // target slot. Updating into it would either UNIQUE-violate or
+    // overwrite another scan's row.
+    let existing = sqlx::query(
+        "SELECT id FROM episodes WHERE season_id = ? AND episode_number = ? AND id != ?",
+    )
+    .bind(target_season_id)
+    .bind(target_episode_number)
+    .bind(episode_id)
+    .fetch_optional(pool)
+    .await?;
+    if existing.is_some() {
+        return Ok(false);
+    }
+
+    let now = now_ms();
+    let res = sqlx::query(
+        "UPDATE episodes
+         SET season_id = ?, episode_number = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(target_season_id)
+    .bind(target_episode_number)
+    .bind(now)
+    .bind(episode_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Set the per-show episode-numbering mode. Used by the absolute-ep
+/// resolver after first detection so subsequent files in the same
+/// show take the fast path through resolved (season, episode) instead
+/// of re-running detection. Default is `'season_relative'`; only
+/// flipped to `'absolute'` for anime shows where the on-disk numbering
+/// is the absolute episode index across the whole series.
+pub async fn set_episode_numbering_mode(
+    pool: &SqlitePool,
+    show_id: i64,
+    mode: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE items SET episode_numbering_mode = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(mode)
+    .bind(now_ms())
+    .bind(show_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Return the current `episode_numbering_mode` for a show.
+pub async fn get_episode_numbering_mode(pool: &SqlitePool, show_id: i64) -> Result<String> {
+    let row = sqlx::query("SELECT episode_numbering_mode FROM items WHERE id = ?")
+        .bind(show_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row
+        .and_then(|r| r.try_get::<String, _>("episode_numbering_mode").ok())
+        .unwrap_or_else(|| "season_relative".to_string()))
+}
+
+/// One-shot heal pass: re-sanitize every episode title that matches
+/// the "looks filename-derived" pattern set. Runs at server startup so
+/// rows that were upserted before the parser sanitizer + the
+/// `upsert_episode` CASE were widened still get cleaned up without
+/// forcing the operator to touch every file's mtime + rescan.
+///
+/// Idempotent: matches the same GLOB / LIKE patterns
+/// `upsert_episode` uses to decide overwrite-eligibility, runs them
+/// through [`crate::parser::sanitize_title_pub`], and only updates
+/// rows where the sanitized form differs. A second invocation is a
+/// no-op.
+///
+/// Doesn't touch episodes whose row has `locked_fields` containing
+/// `'title'` — operators who hand-edited a title don't want their
+/// edit revoked by a routine startup pass.
+pub async fn heal_filename_derived_episode_titles(pool: &SqlitePool) -> Result<u64> {
+    let candidates = sqlx::query(
+        "SELECT e.id, e.title
+         FROM episodes e
+         LEFT JOIN items i ON i.id = (SELECT show_id FROM seasons WHERE id = e.season_id)
+         WHERE
+              length(trim(e.title)) = 0
+           OR e.title LIKE 'Episode %'
+           OR LOWER(e.title) LIKE '%1080p%'
+           OR LOWER(e.title) LIKE '%720p%'
+           OR LOWER(e.title) LIKE '%2160p%'
+           OR LOWER(e.title) LIKE '%480p%'
+           OR LOWER(e.title) LIKE '%web-dl%'
+           OR LOWER(e.title) LIKE '%webrip%'
+           OR LOWER(e.title) LIKE '%bluray%'
+           OR LOWER(e.title) LIKE '%blu-ray%'
+           OR LOWER(e.title) LIKE '%hevc%'
+           OR LOWER(e.title) LIKE '%x265%'
+           OR LOWER(e.title) LIKE '%x264%'
+           OR LOWER(e.title) LIKE '%10bit%'
+           OR LOWER(e.title) LIKE '%remux%'
+           OR e.title GLOB '[0-9][0-9] *'
+           OR e.title GLOB '[0-9][0-9][0-9] *'
+           OR e.title GLOB '[0-9][0-9][0-9][0-9] *'
+           OR e.title GLOB '[0-9][0-9]-*'
+           OR e.title GLOB '[0-9][0-9][0-9]-*'
+           OR e.title GLOB '[0-9][0-9][0-9][0-9]-*'
+           OR e.title GLOB '* -[A-Z]*'
+           OR e.title GLOB '* -[0-9]*'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut healed = 0u64;
+    let now = now_ms();
+    for row in candidates {
+        let id: i64 = row.try_get("id")?;
+        let title: String = row.try_get("title").unwrap_or_default();
+        let sanitized = crate::parser::sanitize_title_pub(&title);
+        // Skip when sanitization didn't change anything (the GLOB
+        // matched a substring but sanitize_title's narrower rules
+        // decided to keep it) or produced an empty result (no
+        // recoverable signal — leave the row alone so a later scan
+        // can replace it with `Episode N`).
+        if sanitized.is_empty() || sanitized == title {
+            continue;
+        }
+        let res = sqlx::query(
+            "UPDATE episodes SET title = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&sanitized)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        healed += res.rows_affected();
+    }
+    Ok(healed)
+}
+
+/// Delete `images` rows whose `source_url` is blank — these end up in
+/// the DB when an agent surfaces an empty string instead of `None`
+/// (notably TVDB's episode `image` field on episodes without stills).
+/// `<img src="">` reloads the current page and renders as a black tile
+/// in the UI; deleting the row makes the renderer fall through to the
+/// "no thumbnail" placeholder instead.
+///
+/// Idempotent — safe to run on every startup. Returns the number of
+/// rows removed so the boot path can log a sensible heal counter.
+pub async fn heal_blank_image_rows(pool: &SqlitePool) -> Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM images
+         WHERE source_url IS NULL
+            OR length(trim(source_url)) = 0",
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn upsert_episode(
     pool: &SqlitePool,
     season_id: i64,
     episode_number: i32,
     title: &str,
+    absolute_number: Option<i32>,
 ) -> Result<i64> {
     let now = now_ms();
+    // The CASE preserves a metadata-derived title across rescans
+    // (we don't want a TMDB / AniList title to revert to the parser's
+    // filename stem just because the file was re-seen) BUT must allow
+    // overwriting when the stored title clearly came from the parser
+    // — otherwise rows that pre-date the parser's sanitize_title fix
+    // stay broken forever ("026 - Each Ones Promise -OZR" never
+    // heals to "Each Ones Promise" because the CASE used to only
+    // catch "Episode N" stems).
+    //
+    // The pattern set below matches the same heuristic
+    // `looks_filename_derived` (queries.rs) uses for AniList fill-nulls:
+    //   - empty / "Episode N" — parser fallback
+    //   - quality tokens — unbracketed release-name leakage
+    //   - leading 2-4 digit prefix + dash — anime absolute-episode prefix
+    //   - " -Token$" — trailing kebab-style release group
+    //   - "Token-XYZ$" where the trailing token is uppercase / digit
+    //     (handled by the suffix glob `'*[a-z] -[A-Z]*'` and the
+    //     no-space variant)
+    //
+    // Owner-locked titles aren't checked here (upsert_episode predates
+    // the locks system); fix-match / Edit Metadata uses
+    // `replace_item_credits` and stores titles via a different path
+    // that goes through `fetch_locked_fields`.
     let row = sqlx::query(
-        "INSERT INTO episodes (season_id, episode_number, title, added_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+        "INSERT INTO episodes (season_id, episode_number, title, absolute_number, added_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(season_id, episode_number) DO UPDATE SET
              title = CASE
-                WHEN length(episodes.title) = 0 OR episodes.title LIKE 'Episode %'
+                WHEN length(trim(episodes.title)) = 0
+                  OR episodes.title LIKE 'Episode %'
+                  OR LOWER(episodes.title) LIKE '%1080p%'
+                  OR LOWER(episodes.title) LIKE '%720p%'
+                  OR LOWER(episodes.title) LIKE '%2160p%'
+                  OR LOWER(episodes.title) LIKE '%480p%'
+                  OR LOWER(episodes.title) LIKE '%web-dl%'
+                  OR LOWER(episodes.title) LIKE '%webrip%'
+                  OR LOWER(episodes.title) LIKE '%bluray%'
+                  OR LOWER(episodes.title) LIKE '%blu-ray%'
+                  OR LOWER(episodes.title) LIKE '%hevc%'
+                  OR LOWER(episodes.title) LIKE '%x265%'
+                  OR LOWER(episodes.title) LIKE '%x264%'
+                  OR LOWER(episodes.title) LIKE '%10bit%'
+                  OR LOWER(episodes.title) LIKE '%remux%'
+                  OR episodes.title GLOB '[0-9][0-9] *'
+                  OR episodes.title GLOB '[0-9][0-9][0-9] *'
+                  OR episodes.title GLOB '[0-9][0-9][0-9][0-9] *'
+                  OR episodes.title GLOB '[0-9][0-9]-*'
+                  OR episodes.title GLOB '[0-9][0-9][0-9]-*'
+                  OR episodes.title GLOB '[0-9][0-9][0-9][0-9]-*'
+                  OR episodes.title GLOB '* -[A-Z]*'
+                  OR episodes.title GLOB '* -[0-9]*'
                 THEN excluded.title
                 ELSE episodes.title
              END,
+             absolute_number = COALESCE(episodes.absolute_number, excluded.absolute_number),
              updated_at = excluded.updated_at
          RETURNING id",
     )
     .bind(season_id)
     .bind(episode_number)
     .bind(title)
+    .bind(absolute_number)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -4315,7 +4651,7 @@ pub async fn upsert_media_file(
             -- disk (the scanner only emits an upsert when it sees a
             -- candidate file). Clear the soft-delete marker so the
             -- row reappears in listings; preserves the existing id
-            -- so play_state / markers / preview sprites stay linked.
+            -- so play_state / markers stay linked.
             removed_at = NULL
          RETURNING id",
     )
@@ -4500,7 +4836,26 @@ fn pick<T>(locked: &[String], field: &str, value: T) -> Option<T> {
     }
 }
 
-pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMovie) -> Result<()> {
+/// Write TMDB movie metadata to `items`.
+///
+/// `is_primary` selects the merge mode:
+/// - `true`: TMDB is the canonical source for this library — its title /
+///   summary / tagline / year / genres / posters overwrite existing
+///   values (subject to per-field locks). The legacy semantics; used
+///   when TMDB is first in the library's agent chain, or when the
+///   operator hits the Refresh button.
+/// - `false`: TMDB is running behind another primary agent (e.g. AniList
+///   for an anime library where the operator ranked TMDB lower). All
+///   shared fields fill nulls only; TMDB-owned identifiers (tmdb_id,
+///   imdb_id, logo_path) still backfill if missing. Genres are unioned
+///   rather than replaced; posters/backdrops insert only when none of
+///   that kind already exist.
+pub async fn apply_movie_metadata(
+    pool: &SqlitePool,
+    item_id: i64,
+    meta: &TmdbMovie,
+    is_primary: bool,
+) -> Result<()> {
     let now = now_ms();
     let locked = fetch_locked_fields(pool, item_id).await?;
     let title = pick(&locked, "title", meta.title.clone());
@@ -4525,79 +4880,405 @@ pub async fn apply_movie_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbMo
     // ≤ 1500px wide at original; w500 keeps payload light.
     let logo_url = meta.logo_path.as_deref().map(|p| tmdb_image_url(p, "w500"));
 
-    // `title_present` is the gate for the "title-derived fields"
-    // (original_title / summary / tagline) — if TMDB returned no title
-    // we don't overwrite them. Bound once, referenced via three CASEs.
-    let title_present = title.is_some();
-    sqlx::query(
-        "UPDATE items SET
-            title = COALESCE(?, title),
-            original_title = CASE WHEN ? THEN ? ELSE original_title END,
-            summary = CASE WHEN ? THEN ? ELSE summary END,
-            tagline = CASE WHEN ? THEN ? ELSE tagline END,
-            year = COALESCE(?, year),
-            duration_ms = COALESCE(duration_ms, ?),
-            rating_audience = COALESCE(?, rating_audience),
-            tmdb_id = ?,
-            imdb_id = COALESCE(?, imdb_id),
-            logo_path = COALESCE(?, logo_path),
-            refreshed_at = ?,
-            updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&title)
-    .bind(title_present)
-    .bind(&original_title)
-    .bind(title_present)
-    .bind(&summary)
-    .bind(title_present)
-    .bind(&tagline)
-    .bind(year)
-    .bind(duration_ms)
-    .bind(rating_audience)
-    .bind(meta.tmdb_id)
-    .bind(meta.imdb_id.as_deref())
-    .bind(logo_url.as_deref())
-    .bind(now)
-    .bind(now)
-    .bind(item_id)
-    .execute(pool)
-    .await?;
+    if is_primary {
+        // `title_present` is the gate for the "title-derived fields"
+        // (original_title / summary / tagline) — if TMDB returned no
+        // title we don't overwrite them. Bound once, referenced via
+        // three CASEs.
+        let title_present = title.is_some();
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(?, title),
+                original_title = CASE WHEN ? THEN ? ELSE original_title END,
+                summary = CASE WHEN ? THEN ? ELSE summary END,
+                tagline = CASE WHEN ? THEN ? ELSE tagline END,
+                year = COALESCE(?, year),
+                duration_ms = COALESCE(duration_ms, ?),
+                rating_audience = COALESCE(?, rating_audience),
+                tmdb_id = ?,
+                imdb_id = COALESCE(?, imdb_id),
+                logo_path = COALESCE(?, logo_path),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(title_present)
+        .bind(&original_title)
+        .bind(title_present)
+        .bind(&summary)
+        .bind(title_present)
+        .bind(&tagline)
+        .bind(year)
+        .bind(duration_ms)
+        .bind(rating_audience)
+        .bind(meta.tmdb_id)
+        .bind(meta.imdb_id.as_deref())
+        .bind(logo_url.as_deref())
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    } else {
+        // Non-primary mode: fill nulls only. `COALESCE(col, ?)` keeps
+        // the existing value when set. `tmdb_id` is TMDB-owned so we
+        // still backfill it when missing — needed for downstream
+        // operations (collection lookup, credits) to function.
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(title, ?),
+                original_title = COALESCE(original_title, ?),
+                summary = COALESCE(summary, ?),
+                tagline = COALESCE(tagline, ?),
+                year = COALESCE(year, ?),
+                duration_ms = COALESCE(duration_ms, ?),
+                rating_audience = COALESCE(rating_audience, ?),
+                tmdb_id = COALESCE(tmdb_id, ?),
+                imdb_id = COALESCE(imdb_id, ?),
+                logo_path = COALESCE(logo_path, ?),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&original_title)
+        .bind(&summary)
+        .bind(&tagline)
+        .bind(year)
+        .bind(duration_ms)
+        .bind(rating_audience)
+        .bind(meta.tmdb_id)
+        .bind(meta.imdb_id.as_deref())
+        .bind(logo_url.as_deref())
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    }
 
     if !is_locked(&locked, "genres") {
-        apply_genres(pool, item_id, &meta.genres).await?;
+        if is_primary {
+            apply_genres(pool, item_id, &meta.genres).await?;
+        } else {
+            apply_genres_additive(pool, item_id, &meta.genres).await?;
+        }
     }
     if !is_locked(&locked, "poster") {
         if let Some(p) = &meta.poster_path {
-            store_image(
-                pool,
-                Some(item_id),
-                None,
-                "poster",
-                "tmdb",
-                &tmdb_image_url(p, "w500"),
-            )
-            .await?;
+            let url = tmdb_image_url(p, "w500");
+            if is_primary {
+                store_image(pool, Some(item_id), None, "poster", "tmdb", &url).await?;
+            } else {
+                store_image_if_missing(pool, Some(item_id), None, "poster", "tmdb", &url).await?;
+            }
         }
     }
     if !is_locked(&locked, "backdrop") {
         if let Some(p) = &meta.backdrop_path {
-            store_image(
-                pool,
-                Some(item_id),
-                None,
-                "backdrop",
-                "tmdb",
-                &tmdb_image_url(p, "w1280"),
-            )
-            .await?;
+            let url = tmdb_image_url(p, "w1280");
+            if is_primary {
+                store_image(pool, Some(item_id), None, "backdrop", "tmdb", &url).await?;
+            } else {
+                store_image_if_missing(pool, Some(item_id), None, "backdrop", "tmdb", &url).await?;
+            }
         }
     }
 
     Ok(())
 }
 
-pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbShow) -> Result<()> {
+/// Polymorphic movie writer. Accepts a [`MovieData`] (the
+/// agent-agnostic common shape) and writes only the columns the agent
+/// populated. `mode` selects between Primary (overwrite null-or-stale)
+/// and FillNulls (only write to NULL columns). Locked fields are
+/// honored in both modes.
+///
+/// This is the path scan-time enrichment uses post-Slice-3. Provider-
+/// specific writers (`apply_movie_metadata` for TMDB,
+/// `apply_movie_metadata_tvdb` for TVDB) remain available for legacy
+/// refresh paths until those are migrated too — they share the same
+/// underlying columns so running them in sequence is safe.
+pub async fn apply_movie_data(
+    pool: &SqlitePool,
+    item_id: i64,
+    data: &chimpflix_metadata::MovieData,
+    mode: WriteMode,
+    source: &str,
+) -> Result<()> {
+    let now = now_ms();
+    let locked = fetch_locked_fields(pool, item_id).await?;
+    let title = pick(&locked, "title", data.title.clone()).flatten();
+    let original_title = pick(&locked, "original_title", data.original_title.clone()).flatten();
+    let summary = pick(&locked, "summary", data.summary.clone()).flatten();
+    let tagline = pick(&locked, "tagline", data.tagline.clone()).flatten();
+    let year = pick(&locked, "year", data.year).flatten();
+    let rating_audience = pick(&locked, "rating_audience", data.rating_audience).flatten();
+    let duration_ms = data.runtime_ms;
+
+    if mode.overwrites() {
+        let title_present = title.is_some();
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(?, title),
+                original_title = CASE WHEN ? THEN ? ELSE original_title END,
+                summary = CASE WHEN ? THEN ? ELSE summary END,
+                tagline = CASE WHEN ? THEN ? ELSE tagline END,
+                year = COALESCE(?, year),
+                duration_ms = COALESCE(duration_ms, ?),
+                rating_audience = COALESCE(?, rating_audience),
+                tmdb_id = COALESCE(?, tmdb_id),
+                imdb_id = COALESCE(?, imdb_id),
+                tvdb_id = COALESCE(?, tvdb_id),
+                logo_path = COALESCE(?, logo_path),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(title_present)
+        .bind(&original_title)
+        .bind(title_present)
+        .bind(&summary)
+        .bind(title_present)
+        .bind(&tagline)
+        .bind(year)
+        .bind(duration_ms)
+        .bind(rating_audience)
+        .bind(data.tmdb_id)
+        .bind(data.imdb_id.as_deref())
+        .bind(data.tvdb_id)
+        .bind(data.logo_url.as_deref())
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(title, ?),
+                original_title = COALESCE(original_title, ?),
+                summary = COALESCE(summary, ?),
+                tagline = COALESCE(tagline, ?),
+                year = COALESCE(year, ?),
+                duration_ms = COALESCE(duration_ms, ?),
+                rating_audience = COALESCE(rating_audience, ?),
+                tmdb_id = COALESCE(tmdb_id, ?),
+                imdb_id = COALESCE(imdb_id, ?),
+                tvdb_id = COALESCE(tvdb_id, ?),
+                logo_path = COALESCE(logo_path, ?),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&original_title)
+        .bind(&summary)
+        .bind(&tagline)
+        .bind(year)
+        .bind(duration_ms)
+        .bind(rating_audience)
+        .bind(data.tmdb_id)
+        .bind(data.imdb_id.as_deref())
+        .bind(data.tvdb_id)
+        .bind(data.logo_url.as_deref())
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    }
+
+    if !is_locked(&locked, "genres") && !data.genres.is_empty() {
+        if mode.overwrites() {
+            apply_genres(pool, item_id, &data.genres).await?;
+        } else {
+            apply_genres_additive(pool, item_id, &data.genres).await?;
+        }
+    }
+
+    if !is_locked(&locked, "poster") {
+        for variant in data.posters.iter().take(1) {
+            if mode.overwrites() {
+                store_image(pool, Some(item_id), None, "poster", source, &variant.url).await?;
+            } else {
+                store_image_if_missing(
+                    pool,
+                    Some(item_id),
+                    None,
+                    "poster",
+                    source,
+                    &variant.url,
+                )
+                .await?;
+            }
+        }
+    }
+    if !is_locked(&locked, "backdrop") {
+        for variant in data.backdrops.iter().take(1) {
+            if mode.overwrites() {
+                store_image(pool, Some(item_id), None, "backdrop", source, &variant.url).await?;
+            } else {
+                store_image_if_missing(
+                    pool,
+                    Some(item_id),
+                    None,
+                    "backdrop",
+                    source,
+                    &variant.url,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Polymorphic show writer. Mirror of [`apply_movie_data`] for TV.
+/// AniList ids and TVMaze ids are written exclusively here — they were
+/// previously kept in agent-specific writers. Columns are added
+/// idempotently by each agent's pass through the chain.
+pub async fn apply_show_data(
+    pool: &SqlitePool,
+    item_id: i64,
+    data: &chimpflix_metadata::ShowData,
+    mode: WriteMode,
+    source: &str,
+) -> Result<()> {
+    let now = now_ms();
+    let locked = fetch_locked_fields(pool, item_id).await?;
+    let title = pick(&locked, "title", data.title.clone()).flatten();
+    let original_title = pick(&locked, "original_title", data.original_title.clone()).flatten();
+    let summary = pick(&locked, "summary", data.summary.clone()).flatten();
+    let year = pick(&locked, "year", data.year).flatten();
+
+    if mode.overwrites() {
+        let title_present = title.is_some();
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(?, title),
+                original_title = CASE WHEN ? THEN ? ELSE original_title END,
+                summary = CASE WHEN ? THEN ? ELSE summary END,
+                year = COALESCE(?, year),
+                tmdb_id = COALESCE(?, tmdb_id),
+                imdb_id = COALESCE(?, imdb_id),
+                tvdb_id = COALESCE(?, tvdb_id),
+                anilist_id = COALESCE(?, anilist_id),
+                tvmaze_id = COALESCE(?, tvmaze_id),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(title_present)
+        .bind(&original_title)
+        .bind(title_present)
+        .bind(&summary)
+        .bind(year)
+        .bind(data.tmdb_id)
+        .bind(data.imdb_id.as_deref())
+        .bind(data.tvdb_id)
+        .bind(data.anilist_id)
+        .bind(data.tvmaze_id)
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(title, ?),
+                original_title = COALESCE(original_title, ?),
+                summary = COALESCE(summary, ?),
+                year = COALESCE(year, ?),
+                tmdb_id = COALESCE(tmdb_id, ?),
+                imdb_id = COALESCE(imdb_id, ?),
+                tvdb_id = COALESCE(tvdb_id, ?),
+                anilist_id = COALESCE(anilist_id, ?),
+                tvmaze_id = COALESCE(tvmaze_id, ?),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&original_title)
+        .bind(&summary)
+        .bind(year)
+        .bind(data.tmdb_id)
+        .bind(data.imdb_id.as_deref())
+        .bind(data.tvdb_id)
+        .bind(data.anilist_id)
+        .bind(data.tvmaze_id)
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    }
+
+    if !is_locked(&locked, "genres") && !data.genres.is_empty() {
+        if mode.overwrites() {
+            apply_genres(pool, item_id, &data.genres).await?;
+        } else {
+            apply_genres_additive(pool, item_id, &data.genres).await?;
+        }
+    }
+
+    if !is_locked(&locked, "poster") {
+        for variant in data.posters.iter().take(1) {
+            if mode.overwrites() {
+                store_image(pool, Some(item_id), None, "poster", source, &variant.url).await?;
+            } else {
+                store_image_if_missing(
+                    pool,
+                    Some(item_id),
+                    None,
+                    "poster",
+                    source,
+                    &variant.url,
+                )
+                .await?;
+            }
+        }
+    }
+    if !is_locked(&locked, "backdrop") {
+        for variant in data.backdrops.iter().take(1) {
+            if mode.overwrites() {
+                store_image(pool, Some(item_id), None, "backdrop", source, &variant.url).await?;
+            } else {
+                store_image_if_missing(
+                    pool,
+                    Some(item_id),
+                    None,
+                    "backdrop",
+                    source,
+                    &variant.url,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Write TMDB show metadata to `items`.
+///
+/// `is_primary` selects the merge mode — see `apply_movie_metadata`
+/// for the rationale. Briefly: primary overwrites shared fields, non-
+/// primary fills nulls. Episode-level enrichment is unaffected — see
+/// `apply_episode_metadata` (always runs when TMDB is enabled, since
+/// no other agent supplies per-episode metadata today).
+pub async fn apply_show_metadata(
+    pool: &SqlitePool,
+    item_id: i64,
+    meta: &TmdbShow,
+    is_primary: bool,
+) -> Result<()> {
     let now = now_ms();
     let locked = fetch_locked_fields(pool, item_id).await?;
     let title = pick(&locked, "title", meta.title.clone());
@@ -4612,62 +5293,90 @@ pub async fn apply_show_metadata(pool: &SqlitePool, item_id: i64, meta: &TmdbSho
     let year = pick(&locked, "year", meta.year).flatten();
     let logo_url = meta.logo_path.as_deref().map(|p| tmdb_image_url(p, "w500"));
 
-    let title_present = title.is_some();
-    sqlx::query(
-        "UPDATE items SET
-            title = COALESCE(?, title),
-            original_title = CASE WHEN ? THEN ? ELSE original_title END,
-            summary = CASE WHEN ? THEN ? ELSE summary END,
-            year = COALESCE(?, year),
-            tmdb_id = ?,
-            imdb_id = COALESCE(?, imdb_id),
-            logo_path = COALESCE(?, logo_path),
-            refreshed_at = ?,
-            updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&title)
-    .bind(title_present)
-    .bind(&original_title)
-    .bind(title_present)
-    .bind(&summary)
-    .bind(year)
-    .bind(meta.tmdb_id)
-    .bind(meta.imdb_id.as_deref())
-    .bind(logo_url.as_deref())
-    .bind(now)
-    .bind(now)
-    .bind(item_id)
-    .execute(pool)
-    .await?;
+    if is_primary {
+        let title_present = title.is_some();
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(?, title),
+                original_title = CASE WHEN ? THEN ? ELSE original_title END,
+                summary = CASE WHEN ? THEN ? ELSE summary END,
+                year = COALESCE(?, year),
+                tmdb_id = ?,
+                imdb_id = COALESCE(?, imdb_id),
+                logo_path = COALESCE(?, logo_path),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(title_present)
+        .bind(&original_title)
+        .bind(title_present)
+        .bind(&summary)
+        .bind(year)
+        .bind(meta.tmdb_id)
+        .bind(meta.imdb_id.as_deref())
+        .bind(logo_url.as_deref())
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    } else {
+        // Non-primary mode: fill nulls only. `tmdb_id` still backfills
+        // because downstream episode enrichment depends on it.
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(title, ?),
+                original_title = COALESCE(original_title, ?),
+                summary = COALESCE(summary, ?),
+                year = COALESCE(year, ?),
+                tmdb_id = COALESCE(tmdb_id, ?),
+                imdb_id = COALESCE(imdb_id, ?),
+                logo_path = COALESCE(logo_path, ?),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&original_title)
+        .bind(&summary)
+        .bind(year)
+        .bind(meta.tmdb_id)
+        .bind(meta.imdb_id.as_deref())
+        .bind(logo_url.as_deref())
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    }
 
     if !is_locked(&locked, "genres") {
-        apply_genres(pool, item_id, &meta.genres).await?;
+        if is_primary {
+            apply_genres(pool, item_id, &meta.genres).await?;
+        } else {
+            apply_genres_additive(pool, item_id, &meta.genres).await?;
+        }
     }
     if !is_locked(&locked, "poster") {
         if let Some(p) = &meta.poster_path {
-            store_image(
-                pool,
-                Some(item_id),
-                None,
-                "poster",
-                "tmdb",
-                &tmdb_image_url(p, "w500"),
-            )
-            .await?;
+            let url = tmdb_image_url(p, "w500");
+            if is_primary {
+                store_image(pool, Some(item_id), None, "poster", "tmdb", &url).await?;
+            } else {
+                store_image_if_missing(pool, Some(item_id), None, "poster", "tmdb", &url).await?;
+            }
         }
     }
     if !is_locked(&locked, "backdrop") {
         if let Some(p) = &meta.backdrop_path {
-            store_image(
-                pool,
-                Some(item_id),
-                None,
-                "backdrop",
-                "tmdb",
-                &tmdb_image_url(p, "w1280"),
-            )
-            .await?;
+            let url = tmdb_image_url(p, "w1280");
+            if is_primary {
+                store_image(pool, Some(item_id), None, "backdrop", "tmdb", &url).await?;
+            } else {
+                store_image_if_missing(pool, Some(item_id), None, "backdrop", "tmdb", &url).await?;
+            }
         }
     }
 
@@ -5395,15 +6104,17 @@ pub async fn apply_show_metadata_tvmaze(
     Ok(())
 }
 
-/// Apply AniList show metadata as the **primary** source for an anime
-/// item. Distinct from `apply_show_metadata_tvmaze`/`_tvdb` which only
-/// fill nulls — here we overwrite null-or-stale columns with AniList's
-/// canonical values for fields AniList owns (anilist_id, original_title,
-/// summary, year, duration_ms), while still honoring per-item locks.
+/// Write AniList show metadata to `items`.
+///
+/// `is_primary` selects the merge mode — see `apply_movie_metadata`
+/// for the rationale. AniList is the typical primary for anime
+/// libraries (the seed-default ordering puts it first), but operators
+/// can rank it lower and have it run as a null-filler behind TMDB.
 pub async fn apply_show_metadata_anilist(
     pool: &SqlitePool,
     item_id: i64,
     meta: &AniListShow,
+    is_primary: bool,
 ) -> Result<()> {
     let now = now_ms();
     let locked = fetch_locked_fields(pool, item_id).await?;
@@ -5426,29 +6137,59 @@ pub async fn apply_show_metadata_anilist(
     )
     .flatten();
 
-    sqlx::query(
-        "UPDATE items SET
-            title = COALESCE(?, title),
-            original_title = COALESCE(?, original_title),
-            summary = COALESCE(?, summary),
-            year = COALESCE(?, year),
-            duration_ms = COALESCE(?, duration_ms),
-            anilist_id = COALESCE(?, anilist_id),
-            refreshed_at = ?,
-            updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&title)
-    .bind(&original_title)
-    .bind(&summary)
-    .bind(year)
-    .bind(duration_ms)
-    .bind(anilist_id)
-    .bind(now)
-    .bind(now)
-    .bind(item_id)
-    .execute(pool)
-    .await?;
+    if is_primary {
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(?, title),
+                original_title = COALESCE(?, original_title),
+                summary = COALESCE(?, summary),
+                year = COALESCE(?, year),
+                duration_ms = COALESCE(?, duration_ms),
+                anilist_id = COALESCE(?, anilist_id),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&original_title)
+        .bind(&summary)
+        .bind(year)
+        .bind(duration_ms)
+        .bind(anilist_id)
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    } else {
+        // Non-primary mode: fill nulls only on shared fields. The
+        // anilist_id column is AniList-owned, so it backfills even
+        // in non-primary mode (downstream episode enrichment will
+        // depend on it once that lands).
+        sqlx::query(
+            "UPDATE items SET
+                title = COALESCE(title, ?),
+                original_title = COALESCE(original_title, ?),
+                summary = COALESCE(summary, ?),
+                year = COALESCE(year, ?),
+                duration_ms = COALESCE(duration_ms, ?),
+                anilist_id = COALESCE(anilist_id, ?),
+                refreshed_at = ?,
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&original_title)
+        .bind(&summary)
+        .bind(year)
+        .bind(duration_ms)
+        .bind(anilist_id)
+        .bind(now)
+        .bind(now)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+    }
 
     if !is_locked(&locked, "genres") {
         apply_genres_additive(pool, item_id, &meta.genres).await?;
@@ -5675,6 +6416,155 @@ async fn upsert_person_by_tmdb(
 
 /// Replace all credits for an item. Locked `credits` field skips the
 /// whole operation so user-curated cast lists survive re-enrichment.
+/// Polymorphic item-credits writer. Mirror of
+/// [`apply_episode_credits_for_source`] for the show / movie level —
+/// reads `Vec<PersonCredit>` from [`MovieData`] or [`ShowData`] and
+/// writes to `item_credits` scoped by `source` so multi-source cast
+/// from different agents can coexist.
+pub async fn apply_item_credits_for_source(
+    pool: &SqlitePool,
+    item_id: i64,
+    people: &[chimpflix_metadata::PersonCredit],
+    source: &str,
+) -> Result<()> {
+    let locked = fetch_locked_fields(pool, item_id).await?;
+    if is_locked(&locked, "credits") {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM item_credits WHERE item_id = ? AND source = ?")
+        .bind(item_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+    if people.is_empty() {
+        tx.commit().await?;
+        return Ok(());
+    }
+    for credit in people {
+        let person_id: i64 = {
+            let row = sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+                .bind(&credit.name)
+                .bind(credit.profile_url.as_deref())
+                .fetch_one(&mut *tx)
+                .await?;
+            row.try_get("id")?
+        };
+        let role_kind = match credit.role.as_str() {
+            "actor" => "cast",
+            "director" | "writer" | "producer" | "crew" => credit.role.as_str(),
+            _ => "crew",
+        };
+        sqlx::query(
+            "INSERT INTO item_credits
+                (item_id, person_id, role_kind, role, character_name, sort_order, source)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(person_id)
+        .bind(role_kind)
+        .bind(&credit.role)
+        .bind(credit.character.as_deref())
+        .bind(credit.order as i64)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Polymorphic episode-credits writer. Reads the
+/// `people: Vec<PersonCredit>` field from [`EpisodeData`] and writes
+/// it to `episode_credits` with the supplied `source` (agent name).
+/// Scopes the DELETE-before-insert pattern by source so two agents'
+/// episode-cast lists can coexist (the apply layer reads them ordered
+/// by primary-source first, secondary-source second).
+///
+/// People are upserted by `(name, source_external_id)` — if a
+/// `PersonCredit::external_id` is present, we dedupe across runs of
+/// the same source via that id; otherwise we fall back to inserting a
+/// fresh `people` row each time (the cleanup pass can dedupe by name
+/// later).
+///
+/// No-op when `people` is empty.
+pub async fn apply_episode_credits_for_source(
+    pool: &SqlitePool,
+    episode_id: i64,
+    people: &[chimpflix_metadata::PersonCredit],
+    source: &str,
+) -> Result<()> {
+    if people.is_empty() {
+        // Even when empty we still scope-delete: the agent declared
+        // it returned no cast for this episode, which is a meaningful
+        // signal — e.g. clearing out stale rows from a prior scan.
+        sqlx::query("DELETE FROM episode_credits WHERE episode_id = ? AND source = ?")
+            .bind(episode_id)
+            .bind(source)
+            .execute(pool)
+            .await?;
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM episode_credits WHERE episode_id = ? AND source = ?")
+        .bind(episode_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
+    for credit in people {
+        // Upsert the person. People are deduped within a source by
+        // external_id; across sources they're separate rows for now
+        // (later cleanup can merge by canonical name). This keeps
+        // each agent's people graph independent so a TVDB rescan
+        // doesn't accidentally mutate TMDB-attributed rows.
+        let person_id: i64 = if let Some(ext) = credit.external_id.as_deref() {
+            // people table doesn't currently have a (source, external_id)
+            // unique constraint — fall through to a plain insert and
+            // accept that two scans may insert duplicate rows for the
+            // same external_id. The cleanup pass tracked in Slice 9
+            // will introduce that constraint.
+            let _ = ext;
+            let row = sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+                .bind(&credit.name)
+                .bind(credit.profile_url.as_deref())
+                .fetch_one(&mut *tx)
+                .await?;
+            row.try_get("id")?
+        } else {
+            let row = sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+                .bind(&credit.name)
+                .bind(credit.profile_url.as_deref())
+                .fetch_one(&mut *tx)
+                .await?;
+            row.try_get("id")?
+        };
+
+        let role_kind = match credit.role.as_str() {
+            "actor" => "cast",
+            "guest" => "guest",
+            other => other,
+        };
+        sqlx::query(
+            "INSERT INTO episode_credits
+                (episode_id, person_id, role_kind, role, character_name, sort_order, source)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(episode_id)
+        .bind(person_id)
+        .bind(role_kind)
+        .bind(&credit.role)
+        .bind(credit.character.as_deref())
+        .bind(credit.order as i64)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn apply_item_credits(
     pool: &SqlitePool,
     item_id: i64,
@@ -5684,8 +6574,13 @@ pub async fn apply_item_credits(
     if is_locked(&locked, "credits") {
         return Ok(());
     }
+    // Scope the DELETE to the TMDB source so a future TVDB credits
+    // pass doesn't wipe TMDB's rows from under it. The `source`
+    // column landed in phase 74 with a default of 'tmdb' for existing
+    // rows, so this DELETE catches both legacy untagged rows AND new
+    // TMDB writes from this function below.
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM item_credits WHERE item_id = ?")
+    sqlx::query("DELETE FROM item_credits WHERE item_id = ? AND source = 'tmdb'")
         .bind(item_id)
         .execute(&mut *tx)
         .await?;
@@ -5802,8 +6697,8 @@ pub async fn replace_item_credits(
         };
         sqlx::query(
             "INSERT INTO item_credits
-                (item_id, person_id, role_kind, role, character_name, sort_order)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                (item_id, person_id, role_kind, role, character_name, sort_order, source)
+             VALUES (?, ?, ?, ?, ?, ?, 'manual')",
         )
         .bind(item_id)
         .bind(person_id)
@@ -5845,7 +6740,7 @@ pub async fn replace_item_credits(
 pub async fn apply_item_extras(
     pool: &SqlitePool,
     item_id: i64,
-    videos: &[TmdbVideo],
+    videos: &[chimpflix_metadata::VideoLink],
 ) -> Result<()> {
     let locked = fetch_locked_fields(pool, item_id).await?;
     if is_locked(&locked, "extras") {
@@ -5857,16 +6752,16 @@ pub async fn apply_item_extras(
         .execute(&mut *tx)
         .await?;
     for (idx, v) in videos.iter().enumerate() {
+        // VideoLink.kind already comes in the lowercased common shape
+        // ("trailer", "teaser", etc.). Map directly into the column
+        // value, with "other" -> "clip" as the catch-all.
         let kind = match v.kind.as_str() {
-            "Trailer" => "trailer",
-            "Teaser" => "teaser",
-            "Featurette" => "featurette",
-            "Behind the Scenes" => "behind_the_scenes",
-            "Clip" => "clip",
+            "trailer" | "teaser" | "featurette" | "clip" => v.kind.as_str(),
+            "behind-the-scenes" => "behind_the_scenes",
             _ => "clip",
         };
-        let thumb = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", v.key);
-        let published_ms = v.published_at.as_deref().and_then(parse_iso8601_ms);
+        let thumb = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", v.provider_key);
+        let published_ms = v.published_at_ms;
         sqlx::query(
             "INSERT OR IGNORE INTO item_extras
                 (item_id, kind, title, source, source_id, thumb_url, published_at, sort_order)
@@ -5880,7 +6775,7 @@ pub async fn apply_item_extras(
         } else {
             v.name.clone()
         })
-        .bind(&v.key)
+        .bind(&v.provider_key)
         .bind(&thumb)
         .bind(published_ms)
         .bind(idx as i64)
@@ -6118,18 +7013,48 @@ pub async fn enqueue_job(pool: &SqlitePool, input: JobInput) -> Result<i64> {
 /// match against `json_extract(payload, '$.<field>')` via a literal
 /// `payload LIKE` to avoid the json1 dependency. The payload must
 /// include a top-level field matching `dedup_field`.
+/// Enqueue a job IF no equivalent row already exists. Returns the new
+/// row id on insert, `None` on dedup-skip.
+///
+/// **Uses `BEGIN IMMEDIATE`** to acquire the writer lock up front rather
+/// than upgrading from a read snapshot. The previous deferred-BEGIN
+/// implementation hit `SQLITE_BUSY_SNAPSHOT` (code 517) constantly under
+/// load — its SELECT-for-dedup grabbed a read snapshot, and any concurrent
+/// writer (scanner per-file inserts, worker job-status updates) invalidated
+/// it by the time the INSERT tried to commit. The whole tx then needs an
+/// application-level retry, which busy_timeout does NOT provide.
+///
+/// **Wrapped in [`with_busy_retry`]** as a defensive net for the remaining
+/// race window: even with `BEGIN IMMEDIATE`, deep contention can still
+/// produce code 5 (BUSY waiting for the writer slot) if 30s of
+/// busy_timeout polling exhausts. Eight retries with exponential backoff
+/// absorb that.
 pub async fn enqueue_job_unique(
     pool: &SqlitePool,
     input: JobInput,
     dedup_field: &str,
     dedup_value: i64,
 ) -> Result<Option<i64>> {
-    let mut tx = pool.begin().await?;
-    // `&mut *tx` derefs through Transaction to the underlying
-    // SqliteConnection — matches the new tx-helper signatures.
-    let inserted = enqueue_job_unique_tx(&mut tx, input, dedup_field, dedup_value).await?;
-    tx.commit().await?;
-    Ok(inserted)
+    crate::db::with_busy_retry(|| {
+        let input = input.clone();
+        async move {
+            let mut conn = pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let result = enqueue_job_unique_tx(&mut conn, input, dedup_field, dedup_value).await;
+            match &result {
+                Ok(_) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                }
+                Err(_) => {
+                    // Best-effort rollback — sqlx will reset the
+                    // connection on return-to-pool regardless.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                }
+            }
+            result
+        }
+    })
+    .await
 }
 
 /// Connection-scoped variant — call within an existing transaction
@@ -6197,6 +7122,64 @@ pub async fn enqueue_job_tx(conn: &mut sqlx::SqliteConnection, input: JobInput) 
     Ok(res.last_insert_rowid())
 }
 
+/// Bulk-enqueue one job per file_id under `kind`, with per-file
+/// dedup keyed on `file_id`. Wraps the entire batch in a single
+/// `BEGIN IMMEDIATE` transaction so the writer lock is held once for
+/// the whole batch (one fsync, no 517 race between SELECT and INSERT)
+/// instead of acquired N times.
+///
+/// This is the canonical replacement for the "loop calling
+/// `enqueue_job_unique`" pattern in the handler `enqueue_for_files`
+/// helpers, which was the hottest 517-trigger when the operator
+/// clicked "Process all pending" on a large library.
+///
+/// Payload shape is fixed at `{ "file_id": <id> }` — matches what every
+/// `_for_files` caller in the codebase needs. Bigger / heterogeneous
+/// payloads can build their own batched helper alongside this one;
+/// the savings come from one tx, not from the payload shape.
+///
+/// Returns the count of jobs actually inserted (dedup-skipped rows
+/// don't count). Wrapped in [`crate::db::with_busy_retry`] so the
+/// whole batch retries on transient contention.
+pub async fn enqueue_jobs_for_files_batched(
+    pool: &SqlitePool,
+    kind: &str,
+    file_ids: &[i64],
+) -> Result<usize> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+    crate::db::with_busy_retry(|| async {
+        let mut conn = pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result: Result<usize> = async {
+            let mut queued = 0usize;
+            for &file_id in file_ids {
+                let payload = serde_json::json!({ "file_id": file_id });
+                let input = JobInput::new(kind, payload);
+                if enqueue_job_unique_tx(&mut conn, input, "file_id", file_id)
+                    .await?
+                    .is_some()
+                {
+                    queued += 1;
+                }
+            }
+            Ok(queued)
+        }
+        .await;
+        match &result {
+            Ok(_) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+            }
+            Err(_) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            }
+        }
+        result
+    })
+    .await
+}
+
 /// Atomically claim the next eligible job. Uses an UPDATE…RETURNING
 /// on a SELECT subquery so two concurrent workers can't race onto
 /// the same row. SQLite serializes writes, so the UPDATE wins
@@ -6237,33 +7220,39 @@ pub async fn claim_next_job(pool: &SqlitePool) -> Result<Option<JobRow>> {
 /// is registered for a job's kind — there's no point in burning
 /// retries against an impossible-to-process row.
 pub async fn mark_job_dead(pool: &SqlitePool, job_id: i64, error: &str) -> Result<()> {
-    let now = now_ms();
-    sqlx::query(
-        "UPDATE jobs
-         SET status      = 'dead',
-             locked_at   = NULL,
-             finished_at = ?,
-             last_error  = ?
-         WHERE id = ?",
-    )
-    .bind(now)
-    .bind(error)
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    crate::db::with_busy_retry(|| async {
+        let now = now_ms();
+        sqlx::query(
+            "UPDATE jobs
+             SET status      = 'dead',
+                 locked_at   = NULL,
+                 finished_at = ?,
+                 last_error  = ?
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(error)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Heartbeat for a long-running job — refreshes `locked_at` to
 /// `now()` so the orphan-reclaim sweep doesn't grab a row out
 /// from under a still-alive worker. Cheap (one UPDATE).
 pub async fn touch_job_lease(pool: &SqlitePool, job_id: i64) -> Result<()> {
-    sqlx::query("UPDATE jobs SET locked_at = ? WHERE id = ? AND status = 'running'")
-        .bind(now_ms())
-        .bind(job_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    crate::db::with_busy_retry(|| async {
+        sqlx::query("UPDATE jobs SET locked_at = ? WHERE id = ? AND status = 'running'")
+            .bind(now_ms())
+            .bind(job_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Saturation-aware variant of `claim_next_job` — skips any kind
@@ -6314,19 +7303,47 @@ pub async fn claim_next_job_excluding_kinds(
 
 /// Terminal success state.
 pub async fn mark_job_succeeded(pool: &SqlitePool, job_id: i64) -> Result<()> {
-    let now = now_ms();
-    sqlx::query(
-        "UPDATE jobs
-         SET status       = 'succeeded',
-             locked_at    = NULL,
-             finished_at  = ?,
-             last_error   = NULL
-         WHERE id = ?",
-    )
-    .bind(now)
-    .bind(job_id)
-    .execute(pool)
-    .await?;
+    // Called by every worker on every successful job completion —
+    // wraps in retry because under heavy scan + worker concurrency
+    // this is one of the hottest writer paths (job-status churn).
+    crate::db::with_busy_retry(|| async {
+        let now = now_ms();
+        sqlx::query(
+            "UPDATE jobs
+             SET status       = 'succeeded',
+                 locked_at    = NULL,
+                 finished_at  = ?,
+                 last_error   = NULL
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// Write a per-stage timing JSON blob for one job row. Handlers
+/// call this from within `JobContext::scope` after a tacet
+/// `analyze_audio` call so the persisted breakdown is visible to
+/// the operator UI ("done in 4m 12s · decode 3m 02s · fingerprint
+/// 1m 04s") without needing a separate API.
+///
+/// Best-effort: a write failure here is logged but never fails the
+/// surrounding handler — the timings are operator-facing nicety,
+/// not data integrity.
+pub async fn record_job_stage_timings(
+    pool: &SqlitePool,
+    job_id: i64,
+    timings_json: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE jobs SET stage_timings_json = ? WHERE id = ?")
+        .bind(timings_json)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -6358,48 +7375,51 @@ pub async fn mark_job_failed_with_class(
     backoff_ms: i64,
     error_class: Option<&str>,
 ) -> Result<()> {
-    let now = now_ms();
-    let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
-        .bind(job_id)
-        .fetch_one(pool)
-        .await?;
-    let attempts: i64 = row.try_get("attempts")?;
-    let max_attempts: i64 = row.try_get("max_attempts")?;
-    let force_terminal = matches!(error_class, Some("external_auth") | Some("permanent"));
-    if force_terminal || attempts >= max_attempts {
-        sqlx::query(
-            "UPDATE jobs
-             SET status      = 'dead',
-                 locked_at   = NULL,
-                 finished_at = ?,
-                 last_error  = ?,
-                 error_class = ?
-             WHERE id = ?",
-        )
-        .bind(now)
-        .bind(error)
-        .bind(error_class)
-        .bind(job_id)
-        .execute(pool)
-        .await?;
-    } else {
-        sqlx::query(
-            "UPDATE jobs
-             SET status      = 'failed',
-                 locked_at   = NULL,
-                 run_after   = ?,
-                 last_error  = ?,
-                 error_class = ?
-             WHERE id = ?",
-        )
-        .bind(now + backoff_ms)
-        .bind(error)
-        .bind(error_class)
-        .bind(job_id)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
+    crate::db::with_busy_retry(|| async {
+        let now = now_ms();
+        let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+        let attempts: i64 = row.try_get("attempts")?;
+        let max_attempts: i64 = row.try_get("max_attempts")?;
+        let force_terminal = matches!(error_class, Some("external_auth") | Some("permanent"));
+        if force_terminal || attempts >= max_attempts {
+            sqlx::query(
+                "UPDATE jobs
+                 SET status      = 'dead',
+                     locked_at   = NULL,
+                     finished_at = ?,
+                     last_error  = ?,
+                     error_class = ?
+                 WHERE id = ?",
+            )
+            .bind(now)
+            .bind(error)
+            .bind(error_class)
+            .bind(job_id)
+            .execute(pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE jobs
+                 SET status      = 'failed',
+                     locked_at   = NULL,
+                     run_after   = ?,
+                     last_error  = ?,
+                     error_class = ?
+                 WHERE id = ?",
+            )
+            .bind(now + backoff_ms)
+            .bind(error)
+            .bind(error_class)
+            .bind(job_id)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// On startup: any row left as `running` whose `locked_at` is older
@@ -6919,16 +7939,20 @@ pub async fn list_reviews_for_item(pool: &SqlitePool, item_id: i64) -> Result<Ve
         .collect()
 }
 
-/// Replace TMDB-sourced reviews for an item. Other-source reviews (when we
-/// add them) survive — the WHERE clause scopes the delete to source='tmdb'.
-pub async fn apply_tmdb_reviews(
+/// Replace one source's reviews for an item. Source-scoped DELETE so
+/// reviews from other agents (and per-user reviews tagged `source =
+/// 'user'`) survive. Provider-agnostic — takes the common
+/// [`chimpflix_metadata::ReviewEntry`] shape any agent can populate.
+pub async fn apply_item_reviews_for_source(
     pool: &SqlitePool,
     item_id: i64,
-    reviews: &[chimpflix_metadata::TmdbReview],
+    reviews: &[chimpflix_metadata::ReviewEntry],
+    source: &str,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM item_reviews WHERE item_id = ? AND source = 'tmdb'")
+    sqlx::query("DELETE FROM item_reviews WHERE item_id = ? AND source = ?")
         .bind(item_id)
+        .bind(source)
         .execute(&mut *tx)
         .await?;
     for r in reviews {
@@ -6936,16 +7960,17 @@ pub async fn apply_tmdb_reviews(
             "INSERT OR IGNORE INTO item_reviews
                 (item_id, source, source_id, author, author_url, avatar_url,
                  rating, body, created_at)
-             VALUES (?, 'tmdb', ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(item_id)
+        .bind(source)
         .bind(&r.source_id)
         .bind(&r.author)
         .bind(r.author_url.as_deref())
         .bind(r.avatar_url.as_deref())
         .bind(r.rating)
         .bind(r.body.as_deref())
-        .bind(r.created_at)
+        .bind(r.created_at_ms)
         .execute(&mut *tx)
         .await?;
     }
@@ -6953,36 +7978,326 @@ pub async fn apply_tmdb_reviews(
     Ok(())
 }
 
-/// Parse ISO 8601 timestamps (TMDB's `published_at` is e.g.
-/// `2024-03-15T12:00:00.000Z`) to epoch ms. Returns None on any parse
-/// failure so callers just skip the field.
-fn parse_iso8601_ms(s: &str) -> Option<i64> {
-    // Minimal parse: split on 'T', then 'Z'/'+', take date YYYY-MM-DD and
-    // time HH:MM:SS. We don't depend on chrono since the metadata crate
-    // already keeps its surface tiny.
-    let (date, rest) = s.split_once('T')?;
-    let time = rest.split(['Z', '+', '.']).next()?;
-    let mut date_parts = date.split('-');
-    let y: i32 = date_parts.next()?.parse().ok()?;
-    let m: u32 = date_parts.next()?.parse().ok()?;
-    let d: u32 = date_parts.next()?.parse().ok()?;
-    let mut time_parts = time.split(':');
-    let hh: u32 = time_parts.next()?.parse().ok()?;
-    let mm: u32 = time_parts.next()?.parse().ok()?;
-    let ss: u32 = time_parts.next().unwrap_or("0").parse().ok()?;
-    // Days since 1970-01-01 (proleptic Gregorian, sane only for 1970+).
-    fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y } as i64;
-        let m = m as i64;
-        let d = d as i64;
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146097 + doe - 719468
+// `parse_iso8601_ms` removed — its only caller was the old
+// `apply_item_extras(&[TmdbVideo])`. The new VideoLink-based signature
+// receives `published_at_ms` already parsed by the metadata crate
+// (`chrono_lite` in agents.rs).
+
+/// Write per-episode AniList data (title from `streamingEpisodes`, plus
+/// thumbnail) honoring chain-position semantics.
+///
+/// In `WriteMode::Primary`, AniList is the primary episode source: the
+/// title overwrites any existing value that wasn't owner-locked, and
+/// the thumbnail replaces any existing one. In `WriteMode::FillNulls`,
+/// AniList only writes when the existing title looks filename-derived
+/// (a heuristic — `episodes.title` is `NOT NULL` so we can't use a raw
+/// IS NULL check) and the thumbnail is set via `store_image_if_missing`.
+///
+/// **Why this got reworked:** the prior implementation used
+/// `COALESCE(title, ?)` against a `NOT NULL` column, which is a
+/// universal no-op — the existing title (filename stem inserted at
+/// upsert time) always won, so AniList's title never landed. That bug
+/// was masked by TMDB unconditionally overwriting episode titles
+/// regardless of chain position; with TMDB removed from a chain the
+/// bug surfaced as "every anime episode shows the raw filename stem."
+///
+/// Returns `Ok(true)` when at least one column was written; `Ok(false)`
+/// otherwise. Owner-locked title columns are honored in both modes via
+/// the existing `fetch_locked_fields` machinery.
+pub async fn apply_episode_metadata_anilist(
+    pool: &SqlitePool,
+    episode_id: i64,
+    title: &str,
+    thumbnail_url: Option<&str>,
+    mode: WriteMode,
+) -> Result<bool> {
+    let now = now_ms();
+    // Decide whether to overwrite the title. Primary mode always wins
+    // over filename-derived stems; fill-nulls only wins over stems that
+    // look like they came from the parser fallback.
+    let should_overwrite = match mode {
+        WriteMode::Primary => true,
+        WriteMode::FillNulls => {
+            let row = sqlx::query("SELECT title FROM episodes WHERE id = ?")
+                .bind(episode_id)
+                .fetch_optional(pool)
+                .await?;
+            match row {
+                Some(r) => {
+                    let existing: String = r.try_get("title").unwrap_or_default();
+                    looks_filename_derived(&existing)
+                }
+                None => false,
+            }
+        }
+    };
+
+    let res = if should_overwrite {
+        sqlx::query(
+            "UPDATE episodes SET title = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(title)
+        .bind(now)
+        .bind(episode_id)
+        .execute(pool)
+        .await?
+    } else {
+        sqlx::query("UPDATE episodes SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(episode_id)
+            .execute(pool)
+            .await?
+    };
+    let mut any_change = should_overwrite && res.rows_affected() > 0;
+
+    if let Some(url) = thumbnail_url {
+        let wrote_thumb = match mode {
+            WriteMode::Primary => {
+                store_image(pool, None, Some(episode_id), "thumb", "anilist", url).await?;
+                true
+            }
+            WriteMode::FillNulls => {
+                store_image_if_missing(pool, None, Some(episode_id), "thumb", "anilist", url)
+                    .await?;
+                // store_image_if_missing doesn't report whether it wrote; assume
+                // it might have. Cheap to assume true for the activity log.
+                true
+            }
+        };
+        any_change = any_change || wrote_thumb;
     }
-    let days = days_from_civil(y, m, d);
-    Some(days * 86_400_000 + hh as i64 * 3_600_000 + mm as i64 * 60_000 + ss as i64 * 1_000)
+    Ok(any_change)
+}
+
+/// Heuristic — does this title string look like it came from a raw
+/// filename stem rather than a metadata agent? Matches:
+///   - Empty / whitespace-only
+///   - Starts with `Episode \d+` (parser fallback)
+///   - Contains common quality / codec tokens (1080p / WEB-DL / HEVC / x265 / x264 / BluRay / 2160p / 720p)
+///   - Starts with `\d{2,4}\s*-` (anime absolute-episode prefix like "013 - ")
+///   - Ends with `-Word` where Word is a single capitalized release-group
+///     token (`-Kitsune`, `-ToonsHub`, `-AnoZu`) — heuristic: dash with
+///     no surrounding space immediately before a non-whitespace run at
+///     end of string.
+///
+/// Errs on the side of overwriting. A real metadata-derived title that
+/// happens to contain "1080p" (very rare) will get overwritten by a
+/// later AniList write — acceptable; metadata writers come from a
+/// higher-quality source than the filename anyway.
+fn looks_filename_derived(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with("Episode ") || trimmed == "Episode" {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const TOKENS: &[&str] = &[
+        "1080p", "720p", "2160p", "480p", "web-dl", "webdl", "bluray",
+        "blu-ray", "hevc", "x265", "x264", "h.264", "h264", "h.265", "h265",
+        "10bit", "8bit", "aac", "flac", "ddp5.1", "ddp", "remux",
+    ];
+    if TOKENS.iter().any(|t| lower.contains(t)) {
+        return true;
+    }
+    // Anime absolute-episode prefix: "^\d{2,4}\s*-"
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if (2..=4).contains(&i) {
+        let rest = &trimmed[i..];
+        if rest.starts_with(|c: char| c.is_whitespace() || c == '-') {
+            return true;
+        }
+    }
+    // Trailing release-group: ends with `-Token` where Token has no
+    // internal whitespace and starts with an uppercase letter or digit.
+    // The char before the dash is irrelevant (real release patterns are
+    // both " -Kitsune" and "Day-Kitsune"). What disambiguates is no
+    // whitespace *after* the dash and the capitalized-token shape.
+    // A real title like "Mockingjay - Part 1" is preserved because the
+    // dash is followed by whitespace.
+    if let Some(last_dash) = trimmed.rfind('-') {
+        let after = &trimmed[last_dash + 1..];
+        if !after.is_empty() && !after.contains(char::is_whitespace) {
+            let first = after.chars().next().unwrap();
+            if first.is_ascii_uppercase() || first.is_ascii_digit() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod looks_filename_derived_tests {
+    use super::looks_filename_derived;
+
+    #[test]
+    fn detects_anime_absolute_prefix() {
+        assert!(looks_filename_derived("013 - Barrier Day"));
+        assert!(looks_filename_derived("014 - The Party from Hell"));
+        assert!(looks_filename_derived("01 - Pilot"));
+    }
+
+    #[test]
+    fn detects_trailing_release_group() {
+        assert!(looks_filename_derived("Barrier Day -Kitsune"));
+        assert!(looks_filename_derived("The First Bloom -ToonsHub"));
+        assert!(looks_filename_derived("The Day of Departure -AnoZu"));
+    }
+
+    #[test]
+    fn detects_quality_tokens() {
+        assert!(looks_filename_derived("Episode Name 1080p WEB-DL"));
+        assert!(looks_filename_derived("Movie x265 HEVC"));
+        assert!(looks_filename_derived("Show 2160p BluRay"));
+    }
+
+    #[test]
+    fn detects_parser_fallback() {
+        assert!(looks_filename_derived(""));
+        assert!(looks_filename_derived("Episode 7"));
+        assert!(looks_filename_derived("Episode"));
+    }
+
+    #[test]
+    fn accepts_real_titles() {
+        assert!(!looks_filename_derived("Commanders' Meeting"));
+        assert!(!looks_filename_derived("Ren's Shadow"));
+        assert!(!looks_filename_derived("A Storm Rolls In"));
+        assert!(!looks_filename_derived("self-titled debut"));
+    }
+
+    #[test]
+    fn handles_dash_in_real_title() {
+        // "The Hunger Games: Mockingjay - Part 1" should NOT be filtered:
+        // there's whitespace before the dash → not a release tag.
+        assert!(!looks_filename_derived("Mockingjay - Part 1"));
+    }
+}
+
+/// Polymorphic episode writer. Mirror of [`apply_movie_data`] /
+/// [`apply_show_data`] for the per-episode level. The first agent in
+/// the chain to return non-`None` from `fetch_episode` lands its data
+/// in `Primary` mode (overwriting filename-derived columns); later
+/// agents fill nulls. Title overwrite uses the same
+/// `looks_filename_derived` heuristic from
+/// [`apply_episode_metadata_anilist`] so a stem-derived title yields
+/// to any real metadata title.
+///
+/// `source` is the agent name ("tmdb" / "tvdb" / "tvmaze" / "anilist")
+/// used to attribute the still image in the `images` table.
+pub async fn apply_episode_data(
+    pool: &SqlitePool,
+    episode_id: i64,
+    data: &chimpflix_metadata::EpisodeData,
+    mode: WriteMode,
+    source: &str,
+) -> Result<()> {
+    let now = now_ms();
+
+    // Decide title overwrite based on mode + heuristic. `episodes.title`
+    // is NOT NULL so we can't use a raw IS NULL check.
+    let should_overwrite_title = match (mode, data.title.as_deref()) {
+        (WriteMode::Primary, Some(_)) => true,
+        (WriteMode::FillNulls, Some(_)) => {
+            let row = sqlx::query("SELECT title FROM episodes WHERE id = ?")
+                .bind(episode_id)
+                .fetch_optional(pool)
+                .await?;
+            match row {
+                Some(r) => {
+                    let existing: String = r.try_get("title").unwrap_or_default();
+                    looks_filename_derived(&existing)
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    };
+
+    if should_overwrite_title
+        && let Some(title) = &data.title
+    {
+        sqlx::query("UPDATE episodes SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(title)
+            .bind(now)
+            .bind(episode_id)
+            .execute(pool)
+            .await?;
+    }
+
+    // Other columns honor mode via COALESCE.
+    let runtime_ms = data.runtime_ms;
+    let air_date_ms = data.air_date_ms;
+    let summary = data.summary.as_deref();
+    let tmdb_id = data.tmdb_id;
+    let tvdb_id = data.tvdb_id;
+
+    if mode.overwrites() {
+        sqlx::query(
+            "UPDATE episodes SET
+                summary = COALESCE(?, summary),
+                duration_ms = COALESCE(duration_ms, ?),
+                air_date = COALESCE(air_date, ?),
+                tmdb_id = COALESCE(?, tmdb_id),
+                tvdb_id = COALESCE(?, tvdb_id),
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(summary)
+        .bind(runtime_ms)
+        .bind(air_date_ms)
+        .bind(tmdb_id)
+        .bind(tvdb_id)
+        .bind(now)
+        .bind(episode_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE episodes SET
+                summary = COALESCE(summary, ?),
+                duration_ms = COALESCE(duration_ms, ?),
+                air_date = COALESCE(air_date, ?),
+                tmdb_id = COALESCE(tmdb_id, ?),
+                tvdb_id = COALESCE(tvdb_id, ?),
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(summary)
+        .bind(runtime_ms)
+        .bind(air_date_ms)
+        .bind(tmdb_id)
+        .bind(tvdb_id)
+        .bind(now)
+        .bind(episode_id)
+        .execute(pool)
+        .await?;
+    }
+
+    // Refuse to write a blank/whitespace still URL — that would land
+    // as `<img src="">` in the UI and render as a black thumbnail (the
+    // browser interprets "" as a self-reference to the current page).
+    // Belt-and-suspenders against agents that surface empty strings
+    // instead of None for episodes without stills.
+    let still_url = data
+        .still_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(url) = still_url {
+        if mode.overwrites() {
+            store_image(pool, None, Some(episode_id), "thumb", source, url).await?;
+        } else {
+            store_image_if_missing(pool, None, Some(episode_id), "thumb", source, url).await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn apply_episode_metadata(
@@ -7006,7 +8321,7 @@ pub async fn apply_episode_metadata(
     .bind(meta.summary.as_deref())
     .bind(meta.runtime_min.map(|m| (m as i64) * 60_000))
     .bind(air_date_ms)
-    .bind(meta.episode_number as i64)
+    .bind(meta.tmdb_id)
     .bind(now)
     .bind(episode_id)
     .execute(pool)
@@ -7577,12 +8892,6 @@ pub async fn update_server_settings(
         }
         sqlx::query("UPDATE server_settings SET recently_added_days = ? WHERE id = 1")
             .bind(v)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = patch.chapter_thumbs_enabled {
-        sqlx::query("UPDATE server_settings SET chapter_thumbs_enabled = ? WHERE id = 1")
-            .bind(i64::from(v))
             .execute(&mut *tx)
             .await?;
     }
@@ -8942,235 +10251,6 @@ pub async fn remove_tag_from_item(pool: &SqlitePool, item_id: i64, tag_id: i64) 
     Ok(res.rows_affected() > 0)
 }
 
-// ─── Preview sprites ───────────────────────────────────────────────────────
-//
-// One scrub-preview sprite per media_file. Dimensions live on the row so
-// the player can compute tile offsets without an extra round trip.
-
-#[derive(Debug, Clone)]
-pub struct PreviewSpriteRecord {
-    pub media_file_id: i64,
-    pub path: String,
-    pub interval_ms: i64,
-    pub tile_width: i64,
-    pub tile_height: i64,
-    pub tile_cols: i64,
-    pub tile_count: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct MediaFileForPreview {
-    pub id: i64,
-    pub path: String,
-    pub duration_ms: Option<i64>,
-}
-
-/// Return media files in the given library (or globally if `None`) that
-/// have a non-null duration and no preview sprite yet.
-pub async fn list_media_files_needing_previews(
-    pool: &SqlitePool,
-    library_id: Option<i64>,
-    limit: i64,
-) -> Result<Vec<MediaFileForPreview>> {
-    let rows = if let Some(lid) = library_id {
-        sqlx::query(
-            "SELECT mf.id AS id, mf.path AS path, mf.duration_ms AS duration_ms
-             FROM media_files mf
-             LEFT JOIN items i ON i.id = mf.item_id
-             LEFT JOIN episodes e ON e.id = mf.episode_id
-             LEFT JOIN seasons s ON s.id = e.season_id
-             WHERE mf.preview_sprite_path IS NULL
-               AND mf.duration_ms IS NOT NULL
-               AND (i.library_id = ? OR s.show_id IN
-                    (SELECT id FROM items WHERE library_id = ?))
-             LIMIT ?",
-        )
-        .bind(lid)
-        .bind(lid)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT id, path, duration_ms FROM media_files
-             WHERE preview_sprite_path IS NULL AND duration_ms IS NOT NULL
-             LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    };
-    rows.iter()
-        .map(|row| {
-            Ok(MediaFileForPreview {
-                id: row.try_get("id")?,
-                path: row.try_get("path")?,
-                duration_ms: row.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
-            })
-        })
-        .collect()
-}
-
-pub async fn record_preview_sprite(pool: &SqlitePool, record: PreviewSpriteRecord) -> Result<()> {
-    sqlx::query(
-        "UPDATE media_files SET
-            preview_sprite_path = ?,
-            preview_interval_ms = ?,
-            preview_tile_width = ?,
-            preview_tile_height = ?,
-            preview_tile_cols = ?,
-            preview_tile_count = ?
-         WHERE id = ?",
-    )
-    .bind(&record.path)
-    .bind(record.interval_ms)
-    .bind(record.tile_width)
-    .bind(record.tile_height)
-    .bind(record.tile_cols)
-    .bind(record.tile_count)
-    .bind(record.media_file_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn get_preview_sprite(
-    pool: &SqlitePool,
-    media_file_id: i64,
-) -> Result<Option<PreviewSpriteRecord>> {
-    let row = sqlx::query(
-        "SELECT id, preview_sprite_path, preview_interval_ms,
-                preview_tile_width, preview_tile_height,
-                preview_tile_cols, preview_tile_count
-         FROM media_files WHERE id = ?",
-    )
-    .bind(media_file_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else { return Ok(None) };
-    let path: Option<String> = row.try_get("preview_sprite_path").ok().flatten();
-    let Some(path) = path else { return Ok(None) };
-    Ok(Some(PreviewSpriteRecord {
-        media_file_id: row.try_get("id")?,
-        path,
-        interval_ms: row.try_get("preview_interval_ms")?,
-        tile_width: row.try_get("preview_tile_width")?,
-        tile_height: row.try_get("preview_tile_height")?,
-        tile_cols: row.try_get("preview_tile_cols")?,
-        tile_count: row.try_get("preview_tile_count")?,
-    }))
-}
-
-// ─── Chapter thumbnails ────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct MediaFileForChapterThumbs {
-    pub id: i64,
-    pub path: String,
-}
-
-/// Files that haven't had their chapter-thumb pass run yet. We use a
-/// nullable timestamp column rather than a boolean so a future
-/// "regenerate after X days" sweep can compare timestamps directly.
-pub async fn list_media_files_needing_chapter_thumbs(
-    pool: &SqlitePool,
-    library_id: Option<i64>,
-    limit: i64,
-) -> Result<Vec<MediaFileForChapterThumbs>> {
-    let rows = if let Some(lid) = library_id {
-        sqlx::query(
-            "SELECT mf.id AS id, mf.path AS path
-             FROM media_files mf
-             LEFT JOIN items i ON i.id = mf.item_id
-             LEFT JOIN episodes e ON e.id = mf.episode_id
-             LEFT JOIN seasons s ON s.id = e.season_id
-             WHERE mf.chapter_thumbs_generated_at IS NULL
-               AND mf.removed_at IS NULL
-               AND (i.library_id = ? OR s.show_id IN
-                    (SELECT id FROM items WHERE library_id = ?))
-             LIMIT ?",
-        )
-        .bind(lid)
-        .bind(lid)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT id, path FROM media_files
-             WHERE chapter_thumbs_generated_at IS NULL AND removed_at IS NULL
-             LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    };
-    rows.iter()
-        .map(|row| {
-            Ok(MediaFileForChapterThumbs {
-                id: row.try_get("id")?,
-                path: row.try_get("path")?,
-            })
-        })
-        .collect()
-}
-
-/// Stamp `chapter_thumbs_generated_at` + record how many chapters the
-/// file had. `chapter_count = 0` is a valid "no chapters" result — we
-/// still set the timestamp so the next task run doesn't re-probe.
-pub async fn record_chapter_thumbs_generated(
-    pool: &SqlitePool,
-    media_file_id: i64,
-    chapter_count: i64,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE media_files
-         SET chapter_thumbs_generated_at = ?, chapter_count = ?
-         WHERE id = ?",
-    )
-    .bind(now_ms())
-    .bind(chapter_count)
-    .bind(media_file_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Look up a media_file's stored chapter count + processing timestamp.
-/// Returns `None` if the file is unknown; returns `Some((None, _))`
-/// for a file that hasn't been processed yet.
-pub async fn get_chapter_thumbs_status(
-    pool: &SqlitePool,
-    media_file_id: i64,
-) -> Result<Option<(Option<i64>, Option<i64>)>> {
-    let row = sqlx::query(
-        "SELECT chapter_thumbs_generated_at, chapter_count, path
-         FROM media_files WHERE id = ?",
-    )
-    .bind(media_file_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else { return Ok(None) };
-    Ok(Some((
-        row.try_get::<Option<i64>, _>("chapter_thumbs_generated_at")
-            .ok()
-            .flatten(),
-        row.try_get::<Option<i64>, _>("chapter_count")
-            .ok()
-            .flatten(),
-    )))
-}
-
-/// Resolve the disk path for a media_file. Used by the chapter-thumb
-/// API to feed `probe_chapters` without rehydrating the full row.
-pub async fn get_media_file_path(pool: &SqlitePool, media_file_id: i64) -> Result<Option<String>> {
-    let row = sqlx::query("SELECT path FROM media_files WHERE id = ?")
-        .bind(media_file_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.and_then(|r| r.try_get("path").ok()))
-}
-
 // ─── Loudness analysis ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -10347,15 +11427,55 @@ pub async fn count_episodes_in_season(
     Ok(row.try_get::<i64, _>("n").unwrap_or(0))
 }
 
-/// List every media_file path in a season — used by
-/// `bootstrap_season_refs` to feed tacet's reference builder.
-pub async fn list_episode_paths_in_season(
+/// Count episodes in a season that still need marker detection
+/// (`markers_detected_at IS NULL`). Used to gate
+/// `bootstrap_season_refs`: when every episode already has markers
+/// (e.g. all from Phase A embedded chapter labels), running tacet
+/// bootstrap would decode every episode for zero useful output.
+pub async fn count_episodes_needing_markers_in_season(
     pool: &SqlitePool,
     show_id: i64,
     season_number: i32,
-) -> Result<Vec<String>> {
+) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n
+         FROM media_files mf
+         JOIN episodes e ON e.id = mf.episode_id
+         JOIN seasons s ON s.id = e.season_id
+         WHERE s.show_id = ?
+           AND s.season_number = ?
+           AND mf.removed_at IS NULL
+           AND mf.duration_ms IS NOT NULL
+           AND mf.markers_detected_at IS NULL",
+    )
+    .bind(show_id)
+    .bind(season_number)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("n").unwrap_or(0))
+}
+
+/// One row returned by [`list_episodes_in_season_for_detection`]. Carries
+/// the file_id so tacet's per-episode markers can be mapped back to the
+/// originating row when written to the markers table.
+pub struct EpisodeForDetection {
+    pub file_id: i64,
+    pub path: String,
+    pub episode_number: i32,
+}
+
+/// List every media_file in a season alongside its episode number — used by
+/// `bootstrap_season_refs` to feed tacet's [`tacet::detection::detect_season`]
+/// entry point. Ordered by `episode_number ASC` so tacet's internal logging
+/// reads cleanly and any future cross-episode heuristics see episodes in
+/// broadcast order.
+pub async fn list_episodes_in_season_for_detection(
+    pool: &SqlitePool,
+    show_id: i64,
+    season_number: i32,
+) -> Result<Vec<EpisodeForDetection>> {
     let rows = sqlx::query(
-        "SELECT mf.path AS path
+        "SELECT mf.id AS file_id, mf.path AS path, e.episode_number AS episode_number
          FROM media_files mf
          JOIN episodes e ON e.id = mf.episode_id
          JOIN seasons s ON s.id = e.season_id
@@ -10369,10 +11489,15 @@ pub async fn list_episode_paths_in_season(
     .bind(season_number)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<String, _>("path").ok())
-        .collect())
+    rows.iter()
+        .map(|r| {
+            Ok(EpisodeForDetection {
+                file_id: r.try_get("file_id")?,
+                path: r.try_get("path")?,
+                episode_number: r.try_get("episode_number")?,
+            })
+        })
+        .collect()
 }
 
 /// Loaded blobs for a season's intro + credits reference fingerprints,

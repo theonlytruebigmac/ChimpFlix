@@ -260,12 +260,13 @@ function PerKindHealthCard({ rows }: { rows: ActivityKindHealth[] }) {
           </div>
         </div>
       </div>
-      <div className="grid grid-cols-[1fr_70px_70px_80px_80px_70px] border-b border-white/8 bg-white/3 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-[0.07em] text-white/55">
+      <div className="grid grid-cols-[1fr_70px_70px_70px_80px_90px_70px] border-b border-white/8 bg-white/3 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-[0.07em] text-white/55">
         <span>Kind</span>
         <span className="text-right">Queue</span>
         <span className="text-right">In-flight</span>
         <span className="text-right">Per min</span>
         <span className="text-right">p95</span>
+        <span className="text-right">ETA</span>
         <span className="text-right">Errors</span>
       </div>
       {rows.length === 0 ? (
@@ -281,7 +282,7 @@ function PerKindHealthCard({ rows }: { rows: ActivityKindHealth[] }) {
 
 function PerKindHealthRow({ row }: { row: ActivityKindHealth }) {
   return (
-    <div className="grid grid-cols-[1fr_70px_70px_80px_80px_70px] items-center gap-2 border-b border-white/8 px-3 py-2 text-[12.5px] last:border-b-0">
+    <div className="grid grid-cols-[1fr_70px_70px_70px_80px_90px_70px] items-center gap-2 border-b border-white/8 px-3 py-2 text-[12.5px] last:border-b-0">
       <span className="min-w-0 truncate font-medium text-white/95">
         {row.display_name}
         <span className="ml-2 font-mono text-[10.5px] text-white/40">
@@ -303,6 +304,18 @@ function PerKindHealthRow({ row }: { row: ActivityKindHealth }) {
           : formatDurationMs(row.p95_duration_ms)}
       </span>
       <span
+        className="text-right font-mono tabular-nums text-white/65"
+        title={
+          row.eta_seconds_remaining == null
+            ? row.queue_depth === 0
+              ? "Queue empty — nothing to drain."
+              : "Not enough run history yet to estimate (need 5+ successful runs)."
+            : `${row.queue_depth} queued × p95 ÷ effective concurrency. Coarse estimate; assumes current throughput.`
+        }
+      >
+        {formatEta(row.eta_seconds_remaining)}
+      </span>
+      <span
         className={`text-right font-mono tabular-nums ${
           row.recent_errors > 0 ? "text-red-300" : "text-white/40"
         }`}
@@ -311,6 +324,23 @@ function PerKindHealthRow({ row }: { row: ActivityKindHealth }) {
       </span>
     </div>
   );
+}
+
+/// Render a wall-clock ETA as a short human label: "—" / "~12s" /
+/// "~4m" / "~2h 15m" / "~3d 4h". Deliberately coarse — the underlying
+/// estimate is queue × p95 with all the noise that implies, so
+/// minute-precision past an hour would be false confidence.
+function formatEta(seconds: number | null): string {
+  if (seconds == null) return "—";
+  if (seconds < 60) return `~${Math.max(1, Math.round(seconds))}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `~${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hours < 24) return mins === 0 ? `~${hours}h` : `~${hours}h ${mins}m`;
+  const days = Math.floor(hours / 24);
+  const hr = hours % 24;
+  return hr === 0 ? `~${days}d` : `~${days}d ${hr}h`;
 }
 
 // ─── Per-kind concurrency editor ───────────────────────────────────────

@@ -84,7 +84,7 @@ export function MarkerEditor({
   }, [open, mediaFileId]);
 
   const autoRows = useMemo(
-    () => (loaded ? loaded.markers.filter((m) => m.source === "auto") : []),
+    () => (loaded ? loaded.markers.filter((m) => m.source !== "manual") : []),
     [loaded],
   );
 
@@ -198,7 +198,8 @@ export function MarkerEditor({
                   <p className="mb-2 text-[11.5px] text-white/45">
                     Re-runs of the scheduled marker-detection task replace
                     these. Add a manual marker below to override any of
-                    them — manual rows always win on the player.
+                    them — manual rows always win on the player. The badge
+                    shows how each marker was found.
                   </p>
                   <ul className="divide-y divide-white/6 rounded-md border border-white/10 bg-white/2">
                     {autoRows.map((m) => (
@@ -213,7 +214,7 @@ export function MarkerEditor({
                           {formatSeconds(m.start_ms / 1000)} →{" "}
                           {formatSeconds(m.end_ms / 1000)}
                         </span>
-                        <span className="text-[11px] text-white/40">auto</span>
+                        <SourceBadge source={m.source} />
                       </li>
                     ))}
                   </ul>
@@ -363,6 +364,62 @@ function labelForKind(kind: string): string {
   if (kind === "credits") return "Credits";
   if (kind === "commercial") return "Ad";
   return kind;
+}
+
+/// Visual badge for a marker's detection method. Helps an operator
+/// reading the editor distinguish "the container told us this is the
+/// intro" (highest confidence) from "tacet inferred it from audio"
+/// from "blackdetect guessed from a fade-to-black."
+function SourceBadge({ source }: { source: string }) {
+  const { label, title, tone } = sourceMeta(source);
+  const toneClass =
+    tone === "high"
+      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+      : tone === "med"
+        ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+        : "border-white/15 bg-white/5 text-white/55";
+  return (
+    <span
+      title={title}
+      className={`rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${toneClass}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function sourceMeta(
+  source: string,
+): { label: string; title: string; tone: "high" | "med" | "low" } {
+  switch (source) {
+    case "embedded":
+      return {
+        label: "Chapter",
+        title: "Trusted from a container chapter label (e.g. \"Opening\", \"End Credits\").",
+        tone: "high",
+      };
+    case "tacet":
+      return {
+        label: "Audio",
+        title: "Audio-fingerprint match against the season's reference set.",
+        tone: "med",
+      };
+    case "blackframe":
+      return {
+        label: "Blackframe",
+        title: "Heuristic — located via fade-to-black detection. Lowest confidence.",
+        tone: "low",
+      };
+    case "auto":
+      // Legacy rows from before Phase 71. Re-detection will relabel them.
+      return {
+        label: "Auto",
+        title: "Auto-detected (legacy row). Will be relabeled on next detection pass.",
+        tone: "low",
+      };
+    default:
+      return { label: source, title: source, tone: "low" };
+  }
 }
 
 function formatSeconds(s: number): string {

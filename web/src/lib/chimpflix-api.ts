@@ -141,6 +141,7 @@ export type LibraryKind = "movies" | "shows" | "anime";
 export type EpisodeSortOrder = "oldest_first" | "newest_first";
 export type EpisodeNaming = "tmdb" | "original" | "absolute";
 export type LibraryVisibility = "home_and_search" | "search_only" | "hidden";
+export type PrimaryMetadataAgent = "tmdb" | "tvdb";
 
 export interface Library {
   id: number;
@@ -156,6 +157,11 @@ export interface Library {
   /** When true, the item modal exposes a Delete-from-disk button.
    *  Off by default to protect against accidental loss. */
   allow_media_deletion: boolean;
+  /** Which metadata agent runs first (Primary mode) for this library.
+   *  The remaining agents in `library_agents` run after it as FillNulls
+   *  fallbacks. New movie/show libraries default to "tmdb"; anime
+   *  libraries default to "tvdb". */
+  primary_metadata_agent: PrimaryMetadataAgent;
   created_at: number;
   updated_at: number;
 }
@@ -176,6 +182,7 @@ export interface LibraryUpdateInput {
   certification_country?: string;
   visibility?: LibraryVisibility;
   allow_media_deletion?: boolean;
+  primary_metadata_agent?: PrimaryMetadataAgent;
 }
 
 export interface LibraryAgent {
@@ -190,6 +197,28 @@ export interface AgentInfo {
   display_name: string;
   supported_kinds: string[];
   configured: boolean;
+  /** Whether this agent participates in the scan-time metadata chain.
+   *  Non-chain agents (OMDb / Trakt / OpenSubtitles) are listed for
+   *  credential-status visibility only — adding them to the priority
+   *  picker would silently no-op. */
+  participates_in_chain: boolean;
+  /** Per-stage capability flags sourced from `MetadataAgent::capabilities()`.
+   *  The UI renders one badge per `true` field so operators see at a
+   *  glance what the agent can contribute. Agents that don't go through
+   *  the chain (opensubtitles, trakt) return all false. */
+  capabilities: AgentCapabilities;
+  /** Operator-facing limitations — surfaced in an info tooltip next to
+   *  the badges. Empty when there's nothing notable. */
+  limitations: string[];
+}
+
+export interface AgentCapabilities {
+  movie: boolean;
+  show: boolean;
+  episode: boolean;
+  cast: boolean;
+  artwork: boolean;
+  ratings: boolean;
 }
 
 // ─── Scheduled tasks ───────────────────────────────────────────────────────
@@ -365,6 +394,11 @@ export interface ActivityKindHealth {
   /// activity page's per-kind cap editor can render "default N"
   /// hints alongside an editable override.
   default_concurrency: number;
+  /// Rough wall-clock ETA to drain the queue, in seconds. Computed
+  /// server-side as `queue × p95 / effective_concurrency`. `null`
+  /// when the queue is empty or there's not enough run history yet
+  /// to produce a p95.
+  eta_seconds_remaining: number | null;
 }
 
 export interface ActivityRecentRun {
@@ -864,12 +898,23 @@ export interface JobRow {
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
+  /// Per-stage timing JSON (e.g. `{"markers_ms":182000,
+  /// "loudness_ms":67000}`) when the handler reports a breakdown.
+  /// Null for legacy rows + kinds that don't emit timings.
+  stage_timings_json: string | null;
+}
+
+/// Live progress entry for an in-flight job. Returned in the
+/// `/admin/jobs` response keyed by job id; missing entries mean the
+/// job isn't currently executing.
+export interface JobProgress {
+  stage: string;
+  percent: number | null;
+  updated_at_ms: number;
 }
 
 export interface JobSweepCounts {
   markers: number;
-  previews: number;
-  chapter_thumbs: number;
   loudness: number;
 }
 
@@ -1262,7 +1307,7 @@ export interface ServerSettings {
   transcoder_background_preset: TranscoderBackgroundPreset;
   /** Cap on background optimize-versions concurrency per scheduler tick. */
   transcoder_max_background_concurrent: number;
-  /** Worker count for the durable job queue (markers/sprites/thumbs/loudness). */
+  /** Worker count for the durable job queue (markers/loudness/subtitles/ratings). */
   job_workers: number;
   /** JSON object mapping job_kind → concurrency cap. Empty `{}` =
    *  registry defaults for every kind. Hot-reloadable. */
@@ -1516,44 +1561,6 @@ export const externalSubtitles = {
       `/episodes/${episodeId}/external-subtitles`,
     ),
   fileUrl: (id: number) => `/api/v1/external-subtitles/${id}/file`,
-};
-
-// ─── Scrub-preview sprites (Phase 12b) ─────────────────────────────────────
-
-export interface PreviewManifest {
-  sprite_url: string;
-  interval_ms: number;
-  tile_width: number;
-  tile_height: number;
-  tile_cols: number;
-  tile_count: number;
-}
-
-export const previews = {
-  manifest: (mediaFileId: number) =>
-    apiFetch<PreviewManifest>(`/media-files/${mediaFileId}/preview/manifest`),
-};
-
-// ─── Chapter thumbnails (Phase 38) ─────────────────────────────────────────
-
-export interface ChapterEntry {
-  index: number;
-  start_ms: number;
-  end_ms: number;
-  title: string | null;
-  /// Server-relative URL; null when the generate_chapter_thumbs task
-  /// hasn't run for this file yet (or extraction failed).
-  thumb_url: string | null;
-}
-
-export interface ChaptersResponse {
-  chapters: ChapterEntry[];
-  thumbs_ready: boolean;
-}
-
-export const chapters = {
-  list: (mediaFileId: number) =>
-    apiFetch<ChaptersResponse>(`/media-files/${mediaFileId}/chapters`),
 };
 
 // ─── Pre-roll video (Phase 42) ─────────────────────────────────────────────
@@ -2538,9 +2545,9 @@ export interface DeleteMediaResponse {
   episodes_purged: number;
   seasons_purged: number;
   items_purged: number;
-  /** Source-file and preview-sprite paths the server is unlinking
-   *  in the background. Surfaced so the operator UI can confirm
-   *  exactly what got removed. */
+  /** Source-file paths the server is unlinking in the background.
+   *  Surfaced so the operator UI can confirm exactly what got
+   *  removed. */
   paths: string[];
 }
 
@@ -2845,9 +2852,11 @@ export const admin = {
       if (opts.limit != null) qs.set("limit", String(opts.limit));
       if (opts.offset != null) qs.set("offset", String(opts.offset));
       const suffix = qs.toString() ? `?${qs}` : "";
-      return apiFetch<{ jobs: JobRow[]; total: number }>(
-        `/admin/jobs${suffix}`,
-      );
+      return apiFetch<{
+        jobs: JobRow[];
+        total: number;
+        progress: Record<string, JobProgress>;
+      }>(`/admin/jobs${suffix}`);
     },
     requeue: (jobId: number) =>
       apiFetch<{ requeued: boolean }>(`/admin/jobs/${jobId}/requeue`, {

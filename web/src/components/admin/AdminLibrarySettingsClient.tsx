@@ -340,14 +340,14 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
 
       <SettingsCard
         title="Metadata"
-        description="Preferred language for TMDB-sourced descriptions, taglines, and localized titles."
+        description="Preferred language for descriptions, taglines, and titles. Honored by every metadata agent that supports it (TMDB, TheTVDB, AniList)."
       >
         <SettingsRow
           label="Metadata language"
           help={
             metadataLanguageChanged
               ? "Server restart required for changes to take effect. Existing items keep their current text — run Refresh metadata on a library (or per-item) to re-pull in the new language."
-              : "BCP-47 tag (e.g. en-US, ja-JP). TMDB returns text in this language when available; for items missing a translation it falls back to the original language silently."
+              : "BCP-47 tag (e.g. en-US, ja-JP). TMDB honors it directly; TheTVDB picks the closest ISO 639-3 endpoint; AniList prefers English on en-* locales and Japanese on ja-* locales. OMDb is always English."
           }
           changed={metadataLanguageChanged}
         >

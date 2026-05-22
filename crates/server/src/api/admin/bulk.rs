@@ -45,18 +45,19 @@ pub async fn refresh_metadata(
 ) -> Result<Json<BulkReport>, ApiError> {
     cap_check(req.item_ids.len())?;
     let tmdb_snapshot = state.tmdb_snapshot().await;
-    let Some(tmdb) = tmdb_snapshot.as_ref() else {
-        return Err(ApiError::validation("TMDB enrichment is disabled"));
-    };
     let tvdb_snapshot = state.tvdb_snapshot().await;
+    let anilist_snapshot = state.anilist_snapshot().await;
+    let omdb_snapshot = state.omdb_snapshot().await;
     let mut ok = 0usize;
     let mut errors: Vec<BulkError> = Vec::new();
     for id in &req.item_ids {
         match scanner::refresh_item_metadata(
             &state.pool,
-            tmdb,
+            tmdb_snapshot.as_ref(),
             tvdb_snapshot.as_ref(),
             state.tvmaze.as_ref(),
+            anilist_snapshot.as_ref(),
+            omdb_snapshot.as_ref(),
             *id,
             None,
         )

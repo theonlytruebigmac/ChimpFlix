@@ -583,7 +583,7 @@ export function AdminTranscoderClient({
         </SettingsRow>
         <SettingsRow
           label="Job queue workers"
-          help="How many worker tasks pull from the durable job queue (marker detection, preview sprites, chapter thumbs, loudness). Each worker can run any kind, so raising this lets more pipeline kinds make progress in parallel when files pile up. Applies live — shrinking drains workers as soon as they finish their current job."
+          help="How many worker tasks pull from the durable job queue (marker detection, loudness, subtitles, ratings). Each worker can run any kind, so raising this lets more pipeline kinds make progress in parallel when files pile up. Applies live — shrinking drains workers as soon as they finish their current job."
           changed={dirtyFields["Job queue workers"]}
         >
           <input

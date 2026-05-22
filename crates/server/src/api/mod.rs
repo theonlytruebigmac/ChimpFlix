@@ -3,7 +3,6 @@
 pub(crate) mod access;
 pub(crate) mod admin;
 mod auth;
-mod chapters;
 mod collections;
 mod cors;
 mod csrf;
@@ -17,7 +16,6 @@ mod my_list;
 mod notifications;
 mod play_state;
 mod prefs;
-mod previews;
 pub mod rate_limit;
 mod scans;
 mod seasons;
@@ -171,10 +169,6 @@ pub fn router(state: AppState) -> Router {
             "/libraries/{id}/refresh-metadata",
             post(libraries::refresh_metadata),
         )
-        .route(
-            "/libraries/{id}/generate-previews",
-            post(libraries::generate_previews),
-        )
         .route("/items/{id}/detect-markers", post(markers::detect_for_item))
         // Per-media-file marker editor (operator-only) — used by the
         // owner-side marker-correction UI. The player-side surface
@@ -239,16 +233,6 @@ pub fn router(state: AppState) -> Router {
             get(subtitles::list_for_episode),
         )
         .route("/external-subtitles/{id}/file", get(subtitles::serve_file))
-        .route(
-            "/media-files/{id}/preview/manifest",
-            get(previews::manifest),
-        )
-        .route("/media-files/{id}/preview/sprite", get(previews::sprite))
-        .route("/media-files/{id}/chapters", get(chapters::list))
-        .route(
-            "/media-files/{id}/chapters/{index}/thumb",
-            get(chapters::thumb),
-        )
         .route(
             "/items/{id}/credits",
             axum::routing::patch(items::patch_credits),
@@ -363,9 +347,10 @@ pub fn router(state: AppState) -> Router {
             post(admin::bulk::detect_markers),
         )
         // Background job queue (Owner-only) — durable pipeline jobs
-        // for marker detection, preview sprites, loudness analysis,
-        // chapter thumbs. The list endpoint also accepts ?kind=...
-        // and ?status=... query params for filtering.
+        // for marker detection, loudness analysis, subtitle fetch,
+        // ratings, season fingerprint bootstrap. The list endpoint
+        // also accepts ?kind=... and ?status=... query params for
+        // filtering.
         .route("/admin/jobs", get(admin::jobs::list))
         .route("/admin/jobs/summary", get(admin::jobs::summary))
         .route("/admin/jobs/{id}/requeue", post(admin::jobs::requeue))

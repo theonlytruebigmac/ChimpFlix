@@ -10,7 +10,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::http::header::USER_AGENT;
-use chimpflix_library::{AgentInfo, LibraryAgent, NewAuditEntry, queries};
+use chimpflix_library::{AgentCapabilitiesDto, AgentInfo, LibraryAgent, NewAuditEntry, queries};
+use chimpflix_metadata::agents::{static_capabilities_for, static_limitations_for};
 use serde::{Deserialize, Serialize};
 
 use crate::api::admin::audit_log;
@@ -124,30 +125,61 @@ async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
     // client is actually constructed on AppState (TMDB and TVDB require
     // tokens); disabled agents can still be listed for the owner to see,
     // but won't produce metadata when run.
+    //
+    // `participates_in_chain` distinguishes true metadata agents that
+    // the scanner dispatch loop in `crates/library/src/scanner.rs` knows
+    // how to invoke (tmdb / tvdb / tvmaze / anilist) from non-metadata
+    // providers exposed only for credential-status visibility
+    // (opensubtitles, trakt, omdb). The latter are triggered via their
+    // own dedicated paths — OMDb via the `fetch_external_ratings`
+    // background job, OpenSubtitles via the subtitle-search code path,
+    // Trakt via /settings/integrations sync. Before this flag existed,
+    // operators could add a non-chain agent (e.g. OMDb) to a library's
+    // priority list and it would silently no-op, suggesting it was
+    // doing work when it wasn't.
     let tmdb_configured = state.tmdb.read().await.is_some();
     let tvdb_configured = state.tvdb.read().await.is_some();
     let anilist_configured = state.anilist.read().await.is_some();
     let opensubtitles_configured = state.opensubtitles.read().await.is_some();
     let trakt_configured = state.trakt.read().await.is_some();
     let omdb_configured = state.omdb.read().await.is_some();
+    // Helper to look up the static capability + limitations strings
+    // by agent name. Returns empty for non-chain agents (opensubtitles,
+    // trakt) — those don't go through the MetadataAgent trait.
+    let caps = |name: &str| AgentCapabilitiesDto::from(static_capabilities_for(name));
+    let limits = |name: &str| -> Vec<String> {
+        static_limitations_for(name)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    };
     vec![
         AgentInfo {
             name: "tmdb".into(),
             display_name: "The Movie Database".into(),
             supported_kinds: vec!["movie".into(), "show".into()],
             configured: tmdb_configured,
+            participates_in_chain: true,
+            capabilities: caps("tmdb"),
+            limitations: limits("tmdb"),
         },
         AgentInfo {
             name: "tvdb".into(),
             display_name: "TheTVDB".into(),
             supported_kinds: vec!["movie".into(), "show".into()],
             configured: tvdb_configured,
+            participates_in_chain: true,
+            capabilities: caps("tvdb"),
+            limitations: limits("tvdb"),
         },
         AgentInfo {
             name: "tvmaze".into(),
             display_name: "TVmaze".into(),
             supported_kinds: vec!["show".into()],
             configured: state.tvmaze.is_some(),
+            participates_in_chain: true,
+            capabilities: caps("tvmaze"),
+            limitations: limits("tvmaze"),
         },
         AgentInfo {
             name: "anilist".into(),
@@ -158,6 +190,9 @@ async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
             // on the seed defaults to enable it only for anime libraries.
             supported_kinds: vec!["show".into()],
             configured: anilist_configured,
+            participates_in_chain: true,
+            capabilities: caps("anilist"),
+            limitations: limits("anilist"),
         },
         AgentInfo {
             name: "opensubtitles".into(),
@@ -166,6 +201,9 @@ async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
             // kinds so the per-library picker offers it everywhere.
             supported_kinds: vec!["movie".into(), "show".into()],
             configured: opensubtitles_configured,
+            participates_in_chain: false,
+            capabilities: AgentCapabilitiesDto::default(),
+            limitations: vec!["Subtitle search only; not a metadata agent.".to_string()],
         },
         AgentInfo {
             name: "trakt".into(),
@@ -176,18 +214,24 @@ async fn build_registry(state: &AppState) -> Vec<AgentInfo> {
             // individually from /settings/integrations.
             supported_kinds: vec!["movie".into(), "show".into()],
             configured: trakt_configured,
+            participates_in_chain: false,
+            capabilities: AgentCapabilitiesDto::default(),
+            limitations: vec![
+                "Two-way watch-state sync; doesn't supply metadata or artwork.".to_string(),
+            ],
         },
         AgentInfo {
             name: "omdb".into(),
             display_name: "OMDb".into(),
-            // External-ratings supplement — IMDb/Rotten Tomatoes/
-            // Metacritic/MPAA. Read by the `fetch_external_ratings`
-            // per-item handler; not a primary metadata source so it
-            // doesn't need to be in the per-library priority list,
-            // but listing it here keeps the configured-status badge
-            // visible next to the other providers.
+            // Slice 7 promoted OMDb to a full chain participant.
+            // It can supply movie/show/episode metadata as well as
+            // ratings — though the 1k req/day cap means operators
+            // should place it late in the chain for large libraries.
             supported_kinds: vec!["movie".into(), "show".into()],
             configured: omdb_configured,
+            participates_in_chain: true,
+            capabilities: caps("omdb"),
+            limitations: limits("omdb"),
         },
     ]
 }

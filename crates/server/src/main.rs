@@ -95,6 +95,45 @@ async fn main() -> anyhow::Result<()> {
     };
     queries::ensure_default_user(&pool).await?;
 
+    // One-shot heal pass for episode titles that look filename-derived.
+    // Catches rows that were upserted before the parser sanitizer +
+    // the widened `upsert_episode` CASE shipped. Idempotent — a
+    // second boot finds nothing to fix because the GLOB / LIKE
+    // pattern set ALSO matches what sanitize_title produces, but the
+    // function checks `sanitized != original` before writing so
+    // already-clean rows are no-ops.
+    match queries::heal_filename_derived_episode_titles(&pool).await {
+        Ok(0) => {}
+        Ok(n) => info!(healed = n, "rewrote filename-derived episode titles"),
+        Err(e) => warn!(error = %format!("{e:#}"), "episode title heal failed"),
+    }
+
+    // Drop `images` rows with empty source_url — those render as
+    // `<img src="">` (black tile) in the episode list. Most commonly
+    // produced by TVDB's episode `image: ""` payload for episodes
+    // without stills before [`tvdb::normalize_tvdb_image`] filtered
+    // them at the source.
+    match queries::heal_blank_image_rows(&pool).await {
+        Ok(0) => {}
+        Ok(n) => info!(healed = n, "removed blank image rows"),
+        Err(e) => warn!(error = %format!("{e:#}"), "blank-image heal failed"),
+    }
+
+    // Phase 71 cleanup — remove orphaned on-disk artifacts from the
+    // dropped preview-sprite and chapter-thumb features. Idempotent:
+    // once the dirs are gone the calls are no-ops, so we don't bother
+    // gating on a settings flag. Errors are logged and ignored — a
+    // stranded directory isn't worth blocking boot for.
+    for sub in ["previews", "chapter_thumbs"] {
+        let dir = data_dir.join(sub);
+        if tokio::fs::metadata(&dir).await.is_ok() {
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => info!(path = %dir.display(), "removed orphaned artifact directory"),
+                Err(e) => warn!(path = %dir.display(), error = %e, "could not remove orphaned artifact directory"),
+            }
+        }
+    }
+
     // Migrate any legacy plaintext webhook secrets into the encrypted
     // columns. Idempotent — once every row is converted this is a no-op.
     match queries::backfill_webhook_secrets(&pool, &vault).await {
@@ -373,6 +412,11 @@ async fn main() -> anyhow::Result<()> {
         trakt_refresh_locks: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         task_metrics: crate::tasks::metrics::LiveMetrics::new(),
         worker_pool: Arc::new(tokio::sync::RwLock::new(None)),
+        job_progress: crate::jobs::progress::JobProgressStore::new(),
+        library_scan_exclusive: crate::jobs::scan_gate::LibraryScanGate::new(),
+        // 1 permit = bulk operations serialize against each other.
+        // See `AppState::bulk_write_lock` for the rationale.
+        bulk_write_lock: Arc::new(tokio::sync::Semaphore::new(1)),
     };
 
     // Scheduled tasks: flip orphaned `running` rows, seed defaults, spawn
@@ -451,14 +495,29 @@ fn init_tracing(buffer: log_buffer::LogBuffer) {
     // The buffer cap (5k lines in log_buffer.rs) keeps memory bounded
     // even when a chatty crate spams DEBUG; oldest evicts first.
     let stdout_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,tower_http=info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,tower_http=info,symphonia=warn"));
     // Buffer captures TRACE+ globally so the UI dropdown is meaningful,
     // but silences a few notoriously chatty deps (sqlx at the statement
     // level, the hyper/reqwest HTTP plumbing) to keep the 5k-line ring
-    // useful instead of swamped with one-shot request frames.
-    let buffer_filter = EnvFilter::new("trace,sqlx=info,hyper=info,h2=info,reqwest=info");
+    // useful instead of swamped with one-shot request frames. `symphonia`
+    // is silenced at INFO because its MKV demuxer logs an "unknown codec"
+    // line for every non-audio track (subtitles, video) it iterates past
+    // when tacet opens a file for audio analysis — those are expected,
+    // not actionable, and a single mixed-stream MKV produces 3-5 lines.
+    let buffer_filter =
+        EnvFilter::new("trace,sqlx=info,hyper=info,h2=info,reqwest=info,symphonia=warn");
+    // Strip ANSI colors when stdout isn't a terminal — Docker captures
+    // stdout into a non-TTY file, so the escapes show up as literal
+    // `[2m...[0m` noise in `docker logs` and any tail of the captured
+    // log file. Interactive `docker logs -f` from a terminal still gets
+    // colored output because IsTerminal reports true there.
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::registry()
-        .with(fmt::layer().with_filter(stdout_filter))
+        .with(
+            fmt::layer()
+                .with_ansi(stdout_is_tty)
+                .with_filter(stdout_filter),
+        )
         .with(log_buffer::LogBufferLayer::new(buffer).with_filter(buffer_filter))
         .init();
 }
@@ -609,7 +668,11 @@ async fn build_tvdb_from_vault(
     let Some(apikey) = vault_get_or_warn(pool, vault, "tvdb").await else {
         return Ok(None);
     };
-    Ok(Some(TvdbClient::new(&apikey, None)?))
+    let language = match queries::get_server_settings(pool).await {
+        Ok(s) => s.metadata_language,
+        Err(_) => "en-US".to_string(),
+    };
+    Ok(Some(TvdbClient::with_language(&apikey, None, &language)?))
 }
 
 async fn build_anilist_from_vault(

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   admin as adminApi,
+  type JobProgress,
   type JobRow,
   type JobStatusFilter,
   type JobSummary,
@@ -54,11 +55,15 @@ export function AdminJobsClient({
     summary: JobSummary;
     jobs: JobRow[];
     total: number;
+    /// Per-job live progress keyed by job id. Empty on first
+    /// render; populated by each poll tick.
+    progress: Record<string, JobProgress>;
     nowMs: number;
   }>({
     summary: initialSummary,
     jobs: initialJobs,
     total: initialJobs.length,
+    progress: {},
     nowMs: 0,
   });
   const [kind, setKind] = useState<string>("");
@@ -140,6 +145,7 @@ export function AdminJobsClient({
           summary,
           jobs: list.jobs,
           total: list.total,
+          progress: list.progress,
           nowMs: Date.now(),
         });
         setError(null);
@@ -166,12 +172,11 @@ export function AdminJobsClient({
     setSweepResult(null);
     try {
       const counts = await adminApi.jobs.processAllPending();
-      const total =
-        counts.markers + counts.previews + counts.chapter_thumbs + counts.loudness;
+      const total = counts.markers + counts.loudness;
       setSweepResult(
         total === 0
           ? "All files already have every artifact — nothing to enqueue."
-          : `Enqueued ${total.toLocaleString()} jobs: ${counts.markers} markers, ${counts.previews} previews, ${counts.chapter_thumbs} chapter thumbs, ${counts.loudness} loudness.`,
+          : `Enqueued ${total.toLocaleString()} jobs: ${counts.markers} markers, ${counts.loudness} loudness.`,
       );
       // Refresh now so the summary counters jump immediately rather
       // than waiting for the next poll tick.
@@ -188,6 +193,7 @@ export function AdminJobsClient({
         summary,
         jobs: list.jobs,
         total: list.total,
+        progress: list.progress,
         nowMs: Date.now(),
       });
     } catch (e) {
@@ -221,6 +227,7 @@ export function AdminJobsClient({
         summary,
         jobs: list.jobs,
         total: list.total,
+        progress: list.progress,
         nowMs: Date.now(),
       });
     } catch (e) {
@@ -254,6 +261,7 @@ export function AdminJobsClient({
         summary,
         jobs: list.jobs,
         total: list.total,
+        progress: list.progress,
         nowMs: Date.now(),
       });
     } catch (e) {
@@ -281,6 +289,7 @@ export function AdminJobsClient({
         summary,
         jobs: list.jobs,
         total: list.total,
+        progress: list.progress,
         // eslint-disable-next-line react-hooks/purity
         nowMs: Date.now(),
       });
@@ -291,7 +300,7 @@ export function AdminJobsClient({
     }
   }
 
-  const { summary, jobs, nowMs } = state;
+  const { summary, jobs, nowMs, progress } = state;
 
   return (
     <div className="space-y-5">
@@ -361,8 +370,7 @@ export function AdminJobsClient({
               <>
                 <p>
                   Sweep every file lacking a pipeline artifact (markers,
-                  preview sprite, chapter thumbs, loudness) and enqueue jobs
-                  for them.
+                  loudness) and enqueue jobs for them.
                 </p>
                 <p className="mt-2">
                   This is idempotent — re-running while jobs are in flight is
@@ -489,6 +497,14 @@ export function AdminJobsClient({
                   </td>
                   <td className="px-3 py-3 text-[11.5px] text-white/55">
                     <code className="font-mono break-all">{j.payload}</code>
+                    {/*
+                      Live progress for in-flight jobs and stage
+                      breakdown for completed ones. Both are
+                      operator-visibility nicety; never block
+                      anything — render only when data is present.
+                    */}
+                    <LiveProgressLine progress={progress[String(j.id)]} />
+                    <StageTimingsLine stageTimingsJson={j.stage_timings_json} />
                     {j.last_error && (
                       <div className="mt-1 text-[11px] text-red-300/80">
                         {j.last_error}
@@ -600,4 +616,75 @@ function relativeSince(epochMs: number, nowMs: number): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min ago`;
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
   return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+/// Inline live-progress pill for an in-flight job. Returns null when
+/// the job isn't currently executing — the parent row renders without
+/// any progress chrome.
+function LiveProgressLine({ progress }: { progress: JobProgress | undefined }) {
+  if (!progress) return null;
+  const pct =
+    progress.percent != null
+      ? `${Math.round(progress.percent * 100)}%`
+      : null;
+  return (
+    <div className="mt-1 flex items-center gap-2 text-[11px] text-sky-300/85">
+      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+      <span>
+        {progress.stage}
+        {pct && ` · ${pct}`}
+      </span>
+    </div>
+  );
+}
+
+/// Inline stage-breakdown for jobs with a persisted timing blob.
+/// Renders as "decode 3m 02s · fingerprint 1m 04s · loudness 67s".
+/// Falls back to null on parse failure (e.g. legacy blob shape).
+function StageTimingsLine({
+  stageTimingsJson,
+}: {
+  stageTimingsJson: string | null;
+}) {
+  if (!stageTimingsJson) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(stageTimingsJson) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  // Extract recognized fields; ignore unknown ones so the UI keeps
+  // working as tacet's API grows.
+  const stages: Array<[string, number]> = [];
+  for (const [label, key] of [
+    ["markers", "markers_ms"],
+    ["fingerprint", "fingerprint_ms"],
+    ["decode", "decode_ms"],
+    ["loudness", "loudness_ms"],
+  ] as const) {
+    const v = parsed[key];
+    if (typeof v === "number" && v > 0) {
+      stages.push([label, v]);
+    }
+  }
+  if (stages.length === 0) return null;
+  return (
+    <div className="mt-1 text-[11px] text-white/40">
+      {stages.map(([label, ms], i) => (
+        <span key={label}>
+          {i > 0 && <span className="mx-1.5">·</span>}
+          {label} {formatShortDuration(ms)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function formatShortDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  const m = Math.floor(s / 60);
+  const sec = Math.round(s % 60);
+  return sec === 0 ? `${m}m` : `${m}m ${sec}s`;
 }

@@ -13,7 +13,6 @@ import {
   items as itemsApi,
   playState as playStateApi,
   preroll as prerollApi,
-  previews as previewsApi,
   seasons as seasonsApi,
   type EpisodeDetail,
   type EpisodeListed,
@@ -21,7 +20,6 @@ import {
   type ItemDetail,
   type MediaFileSummary,
   type MediaStreamSummary,
-  type PreviewManifest,
   type SeasonSummary,
   type User,
 } from "@/lib/chimpflix-api";
@@ -71,7 +69,6 @@ interface Resolved {
   /// All seasons in the show, ordered as the API returns them. Source
   /// of truth for the picker list (with a checkmark on the current one).
   seasons?: { id: number; season_number: number; title: string | null }[];
-  previewManifest?: PreviewManifest;
   versions?: VersionChoice[];
 }
 
@@ -110,18 +107,6 @@ function versionsFor(
       subtitleTracks: mergeExternalSubtitles(embedded, external),
     };
   });
-}
-
-async function maybePreviewManifest(
-  mediaFileId: number,
-): Promise<PreviewManifest | undefined> {
-  // 404 just means previews haven't been generated for this file yet;
-  // anything else (network blip, server hiccup) gets the same treatment.
-  try {
-    return await previewsApi.manifest(mediaFileId);
-  } catch {
-    return undefined;
-  }
 }
 
 function languageLabel(code: string | null | undefined): string | null {
@@ -271,7 +256,6 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
   } catch {
     // Best-effort; an outage in OpenSubtitles shouldn't break playback.
   }
-  const previewManifest = await maybePreviewManifest(file.id);
   return {
     mediaFileId: file.id,
     title: detail.title,
@@ -282,7 +266,6 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
     audioTracks: tracks.audio,
     subtitleTracks: mergeExternalSubtitles(tracks.subtitle, external),
     markers: file.markers ?? [],
-    previewManifest,
     versions: versionsFor(detail.files, external),
   };
 }
@@ -345,7 +328,6 @@ async function resolveEpisode(
       season_number: s.season_number,
       title: s.title,
     })),
-    previewManifest: await maybePreviewManifest(file.id),
     versions: versionsFor(episode.files, external),
   };
 }
@@ -582,7 +564,6 @@ export default async function WatchPage({
       showId={resolved.showId}
       showTitle={resolved.showTitle}
       seasons={resolved.seasons}
-      previewManifest={resolved.previewManifest}
       versions={resolved.versions}
       playedThresholdPct={playedThresholdPct}
       completionBehaviour={completionBehaviour}

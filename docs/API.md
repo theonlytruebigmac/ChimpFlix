@@ -533,8 +533,6 @@ Complete route list grouped by category. All routes are prefixed with
 
 ### Media-file ancillary
 
-- `GET    /media-files/{id}/preview/manifest`, `GET /media-files/{id}/preview/sprite` (BIF)
-- `GET    /media-files/{id}/chapters`, `GET /media-files/{id}/chapters/{index}/thumb`
 - `GET    /external-subtitles/{id}/file`
 
 ### Play state (routes)

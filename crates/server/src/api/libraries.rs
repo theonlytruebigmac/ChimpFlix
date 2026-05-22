@@ -91,7 +91,7 @@ pub async fn trigger_scan(
     _owner: OwnerAuth,
     Path(library_id): Path<i64>,
 ) -> Result<(StatusCode, Json<ScanJob>), ApiError> {
-    let _library = queries::get_library(&state.pool, library_id)
+    let library = queries::get_library(&state.pool, library_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
@@ -109,6 +109,27 @@ pub async fn trigger_scan(
         ));
     }
 
+    // First-scan exclusivity: when this is the operator's initial
+    // scan of a brand-new library (no `last_scan_at` yet), pause the
+    // worker pool + scheduler tick until the scan completes. The
+    // pre-flag failure mode was: scanner racing 8 workers on the
+    // shared SQLite write lock → busy_timeout exhausted on some
+    // inserts → scan bails halfway through → half-populated library
+    // shown to the operator (e.g. 75 files visible out of 1560).
+    //
+    // Incremental scans (already-scanned libraries, file watcher
+    // adds, scheduled re-scans) DON'T set this — the library is
+    // already functional for users and pausing all background work
+    // for a few new files would be heavy-handed.
+    let is_first_scan = library.last_scan_at.is_none();
+    if is_first_scan {
+        state.library_scan_exclusive.acquire().await;
+        tracing::info!(
+            library_id,
+            "first scan: enabling exclusivity (pausing workers + scheduler until complete)"
+        );
+    }
+
     let job = queries::create_scan_job(&state.pool, library_id).await?;
     let job_id = job.id;
 
@@ -118,6 +139,7 @@ pub async fn trigger_scan(
     let tvdb = state.tvdb_snapshot().await;
     let anilist = state.anilist_snapshot().await;
     let tvmaze = state.tvmaze.clone();
+    let omdb = state.omdb_snapshot().await;
     let hub = state.hub.clone();
 
     let emitter: ScanEmitter = Arc::new(move |event: ScanEvent| {
@@ -151,9 +173,9 @@ pub async fn trigger_scan(
     let cache_root = state.transcoder.cache_root().to_path_buf();
     let state_for_release = state.clone();
     // Wrap the emitter so FileAdded events fan out into the
-    // discovery pipeline (detect_markers / preview / loudness /
-    // chapter thumbs jobs per new file). The inner emitter still
-    // gets every event for hub + webhook delivery.
+    // discovery pipeline (detect_markers / loudness jobs per new
+    // file). The inner emitter still gets every event for hub +
+    // webhook delivery.
     let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(state.clone(), emitter);
     tokio::spawn(async move {
         if let Err(e) = chimpflix_library::run_scan(
@@ -163,6 +185,7 @@ pub async fn trigger_scan(
             tvdb,
             anilist,
             tvmaze,
+            omdb,
             library_id,
             job_id,
             Some(cache_root),
@@ -173,6 +196,18 @@ pub async fn trigger_scan(
             warn!(error = %format!("{e:#}"), library_id, job_id, "scan task ended with error");
         }
         state_for_release.release_library_scan(library_id).await;
+        // Release the first-scan exclusivity gate regardless of
+        // outcome. The counter inside `LibraryScanGate` correctly
+        // handles overlapping first-scans — workers + scheduler
+        // resume only when every outstanding first-scan has
+        // released.
+        if is_first_scan {
+            state_for_release.library_scan_exclusive.release().await;
+            tracing::info!(
+                library_id,
+                "first scan complete: releasing exclusivity"
+            );
+        }
     });
 
     Ok((StatusCode::ACCEPTED, Json(job)))
@@ -364,12 +399,14 @@ pub async fn refresh_metadata(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let Some(tmdb) = state.tmdb_snapshot().await else {
-        // No TMDB credential — nothing to refresh.
-        return Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued: 0 })));
-    };
+    // Library-wide refresh — chain-aware, runs even when TMDB isn't
+    // configured (other agents in the chain still get a chance to
+    // populate metadata).
+    let tmdb = state.tmdb_snapshot().await;
     let tvdb = state.tvdb_snapshot().await;
     let tvmaze = state.tvmaze.clone();
+    let anilist = state.anilist_snapshot().await;
+    let omdb = state.omdb_snapshot().await;
     let item_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM items WHERE library_id = ?")
         .bind(library_id)
         .fetch_all(&state.pool)
@@ -383,9 +420,11 @@ pub async fn refresh_metadata(
         for item_id in item_ids {
             match chimpflix_library::scanner::refresh_item_metadata(
                 &pool,
-                &tmdb,
+                tmdb.as_ref(),
                 tvdb.as_ref(),
                 tvmaze.as_ref(),
+                anilist.as_ref(),
+                omdb.as_ref(),
                 item_id,
                 None,
             )
@@ -397,82 +436,6 @@ pub async fn refresh_metadata(
         }
         info!(library_id, ok, err, "library refresh_metadata completed");
     });
-    Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued })))
-}
-
-/// Generate scrub-preview sprite tiles for every media file in this
-/// library that doesn't already have one. Sequential because each
-/// sprite-gen pegs a CPU core. The standard `generate_previews`
-/// scheduled task does the same thing on a batch-of-N cadence;
-/// this endpoint just kicks the whole library at once for the
-/// "I want previews on everything NOW" path.
-pub async fn generate_previews(
-    State(state): State<AppState>,
-    _owner: OwnerAuth,
-    Path(library_id): Path<i64>,
-) -> Result<(StatusCode, Json<LibraryJobQueued>), ApiError> {
-    let _library = queries::get_library(&state.pool, library_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    // Batch = 0 means "no per-call cap" inside the query.
-    let candidates = queries::list_media_files_needing_previews(&state.pool, Some(library_id), 0)
-        .await
-        .map_err(ApiError::Internal)?;
-    let queued = candidates.len();
-    if queued == 0 {
-        return Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued: 0 })));
-    }
-
-    let pool = state.pool.clone();
-    let ffmpeg = state.ffmpeg.clone();
-    let dir = state.data_dir.join("previews");
-    tokio::spawn(async move {
-        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-            warn!(error = %e, "could not create previews dir");
-            return;
-        }
-        let mut ok = 0usize;
-        let mut err = 0usize;
-        for cand in &candidates {
-            let duration = cand.duration_ms.unwrap_or(0);
-            let output = dir.join(format!("{}.jpg", cand.id));
-            match chimpflix_transcoder::generate_sprite(
-                &ffmpeg,
-                std::path::Path::new(&cand.path),
-                &output,
-                duration,
-                chimpflix_transcoder::DEFAULT_INTERVAL_S,
-                chimpflix_transcoder::DEFAULT_TILE_WIDTH,
-            )
-            .await
-            {
-                Ok(info) => {
-                    if queries::record_preview_sprite(
-                        &pool,
-                        queries::PreviewSpriteRecord {
-                            media_file_id: cand.id,
-                            path: info.path.to_string_lossy().into_owned(),
-                            interval_ms: info.interval_ms,
-                            tile_width: i64::from(info.tile_width),
-                            tile_height: i64::from(info.tile_height),
-                            tile_cols: i64::from(info.tile_cols),
-                            tile_count: i64::from(info.tile_count),
-                        },
-                    )
-                    .await
-                    .is_ok()
-                    {
-                        ok += 1;
-                    } else {
-                        err += 1;
-                    }
-                }
-                Err(_) => err += 1,
-            }
-        }
-        info!(library_id, ok, err, "library generate_previews completed");
-    });
-
     Ok((StatusCode::ACCEPTED, Json(LibraryJobQueued { queued })))
 }
 

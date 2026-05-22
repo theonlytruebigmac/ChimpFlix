@@ -51,9 +51,41 @@ const securityHeaders = [
   { key: "X-Frame-Options", value: "DENY" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   {
+    // Permissions-Policy: keep destructive surfaces (camera, mic,
+    // geolocation, payment, USB) hard-blocked even from this origin,
+    // but allow benign sensors that the player and any third-party
+    // library may legitimately want to read. Locking sensors to `()`
+    // (no origin allowed) caused a tight React render loop on Android
+    // Chrome PWAs: a bundled dependency tried to subscribe to
+    // accelerometer / deviceorientation each render, hit the violation
+    // synchronously, never finished the effect, and React kept
+    // rescheduling forever — symptom was a black video with
+    // unresponsive controls. Allowing `self` lets the subscription
+    // resolve (with or without real data) so the player can mount.
+    //
+    // YouTube's embedded player (used for hero trailers) also calls
+    // accelerometer / gyroscope / deviceorientation synchronously on
+    // load. The iframe's `allow=` attribute only delegates features
+    // the *parent* already holds, so we whitelist youtube-nocookie.com
+    // alongside `self`. Without that origin in the list every hero
+    // trailer mount logs ~70 violation entries plus a render-loop
+    // burst that visibly slows the home page.
     key: "Permissions-Policy",
-    value:
-      "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()",
+    value: [
+      'accelerometer=(self "https://www.youtube-nocookie.com")',
+      'gyroscope=(self "https://www.youtube-nocookie.com")',
+      'magnetometer=(self "https://www.youtube-nocookie.com")',
+      'fullscreen=(self "https://www.youtube-nocookie.com")',
+      'picture-in-picture=(self "https://www.youtube-nocookie.com")',
+      "screen-wake-lock=(self)",
+      'autoplay=(self "https://www.youtube-nocookie.com")',
+      'encrypted-media=(self "https://www.youtube-nocookie.com")',
+      "camera=()",
+      "geolocation=()",
+      "microphone=()",
+      "payment=()",
+      "usb=()",
+    ].join(", "),
   },
   { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
   // Frontend serves cross-origin resources via /api/v1/* (images, HLS

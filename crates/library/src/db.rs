@@ -119,18 +119,27 @@ pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::R
     migrate_pool.close().await;
 
     // ── App pool: full concurrency, FK on ──────────────────────────
-    // `busy_timeout` lets SQLite poll for up to 5s before returning
+    // `busy_timeout` lets SQLite poll for up to 30s before returning
     // SQLITE_BUSY when another connection holds the write lock — the
     // default of 0 surfaces as "database is locked" 500s on any
     // mid-transaction collision (e.g. the merge endpoint racing a
-    // scanner upsert on a parallel connection). Five seconds is
-    // generous for the kinds of short writes we run; nothing in the
-    // app should legitimately hold the lock longer than that.
+    // scanner upsert on a parallel connection).
+    //
+    // 30s is generous on purpose. The original 5s was enough for
+    // light contention but lost under load — a library scan racing
+    // 8 active workers (markers + loudness + bootstrap) was hitting
+    // BUSY on inserts within seconds and the scanner would bail
+    // mid-run, half-populating the library. Bumping to 30s absorbs
+    // burst contention from the worker pool. Layer 2's
+    // `library_scan_exclusive` flag pauses workers during a fresh
+    // library scan so the 30s shouldn't ever actually elapse in
+    // practice — it's a safety net for the unexpected case (e.g.
+    // a workflow that holds an admin write open longer than usual).
     let mut opts = SqliteConnectOptions::from_str(&url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_secs(5))
+        .busy_timeout(std::time::Duration::from_secs(30))
         .foreign_keys(true);
     if let Some(mb) = cache_size_mb.filter(|n| *n > 0) {
         // Negative N = "N KiB of cache"; positive N = "N pages". We
@@ -163,6 +172,86 @@ pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::R
         "library database ready",
     );
     Ok(pool)
+}
+
+// ---------------------------------------------------------------------------
+// BUSY / SNAPSHOT retry helper
+// ---------------------------------------------------------------------------
+
+/// Run `f` and transparently retry on the two flavors of SQLite write
+/// contention that aren't already absorbed by `busy_timeout`:
+///
+/// - **Code 5 (`SQLITE_BUSY`)** — the writer lock is held by another
+///   connection. `busy_timeout` polls for this up to 30s; the retry
+///   here is defensive for the edge case where the timeout itself
+///   expires (deep contention, slow writes).
+/// - **Code 517 (`SQLITE_BUSY_SNAPSHOT`)** — extended-result-code-only
+///   error specific to WAL mode. Fires at *commit* time when our read
+///   snapshot started before another writer advanced the WAL. This is
+///   the variant that the Movies backfill kept hitting because
+///   `enqueue_job_unique` does SELECT (snapshot) → INSERT (upgrade);
+///   `busy_timeout` does NOT poll-retry 517 because it's not a wait-
+///   for-lock condition — it's an optimistic-concurrency conflict.
+///
+/// Retries with exponential backoff capped at ~1.6s (25, 50, 100, 200,
+/// 400, 800, 1600 ms, then 1600 ms each thereafter). `MAX_ATTEMPTS = 8`
+/// means a worst-case wait of ~5s of cumulative backoff before
+/// surrendering — well under any reasonable HTTP timeout but enough
+/// burst absorption for the scanner+worker race.
+///
+/// When a retry actually fires, logs at `info` so an operator watching
+/// the activity feed can see contention without surprises. Retries
+/// silently succeed are NOT logged — we don't want a log line per
+/// successful write under load.
+pub async fn with_busy_retry<F, Fut, T>(mut f: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    const MAX_ATTEMPTS: usize = 8;
+    let mut backoff_ms: u64 = 25;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !is_sqlite_busy_anyhow(&e) || attempt == MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                let code = anyhow_sqlite_code(&e).unwrap_or_else(|| "?".into());
+                tracing::info!(
+                    attempt,
+                    code = %code,
+                    wait_ms = backoff_ms,
+                    "SQLite write retry after BUSY/SNAPSHOT contention"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(1600);
+            }
+        }
+    }
+    // Unreachable — the loop either returns Ok or returns the inner
+    // Err on the final attempt. Kept for the compiler.
+    unreachable!("with_busy_retry exited loop without returning")
+}
+
+/// True when the error chain contains a SQLite BUSY (code 5) or
+/// BUSY_SNAPSHOT (code 517). Walks the anyhow chain so callers can
+/// freely wrap sqlx errors in context().
+fn is_sqlite_busy_anyhow(e: &anyhow::Error) -> bool {
+    anyhow_sqlite_code(e)
+        .as_deref()
+        .is_some_and(|c| c == "5" || c == "517")
+}
+
+fn anyhow_sqlite_code(e: &anyhow::Error) -> Option<String> {
+    for cause in e.chain() {
+        if let Some(sqlx::Error::Database(db)) = cause.downcast_ref::<sqlx::Error>() {
+            if let Some(code) = db.code() {
+                return Some(code.into_owned());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]

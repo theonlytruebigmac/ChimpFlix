@@ -334,14 +334,15 @@ function HealthRow({ row }: { row: LibraryHealthItemRow }) {
   );
 
   if (row.item_id_for_modal != null) {
-    // Open the title modal in the main app — uses the same
-    // `?modal=<id>` URL trick the rails use so the operator can
-    // jump straight to the offending item without leaving the
-    // admin shell as a "lost" tab.
+    // Open the title modal in the main app — uses the `?title=<id>`
+    // URL parameter that `ModalRoot` listens for. (Earlier versions
+    // of this link used `?modal=` which silently no-op'd because
+    // ModalRoot reads `title` exclusively. Always grep ModalRoot's
+    // TITLE_PARAM before duplicating this pattern.)
     return (
       <li>
         <Link
-          href={`/?modal=${row.item_id_for_modal}`}
+          href={`/?title=${row.item_id_for_modal}`}
           target="_blank"
           rel="noopener"
           className="flex items-baseline justify-between gap-3 px-6 py-2.5 transition-colors hover:bg-white/5"

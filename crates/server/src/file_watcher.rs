@@ -277,6 +277,7 @@ async fn spawn_scan(state: AppState, library_id: i64) {
     let tvdb = state.tvdb_snapshot().await;
     let anilist = state.anilist_snapshot().await;
     let tvmaze = state.tvmaze.clone();
+    let omdb = state.omdb_snapshot().await;
     let hub = state.hub.clone();
     let cache_root = state.transcoder.cache_root().to_path_buf();
     let state_for_release = state.clone();
@@ -298,6 +299,7 @@ async fn spawn_scan(state: AppState, library_id: i64) {
             tvdb,
             anilist,
             tvmaze,
+            omdb,
             library_id,
             job.id,
             Some(cache_root),
@@ -316,12 +318,11 @@ async fn spawn_scan(state: AppState, library_id: i64) {
         // for new files, gated on the `detect_markers_on_add`
         // setting. That's now handled by the discovery pipeline
         // wrapper around the emitter — every FileAdded event fans
-        // out into detect_markers_file / preview / loudness /
-        // chapter-thumbs jobs automatically. The wrapper's
-        // enqueue_job_unique dedup means re-triggers are no-ops.
-        // Marker `detect_markers_on_add` setting is effectively
-        // always-on with the new pipeline; the knob now affects
-        // only the scheduled safety-net task.)
+        // out into detect_markers_file / loudness jobs
+        // automatically. The wrapper's enqueue_job_unique dedup
+        // means re-triggers are no-ops. Marker `detect_markers_on_add`
+        // setting is effectively always-on with the new pipeline;
+        // the knob now affects only the scheduled safety-net task.)
         let _ = scan_ok;
         // Release the lock as the final act so a concurrent scheduled
         // scan or manual trigger can proceed cleanly.

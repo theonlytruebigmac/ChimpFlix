@@ -20,6 +20,13 @@ authors = ["ChimpFlix contributors"]
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.5"
+# Trait macros that desugar `async fn` in traits into
+# `fn -> Pin<Box<dyn Future>>` so the trait can be used behind `dyn`.
+# Used by the metadata-agent framework (`MetadataAgent` trait) to let
+# the scanner hold a heterogeneous `Vec<Arc<dyn MetadataAgent>>`. The
+# bare `async fn in trait` stable since Rust 1.75 isn't dyn-compatible
+# without this shim.
+async-trait = "0.1"
 # tacet — pure-Rust intro/credits detection engine. Reference-based
 # audio fingerprinting (constellation-hash) with a blackframe
 # fallback for live-action shows. Vendored at crates/tacet-core via

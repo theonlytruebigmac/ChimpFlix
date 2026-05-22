@@ -13,6 +13,7 @@
   <header class="page">
     <h1>Media ingest + library maintenance</h1>
     <div class="subtitle">From file-watch event to durable job queue. The on-add discovery pipeline and the weekly safety-net scheduled tasks share the same per-file handlers — two entry points, one fan-out.</div>
+    <div class="subtitle" style="margin-top:0.5rem; opacity:0.8;"><strong>Phase 71 (2026-05-21):</strong> the <code>generate_preview_sprite</code> / <code>generate_previews</code> and <code>build_chapter_thumbs</code> / <code>generate_chapter_thumbs</code> blocks below are <em>historical</em> — both features were removed and their handlers, routes, DB columns, and on-disk artifact dirs are gone. <code>probe_chapters</code> is retained as an internal helper for marker-detection fallback only.</div>
   </header>
 
   <nav class="crumbs">

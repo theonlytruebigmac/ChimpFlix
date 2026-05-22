@@ -496,6 +496,7 @@ impl TmdbClient {
                 .episodes
                 .into_iter()
                 .map(|e| TmdbEpisode {
+                    tmdb_id: e.id,
                     episode_number: e.episode_number,
                     title: e.name,
                     summary: nonempty(e.overview),
@@ -719,6 +720,9 @@ pub struct TmdbSeason {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmdbEpisode {
+    /// TMDB's own episode id (distinct from `episode_number`). Used for
+    /// stable cross-references; persisted in `episodes.tmdb_id`.
+    pub tmdb_id: i64,
     pub episode_number: i32,
     pub title: String,
     pub summary: Option<String>,
@@ -923,6 +927,7 @@ struct RawSeason {
 
 #[derive(Debug, Deserialize)]
 struct RawEpisode {
+    id: i64,
     episode_number: i32,
     name: String,
     overview: Option<String>,

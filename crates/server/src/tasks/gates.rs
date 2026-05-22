@@ -102,7 +102,6 @@ fn evaluate(name: &str, read_bool: impl Fn(&str) -> Option<bool>) -> GateState {
 /// addition and the wiring to stay in sync.
 fn read_gate_bool(settings: &chimpflix_library::ServerSettings, key: &str) -> bool {
     match key {
-        "chapter_thumbs_enabled" => settings.chapter_thumbs_enabled,
         "loudness_analysis_enabled" => settings.loudness_analysis_enabled,
         "subtitle_fetch_enabled" => settings.subtitle_fetch_enabled,
         "embedded_subs_extract_enabled" => settings.embedded_subs_extract_enabled,
@@ -137,7 +136,6 @@ mod tests {
         // turned off via settings.
         assert_eq!(check("detect_markers_file", &gates), GateState::Allowed);
         assert_eq!(check("detect_markers", &gates), GateState::Allowed);
-        assert_eq!(check("generate_preview_sprite", &gates), GateState::Allowed);
     }
 
     #[test]
@@ -159,25 +157,20 @@ mod tests {
 
     #[test]
     fn job_and_sweep_names_resolve_to_same_gate() {
-        // The job-kind `build_chapter_thumbs` and the sweep-kind
-        // `generate_chapter_thumbs` share the chapter_thumbs_enabled
-        // gate. Flipping the gate off must block both names, so the
-        // on-add path and the safety-net cron stop together.
+        // The job-kind `analyze_loudness` and the sweep-kind share the
+        // loudness_analysis_enabled gate. Flipping the gate off must
+        // block both names, so the on-add path and the safety-net cron
+        // stop together.
         let mut off = HashMap::new();
-        off.insert("chapter_thumbs_enabled", false);
+        off.insert("loudness_analysis_enabled", false);
         assert_eq!(
-            check("build_chapter_thumbs", &off),
-            GateState::DisabledByAdmin
-        );
-        assert_eq!(
-            check("generate_chapter_thumbs", &off),
+            check("analyze_loudness", &off),
             GateState::DisabledByAdmin
         );
 
         let mut on = HashMap::new();
-        on.insert("chapter_thumbs_enabled", true);
-        assert_eq!(check("build_chapter_thumbs", &on), GateState::Allowed);
-        assert_eq!(check("generate_chapter_thumbs", &on), GateState::Allowed);
+        on.insert("loudness_analysis_enabled", true);
+        assert_eq!(check("analyze_loudness", &on), GateState::Allowed);
     }
 
     #[test]
@@ -221,7 +214,6 @@ mod tests {
         use crate::tasks::registry;
 
         const PRODUCTION_GATE_KEYS: &[&str] = &[
-            "chapter_thumbs_enabled",
             "loudness_analysis_enabled",
             "subtitle_fetch_enabled",
             "embedded_subs_extract_enabled",

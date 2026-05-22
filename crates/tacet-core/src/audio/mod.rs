@@ -251,7 +251,7 @@ fn track_duration_seconds(
 }
 
 /// Downmix interleaved multi-channel audio to mono by averaging channels.
-fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+pub(crate) fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels == 1 {
         return interleaved.to_vec();
     }
@@ -269,7 +269,7 @@ fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
 /// final partial input chunk is zero-padded. After resampling we trim the
 /// output back to the expected length so the synthetic silence at the tail
 /// doesn't leak into the fingerprint.
-fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
+pub(crate) fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
     let params = SincInterpolationParameters {
         sinc_len: 64,
         f_cutoff: 0.95,

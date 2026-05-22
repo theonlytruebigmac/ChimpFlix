@@ -9,7 +9,7 @@ pub mod queries;
 pub mod scanner;
 pub mod smart_rule;
 
-pub use db::{open, open_with};
+pub use db::{open, open_with, with_busy_retry};
 pub use events::{ScanEmitter, ScanEvent};
 pub use models::*;
 pub use scanner::run_scan;

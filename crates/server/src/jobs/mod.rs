@@ -50,6 +50,8 @@ use crate::state::AppState;
 pub mod error_class;
 pub mod handlers;
 pub mod pipeline;
+pub mod progress;
+pub mod scan_gate;
 
 // Note: the old DEFAULT_LEASE_TTL_MS constant was removed when boot
 // reclaim moved to `lease_ttl=0` (every `running` row at boot is by
@@ -226,14 +228,8 @@ pub fn build_router() -> JobRouter {
         .register(handlers::detect_markers_file::KIND, |s, p| {
             handlers::detect_markers_file::run(s, p)
         })
-        .register(handlers::generate_preview_sprite::KIND, |s, p| {
-            handlers::generate_preview_sprite::run(s, p)
-        })
         .register(handlers::analyze_loudness::KIND, |s, p| {
             handlers::analyze_loudness::run(s, p)
-        })
-        .register(handlers::build_chapter_thumbs::KIND, |s, p| {
-            handlers::build_chapter_thumbs::run(s, p)
         })
         .register(handlers::fetch_subtitles_item::KIND, |s, p| {
             handlers::fetch_subtitles_item::run(s, p)
@@ -378,6 +374,12 @@ async fn worker_loop(
     limiter: KindLimiter,
     mut count_rx: watch::Receiver<usize>,
 ) {
+    // Library-first-scan exclusivity gate. While the gate's counter
+    // is non-zero, this worker awaits a clear before claiming new
+    // jobs — lets operator-initiated scans of brand-new libraries
+    // run uncontended against the worker pool. Incremental scans
+    // (re-scans, file watcher, scheduled) do not raise the gate.
+    let mut scan_exclusive_rx = state.library_scan_exclusive.subscribe();
     loop {
         // Self-exit check. Each worker's id is monotonic; the
         // resize handler bumps the desired count and any worker
@@ -388,6 +390,17 @@ async fn worker_loop(
         if worker_id >= *count_rx.borrow() {
             info!(worker = worker_id, "job worker draining (pool shrunk)");
             return;
+        }
+        // Park while a first-scan is in progress. `changed()`
+        // resolves immediately if the flag was set before the
+        // worker started, then we re-check; once cleared, we fall
+        // through to the claim path. Polled at watch's event
+        // granularity (not a sleep loop) so wake-up is prompt.
+        while *scan_exclusive_rx.borrow() {
+            if scan_exclusive_rx.changed().await.is_err() {
+                // Sender dropped — server shutting down; bow out.
+                return;
+            }
         }
         let saturated = limiter.saturated_kinds().await;
         let claim = claim_next_job_excluding_kinds(&state.pool, &saturated).await;
@@ -455,7 +468,29 @@ async fn worker_loop(
                         }
                     }
                 });
-                let result = handler(state.clone(), payload).await;
+
+                // Per-job progress tracking. The worker installs a
+                // `JobContext` in a tokio task-local before calling
+                // the handler. Handlers that emit progress pull the
+                // sink with `JobContext::current()` and pass it into
+                // tacet's analysis API. We `begin()` here so the UI
+                // shows "Starting…" for the brief gap between job
+                // claim and the first progress event from inside the
+                // handler. `finish()` runs in the `Ok(_) | Err(_)`
+                // arms below regardless of outcome.
+                state.job_progress.begin(job.id);
+                let progress_sink =
+                    progress::WorkerProgressSink::new(job.id, state.job_progress.clone());
+                let job_ctx = progress::JobContext {
+                    job_id: job.id,
+                    kind: kind.clone(),
+                    progress_sink,
+                };
+                let result = progress::JobContext::scope(job_ctx, async {
+                    handler(state.clone(), payload).await
+                })
+                .await;
+                state.job_progress.finish(job.id);
                 heartbeat.abort();
                 let finished_at = chimpflix_common::now_ms();
                 let duration_ms = finished_at.saturating_sub(started_at);

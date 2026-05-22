@@ -1,0 +1,21 @@
+-- Phase 72 — Per-job stage timings.
+--
+-- Perf-plan Phase D continuation: when a handler runs tacet's
+-- `analyze_audio` it now gets back a `StageTimings { markers, loudness }`
+-- duration breakdown. Persisting that lets the operator UI render
+-- "done in 4m 12s (decode 3m 02s, fingerprint 1m 04s)" instead of
+-- "done in 4m 12s" — the difference between "where did the time go?"
+-- needing a log dive and being a one-glance answer.
+--
+-- Schema-wise this is the lightest possible touch: one nullable
+-- TEXT column on the existing `jobs` table holding a JSON blob the
+-- UI can deserialize ad-hoc. We avoid a normalized stages table
+-- because the set of stages is fluid (we'll add more as tacet
+-- grows), the data is per-job and rarely queried, and the UI never
+-- needs to filter by stage.
+--
+-- Null for legacy rows (everything before this migration) and for
+-- handlers that don't emit timings (fetch_subtitles, refresh_logos,
+-- etc.). The UI treats null as "no breakdown available."
+
+ALTER TABLE jobs ADD COLUMN stage_timings_json TEXT;

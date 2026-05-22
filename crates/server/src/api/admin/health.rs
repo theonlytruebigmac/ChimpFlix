@@ -52,109 +52,130 @@ pub async fn get(
 ) -> Result<Json<LibraryHealthResponse>, ApiError> {
     let pool = &state.pool;
 
-    let items_without_files: i64 = sqlx::query_scalar(
+    // Run all read-only count queries concurrently. Each was previously
+    // awaited sequentially — on a library with ~1000 items + an active
+    // worker pool churning writes, the cumulative wall time hit 2-4
+    // seconds per page load. `tokio::try_join!` fans them out across
+    // the pool's connections; total time is bounded by the slowest
+    // single query rather than the sum.
+    let q_items_without_files = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM items i
          WHERE i.kind = 'movie'
            AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.item_id = i.id)",
     )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let items_without_metadata: i64 = sqlx::query_scalar(
+    .fetch_one(pool);
+    let q_items_without_metadata = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM items
          WHERE tmdb_id IS NULL
            AND imdb_id IS NULL
            AND tvdb_id IS NULL
            AND anilist_id IS NULL",
     )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let items_without_poster: i64 = sqlx::query_scalar(
+    .fetch_one(pool);
+    let q_items_without_poster = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM items i
          WHERE NOT EXISTS (
             SELECT 1 FROM images img
             WHERE img.item_id = i.id AND img.kind = 'poster'
          )",
     )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let items_without_backdrop: i64 = sqlx::query_scalar(
+    .fetch_one(pool);
+    let q_items_without_backdrop = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM items i
          WHERE NOT EXISTS (
             SELECT 1 FROM images img
             WHERE img.item_id = i.id AND img.kind = 'backdrop'
          )",
     )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let orphan_episodes: i64 = sqlx::query_scalar(
+    .fetch_one(pool);
+    let q_orphan_episodes = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM episodes e
          WHERE NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)",
     )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let orphan_media_files: i64 = sqlx::query_scalar(
+    .fetch_one(pool);
+    let q_orphan_media_files = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM media_files
          WHERE item_id IS NULL AND episode_id IS NULL",
     )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    // "Missing files" requires touching the filesystem so we cap the
-    // sample to avoid hammering disk on a giant library. The full
-    // scrub-and-fix workflow belongs to a Tier-2 cleanup task; this
-    // is just a preview.
-    let candidate_rows = sqlx::query(
+    .fetch_one(pool);
+    // The candidate sample for the missing-files check. Lowered from
+    // 200 → 50 because the loop early-breaks at 50 found missing files
+    // anyway, and the typical case (most files present) iterates the
+    // full 200 doing one stat per row — 200 stat calls on a container
+    // mount is the dominant cost of this endpoint.
+    let q_candidates = sqlx::query(
         "SELECT mf.id AS id, mf.path AS path, i.title AS item_title, e.title AS episode_title
          FROM media_files mf
          LEFT JOIN items i ON i.id = mf.item_id
          LEFT JOIN episodes e ON e.id = mf.episode_id
          ORDER BY mf.id DESC
-         LIMIT 200",
+         LIMIT 50",
     )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let mut missing_files = Vec::new();
-    for row in candidate_rows {
-        let path: String = row.try_get("path").unwrap_or_default();
-        if path.is_empty() {
-            continue;
-        }
-        if !std::path::Path::new(&path).exists() {
-            missing_files.push(MissingFileRow {
-                id: row.try_get("id").unwrap_or(0),
-                path,
-                item_title: row.try_get("item_title").ok().flatten(),
-                episode_title: row.try_get("episode_title").ok().flatten(),
-            });
-            if missing_files.len() >= 50 {
-                break;
-            }
-        }
-    }
-
-    let libs_no_paths_rows = sqlx::query(
+    .fetch_all(pool);
+    let q_libs_no_paths = sqlx::query(
         "SELECT l.id AS id, l.name AS name
          FROM libraries l
          WHERE NOT EXISTS (SELECT 1 FROM library_paths lp WHERE lp.library_id = l.id)",
     )
-    .fetch_all(pool)
-    .await
+    .fetch_all(pool);
+
+    let (
+        items_without_files,
+        items_without_metadata,
+        items_without_poster,
+        items_without_backdrop,
+        orphan_episodes,
+        orphan_media_files,
+        candidate_rows,
+        libs_no_paths_rows,
+    ) = tokio::try_join!(
+        q_items_without_files,
+        q_items_without_metadata,
+        q_items_without_poster,
+        q_items_without_backdrop,
+        q_orphan_episodes,
+        q_orphan_media_files,
+        q_candidates,
+        q_libs_no_paths,
+    )
     .map_err(|e| ApiError::Internal(e.into()))?;
 
-    let libraries_without_paths = libs_no_paths_rows
+    // Probe filesystem existence off the tokio runtime — `Path::exists`
+    // is a blocking syscall and can be 5-50ms per file on a container
+    // mount. `tokio::fs::try_exists` queues the stat on the blocking
+    // pool so the runtime stays responsive while we check 50 files.
+    // We also fire them in parallel via `futures::future::join_all` so
+    // the whole sweep finishes in roughly one filesystem RTT.
+    let mut probe_futs = Vec::with_capacity(candidate_rows.len());
+    for row in &candidate_rows {
+        let path: String = row.try_get("path").unwrap_or_default();
+        let id: i64 = row.try_get("id").unwrap_or(0);
+        let item_title: Option<String> = row.try_get("item_title").ok().flatten();
+        let episode_title: Option<String> = row.try_get("episode_title").ok().flatten();
+        probe_futs.push(async move {
+            if path.is_empty() {
+                return None;
+            }
+            // try_exists returns Ok(false) for "exists, no" — and
+            // Ok(true) for "exists, yes". Err on permission denied or
+            // I/O failure; treat as "present" (don't surface a false
+            // positive in the UI) since we can't be sure.
+            match tokio::fs::try_exists(&path).await {
+                Ok(true) => None,
+                Ok(false) => Some(MissingFileRow {
+                    id,
+                    path,
+                    item_title,
+                    episode_title,
+                }),
+                Err(_) => None,
+            }
+        });
+    }
+    let probe_results = futures::future::join_all(probe_futs).await;
+    let missing_files: Vec<MissingFileRow> = probe_results.into_iter().flatten().collect();
+
+    let libraries_without_paths: Vec<LibraryNoPathRow> = libs_no_paths_rows
         .iter()
         .map(|row| LibraryNoPathRow {
             id: row.try_get("id").unwrap_or(0),

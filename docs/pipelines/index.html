@@ -30,11 +30,11 @@
       <div class="card-grid">
         <a class="card" href="media.html">
           <h3>Media ingest + maintenance</h3>
-          <p>File watcher, scanner, metadata agents, the per-file discovery fan-out (markers, sprites, chapter thumbs, loudness), the weekly safety-net sweeps, and the verify → purge cycle.</p>
+          <p>File watcher, scanner, metadata agents, the per-file discovery fan-out (markers, loudness), the weekly safety-net sweeps, and the verify → purge cycle.</p>
           <ul class="pipeline-list">
             <li>scan_library, refresh_metadata, refresh_logos, refresh_trending</li>
             <li>detect_markers (incl. tacet integration)</li>
-            <li>generate_previews, generate_chapter_thumbs, analyze_loudness</li>
+            <li>analyze_loudness</li>
             <li>fetch_subtitles, verify_libraries, purge_removed_files</li>
           </ul>
         </a>
@@ -81,7 +81,7 @@
       <div class="notes">
         <h3>Edges between groups</h3>
         <ul>
-          <li><strong>Discovery → safety-net duality.</strong> The on-add discovery pipeline and the weekly safety-net scheduled tasks <em>both call the same per-file handlers</em> (<code>detect_markers_file</code>, <code>generate_preview_sprite</code>, <code>build_chapter_thumbs</code>, <code>analyze_loudness</code>). Disable one entry point and the other still catches the file — provided idempotency keys (<code>chapter_thumbs_generated_at</code>, <code>loudnorm_analyzed_at</code>) keep retries cheap.</li>
+          <li><strong>Discovery → safety-net duality.</strong> The on-add discovery pipeline and the weekly safety-net scheduled tasks <em>both call the same per-file handlers</em> (<code>detect_markers_file</code>, <code>analyze_loudness</code>). Disable one entry point and the other still catches the file — provided idempotency keys (<code>markers_detected_at</code>, <code>loudnorm_analyzed_at</code>) keep retries cheap.</li>
           <li><strong>Scanner contention.</strong> The file watcher, the scheduled <code>scan_library</code> task, and admin-triggered "Scan now" all compete for a single per-library scan lock. Whichever wins runs; the others skip rather than queue. This is the same lock across all three entry points.</li>
           <li><strong>Verify → purge two-phase.</strong> <code>verify_libraries</code> (weekly) only soft-deletes (sets <code>removed_at</code>). <code>purge_removed_files</code> (daily) hard-deletes anything past the grace window (default 7 days). The split prevents losing watch state + markers on a temporary unmount.</li>
           <li><strong>Purge → cache eviction.</strong> <code>purge_removed_files</code> spawns async WebVTT subtitle cache eviction for the purged files. Crosses into the transcoder cache.</li>

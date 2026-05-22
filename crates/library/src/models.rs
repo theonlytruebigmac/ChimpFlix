@@ -122,6 +122,11 @@ pub struct Library {
     /// rows) immediately, no grace window. Default false so a casual
     /// operator can't blow away a library by clicking the wrong button.
     pub allow_media_deletion: bool,
+    /// Operator-selected primary metadata source for this library —
+    /// "tmdb" or "tvdb". The other agents in [`LibraryAgent`] run
+    /// after it in FillNulls mode. See migration phase 78 for the
+    /// reasoning behind the simplified one-of-two model.
+    pub primary_metadata_agent: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -145,6 +150,8 @@ pub struct LibraryUpdate {
     pub certification_country: Option<String>,
     pub visibility: Option<String>,
     pub allow_media_deletion: Option<bool>,
+    /// "tmdb" or "tvdb"; other values rejected at the update endpoint.
+    pub primary_metadata_agent: Option<String>,
 }
 
 impl Library {
@@ -174,6 +181,9 @@ impl Library {
                 .flatten()
                 .unwrap_or(0)
                 != 0,
+            primary_metadata_agent: row
+                .try_get::<String, _>("primary_metadata_agent")
+                .unwrap_or_else(|_| "tmdb".to_string()),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -192,6 +202,11 @@ pub struct LibraryAgent {
     /// JSON-encoded agent-specific config (region code, include-adult, etc.).
     pub config_json: String,
 }
+
+/// Re-export of the canonical write-mode enum from the metadata crate.
+/// Library callers (queries, scanner) use this alias to avoid forcing
+/// every call-site to import from the metadata crate directly.
+pub use chimpflix_metadata::WriteMode;
 
 impl LibraryAgent {
     pub(crate) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
@@ -212,6 +227,51 @@ pub struct AgentInfo {
     pub supported_kinds: Vec<String>,
     /// Whether the agent requires extra setup (e.g. TMDB needs a token).
     pub configured: bool,
+    /// Whether this agent participates in the per-library scan-time
+    /// metadata chain. The scanner dispatch loop only knows how to
+    /// invoke tmdb / tvdb / tvmaze / anilist; other providers
+    /// (opensubtitles, trakt, omdb) are surfaced here for credential-
+    /// status visibility only and are triggered via their own
+    /// dedicated paths (background ratings job, subtitle search,
+    /// /settings/integrations sync). UI uses this to filter the
+    /// per-library priority picker so operators can't add a provider
+    /// that would silently no-op.
+    #[serde(default)]
+    pub participates_in_chain: bool,
+    /// What categories of metadata this agent can return. Sourced from
+    /// `MetadataAgent::capabilities()` for chain participants; empty
+    /// for non-chain providers. The admin UI renders one badge per
+    /// `true` field so operators see at a glance what removing a given
+    /// agent from a chain would lose.
+    #[serde(default)]
+    pub capabilities: AgentCapabilitiesDto,
+    /// Operator-facing one-line caveats. Surfaced as info-icon tooltip
+    /// text next to the badges. Empty when there's nothing notable.
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct AgentCapabilitiesDto {
+    pub movie: bool,
+    pub show: bool,
+    pub episode: bool,
+    pub cast: bool,
+    pub artwork: bool,
+    pub ratings: bool,
+}
+
+impl From<chimpflix_metadata::Capabilities> for AgentCapabilitiesDto {
+    fn from(c: chimpflix_metadata::Capabilities) -> Self {
+        Self {
+            movie: c.movie,
+            show: c.show,
+            episode: c.episode,
+            cast: c.cast,
+            artwork: c.artwork,
+            ratings: c.ratings,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,12 +1023,20 @@ pub struct Marker {
     pub start_ms: i64,
     pub end_ms: i64,
     pub label: Option<String>,
-    /// `auto` when written by the detect_markers task (chapter probe,
-    /// blackdetect, chromaprint override) or `manual` when the
-    /// operator drew it in the marker editor. The player uses this
-    /// to render auto-detected segments more prominently on the
-    /// timeline so the user can see at a glance which areas were
-    /// machine-found vs hand-curated.
+    /// How this marker was derived:
+    ///
+    /// - `embedded` — container chapter label (e.g. "Opening").
+    /// - `tacet` — audio-fingerprint match against the season's
+    ///   reference set.
+    /// - `blackframe` — fade-to-black heuristic fallback.
+    /// - `manual` — operator drew it in the marker editor.
+    /// - `auto` — legacy value from before phase 71; gets relabeled
+    ///   on the next detection pass.
+    ///
+    /// The player uses this to render auto-detected segments more
+    /// prominently on the timeline so the user can see at a glance
+    /// which areas were machine-found vs hand-curated. The operator
+    /// marker editor surfaces the full taxonomy as badges.
     pub source: String,
 }
 
@@ -1634,7 +1702,7 @@ pub struct ServerSettings {
     /// the running worker pool live (see `WorkerPoolHandle::resize`).
     pub job_workers: i64,
     /// JSON object overriding per-kind concurrency caps. Shape:
-    /// `{ "detect_markers_file": 4, "generate_preview_sprite": 4 }`.
+    /// `{ "detect_markers_file": 4, "analyze_loudness": 4 }`.
     /// Empty object = use the registry defaults shipped in
     /// `crates/server/src/tasks/registry.rs`. Hot-reloadable: the
     /// settings PATCH path calls `KindLimiter::resize(name, cap)`
@@ -1786,12 +1854,6 @@ pub struct ServerSettings {
     /// the original hardcoded window from the Card component.
     pub recently_added_days: i64,
     // ---- Task gating (phase 59) ----------------------------------------
-    /// Master toggle for the per-file chapter-thumbnail handler. When
-    /// false, neither the on-add discovery pipeline nor the weekly
-    /// safety-net sweep enqueues `build_chapter_thumbs` jobs. Off by
-    /// default — chapter thumbs are nice-to-have but add ffmpeg load on
-    /// every file, so we let the operator opt in.
-    pub chapter_thumbs_enabled: bool,
     /// Master toggle for per-file EBU R 128 loudness analysis. Off by
     /// default. Gates both pipeline entry points for `analyze_loudness`.
     pub loudness_analysis_enabled: bool,
@@ -2029,12 +2091,6 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(14),
-            chapter_thumbs_enabled: row
-                .try_get::<Option<i64>, _>("chapter_thumbs_enabled")
-                .ok()
-                .flatten()
-                .unwrap_or(0)
-                != 0,
             loudness_analysis_enabled: row
                 .try_get::<Option<i64>, _>("loudness_analysis_enabled")
                 .ok()
@@ -2203,8 +2259,6 @@ pub struct ServerSettingsUpdate {
     pub metadata_language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recently_added_days: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chapter_thumbs_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loudness_analysis_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2411,6 +2465,13 @@ pub struct JobRow {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// Per-stage timing JSON blob (e.g. `{"markers_ms":182000,
+    /// "loudness_ms":67000}`) written by handlers that have stage
+    /// breakdowns to report. Surfaced verbatim so the UI can pick
+    /// which fields to display without the library layer needing
+    /// per-handler schemas. `None` for legacy rows + kinds that
+    /// don't emit timings.
+    pub stage_timings_json: Option<String>,
 }
 
 impl JobRow {
@@ -2430,6 +2491,7 @@ impl JobRow {
             created_at: row.try_get("created_at")?,
             started_at: row.try_get("started_at")?,
             finished_at: row.try_get("finished_at")?,
+            stage_timings_json: row.try_get("stage_timings_json").ok().flatten(),
         })
     }
 }

@@ -48,11 +48,13 @@
 //! - **Confidence math anchored to the reference**, so the match_threshold
 //!   means the same thing regardless of scan window size.
 
+pub mod analyze;
 pub mod audio;
 pub mod blackframe;
 pub mod boundary;
 pub mod detection;
 pub mod fingerprint;
+pub mod loudness;
 pub mod matching;
 
 #[cfg(feature = "store")]

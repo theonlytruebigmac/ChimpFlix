@@ -55,6 +55,13 @@ pub struct ListResponse {
     /// Total rows matching the kind/status filter — drives the
     /// pagination footer's "X–Y of Z" summary and last-page button.
     pub total: i64,
+    /// Live per-job progress snapshot for whichever jobs in the
+    /// `jobs` vec are currently executing. Keyed by `job.id`.
+    /// Missing entries mean "not currently running" (queued,
+    /// succeeded, dead, etc.) — the UI shows progress only for
+    /// rows present here. Sourced from the in-memory
+    /// `JobProgressStore`; resets on server restart.
+    pub progress: std::collections::HashMap<i64, crate::jobs::progress::JobProgress>,
 }
 
 pub async fn list(
@@ -74,7 +81,21 @@ pub async fn list(
         queries::count_jobs(&state.pool, q.kind.as_deref(), status),
     )
     .map_err(ApiError::Internal)?;
-    Ok(Json(ListResponse { jobs, total }))
+    // Filter the live progress snapshot to just the ids in the
+    // returned page. A 50k-job library could otherwise serialize
+    // tens of thousands of "Starting" entries the UI doesn't render.
+    let page_ids: std::collections::HashSet<i64> = jobs.iter().map(|j| j.id).collect();
+    let progress: std::collections::HashMap<i64, crate::jobs::progress::JobProgress> = state
+        .job_progress
+        .snapshot()
+        .into_iter()
+        .filter(|(id, _)| page_ids.contains(id))
+        .collect();
+    Ok(Json(ListResponse {
+        jobs,
+        total,
+        progress,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +126,17 @@ pub async fn process_all_pending(
     State(state): State<AppState>,
     _owner: OwnerAuth,
 ) -> Result<(StatusCode, Json<crate::jobs::pipeline::SweepCounts>), ApiError> {
+    // Acquire the bulk-write lock so two concurrent operator clicks
+    // (or this + a library-delete cascade) don't race for the SQLite
+    // writer slot. The retry layer would catch the contention either
+    // way; holding the lock means we don't even create it. The await
+    // is brief — the lock is released as soon as `enqueue_full_sweep`
+    // returns, before this handler responds to the client.
+    let _permit = state
+        .bulk_write_lock
+        .acquire()
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("bulk_write_lock acquire: {e}")))?;
     let counts = crate::jobs::pipeline::enqueue_full_sweep(&state)
         .await
         .map_err(ApiError::Internal)?;

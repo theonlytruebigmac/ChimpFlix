@@ -43,6 +43,28 @@ pub struct OmdbRatings {
     pub mpaa: Option<String>,
 }
 
+/// Full OMDb title payload normalized into the fields the chain
+/// dispatch cares about. Used for movies, shows, and specific
+/// episodes — OMDb returns the same shape for all three.
+#[derive(Debug, Clone, Default)]
+pub struct OmdbTitle {
+    pub imdb_id: Option<String>,
+    pub title: Option<String>,
+    pub year: Option<i32>,
+    pub summary: Option<String>,
+    pub runtime_minutes: Option<i32>,
+    pub genres: Vec<String>,
+    pub mpaa: Option<String>,
+    pub poster_url: Option<String>,
+    pub metascore: Option<i32>,
+    pub director: Option<String>,
+    pub writer: Option<String>,
+    /// Top-billed actors as a comma-joined string ("Tom Hanks, Robin
+    /// Wright, Gary Sinise"). Split + dedupe in the apply layer when
+    /// populating `item_credits`.
+    pub actors: Option<String>,
+}
+
 impl OmdbClient {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         let api_key = api_key.into();
@@ -60,6 +82,92 @@ impl OmdbClient {
             api_key,
             base_url: OMDB_BASE_URL.to_string(),
         })
+    }
+
+    /// Lookup a movie by title (with optional year disambiguation).
+    /// Returns the full OMDb payload mapped into the shared `OmdbTitle`
+    /// shape so the chain dispatch can treat it uniformly with the
+    /// other agents.
+    pub async fn lookup_movie(
+        &self,
+        title: &str,
+        year: Option<i32>,
+    ) -> Result<Option<OmdbTitle>> {
+        self.lookup(title, year, Some("movie")).await
+    }
+
+    /// Lookup a TV series by title.
+    pub async fn lookup_show(&self, title: &str, year: Option<i32>) -> Result<Option<OmdbTitle>> {
+        self.lookup(title, year, Some("series")).await
+    }
+
+    /// Fetch a specific episode of a show by its IMDb id and season /
+    /// episode numbers. Returns the same shape as `lookup_*` — fields
+    /// are populated to what OMDb knows about that episode (title,
+    /// summary, runtime, poster).
+    pub async fn fetch_episode(
+        &self,
+        imdb_id: &str,
+        season: i32,
+        episode: i32,
+    ) -> Result<Option<OmdbTitle>> {
+        let resp = self
+            .http
+            .get(&self.base_url)
+            .query(&[
+                ("apikey", self.api_key.as_str()),
+                ("i", imdb_id),
+                ("Season", &season.to_string()),
+                ("Episode", &episode.to_string()),
+            ])
+            .send()
+            .await
+            .context("omdb http send")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("omdb http {}", resp.status());
+        }
+        let raw: RawResponse = resp.json().await.context("omdb body decode")?;
+        if raw.Response.as_deref() == Some("False") {
+            return Ok(None);
+        }
+        Ok(Some(raw.into_title()))
+    }
+
+    async fn lookup(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        omdb_type: Option<&str>,
+    ) -> Result<Option<OmdbTitle>> {
+        let year_str = year.map(|y| y.to_string());
+        let mut params: Vec<(&str, &str)> = vec![
+            ("apikey", self.api_key.as_str()),
+            ("t", title),
+            ("plot", "full"),
+        ];
+        if let Some(y) = year_str.as_deref() {
+            params.push(("y", y));
+        }
+        if let Some(t) = omdb_type {
+            params.push(("type", t));
+        }
+        let resp = self
+            .http
+            .get(&self.base_url)
+            .query(&params)
+            .send()
+            .await
+            .context("omdb http send")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("omdb http {}", resp.status());
+        }
+        let raw: RawResponse = resp.json().await.context("omdb body decode")?;
+        if raw.Response.as_deref() == Some("False") {
+            // Title not in OMDb — treat as a clean miss so the chain
+            // moves to the next agent.
+            return Ok(None);
+        }
+        Ok(Some(raw.into_title()))
     }
 
     /// Fetch ratings for the given IMDb id (e.g. "tt0816692").
@@ -109,6 +217,16 @@ impl OmdbClient {
 struct RawResponse {
     Response: Option<String>,
     Error: Option<String>,
+    imdbID: Option<String>,
+    Title: Option<String>,
+    Year: Option<String>,
+    Plot: Option<String>,
+    Runtime: Option<String>,
+    Genre: Option<String>,
+    Poster: Option<String>,
+    Director: Option<String>,
+    Writer: Option<String>,
+    Actors: Option<String>,
     imdbRating: Option<String>,
     imdbVotes: Option<String>,
     Metascore: Option<String>,
@@ -125,6 +243,56 @@ struct RawRatingEntry {
 
 #[allow(non_snake_case)]
 impl RawResponse {
+    /// Translate the OMDb response into the chain's common title shape.
+    fn into_title(self) -> OmdbTitle {
+        // OMDb returns runtime as "142 min". Strip the unit suffix.
+        let runtime_minutes = self.Runtime.as_deref().and_then(|r| {
+            r.split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<i32>().ok())
+        });
+        // "Year" can be "2014" or "2010–2015" for shows. Take the
+        // first 4 digits.
+        let year = self.Year.as_deref().and_then(|y| {
+            let digits: String = y.chars().take(4).collect();
+            digits.parse().ok()
+        });
+        // OMDb returns "N/A" for empty optional fields. Normalize to
+        // None so the apply layer's COALESCE doesn't insert literal
+        // "N/A" strings.
+        fn na_filter(v: Option<String>) -> Option<String> {
+            v.filter(|s| !s.is_empty() && s != "N/A")
+        }
+        let genres = self
+            .Genre
+            .as_deref()
+            .map(|g| {
+                g.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        OmdbTitle {
+            imdb_id: na_filter(self.imdbID.clone()),
+            title: na_filter(self.Title),
+            year,
+            summary: na_filter(self.Plot),
+            runtime_minutes,
+            genres,
+            mpaa: na_filter(self.Rated.clone()),
+            poster_url: na_filter(self.Poster),
+            metascore: self
+                .Metascore
+                .as_deref()
+                .filter(|s| *s != "N/A")
+                .and_then(|s| s.parse().ok()),
+            director: na_filter(self.Director),
+            writer: na_filter(self.Writer),
+            actors: na_filter(self.Actors),
+        }
+    }
+
     fn into_normalized(self) -> OmdbRatings {
         let mut out = OmdbRatings::default();
 

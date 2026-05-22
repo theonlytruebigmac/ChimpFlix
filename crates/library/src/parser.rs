@@ -24,6 +24,12 @@ pub enum Classification {
         season: i32,
         episode: i32,
         title: Option<String>,
+        /// When the file was absolute-numbered (anime style with no
+        /// S/E tag), the raw on-disk number. The dispatcher may later
+        /// remap (season, episode) to season-relative form, but we
+        /// preserve the absolute number so absolute-aware metadata
+        /// agents can look up by their native numbering.
+        absolute_number: Option<i32>,
     },
 }
 
@@ -140,6 +146,9 @@ fn fallback_classification(file_path: &Path, root: &Path, kind: LibraryKind) -> 
                 season: 1,
                 episode,
                 title: Some(title),
+                // Fallback rows use a hash-based pseudo-episode-number; not
+                // a real absolute number, so leave None.
+                absolute_number: None,
             }
         }
     }
@@ -246,6 +255,9 @@ fn classify_episode(file_path: &Path, root: &Path) -> Option<Classification> {
         season,
         episode,
         title: episode_title,
+        // S/E-tagged paths are season-relative by construction; no
+        // absolute number to preserve.
+        absolute_number: None,
     })
 }
 
@@ -345,6 +357,10 @@ fn classify_anime(file_path: &Path, root: &Path) -> Option<Classification> {
         season: 1,
         episode,
         title: None,
+        // Anime bare-number path — the on-disk number IS the absolute
+        // number. Preserve it so a later resolver can remap into
+        // (season, episode) once season episode-counts are known.
+        absolute_number: Some(episode),
     })
 }
 
@@ -382,11 +398,108 @@ pub fn parse_title_with_year(s: &str) -> Option<(String, Option<i32>)> {
     Some((sanitize_title(trimmed), None))
 }
 
+/// Public wrapper around [`sanitize_title`] for one-shot title heals
+/// (e.g. `queries::heal_filename_derived_episode_titles`). The parser
+/// itself only consumes the function internally; exposing it as
+/// `pub` lets the library crate run the same sanitization pass on
+/// rows that were upserted before the sanitize logic shipped.
+pub fn sanitize_title_pub(s: &str) -> String {
+    sanitize_title(s)
+}
+
 fn sanitize_title(s: &str) -> String {
     let replaced = s.replace(['.', '_'], " ");
-    // Strip noisy bracket/paren groups (release tags, codec info, etc.)
     let cleaned = strip_brackets(&replaced);
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    let collapsed: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Pass order matters:
+    //  1. Quality tokens FIRST so "WEB-DL" and "x265" are consumed as
+    //     whole tokens before the trailing-release-group pass sees the
+    //     internal dash in "WEB-DL" and mistakes "-DL" for a tag.
+    //  2. Trailing release-group ("Day -Kitsune") second.
+    //  3. Leading absolute-ep prefix ("013 - ") last.
+    let collapsed = strip_quality_tokens(&collapsed);
+    let collapsed = strip_trailing_release_group(&collapsed);
+    let collapsed = strip_leading_absolute_ep(&collapsed);
+    collapsed.trim().to_string()
+}
+
+/// Strip a trailing release-group tag like " -Kitsune".
+///
+/// Conservative — only fires when:
+///   - The last dash is preceded by whitespace (or starts the string).
+///     This preserves kebab-case titles like "Self-Titled" and
+///     "X-Ray Vision".
+///   - The dash is NOT followed by whitespace (kills "Mockingjay - Part 1"
+///     as a false positive).
+///   - The trailing token starts with an uppercase letter or digit
+///     (so all-lowercase trailing fragments are preserved).
+fn strip_trailing_release_group(s: &str) -> String {
+    let trimmed = s.trim_end();
+    if let Some(idx) = trimmed.rfind('-') {
+        let after = &trimmed[idx + 1..];
+        if after.is_empty() || after.contains(char::is_whitespace) {
+            return trimmed.to_string();
+        }
+        let first = after.chars().next().unwrap();
+        if !(first.is_ascii_uppercase() || first.is_ascii_digit()) {
+            return trimmed.to_string();
+        }
+        // Require whitespace (or start-of-string) immediately before the
+        // dash so kebab-case titles like "Self-Titled" are preserved.
+        let before_char = trimmed[..idx].chars().last();
+        if before_char.is_some_and(|c| !c.is_whitespace()) {
+            return trimmed.to_string();
+        }
+        return trimmed[..idx].trim_end().to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Strip a leading absolute-episode-number prefix like "013 - ".
+fn strip_leading_absolute_ep(s: &str) -> String {
+    let trimmed = s.trim_start();
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if !(2..=4).contains(&i) {
+        return trimmed.to_string();
+    }
+    let rest = &trimmed[i..];
+    // Accept "13 - Title" / "013 Title" / "13- Title" / "013-Title".
+    let after_dash = rest
+        .trim_start()
+        .strip_prefix('-')
+        .or_else(|| Some(rest.trim_start()))
+        .map(str::trim_start);
+    match after_dash {
+        Some(remaining) if !remaining.is_empty() => remaining.to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+const QUALITY_TOKENS: &[&str] = &[
+    "1080p", "720p", "2160p", "480p", "4k", "uhd", "hdr", "hdr10", "dv",
+    "web-dl", "webdl", "webrip", "bluray", "blu-ray", "bdrip", "dvdrip",
+    "hevc", "x265", "x264", "h.264", "h264", "h.265", "h265", "av1",
+    "10bit", "8bit", "aac", "ac3", "eac3", "flac", "dts", "ddp5.1",
+    "ddp", "remux", "rerip", "proper", "repack",
+];
+
+/// Drop quality / codec tokens that occasionally appear unbracketed in
+/// release filenames. Case-insensitive token match; preserves any token
+/// that isn't recognized so real titles like "1080" (rare but possible)
+/// are unaffected unless they're a recognized quality marker.
+fn strip_quality_tokens(s: &str) -> String {
+    let kept: Vec<&str> = s
+        .split_whitespace()
+        .filter(|tok| {
+            let lower = tok.to_ascii_lowercase();
+            !QUALITY_TOKENS.contains(&lower.as_str())
+        })
+        .collect();
+    kept.join(" ")
 }
 
 fn strip_brackets(s: &str) -> String {
@@ -589,6 +702,41 @@ mod tests {
     }
 
     #[test]
+    fn anime_absolute_captures_absolute_number() {
+        // Bare-number anime files preserve the absolute number for
+        // later season-relative remapping.
+        let p = PathBuf::from("/a/Frieren/[SubsPlease] Frieren - 29.mkv");
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
+            Classification::Episode {
+                absolute_number,
+                episode,
+                season,
+                ..
+            } => {
+                assert_eq!(absolute_number, Some(29));
+                assert_eq!(episode, 29);
+                assert_eq!(season, 1);
+            }
+            _ => panic!("expected episode"),
+        }
+    }
+
+    #[test]
+    fn s_e_tagged_episode_has_no_absolute_number() {
+        // When the file carries a real S/E tag, absolute_number stays
+        // None — the file already says what season + episode it is.
+        let p = PathBuf::from("/a/Attack on Titan/Season 4/Attack.on.Titan.S04E28.mkv");
+        match classify(&p, Path::new("/a"), LibraryKind::Anime).class {
+            Classification::Episode {
+                absolute_number, ..
+            } => {
+                assert_eq!(absolute_number, None);
+            }
+            _ => panic!("expected episode"),
+        }
+    }
+
+    #[test]
     fn anime_with_season_episode_tag_uses_show_parser() {
         // When the file does carry S01E05, prefer that over the absolute
         // path so users who organize anime by season aren't surprised.
@@ -634,5 +782,49 @@ mod tests {
         assert_eq!(make_sort_title("A Quiet Place"), "Quiet Place");
         assert_eq!(make_sort_title("An Education"), "Education");
         assert_eq!(make_sort_title("Inception"), "Inception");
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_release_group() {
+        assert_eq!(sanitize_title("Barrier Day -Kitsune"), "Barrier Day");
+        assert_eq!(
+            sanitize_title("The Party from Hell Begins -Kitsune"),
+            "The Party from Hell Begins"
+        );
+        assert_eq!(sanitize_title("The First Bloom -ToonsHub"), "The First Bloom");
+        assert_eq!(
+            sanitize_title("The Day of Departure -AnoZu"),
+            "The Day of Departure"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_leading_absolute_ep_prefix() {
+        assert_eq!(sanitize_title("013 - Barrier Day"), "Barrier Day");
+        assert_eq!(sanitize_title("01 - Pilot"), "Pilot");
+        assert_eq!(sanitize_title("014 The Party"), "The Party");
+        assert_eq!(sanitize_title("13-Pilot"), "Pilot");
+    }
+
+    #[test]
+    fn sanitize_strips_quality_tokens() {
+        assert_eq!(sanitize_title("Pilot 1080p WEB-DL"), "Pilot");
+        assert_eq!(sanitize_title("Pilot 2160p HEVC x265"), "Pilot");
+        assert_eq!(sanitize_title("Pilot BluRay 10bit"), "Pilot");
+    }
+
+    #[test]
+    fn sanitize_preserves_real_dash_titles() {
+        // "Mockingjay - Part 1" has whitespace after the dash → not a tag.
+        assert_eq!(sanitize_title("Mockingjay - Part 1"), "Mockingjay - Part 1");
+        assert_eq!(sanitize_title("Self-Titled"), "Self-Titled");
+    }
+
+    #[test]
+    fn sanitize_combines_all_fixes_on_real_anime_filename() {
+        assert_eq!(
+            sanitize_title("013 - Barrier Day -Kitsune 1080p WEB-DL"),
+            "Barrier Day"
+        );
     }
 }

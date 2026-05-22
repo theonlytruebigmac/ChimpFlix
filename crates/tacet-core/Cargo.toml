@@ -32,6 +32,13 @@ rubato = "0.15"                    # high-quality resampling
 rustfft = "6.2"                    # FFT engine (auto-selects AVX2/NEON)
 num-complex = "0.4"
 
+# === Loudness measurement (EBU R 128) ===
+# Pure-Rust port of libebur128; output matches the C reference impl
+# bit-exact when ebur128's c-tests feature is enabled. Used by tacet's
+# `analyze_audio` entry point to fold loudness measurement into the
+# single-decode multi-consumer architecture (perf plan Phase C).
+ebur128 = "0.1"
+
 # === Parallelism (CPU-bound; callers in async contexts use spawn_blocking) ===
 rayon = "1.10"
 

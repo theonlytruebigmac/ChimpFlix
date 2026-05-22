@@ -424,7 +424,9 @@ authoritative DDL — each migration is dated + phase-numbered.
 - `*_fts*` tables are virtual + shadow tables maintained by SQLite's
   FTS5 module; never written directly.
 - `media_files` has accumulated optional columns across phases for
-  scrub-preview sprites, chapter thumbs, loudness measurements — see
-  the relevant phase migration for column-by-column docs.
+  loudness measurements, embedded subtitle extraction status, and
+  marker-detection watermarks — see the relevant phase migration for
+  column-by-column docs. Preview-sprite and chapter-thumb columns
+  were dropped in phase 71 (2026-05-21).
 - `collections` was schema-rebuilt twice (phase 36 + phase 41) to add
   the `kind` column and `rule_json`. See the migrations for the dance.

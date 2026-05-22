@@ -99,7 +99,15 @@ export function TrailerPlayer({
           ref={iframeRef}
           src={src}
           title="Trailer"
-          allow="autoplay; encrypted-media"
+          // YouTube's player base.js synchronously subscribes to
+          // accelerometer + gyroscope + deviceorientation on load.
+          // Without delegating those features to the iframe origin
+          // explicitly, the parent's `Permissions-Policy: accelerometer=(self)`
+          // denies it and YouTube floods the console with violation
+          // entries on every hero trailer mount. We list every feature
+          // YouTube's player polls for plus the obvious autoplay /
+          // encrypted-media / fullscreen / PiP it needs to render.
+          allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen"
           // strict-origin-when-cross-origin ensures the browser sends at
           // least the page origin as Referer when loading the embed, even
           // if the surrounding page or a proxy sets a more restrictive

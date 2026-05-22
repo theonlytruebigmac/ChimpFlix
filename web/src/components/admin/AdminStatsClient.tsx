@@ -434,7 +434,7 @@ export function AdminStatsClient({
                     <td className="px-3 py-2">
                       {e.item_id ? (
                         <Link
-                          href={`/?modal=${e.item_id}`}
+                          href={`/?title=${e.item_id}`}
                           className="text-white hover:underline"
                         >
                           {e.title ?? `Item #${e.item_id}`}

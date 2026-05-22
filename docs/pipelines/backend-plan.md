@@ -230,8 +230,6 @@ Recommended caps per kind:
 | Kind | Cap | Why |
 |---|--:|---|
 | `detect_markers_file` | 1 | CPU + ffmpeg blackdetect, eventually tacet |
-| `generate_preview_sprite` | 1 | ffmpeg |
-| `build_chapter_thumbs` | 1 | ffmpeg |
 | `analyze_loudness` | 1 | ffmpeg loudnorm |
 | `extract_embedded_subs` | 1 | PGS OCR is the worst case |
 | `refresh_logos_item` | 4 | network-bound, TMDB |
@@ -269,7 +267,7 @@ The activity screen groups failures by class — "3 jobs rate-limited" reads cle
 
 ### 5.3 Idempotency
 
-Today most handlers check via a column on the target row (`chapter_thumbs_generated_at`, `loudnorm_analyzed_at`). Formalize that as the `already_done()` method on each kind. Called twice:
+Today most handlers check via a column on the target row (`loudnorm_analyzed_at`, `markers_detected_at`). Formalize that as the `already_done()` method on each kind. Called twice:
 
 1. **At enqueue time** — `enqueue_pipeline()` skips inserting if already done. Cheap rejection of duplicate work.
 2. **At execute time** — handler bails before doing real work in case state changed between enqueue and pickup.
@@ -279,8 +277,6 @@ Per-kind idempotency keys:
 | Kind | Key |
 |---|---|
 | `detect_markers_file` | `media_files.markers_detected_at IS NOT NULL` |
-| `generate_preview_sprite` | `media_files.preview_sprite_at IS NOT NULL` |
-| `build_chapter_thumbs` | `media_files.chapter_thumbs_generated_at IS NOT NULL` |
 | `analyze_loudness` | `media_files.loudnorm_analyzed_at IS NOT NULL` |
 | `extract_embedded_subs` | per-(file, lang) — sidecar `.vtt` exists |
 | `refresh_logos_item` | `items.logo_url IS NOT NULL OR logo_attempted_at > now-7d` |
@@ -332,7 +328,7 @@ Sonarr / Radarr writes are noisy — they write to `.partial`, then rename, then
 Today read once at startup ([memory: restart req'd](../../home/dev/.claude/projects/-mnt-data-GitHub-ChimpFlix/memory/feedback_preserve_frontend.md)). Wrap in `tokio::sync::watch::channel`; settings-write path broadcasts the new value; the watcher's event-handling loop checks it on every event. Admin toggles take effect instantly without restart.
 
 ### 6.3 Per-item coalescing
-When Sonarr drops 24 episodes for a season in one burst, per-item kinds (logos, ratings, extras) should fire **once per item**, not 24×. Implement: bucket events by `item_id` (resolved post-scanner) in a 5s window; emit one per-item dispatch per bucket. Per-file kinds (markers, sprite, loudness) still fire per file.
+When Sonarr drops 24 episodes for a season in one burst, per-item kinds (logos, ratings, extras) should fire **once per item**, not 24×. Implement: bucket events by `item_id` (resolved post-scanner) in a 5s window; emit one per-item dispatch per bucket. Per-file kinds (markers, loudness) still fire per file.
 
 ---
 

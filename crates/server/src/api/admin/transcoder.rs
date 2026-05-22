@@ -24,7 +24,7 @@ use crate::state::AppState;
 pub struct CapabilitiesResponse {
     pub capabilities: TranscoderCapabilities,
     /// Absolute path to where the transcoder writes HLS segments, init
-    /// segments, sidecar VTTs, and per-file preview sprites. Surfaced
+    /// segments, and sidecar VTTs. Surfaced
     /// so the admin UI can show "Transcoder temp directory" the way
     /// Plex does without giving the operator a knob to break it
     /// (changing the path needs a server restart so all in-flight

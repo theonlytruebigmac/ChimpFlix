@@ -85,6 +85,96 @@ pub fn detect_season(season: &Season, config: &Config) -> Result<DetectionResult
     Ok(match_analyses(prints, config))
 }
 
+/// Adaptive variant of [`detect_season`]: try a narrow scan window
+/// first, only fall back to the configured wide window when the
+/// narrow attempt fails to produce useful references.
+///
+/// **What it helps with:** most TV intros land in the first 3-5
+/// minutes of the episode. The default `intro_scan_minutes` (18 min)
+/// is conservative — it has to handle the worst case (e.g. Silo
+/// S01E05 has its intro at 14:28). For the *common* case, the wide
+/// window is ~6× more decode work than needed.
+///
+/// **The trade-off:** on shows where the narrow window doesn't find
+/// the intro (long cold opens, late intros, mid-season swaps), we
+/// pay both the narrow attempt AND the full-width attempt — net
+/// slower than `detect_season`. The narrow window is small enough
+/// (5 min) that this overhead is bounded; the average library still
+/// comes out ahead.
+///
+/// Returns the same shape as [`detect_season`]. Callers don't need
+/// to distinguish between "narrow won" and "wide fallback fired."
+pub fn detect_season_adaptive(season: &Season, config: &Config) -> Result<DetectionResult> {
+    /// First-attempt intro window in minutes. Tight enough to catch
+    /// the typical "intro in first 90 seconds" case fast, wide
+    /// enough to tolerate ~3-min cold opens before the intro
+    /// starts. Past this, fall back to the full configured window.
+    const NARROW_INTRO_MINUTES: f32 = 5.0;
+    /// First-attempt credits window. Most end-credits run < 90s and
+    /// land at the very tail of the file, so 4 min of decode covers
+    /// them comfortably.
+    const NARROW_CREDITS_MINUTES: f32 = 4.0;
+
+    if season.episodes.is_empty() {
+        return Ok(DetectionResult {
+            markers: vec![],
+            intro_references: vec![],
+            credits_references: vec![],
+        });
+    }
+
+    // No point doing a narrow pass if the config's wide window
+    // already isn't wider — just route to the standard path.
+    let narrow_possible = config.intro_scan_minutes > NARROW_INTRO_MINUTES
+        || config.credits_scan_minutes > NARROW_CREDITS_MINUTES;
+    if !narrow_possible {
+        return detect_season(season, config);
+    }
+
+    let mut narrow_config = config.clone();
+    narrow_config.intro_scan_minutes = NARROW_INTRO_MINUTES.min(config.intro_scan_minutes);
+    narrow_config.credits_scan_minutes = NARROW_CREDITS_MINUTES.min(config.credits_scan_minutes);
+
+    info!(
+        series = %season.series_id,
+        season = season.season_number,
+        episodes = season.episodes.len(),
+        narrow_intro_minutes = narrow_config.intro_scan_minutes,
+        narrow_credits_minutes = narrow_config.credits_scan_minutes,
+        "adaptive bootstrap: attempting narrow window first"
+    );
+    let narrow_result = detect_season(season, &narrow_config)?;
+
+    // Decide whether the narrow attempt produced useful references.
+    // Both kinds are tracked independently because some shows have a
+    // tail-anchored credits but a long cold open before the intro
+    // (or vice versa). When one side succeeds and the other doesn't,
+    // we still need to expand for the failing side — easiest path
+    // is to re-run the full detect_season at the wide config and
+    // merge.
+    let intro_ok = !narrow_result.intro_references.is_empty();
+    let credits_ok = !narrow_result.credits_references.is_empty();
+    if intro_ok && credits_ok {
+        info!(
+            series = %season.series_id,
+            season = season.season_number,
+            intro_refs = narrow_result.intro_references.len(),
+            credits_refs = narrow_result.credits_references.len(),
+            "adaptive bootstrap: narrow window succeeded"
+        );
+        return Ok(narrow_result);
+    }
+
+    info!(
+        series = %season.series_id,
+        season = season.season_number,
+        intro_ok,
+        credits_ok,
+        "adaptive bootstrap: narrow window incomplete; falling back to configured window"
+    );
+    detect_season(season, config)
+}
+
 fn match_analyses(prints: Vec<EpisodeAnalysis>, config: &Config) -> DetectionResult {
     let intro_fps: Vec<&Fingerprint> = prints
         .iter()
@@ -142,6 +232,11 @@ fn analyze_season(season: &Season, config: &Config) -> Result<Vec<EpisodeAnalysi
 ///
 /// Incremental path: a new episode arrives → load the season references from
 /// storage → call this → save the result.
+///
+/// Thin wrapper around [`detect_single_episode_with_hints`] for callers that
+/// don't have window hints to supply. New code should prefer the hinted
+/// variant — it lets the caller narrow tacet's decode range when external
+/// signals (container chapter boundaries, operator overrides) are available.
 pub fn detect_single_episode(
     path: &Path,
     episode_id: &str,
@@ -149,15 +244,70 @@ pub fn detect_single_episode(
     credits_references: &[ReferenceFingerprint],
     config: &Config,
 ) -> Result<SegmentMarkers> {
+    detect_single_episode_with_hints(
+        path,
+        episode_id,
+        intro_references,
+        credits_references,
+        None,
+        None,
+        config,
+    )
+}
+
+/// Detect intros + credits with optional per-window decode hints.
+///
+/// `intro_window_hint` / `credits_window_hint` narrow (or relocate) the
+/// audio range tacet decodes for fingerprinting. Most useful when the
+/// caller has container chapter boundaries that suggest *where* the
+/// intro/credits live without telling tacet *what* they are — e.g.
+/// "Chapter 1" spans 0-90s with no label; pass `(0.0, 90.0)` as the
+/// intro hint and tacet decodes only that range instead of the full
+/// `config.intro_scan_minutes` window.
+///
+/// Hints are advisory: if `start >= end` or the range is empty, the
+/// hint is ignored and tacet falls back to the default window
+/// (`config.intro_scan_minutes` / `config.credits_scan_minutes`).
+/// Hints that extend past the file's duration are clamped by the
+/// underlying decoder, not by this function.
+pub fn detect_single_episode_with_hints(
+    path: &Path,
+    episode_id: &str,
+    intro_references: &[ReferenceFingerprint],
+    credits_references: &[ReferenceFingerprint],
+    intro_window_hint: Option<(f64, f64)>,
+    credits_window_hint: Option<(f64, f64)>,
+    config: &Config,
+) -> Result<SegmentMarkers> {
     let intro_window = if intro_references.is_empty() {
         None
     } else {
-        decode_and_fingerprint(path, FingerprintKind::Intro, config).ok()
+        match valid_hint(intro_window_hint) {
+            Some((start, end)) => decode_and_fingerprint_window(
+                path,
+                FingerprintKind::Intro,
+                start,
+                end,
+                config,
+            )
+            .ok(),
+            None => decode_and_fingerprint(path, FingerprintKind::Intro, config).ok(),
+        }
     };
     let credits_window = if credits_references.is_empty() {
         None
     } else {
-        decode_and_fingerprint(path, FingerprintKind::Credits, config).ok()
+        match valid_hint(credits_window_hint) {
+            Some((start, end)) => decode_and_fingerprint_window(
+                path,
+                FingerprintKind::Credits,
+                start,
+                end,
+                config,
+            )
+            .ok(),
+            None => decode_and_fingerprint(path, FingerprintKind::Credits, config).ok(),
+        }
     };
 
     let intro = intro_window
@@ -173,6 +323,14 @@ pub fn detect_single_episode(
         intro,
         credits,
     })
+}
+
+fn valid_hint(hint: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let (start, end) = hint?;
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Build the reference set for a season *without* running per-episode
@@ -297,6 +455,14 @@ struct EpisodeAnalysis {
 
 fn analyze_episode(ep: &EpisodeFile, config: &Config) -> Result<EpisodeAnalysis> {
     debug!(id = %ep.id, path = %ep.path.display(), "fingerprinting");
+    // Per-episode timing for the operator-facing diagnostic ("why
+    // did this bootstrap take 14 minutes?"). Logged at INFO so it
+    // surfaces in the standard activity log without bumping
+    // RUST_LOG. Tacet's analyze_season runs episodes through rayon
+    // — these per-episode times run in parallel, so the wall-clock
+    // total is bounded by max(per-episode), not sum().
+    let started = std::time::Instant::now();
+    let intro_start = std::time::Instant::now();
     let intro = match decode_and_fingerprint(&ep.path, FingerprintKind::Intro, config) {
         Ok(w) => Some(w),
         Err(e) => {
@@ -304,6 +470,8 @@ fn analyze_episode(ep: &EpisodeFile, config: &Config) -> Result<EpisodeAnalysis>
             None
         }
     };
+    let intro_ms = intro_start.elapsed().as_millis() as u64;
+    let credits_start = std::time::Instant::now();
     let credits = match decode_and_fingerprint(&ep.path, FingerprintKind::Credits, config) {
         Ok(w) => Some(w),
         Err(e) => {
@@ -311,6 +479,16 @@ fn analyze_episode(ep: &EpisodeFile, config: &Config) -> Result<EpisodeAnalysis>
             None
         }
     };
+    let credits_ms = credits_start.elapsed().as_millis() as u64;
+    let total_ms = started.elapsed().as_millis() as u64;
+    info!(
+        id = %ep.id,
+        episode = ep.episode_number,
+        intro_ms,
+        credits_ms,
+        total_ms,
+        "analyze_episode complete"
+    );
     Ok(EpisodeAnalysis {
         episode_id: ep.id.clone(),
         episode_number: ep.episode_number,
@@ -329,6 +507,21 @@ fn decode_and_fingerprint(
         FingerprintKind::Intro => audio::decode_intro_region(path, config)?,
         FingerprintKind::Credits => audio::decode_credits_region(path, config)?,
     };
+    let fp = fingerprint::fingerprint(&region, config);
+    Ok(AnalyzedWindow { region, fp })
+}
+
+/// Same shape as [`decode_and_fingerprint`] but decodes an absolute time
+/// range supplied by the caller. Used by
+/// [`detect_single_episode_with_hints`] to honor window hints.
+fn decode_and_fingerprint_window(
+    path: &Path,
+    _kind: FingerprintKind,
+    start_secs: f64,
+    end_secs: f64,
+    config: &Config,
+) -> Result<AnalyzedWindow> {
+    let region = audio::decode_region(path, config, start_secs, end_secs)?;
     let fp = fingerprint::fingerprint(&region, config);
     Ok(AnalyzedWindow { region, fp })
 }
@@ -488,11 +681,25 @@ fn match_to_segment(
     config: &Config,
     kind: FingerprintKind,
 ) -> Option<Segment> {
+    match_region_to_segment(references, &window.region, &window.fp, config, kind)
+}
+
+/// Same scoring + boundary-snap pipeline as [`match_to_segment`] but
+/// takes the region + fingerprint as separate arguments. Used by
+/// [`crate::analyze::analyze_audio`]'s fused-decode path, which builds
+/// region + fingerprint independently (no `AnalyzedWindow` wrapper).
+pub(crate) fn match_region_to_segment(
+    references: &[ReferenceFingerprint],
+    region: &AudioRegion,
+    fp: &Fingerprint,
+    config: &Config,
+    kind: FingerprintKind,
+) -> Option<Segment> {
     if references.is_empty() {
         return None;
     }
-    let m = matching::match_against_references(references, &window.fp, config)?;
-    let (start, end) = boundary::refine(&window.region, m.start_seconds, m.end_seconds);
+    let m = matching::match_against_references(references, fp, config)?;
+    let (start, end) = boundary::refine(region, m.start_seconds, m.end_seconds);
     if end - start < config.min_segment_seconds as f64 {
         return None;
     }
@@ -508,7 +715,7 @@ fn match_to_segment(
             );
             return None;
         }
-        if let Some(total) = window.region.total_duration {
+        if let Some(total) = region.total_duration {
             let tail_gap = total - end;
             if tail_gap > config.max_credits_tail_gap as f64 {
                 tracing::debug!(tail_gap, "rejecting credits match too far from file end");

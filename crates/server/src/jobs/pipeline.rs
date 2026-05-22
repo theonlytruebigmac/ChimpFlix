@@ -2,10 +2,9 @@
 //!
 //! When the scanner (scheduled, manual, or file-watcher path)
 //! emits `ScanEvent::FileAdded`, we enqueue the per-file jobs that
-//! make the new file fully playable: marker detection, preview
-//! sprite, loudness analysis, chapter thumbs. They all run through
-//! the durable queue so a server crash mid-processing resumes on
-//! next startup.
+//! make the new file fully playable: marker detection and loudness
+//! analysis. They all run through the durable queue so a server
+//! crash mid-processing resumes on next startup.
 //!
 //! Each kind is enqueued via `enqueue_job_unique` keyed on file_id
 //! so a repeated FileAdded (e.g. a file that was deleted and
@@ -56,7 +55,7 @@ const PIPELINE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// flight + three waiting); if a stuck DB connection backs up the
 /// drainer for longer than that, we'd rather drop new events on
 /// the floor than grow memory without bound — the safety-net
-/// scheduled tasks (`detect_markers`, `generate_previews`, …) will
+/// scheduled tasks (`detect_markers`, `analyze_loudness`, …) will
 /// catch any missed files on their next sweep.
 const PIPELINE_CHANNEL_CAPACITY: usize = PIPELINE_BATCH_MAX * 4;
 
@@ -67,8 +66,6 @@ const PIPELINE_CHANNEL_CAPACITY: usize = PIPELINE_BATCH_MAX * 4;
 /// `refresh_trending`) would never appear here.
 const PIPELINE_KINDS: &[&str] = &[
     handlers::detect_markers_file::KIND,
-    handlers::generate_preview_sprite::KIND,
-    handlers::build_chapter_thumbs::KIND,
     handlers::analyze_loudness::KIND,
 ];
 
@@ -98,7 +95,7 @@ pub fn wrap_emitter_for_pipeline(
             // per-file loop fast. On capacity overflow we log and
             // drop: the file still has a row in `media_files`, so
             // the safety-net sweeps (`detect_markers`,
-            // `generate_previews`, …) pick it up on their next
+            // `analyze_loudness`, …) pick it up on their next
             // tick. Dropped events here are a hint that the DB
             // pool is stuck or the worker pool is undersized.
             if let Err(e) = tx.try_send(media_file_id) {
@@ -263,8 +260,6 @@ async fn enqueue_pipeline_batch_inner(
 #[derive(Debug, Default, serde::Serialize)]
 pub struct SweepCounts {
     pub markers: usize,
-    pub previews: usize,
-    pub chapter_thumbs: usize,
     pub loudness: usize,
 }
 
@@ -301,28 +296,6 @@ pub async fn enqueue_full_sweep(state: &AppState) -> anyhow::Result<SweepCounts>
             let ids: Vec<i64> = rows.into_iter().map(|(id, _, _)| id).collect();
             counts.markers += handlers::detect_markers_file::enqueue_for_files(pool, &ids).await?;
         }
-    }
-
-    // Previews (Automatic).
-    if is_kind_allowed(state, handlers::generate_preview_sprite::KIND)
-        .await
-        .is_allowed()
-    {
-        let previews = queries::list_media_files_needing_previews(pool, None, CAP).await?;
-        let preview_ids: Vec<i64> = previews.iter().map(|c| c.id).collect();
-        counts.previews =
-            handlers::generate_preview_sprite::enqueue_for_files(pool, &preview_ids).await?;
-    }
-
-    // Chapter thumbs (Gated).
-    if is_kind_allowed(state, handlers::build_chapter_thumbs::KIND)
-        .await
-        .is_allowed()
-    {
-        let thumbs = queries::list_media_files_needing_chapter_thumbs(pool, None, CAP).await?;
-        let thumb_ids: Vec<i64> = thumbs.iter().map(|c| c.id).collect();
-        counts.chapter_thumbs =
-            handlers::build_chapter_thumbs::enqueue_for_files(pool, &thumb_ids).await?;
     }
 
     // Loudness (Gated).

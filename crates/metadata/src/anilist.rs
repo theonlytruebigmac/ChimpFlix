@@ -115,6 +115,55 @@ impl AniListClient {
             .with_context(|| format!("AniList id={anilist_id} not found"))
     }
 
+    /// Per-episode metadata for a given AniList show id.
+    ///
+    /// AniList's GraphQL schema has no native per-episode title list. The
+    /// only per-episode data the API exposes is `streamingEpisodes`,
+    /// which AniList populates from the legal-stream listings it knows
+    /// about (Crunchyroll, HiDive, etc.). For shows that aren't streamed
+    /// where AniList tracks streams — older or niche anime, currently-
+    /// airing seasons before their first official sub drops, anything
+    /// region-blocked from AniList's scrapers — `streamingEpisodes`
+    /// is empty and this returns `Ok(vec![])`. Callers should treat
+    /// empty as "AniList has no episode data for this id," not as an
+    /// error.
+    ///
+    /// The returned vector is **sorted by episode number ascending**;
+    /// AniList returns streamingEpisodes in upload order (most-recent
+    /// first) and entries without a parseable episode number are
+    /// dropped from the output. See `parse_streaming_episode_title` for
+    /// the parsing heuristic.
+    pub async fn fetch_episodes(&self, anilist_id: i64) -> Result<Vec<AniListEpisode>> {
+        let resp: GraphQlResponse<EpisodesWrapper> = self
+            .post_graphql(EPISODES_QUERY, &json!({ "id": anilist_id }))
+            .await
+            .with_context(|| format!("AniList fetch_episodes id={anilist_id}"))?;
+        let Some(data) = resp.data else {
+            return Ok(Vec::new());
+        };
+        let Some(media) = data.media else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<AniListEpisode> = media
+            .streaming_episodes
+            .into_iter()
+            .filter_map(|raw| {
+                let parsed = parse_streaming_episode_title(raw.title.as_deref()?)?;
+                Some(AniListEpisode {
+                    episode_number: parsed.episode_number,
+                    title: parsed.title,
+                    thumbnail_url: raw.thumbnail,
+                })
+            })
+            .collect();
+        out.sort_by_key(|e| e.episode_number);
+        // Dedup on episode_number — sometimes AniList lists the same
+        // episode under multiple streaming sites (one entry per site).
+        // Keep the first (which is the lowest-indexed after sort).
+        out.dedup_by_key(|e| e.episode_number);
+        Ok(out)
+    }
+
     async fn post_graphql<T: for<'de> Deserialize<'de>>(
         &self,
         query: &str,
@@ -124,12 +173,32 @@ impl AniListClient {
         // token. On a large anime library scan the worker chews
         // through that bucket fast and a 429 used to just bubble up
         // as a hard failure — half the library would silently miss
-        // enrichment. Handle 429 by reading `Retry-After` and waiting
-        // it out once before giving up. The retry budget is one
-        // attempt: if AniList tells us 60s+, we honor it and try
-        // again; if it lies or the second attempt also 429s, the
-        // caller will log a warn and move on.
-        for attempt in 0..2 {
+        // enrichment.
+        //
+        // Three things going on in this retry loop:
+        //
+        // 1. **Retry budget** — up to MAX_ATTEMPTS attempts on 429.
+        //    The first version of this code only retried once; in
+        //    practice the rate-limit window is often longer than
+        //    one retry's wait, so we'd give up after two 429s and
+        //    the scanner cascade fired.
+        //
+        // 2. **Retry-After floor** — AniList sometimes returns
+        //    `Retry-After: 0` (or the header is absent and we
+        //    default to a smaller wait). Honoring 0 means an
+        //    immediate retry that just hits the rate limit again.
+        //    We floor at MIN_RETRY_AFTER_S so even a zero header
+        //    sleeps long enough for the limit window to advance.
+        //
+        // 3. **Exponential backoff on retry** — each subsequent
+        //    attempt waits at least 2× the previous floor. Caps at
+        //    MAX_RETRY_AFTER_S so a misbehaving server can't park
+        //    us indefinitely.
+        const MAX_ATTEMPTS: usize = 3;
+        const MIN_RETRY_AFTER_S: u64 = 5;
+        const MAX_RETRY_AFTER_S: u64 = 120;
+        let mut backoff_floor = MIN_RETRY_AFTER_S;
+        for attempt in 0..MAX_ATTEMPTS {
             let mut req = self
                 .http
                 .post(&self.url)
@@ -142,24 +211,29 @@ impl AniListClient {
                 .await
                 .with_context(|| format!("POST {}", self.url))?;
             let status = resp.status();
-            if status.as_u16() == 429 && attempt == 0 {
-                let wait_s = resp
+            if status.as_u16() == 429 && attempt + 1 < MAX_ATTEMPTS {
+                let header_wait = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(60)
-                    .min(120);
+                    .unwrap_or(0);
+                let wait_s = header_wait.max(backoff_floor).min(MAX_RETRY_AFTER_S);
                 warn!(
                     wait_s,
-                    "AniList rate-limited (429); sleeping then retrying once"
+                    header_wait,
+                    attempt = attempt + 1,
+                    "AniList rate-limited (429); sleeping then retrying"
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(wait_s)).await;
+                // Double the floor for the next attempt so a server
+                // that keeps returning 0 still backs off geometrically.
+                backoff_floor = (backoff_floor * 2).min(MAX_RETRY_AFTER_S);
                 continue;
             }
             return Self::parse_anilist_response(resp, status).await;
         }
-        anyhow::bail!("AniList POST kept 429-ing after rate-limit wait")
+        anyhow::bail!("AniList POST kept 429-ing after {MAX_ATTEMPTS} attempts")
     }
 
     async fn parse_anilist_response<T: for<'de> Deserialize<'de>>(
@@ -194,6 +268,39 @@ impl AniListClient {
 // Public projection
 // ---------------------------------------------------------------------------
 
+/// Per-episode projection returned by [`AniListClient::fetch_episodes`].
+///
+/// AniList doesn't expose a structured "episode title" field; this
+/// struct is the result of parsing the free-form `streamingEpisodes`
+/// title strings into something usable. When AniList only published an
+/// episode number with no human-readable title (e.g. "Episode 1" with
+/// no separator), `title` is the episode-number string itself — callers
+/// should compare against the parsed `episode_number` and decide
+/// whether the title is informative enough to surface.
+#[derive(Debug, Clone)]
+pub struct AniListEpisode {
+    pub episode_number: i32,
+    pub title: String,
+    pub thumbnail_url: Option<String>,
+}
+
+impl AniListEpisode {
+    /// True when the parsed title is more than just the episode number.
+    /// Useful for callers that want to skip the enrichment when the
+    /// extracted "title" wouldn't improve over filename-derived text.
+    pub fn has_descriptive_title(&self) -> bool {
+        let lower = self.title.to_ascii_lowercase();
+        let trimmed = lower.trim();
+        let stripped = trimmed
+            .trim_start_matches("episode")
+            .trim_start_matches("ep")
+            .trim_start_matches('.')
+            .trim_start_matches(' ')
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '0');
+        !stripped.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AniListShow {
     pub anilist_id: i64,
@@ -201,6 +308,11 @@ pub struct AniListShow {
     /// Title in the order: english if present, then romaji, then native.
     /// Mirrors what most anime catalogue UIs do.
     pub title: String,
+    /// English title as published by AniList, or `None` when the
+    /// `english` field is empty. Exposed separately so language-aware
+    /// callers can refuse to surface a Japanese fallback when the
+    /// operator's `metadata_language` is en-*.
+    pub english_title: Option<String>,
     /// Native (usually Japanese) title for the "alternative title" UI row.
     pub original_title: Option<String>,
     pub romaji_title: Option<String>,
@@ -238,6 +350,26 @@ struct GraphQlError {
 struct MediaWrapper {
     #[serde(rename = "Media")]
     media: Option<RawMedia>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EpisodesWrapper {
+    #[serde(rename = "Media")]
+    media: Option<RawMediaWithEpisodes>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMediaWithEpisodes {
+    #[serde(default, rename = "streamingEpisodes")]
+    streaming_episodes: Vec<RawStreamingEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStreamingEpisode {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    thumbnail: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +481,7 @@ impl AniListShow {
             anilist_id: r.id,
             mal_id: r.id_mal,
             title,
+            english_title: english,
             original_title,
             romaji_title,
             summary,
@@ -404,6 +537,91 @@ fn strip_html(s: &str) -> String {
     }
     out.trim().to_string()
 }
+
+struct ParsedStreamingEpisode {
+    episode_number: i32,
+    title: String,
+}
+
+/// Parse a `streamingEpisodes.title` string into `(episode_number, title)`.
+///
+/// AniList's streaming-episode titles come from the upstream listings
+/// they aggregate, so the format varies: typical examples include
+/// `"Episode 1 - The Adventurers"`, `"Episode 1"`, `"S1 E1 - The Title"`,
+/// `"1 - The Title"`. Returns `None` when no integer episode number can
+/// be extracted (we'd have nothing to key the local episode row by).
+///
+/// When the title has a separator (` - ` or ` | `) the substring after
+/// it is the descriptive title. When there's no separator (just
+/// `"Episode 1"`), `title` is set to the episode-number string itself
+/// and `AniListEpisode::has_descriptive_title()` will return false.
+fn parse_streaming_episode_title(s: &str) -> Option<ParsedStreamingEpisode> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Find the first separator if any. AniList listings use either
+    // ` - ` (most common) or ` | ` (occasionally).
+    let (prefix, title_after) = if let Some(idx) = trimmed.find(" - ") {
+        (&trimmed[..idx], Some(trimmed[idx + 3..].trim().to_string()))
+    } else if let Some(idx) = trimmed.find(" | ") {
+        (&trimmed[..idx], Some(trimmed[idx + 3..].trim().to_string()))
+    } else {
+        (trimmed, None)
+    };
+
+    // Extract the episode number from the prefix. We look for any run
+    // of digits; the first one we encounter wins.
+    //
+    // Common prefix shapes:
+    //   "Episode 1"
+    //   "Episode 01"
+    //   "EP 1"
+    //   "E1"
+    //   "S1 E1"   ← season-and-episode: take the second number
+    //   "1"       ← bare number
+    let mut digits = Vec::new();
+    let mut current = String::new();
+    for c in prefix.chars() {
+        if c.is_ascii_digit() {
+            current.push(c);
+        } else if !current.is_empty() {
+            digits.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        digits.push(current);
+    }
+    // S<n> E<m> shape → episode is the second number; otherwise the
+    // first (and usually only) number.
+    let raw = if prefix.to_ascii_lowercase().contains('s')
+        && digits.len() >= 2
+    {
+        &digits[1]
+    } else {
+        digits.first()?
+    };
+    let episode_number = raw.parse::<i32>().ok()?;
+    if episode_number <= 0 {
+        return None;
+    }
+    let title = title_after.unwrap_or_else(|| trimmed.to_string());
+    Some(ParsedStreamingEpisode {
+        episode_number,
+        title,
+    })
+}
+
+const EPISODES_QUERY: &str = r#"
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    streamingEpisodes {
+      title
+      thumbnail
+    }
+  }
+}
+"#;
 
 const MEDIA_QUERY: &str = r#"
 query ($id: Int, $search: String, $type: MediaType, $startDate_greater: FuzzyDateInt, $startDate_lesser: FuzzyDateInt) {
@@ -508,5 +726,90 @@ mod tests {
     #[test]
     fn unauth_client_builds() {
         assert!(AniListClient::unauthenticated().is_ok());
+    }
+
+    #[test]
+    fn parses_episode_with_dash_separator() {
+        let p = parse_streaming_episode_title("Episode 1 - The Adventurers").unwrap();
+        assert_eq!(p.episode_number, 1);
+        assert_eq!(p.title, "The Adventurers");
+    }
+
+    #[test]
+    fn parses_episode_with_pipe_separator() {
+        let p = parse_streaming_episode_title("Episode 4 | The Land Where Souls Rest").unwrap();
+        assert_eq!(p.episode_number, 4);
+        assert_eq!(p.title, "The Land Where Souls Rest");
+    }
+
+    #[test]
+    fn parses_zero_padded_episode_number() {
+        let p = parse_streaming_episode_title("Episode 01 - First Steps").unwrap();
+        assert_eq!(p.episode_number, 1);
+        assert_eq!(p.title, "First Steps");
+    }
+
+    #[test]
+    fn parses_season_episode_shape() {
+        let p = parse_streaming_episode_title("S1 E12 - The Conclusion").unwrap();
+        assert_eq!(p.episode_number, 12);
+        assert_eq!(p.title, "The Conclusion");
+    }
+
+    #[test]
+    fn no_separator_keeps_episode_number_as_title() {
+        let p = parse_streaming_episode_title("Episode 7").unwrap();
+        assert_eq!(p.episode_number, 7);
+        assert_eq!(p.title, "Episode 7");
+        // Caller should detect the lack of descriptive content:
+        let ep = AniListEpisode {
+            episode_number: p.episode_number,
+            title: p.title.clone(),
+            thumbnail_url: None,
+        };
+        assert!(!ep.has_descriptive_title());
+    }
+
+    #[test]
+    fn bare_number_with_title() {
+        let p = parse_streaming_episode_title("1 - Pilot").unwrap();
+        assert_eq!(p.episode_number, 1);
+        assert_eq!(p.title, "Pilot");
+    }
+
+    #[test]
+    fn refuses_when_no_episode_number() {
+        assert!(parse_streaming_episode_title("Preview").is_none());
+        assert!(parse_streaming_episode_title("").is_none());
+        assert!(parse_streaming_episode_title("   ").is_none());
+    }
+
+    #[test]
+    fn refuses_zero_or_negative_episode_numbers() {
+        // AniList occasionally lists "Episode 0" for previews; treat as
+        // unparseable to keep main-feed enrichment uncluttered.
+        assert!(parse_streaming_episode_title("Episode 0 - Preview").is_none());
+    }
+
+    #[test]
+    fn descriptive_check_handles_episode_n_only() {
+        let ep = AniListEpisode {
+            episode_number: 3,
+            title: "Episode 3".into(),
+            thumbnail_url: None,
+        };
+        assert!(!ep.has_descriptive_title());
+        let ep2 = AniListEpisode {
+            episode_number: 3,
+            title: "ep03".into(),
+            thumbnail_url: None,
+        };
+        assert!(!ep2.has_descriptive_title());
+        let ep3 = AniListEpisode {
+            episode_number: 3,
+            title: "The Reveal".into(),
+            thumbnail_url: None,
+        };
+        assert!(ep3.has_descriptive_title());
     }
 }

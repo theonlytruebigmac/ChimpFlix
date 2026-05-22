@@ -20,8 +20,7 @@ import {
   readCsrfToken,
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
-import { ChaptersControl } from "@/components/ChaptersControl";
-import { detectClientCapabilities } from "@/lib/client-caps";
+import { detectClientCapabilities, isSafari } from "@/lib/client-caps";
 import {
   cssFontFamilyForSubtitlePref,
   getPrefs,
@@ -205,7 +204,6 @@ interface Props {
   /// All seasons in the show, ordered as the API returns them. Powers
   /// the season picker (back-arrow on the episodes pane).
   seasons?: { id: number; season_number: number; title: string | null }[];
-  previewManifest?: PreviewManifest;
   /// When the same title has multiple media files (4K + 1080p, etc.)
   /// the player exposes a Version picker. Initial `mediaFileId` is
   /// treated as the active one; switching versions just swaps the id
@@ -220,15 +218,6 @@ interface Props {
   /// `earliest_of_both`. Drives the scrobble decision alongside
   /// `playedThresholdPct`. Default `threshold_pct` when omitted.
   completionBehaviour?: string;
-}
-
-export interface PreviewManifest {
-  sprite_url: string;
-  interval_ms: number;
-  tile_width: number;
-  tile_height: number;
-  tile_cols: number;
-  tile_count: number;
 }
 
 /// iOS Safari (and standalone iPhone PWAs) doesn't implement
@@ -360,7 +349,6 @@ export function ChimpFlixPlayer({
   showId,
   showTitle,
   seasons,
-  previewManifest,
   versions,
   playedThresholdPct,
   completionBehaviour,
@@ -1127,7 +1115,17 @@ export function ChimpFlixPlayer({
 
       if (resp.session.mode === "transcode" && resp.session.hls_master_url) {
         const url = resp.session.hls_master_url;
-        if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        // Gate native HLS playback on actual Safari, NOT on
+        // `canPlayType("application/vnd.apple.mpegurl")`. Android
+        // Chrome (and especially Chrome PWAs on Android) advertises
+        // HLS support via canPlayType but its demuxer fails with
+        // `PipelineStatus::DEMUXER_ERROR_COULD_NOT_PARSE` the moment
+        // the manifest hits the pipeline — symptom is a black <video>
+        // with controls visible and no useful console output unless
+        // the new <video> error listener catches it. Only iOS and
+        // macOS Safari actually have working native HLS; every other
+        // browser must go through hls.js even if it claims otherwise.
+        if (isSafari() && video.canPlayType("application/vnd.apple.mpegurl")) {
           video.src = url;
           const onLoaded = () => {
             applyResume();
@@ -1239,26 +1237,49 @@ export function ChimpFlixPlayer({
                 hls.subtitleTrack = 0;
                 hls.subtitleDisplay = true;
               }
-              // Pre-roll warmup: wait until the player has a full
-              // segment (~6s) of forward buffer before calling
-              // .play(). The earlier 3s threshold meant playback
-              // started right at the edge of running out — the first
-              // ffmpeg segment is slow to produce (encoder warm-up,
-              // initial GOP), so the next segment often hadn't
-              // arrived by the time the 3s drained. That manifested
-              // as a quick stutter ~3s into a fresh session, followed
-              // by the buffer bar "jumping" forward as the queued
-              // segments arrived in a burst. Bumped to 6s for a full
-              // segment of headroom; the safety timeout is 8s so a
-              // genuinely stuck session still falls through to the
-              // existing error path within a reasonable window.
+              // Pre-roll warmup: wait until the player has 15s of
+              // forward buffer (~2.5 segments) before calling .play().
+              //
+              // The earlier 6s threshold was meant to cover one
+              // segment of headroom, but in practice produced a
+              // visible mid-second-1 stutter on fresh sessions. Root
+              // cause is the ffmpeg manifest cadence: the playlist is
+              // EVENT-type / `hls_list_size 0`, so it grows as new
+              // segments arrive — but HLS.js only re-polls the manifest
+              // every `targetduration` (= 6s) seconds. The sequence we
+              // were hitting:
+              //
+              //   wall=0  load playlist v0; lists [seg0]
+              //   wall=1  seg0 download done → warmup gate fires
+              //   wall=1  .play() called; playback consumes seg0
+              //   wall=6  playlist re-polled, learns about seg1
+              //   wall=6+ seg1 download starts
+              //   wall=7  playback reaches end of seg0; seg1 not yet
+              //           in MSE buffer → STALL → browser shows the
+              //           native loading spinner
+              //
+              // Bumping the warmup to 15s ensures that by the time
+              // .play() fires, the manifest has been polled at least
+              // once or twice and segments 0+1 (and often 2) are
+              // already in the MSE buffer. The encoder + manifest
+              // pipeline then keeps pace with real-time playback for
+              // the rest of the session.
+              //
+              // User preference (2026-05-21): "I'd rather show the
+              // loading screen / circle longer if it hid whatever
+              // causes that stutter." Bias toward longer warmup over
+              // visible buffer underruns.
+              //
+              // Safety timeout bumped in lockstep so a genuinely
+              // slow encoder still falls through to .play() within a
+              // reasonable window rather than spinning forever.
               //
               // We also gate on `video.readyState >= HAVE_FUTURE_DATA`
               // — the browser's own "ready to play through" signal —
               // because `buffered.end` can lag the decoder for a few
               // hundred ms after `FRAG_BUFFERED` fires.
-              const WARMUP_TARGET_SEC = 6;
-              const WARMUP_TIMEOUT_MS = 8000;
+              const WARMUP_TARGET_SEC = 15;
+              const WARMUP_TIMEOUT_MS = 15000;
               let started = false;
               const start = () => {
                 if (started) return;
@@ -1270,11 +1291,29 @@ export function ChimpFlixPlayer({
                 }
                 attemptPlay();
               };
+              // Find the buffered range that contains `currentTime`
+              // and return its forward extent. `buffered.end(0)` would
+              // be wrong after a resume: if the user resumes at
+              // 1:23:45 and HLS has buffered [1:23:40, 1:23:55], that
+              // range is index 0 only if no other range exists.
+              // After a seek-during-warmup it could be index 1.
+              const aheadFromCurrent = (): number => {
+                const buf = video.buffered;
+                const t = video.currentTime;
+                for (let i = 0; i < buf.length; i++) {
+                  // Tiny epsilon to absorb floating-point rounding —
+                  // MSE timestamps occasionally land .001 past the
+                  // exact play head.
+                  if (t >= buf.start(i) - 0.05 && t <= buf.end(i) + 0.05) {
+                    return buf.end(i) - t;
+                  }
+                }
+                return 0;
+              };
               const onFrag = () => {
                 if (video.buffered.length === 0) return;
-                const ahead = video.buffered.end(0) - video.currentTime;
                 if (
-                  ahead >= WARMUP_TARGET_SEC &&
+                  aheadFromCurrent() >= WARMUP_TARGET_SEC &&
                   video.readyState >= 3 /* HAVE_FUTURE_DATA */
                 ) {
                   start();
@@ -1575,6 +1614,44 @@ export function ChimpFlixPlayer({
       setMuted(video.muted);
       setVolume(video.volume);
     };
+    // Surface HTMLMediaElement errors directly. HLS.js's MEDIA_ERROR
+    // path catches most decode failures, but not all of them — Android
+    // Chrome (especially in standalone PWA mode) can put MediaCodec into
+    // a "no decoded output" state that hls.js never sees because the
+    // segment buffer keeps receiving valid appends. Without this
+    // listener the player just sits black with the controls visible,
+    // which is exactly the failure mode bug reports keep describing.
+    // We log the MediaError code + the network/ready states so the
+    // remote-debug DevTools console has something to grep for, and we
+    // pop the error overlay with a human-readable label.
+    const onMediaError = () => {
+      const err = video.error;
+      const code = err?.code ?? 0;
+      const message = err?.message ?? "";
+      const label = ((): string => {
+        switch (code) {
+          case 1:
+            return "playback aborted (MEDIA_ERR_ABORTED)";
+          case 2:
+            return "network error fetching media (MEDIA_ERR_NETWORK)";
+          case 3:
+            return "media decode failed (MEDIA_ERR_DECODE) — codec/level rejected by browser";
+          case 4:
+            return "media not supported (MEDIA_ERR_SRC_NOT_SUPPORTED)";
+          default:
+            return `unknown <video> error (code=${code})`;
+        }
+      })();
+      console.error("[chimpflix] <video> error", {
+        code,
+        message,
+        networkState: video.networkState,
+        readyState: video.readyState,
+        currentSrc: video.currentSrc,
+      });
+      setError(message ? `${label}: ${message}` : label);
+      setReconnecting(false);
+    };
 
     video.addEventListener("loadedmetadata", onLoadedMetadata);
     video.addEventListener("timeupdate", onTimeUpdate);
@@ -1586,6 +1663,7 @@ export function ChimpFlixPlayer({
     video.addEventListener("canplay", onCanPlay);
     video.addEventListener("playing", onPlaying);
     video.addEventListener("volumechange", onVolumeChange);
+    video.addEventListener("error", onMediaError);
 
     return () => {
       video.removeEventListener("loadedmetadata", onLoadedMetadata);
@@ -1598,6 +1676,7 @@ export function ChimpFlixPlayer({
       video.removeEventListener("canplay", onCanPlay);
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("volumechange", onVolumeChange);
+      video.removeEventListener("error", onMediaError);
     };
   }, [attemptPlay, autoplayBlocked, durationMs]);
 
@@ -2827,7 +2906,6 @@ export function ChimpFlixPlayer({
                 onScrubChange={(s) => {
                   scrubbingRef.current = s;
                 }}
-                previewManifest={previewManifest}
                 markers={markers}
               />
             </div>
@@ -2934,10 +3012,6 @@ export function ChimpFlixPlayer({
                 onToggle={() => setSpeedOpen((o) => !o)}
                 onClose={() => setSpeedOpen(false)}
                 onSelect={setSpeed}
-              />
-              <ChaptersControl
-                mediaFileId={mediaFileId}
-                onSeekTo={seekTo}
               />
               <IconButton
                 onClick={togglePip}
@@ -4562,7 +4636,6 @@ function ProgressBar({
   onSeek,
   onSeekHint,
   onScrubChange,
-  previewManifest,
   markers,
 }: {
   currentTime: number;
@@ -4583,7 +4656,6 @@ function ProgressBar({
   /// the auto-skip-intro effect from firing mid-drag, both of which
   /// would yank the playhead from under the user.
   onScrubChange?: (scrubbing: boolean) => void;
-  previewManifest?: PreviewManifest;
   /// Intro / credits / chapter regions to overlay as colored
   /// segments. Each marker spans [start_ms, end_ms] on the source
   /// timeline; we position them as a percentage of duration.
@@ -4798,17 +4870,9 @@ function ProgressBar({
           style={{ left: `${progress}%` }}
         />
       )}
-      {previewManifest && hoverX !== null && hoverTime !== null && (
-        <ScrubPreview
-          manifest={previewManifest}
-          timeSeconds={hoverTime}
-          hoverX={hoverX}
-        />
-      )}
       {/*
         When the cursor sits inside a marker region, surface its
-        label as a small pill above the bar. Useful when the scrub
-        preview is off (no sprite generated yet) and as a quick
+        label as a small pill above the bar. Useful as an
         affordance — "the credits start here" is much clearer than
         "this orange tint here means something."
       */}
@@ -4819,7 +4883,7 @@ function ProgressBar({
           return (
             <div
               className="pointer-events-none absolute -translate-x-1/2 rounded-full border border-white/15 bg-black/85 px-2 py-0.5 text-[0.65rem] font-semibold uppercase tracking-wider text-white/85 shadow-md"
-              style={{ left: hoverX, bottom: previewManifest ? "calc(100% + 9.5rem)" : "calc(100% + 0.5rem)" }}
+              style={{ left: hoverX, bottom: "calc(100% + 0.5rem)" }}
             >
               {hovered.kind}
             </div>
@@ -4827,41 +4891,6 @@ function ProgressBar({
         })()
       )}
     </div>
-  );
-}
-
-/// Floating thumbnail tracking the cursor across the scrub bar. Indexes
-/// into the precomputed sprite via CSS `background-position`; the
-/// browser never decodes a separate image per hover frame.
-function ScrubPreview({
-  manifest,
-  timeSeconds,
-  hoverX,
-}: {
-  manifest: PreviewManifest;
-  timeSeconds: number;
-  hoverX: number;
-}) {
-  const tileIndex = Math.min(
-    manifest.tile_count - 1,
-    Math.max(0, Math.floor((timeSeconds * 1000) / manifest.interval_ms)),
-  );
-  const col = tileIndex % manifest.tile_cols;
-  const row = Math.floor(tileIndex / manifest.tile_cols);
-  const offsetX = -col * manifest.tile_width;
-  const offsetY = -row * manifest.tile_height;
-  return (
-    <div
-      className="pointer-events-none absolute bottom-full mb-2 -translate-x-1/2 rounded border border-white/15 shadow-2xl"
-      style={{
-        left: hoverX,
-        width: manifest.tile_width,
-        height: manifest.tile_height,
-        backgroundImage: `url(${manifest.sprite_url})`,
-        backgroundPosition: `${offsetX}px ${offsetY}px`,
-        backgroundRepeat: "no-repeat",
-      }}
-    />
   );
 }
 

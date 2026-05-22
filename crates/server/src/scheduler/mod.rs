@@ -397,6 +397,19 @@ pub fn spawn(state: AppState) {
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
+            // Defer the tick while a library-first-scan is holding
+            // the exclusivity gate. The scheduler does the same
+            // logical work (claiming + dispatching task rows that
+            // write to the DB) as the worker pool; both need to
+            // park until the scan finishes, otherwise the busy-
+            // timeout absorbs the contention but the scan still
+            // crawls.
+            if state.library_scan_exclusive.is_active() {
+                tracing::debug!(
+                    "scheduler tick deferred: library-first-scan exclusivity active"
+                );
+                continue;
+            }
             if let Err(e) = run_once(&state).await {
                 error!(error = %format!("{e:#}"), "scheduler tick failed");
             }
@@ -678,6 +691,7 @@ async fn dispatch(
             let tvdb = state.tvdb_snapshot().await;
             let anilist = state.anilist_snapshot().await;
             let tvmaze = state.tvmaze.clone();
+            let omdb = state.omdb_snapshot().await;
             let job_id = job.id;
             let hub = state.hub.clone();
             let cache_root = state.transcoder.cache_root().to_path_buf();
@@ -720,6 +734,7 @@ async fn dispatch(
                     tvdb,
                     anilist,
                     tvmaze,
+                    omdb,
                     library_id,
                     job_id,
                     Some(cache_root),
@@ -740,12 +755,13 @@ async fn dispatch(
             let params: serde_json::Value = serde_json::from_str(&task.params_json)
                 .unwrap_or(serde_json::Value::Object(Default::default()));
             let library_id = params.get("library_id").and_then(|v| v.as_i64());
-            let Some(tmdb) = state.tmdb_snapshot().await else {
-                append_log(log, "TMDB disabled — skipping refresh");
-                return Ok(());
-            };
+            // Refresh is chain-aware now — runs whichever agents are
+            // enabled per-library. Missing TMDB is not a blocker.
+            let tmdb = state.tmdb_snapshot().await;
             let tvdb = state.tvdb_snapshot().await;
             let tvmaze = state.tvmaze.clone();
+            let anilist = state.anilist_snapshot().await;
+            let omdb = state.omdb_snapshot().await;
             let rows = if let Some(lid) = library_id {
                 sqlx::query_scalar::<_, i64>("SELECT id FROM items WHERE library_id = ?")
                     .bind(lid)
@@ -762,9 +778,11 @@ async fn dispatch(
             for item_id in rows {
                 match scanner::refresh_item_metadata(
                     &state.pool,
-                    &tmdb,
+                    tmdb.as_ref(),
                     tvdb.as_ref(),
                     tvmaze.as_ref(),
+                    anilist.as_ref(),
+                    omdb.as_ref(),
                     item_id,
                     None,
                 )
@@ -840,8 +858,6 @@ async fn dispatch(
             Ok(())
         }
         "fetch_subtitles" => fetch_subtitles_task(state, task, log).await,
-        "generate_previews" => generate_previews_task(state, task, log).await,
-        "generate_chapter_thumbs" => generate_chapter_thumbs_task(state, task, log).await,
         "analyze_loudness" => analyze_loudness_task(state, task, log).await,
         "verify_backups" => verify_backups_task(state, log).await,
         "trakt_pull" => trakt_pull_task(state, log).await,
@@ -1080,28 +1096,6 @@ pub fn registry() -> Vec<TaskKindInfo> {
             default_requires_maintenance_window: true,
         },
         TaskKindInfo {
-            kind: "generate_previews",
-            display_name: "Generate scrub-preview sprites",
-            description: "Build per-file thumbnail sprites the player uses \
-                          for hover/scrub previews. Idempotent — files with \
-                          a sprite already are skipped.",
-            params_schema: r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 4)", "interval_s": "number (optional; default 10)"}"#,
-            default_frequency: "daily",
-            default_requires_maintenance_window: true,
-        },
-        TaskKindInfo {
-            kind: "generate_chapter_thumbs",
-            display_name: "Generate chapter thumbnails",
-            description: "Extract one thumbnail per container chapter so \
-                          the seek menu can show a poster for each act. \
-                          Files without chapter metadata are marked \
-                          processed on first pass so they don't get \
-                          re-probed.",
-            params_schema: r#"{"library_id": "number (optional)", "batch_size": "number (optional; default 8)"}"#,
-            default_frequency: "weekly",
-            default_requires_maintenance_window: true,
-        },
-        TaskKindInfo {
             kind: "verify_backups",
             display_name: "Verify auto-backups",
             description: "Open every snapshot under `<data_dir>/backups/auto/` \
@@ -1210,83 +1204,6 @@ pub struct TaskKindInfo {
     /// Pre-checked window toggle. Heavy tasks (scans, full refreshes,
     /// backup) default true so they don't compete with playback.
     pub default_requires_maintenance_window: bool,
-}
-
-/// Walk every item lacking a stored subtitle in each requested language,
-/// search OpenSubtitles by tmdb/imdb id (+ season/episode for shows),
-/// and download the top hit. Best-effort; per-item failures do not fail
-/// the whole task.
-/// Safety-net sweep that enqueues `generate_preview_sprite` jobs
-/// for files lacking a sprite. The actual ffmpeg work happens in
-/// the queue worker, not inline here. This catches files that
-/// either pre-date the discovery-pipeline migration or whose
-/// on-discovery job failed past max_attempts.
-async fn generate_previews_task(
-    state: &AppState,
-    task: &ScheduledTask,
-    log: &Arc<std::sync::Mutex<String>>,
-) -> Result<()> {
-    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
-    let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let per_library_cap = params
-        .get("batch_size")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(500)
-        .max(1);
-
-    let candidates =
-        queries::list_media_files_needing_previews(&state.pool, library_id, per_library_cap)
-            .await?;
-    if candidates.is_empty() {
-        append_log(log, "no files need previews — queue is the active path");
-        return Ok(());
-    }
-    let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
-    let enqueued =
-        crate::jobs::handlers::generate_preview_sprite::enqueue_for_files(&state.pool, &file_ids)
-            .await?;
-    append_log(
-        log,
-        format!("enqueued {enqueued} generate_preview_sprite jobs"),
-    );
-    Ok(())
-}
-
-/// Safety-net sweep that enqueues `build_chapter_thumbs` jobs for
-/// files that haven't been chapter-probed yet. Same shape as
-/// generate_previews_task — the queue worker does the work.
-async fn generate_chapter_thumbs_task(
-    state: &AppState,
-    task: &ScheduledTask,
-    log: &Arc<std::sync::Mutex<String>>,
-) -> Result<()> {
-    let params: serde_json::Value = serde_json::from_str(&task.params_json).unwrap_or_default();
-    let library_id = params.get("library_id").and_then(|v| v.as_i64());
-    let per_library_cap = params
-        .get("batch_size")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(500)
-        .max(1);
-
-    let candidates =
-        queries::list_media_files_needing_chapter_thumbs(&state.pool, library_id, per_library_cap)
-            .await?;
-    if candidates.is_empty() {
-        append_log(
-            log,
-            "no files need chapter thumbs — queue is the active path",
-        );
-        return Ok(());
-    }
-    let file_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
-    let enqueued =
-        crate::jobs::handlers::build_chapter_thumbs::enqueue_for_files(&state.pool, &file_ids)
-            .await?;
-    append_log(
-        log,
-        format!("enqueued {enqueued} build_chapter_thumbs jobs"),
-    );
-    Ok(())
 }
 
 /// Safety-net sweep that enqueues `analyze_loudness` jobs for
@@ -1482,7 +1399,7 @@ async fn refresh_trending_task(
 /// still exists on disk. Files that have gone missing are soft-deleted
 /// (`removed_at` timestamped) — they keep existing for a grace window
 /// so a temporary unmount doesn't immediately destroy associated play
-/// state / markers / preview sprites. A separate purge task hard-
+/// state / markers. A separate purge task hard-
 /// deletes them once the window expires.
 ///
 /// This task aggregates across every library and emits one summary
