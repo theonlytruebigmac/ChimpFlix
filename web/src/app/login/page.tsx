@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { brandNameUpper } from "@/lib/env";
 import { auth, ChimpFlixApiError, safeLocalPath } from "@/lib/chimpflix-api";
+import { PlexSignInButton } from "@/components/PlexSignInButton";
 
 type Mode = "login" | "setup" | "register" | "forgot" | "two_factor";
 
@@ -306,6 +307,39 @@ function LoginContent() {
                     : "Sign in"}
           </button>
         </form>
+
+        {/* Plex sign-in. Available for login + invite-bearing signup;
+            hidden on setup / forgot / 2FA challenge where it doesn't
+            apply. The invite-signup path passes the invite code along
+            so the same flow that creates a user via the form can also
+            create one via Plex OAuth. */}
+        {(mode === "login" || mode === "register") && (
+          <div className="mt-4 space-y-2">
+            <div className="flex items-center gap-3 text-[10px] uppercase tracking-wider text-white/40">
+              <span className="h-px flex-1 bg-white/10" />
+              or
+              <span className="h-px flex-1 bg-white/10" />
+            </div>
+            <PlexSignInButton
+              intent={
+                mode === "register"
+                  ? { intent: "signup", invite_code: invite }
+                  : { intent: "login" }
+              }
+              onSuccess={() => {
+                router.push(next);
+                router.refresh();
+              }}
+              onNotLinked={(plexUsername) =>
+                setError(
+                  `No ChimpFlix account is linked to "${plexUsername}". Ask the server owner for an invite, then link your Plex account from Settings → Account.`,
+                )
+              }
+              onError={(msg) => setError(msg)}
+              disabled={busy || (mode === "register" && !invite)}
+            />
+          </div>
+        )}
 
         {/* Mode switchers. Hidden in setup mode (only one path on first run). */}
         {mode === "login" && (

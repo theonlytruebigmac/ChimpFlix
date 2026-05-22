@@ -11,10 +11,14 @@
 //! credential vault under the `omdb` slot — set via `chimpflix
 //! creds set omdb <key>` or the admin credentials page.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 use chimpflix_common::USER_AGENT;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT as UA_HEADER};
 use serde::Deserialize;
+use tracing::warn;
 
 const OMDB_BASE_URL: &str = "https://www.omdbapi.com/";
 
@@ -23,6 +27,19 @@ pub struct OmdbClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    /// Latching circuit breaker. OMDb's free tier returns `401
+    /// Unauthorized` once you cross the daily request cap; the body is
+    /// indistinguishable from a bad-key 401. Without a breaker the
+    /// rest of a library scan keeps blasting the same dead key for
+    /// every show × every episode and floods the log with thousands
+    /// of `omdb http 401` lines. Once any call observes a 401 this
+    /// flag is set and every subsequent call short-circuits to
+    /// `Ok(None)` — chain dispatch treats it as a clean "OMDb has
+    /// nothing for this title" and moves on to the next agent
+    /// without further HTTP. The flag clears on the next client
+    /// construction (admin saves a new key → state.set_omdb gets a
+    /// fresh `OmdbClient`).
+    auth_failed: Arc<AtomicBool>,
 }
 
 /// Normalized output. We strip OMDb's text formatting ("8.4/10",
@@ -81,7 +98,30 @@ impl OmdbClient {
             http,
             api_key,
             base_url: OMDB_BASE_URL.to_string(),
+            auth_failed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Returns true once the circuit breaker has tripped (any prior
+    /// call saw a 401 Unauthorized). When true every public method
+    /// returns `Ok(None)` without touching the network.
+    pub fn is_disabled(&self) -> bool {
+        self.auth_failed.load(Ordering::Relaxed)
+    }
+
+    /// Trip the breaker. Idempotent. Logs once per process when it
+    /// flips from open → closed so operators see the explanation
+    /// instead of a wall of 401 lines.
+    fn trip_breaker(&self) {
+        if self
+            .auth_failed
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            warn!(
+                "OMDb returned 401 Unauthorized — circuit breaker tripped; suppressing further OMDb requests until the client is rebuilt (admin → credentials → OMDb)"
+            );
+        }
     }
 
     /// Lookup a movie by title (with optional year disambiguation).
@@ -93,11 +133,17 @@ impl OmdbClient {
         title: &str,
         year: Option<i32>,
     ) -> Result<Option<OmdbTitle>> {
+        if self.is_disabled() {
+            return Ok(None);
+        }
         self.lookup(title, year, Some("movie")).await
     }
 
     /// Lookup a TV series by title.
     pub async fn lookup_show(&self, title: &str, year: Option<i32>) -> Result<Option<OmdbTitle>> {
+        if self.is_disabled() {
+            return Ok(None);
+        }
         self.lookup(title, year, Some("series")).await
     }
 
@@ -111,6 +157,9 @@ impl OmdbClient {
         season: i32,
         episode: i32,
     ) -> Result<Option<OmdbTitle>> {
+        if self.is_disabled() {
+            return Ok(None);
+        }
         let resp = self
             .http
             .get(&self.base_url)
@@ -123,6 +172,10 @@ impl OmdbClient {
             .send()
             .await
             .context("omdb http send")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.trip_breaker();
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             anyhow::bail!("omdb http {}", resp.status());
         }
@@ -158,6 +211,10 @@ impl OmdbClient {
             .send()
             .await
             .context("omdb http send")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.trip_breaker();
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             anyhow::bail!("omdb http {}", resp.status());
         }
@@ -175,6 +232,9 @@ impl OmdbClient {
     /// every other failure surfaces as an error so the worker pool's
     /// backoff curve can decide whether to retry.
     pub async fn fetch_ratings(&self, imdb_id: &str) -> Result<Option<OmdbRatings>> {
+        if self.is_disabled() {
+            return Ok(None);
+        }
         let resp = self
             .http
             .get(&self.base_url)
@@ -186,6 +246,10 @@ impl OmdbClient {
             .send()
             .await
             .context("omdb http send")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.trip_breaker();
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             anyhow::bail!(
                 "omdb http {}: {}",

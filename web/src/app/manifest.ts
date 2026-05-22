@@ -20,25 +20,34 @@ export default function manifest(): MetadataRoute.Manifest {
     theme_color: "#0d0d0d",
     icons: [
       {
-        src: "/icon",
+        src: "/icons/icon-192.png",
         sizes: "192x192",
         type: "image/png",
         purpose: "any",
       },
       {
-        src: "/icon-512",
+        src: "/icons/icon-512.png",
         sizes: "512x512",
         type: "image/png",
         purpose: "any",
       },
+      // Adaptive-launcher safe-zone variants. Source content is scaled
+      // to ~80% on a solid dark square so Pixel / Samsung / Android
+      // circle/squircle/teardrop crops keep the wordmark legible.
       {
-        src: "/icon-512",
+        src: "/icons/icon-192-maskable.png",
+        sizes: "192x192",
+        type: "image/png",
+        purpose: "maskable",
+      },
+      {
+        src: "/icons/icon-512-maskable.png",
         sizes: "512x512",
         type: "image/png",
         purpose: "maskable",
       },
       {
-        src: "/apple-icon",
+        src: "/icons/apple-touch-icon.png",
         sizes: "180x180",
         type: "image/png",
       },

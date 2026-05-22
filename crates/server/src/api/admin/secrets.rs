@@ -67,19 +67,19 @@ const KNOWN_SLOTS: &[SlotSpec] = &[
     SlotSpec {
         name: "opensubtitles",
         display_name: "OpenSubtitles",
-        description: "JSON triple: {\"api_key\":\"…\",\"username\":\"…\",\"password\":\"…\"}. \
-                      The api_key comes from registering an app at opensubtitles.com; \
-                      username/password are needed for the /download endpoint.",
+        description: "OpenSubtitles API credentials. The api_key comes from \
+                      registering an app at opensubtitles.com; the username \
+                      and password are needed for the /download endpoint.",
         managed: false,
     },
     SlotSpec {
         name: "trakt",
         display_name: "Trakt",
-        description: "JSON pair: {\"client_id\":\"…\",\"client_secret\":\"…\"} from a \
-                      Trakt OAuth app you've registered at trakt.tv/oauth/applications. \
-                      Use redirect URI `urn:ietf:wg:oauth:2.0:oob` so the device-code \
-                      link flow works. Per-user access tokens are minted by users via \
-                      the Link Trakt button under their settings.",
+        description: "OAuth app credentials from trakt.tv/oauth/applications. \
+                      Use redirect URI `urn:ietf:wg:oauth:2.0:oob` so the \
+                      device-code link flow works. Per-user access tokens are \
+                      minted by users via the Link Trakt button under their \
+                      settings.",
         managed: false,
     },
     SlotSpec {

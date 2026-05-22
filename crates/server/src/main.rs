@@ -389,6 +389,8 @@ async fn main() -> anyhow::Result<()> {
         opensubtitles,
         trakt,
         omdb,
+        plex_oauth: Arc::new(tokio::sync::RwLock::new(None)),
+        plex_pin_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         tvmaze,
         hub,
         auth: AuthConfig {

@@ -8,6 +8,37 @@ import {
   type SecretTestResponse,
 } from "@/lib/chimpflix-api";
 
+/// Slots whose vault value is a JSON object on the wire. The UI renders
+/// one labeled input per field and serializes to JSON on save, so the
+/// operator never has to construct `{"client_id":"…",…}` by hand. Field
+/// order here matches the order the inputs appear in the editor.
+type FieldSpec = {
+  key: string;
+  label: string;
+  type?: "text" | "password";
+  hint?: string;
+};
+const SLOT_FIELDS: Record<string, FieldSpec[]> = {
+  trakt: [
+    {
+      key: "client_id",
+      label: "Client ID",
+      type: "text",
+      hint: "The Client ID shown on your Trakt OAuth app page.",
+    },
+    {
+      key: "client_secret",
+      label: "Client Secret",
+      type: "password",
+    },
+  ],
+  opensubtitles: [
+    { key: "api_key", label: "API Key", type: "password" },
+    { key: "username", label: "Username", type: "text" },
+    { key: "password", label: "Password", type: "password" },
+  ],
+};
+
 export function AdminCredentialsClient({
   initial,
 }: {
@@ -69,23 +100,49 @@ function SlotCard({
   onUpdated: (next: SecretSlotView) => void;
   onError: (msg: string | null) => void;
 }) {
+  const fieldSpecs = SLOT_FIELDS[slot.name];
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [fields, setFields] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<"save" | "test" | "clear" | null>(null);
   const [testResult, setTestResult] = useState<SecretTestResponse | null>(null);
 
   const isSet = !!slot.stored;
   const last4 = slot.stored?.last4 ?? null;
 
+  // For multi-field slots we serialize on submit; the backend's
+  // `*Creds::parse` re-parses the JSON identically to a hand-pasted
+  // value, so the wire format is unchanged.
+  function buildValue(): string {
+    if (fieldSpecs) {
+      const obj: Record<string, string> = {};
+      for (const f of fieldSpecs) obj[f.key] = (fields[f.key] ?? "").trim();
+      return JSON.stringify(obj);
+    }
+    return draft.trim();
+  }
+
+  function hasContent(): boolean {
+    if (fieldSpecs) {
+      return fieldSpecs.every((f) => (fields[f.key] ?? "").trim().length > 0);
+    }
+    return draft.trim().length > 0;
+  }
+
+  function resetDraft() {
+    setDraft("");
+    setFields({});
+  }
+
   async function save() {
-    if (!draft.trim()) return;
+    if (!hasContent()) return;
     setBusy("save");
     onError(null);
     setTestResult(null);
     try {
-      const next = await adminApi.secrets.set(slot.name, draft);
+      const next = await adminApi.secrets.set(slot.name, buildValue());
       onUpdated(next);
-      setDraft("");
+      resetDraft();
       setEditing(false);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
@@ -116,7 +173,7 @@ function SlotCard({
     try {
       const res = await adminApi.secrets.test(
         slot.name,
-        editing ? draft.trim() || undefined : undefined,
+        editing && hasContent() ? buildValue() : undefined,
       );
       setTestResult(res);
     } catch (e) {
@@ -167,7 +224,7 @@ function SlotCard({
                 <button
                   onClick={() => {
                     setEditing(true);
-                    setDraft("");
+                    resetDraft();
                     setTestResult(null);
                   }}
                   className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium hover:bg-white/15"
@@ -200,28 +257,56 @@ function SlotCard({
 
       {editing && !slot.managed && (
         <div className="mt-4 border-t border-white/10 pt-4">
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-white/50">
-            New value
-          </label>
-          <input
-            type="password"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="paste credential"
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-            autoFocus
-          />
+          {fieldSpecs ? (
+            <div className="space-y-3">
+              {fieldSpecs.map((f, idx) => (
+                <div key={f.key}>
+                  <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-white/50">
+                    {f.label}
+                  </label>
+                  <input
+                    type={f.type ?? "text"}
+                    value={fields[f.key] ?? ""}
+                    onChange={(e) =>
+                      setFields((prev) => ({ ...prev, [f.key]: e.target.value }))
+                    }
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+                    autoFocus={idx === 0}
+                  />
+                  {f.hint && (
+                    <p className="mt-1 text-[11px] text-white/40">{f.hint}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-white/50">
+                New value
+              </label>
+              <input
+                type="password"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder="paste credential"
+                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
+                autoFocus
+              />
+            </>
+          )}
           <div className="mt-3 flex gap-2">
             <button
               onClick={save}
-              disabled={!draft.trim() || busy !== null}
+              disabled={!hasContent() || busy !== null}
               className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
             >
               {busy === "save" ? "Saving…" : "Save"}
             </button>
             <button
               onClick={test}
-              disabled={!draft.trim() || busy !== null}
+              disabled={!hasContent() || busy !== null}
               className="rounded-md bg-white/10 px-3 py-1.5 text-sm font-medium hover:bg-white/15 disabled:opacity-50"
             >
               {busy === "test" ? "Testing…" : "Test before save"}
@@ -229,7 +314,7 @@ function SlotCard({
             <button
               onClick={() => {
                 setEditing(false);
-                setDraft("");
+                resetDraft();
                 setTestResult(null);
               }}
               disabled={busy !== null}

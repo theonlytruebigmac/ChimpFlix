@@ -1681,6 +1681,59 @@ export const trakt = {
     apiFetch<TraktSyncNowResult>("/trakt/sync-now", { method: "POST" }),
 };
 
+// ─── Plex OAuth (PIN flow) ────────────────────────────────────────────────
+
+export type PlexStartInput =
+  | { intent: "login" }
+  | { intent: "signup"; invite_code: string }
+  | { intent: "link" };
+
+export interface PlexStartResponse {
+  pin_handle: string;
+  auth_url: string;
+  user_code: string;
+  expires_in: number;
+}
+
+/// Poll outcomes. `Ready` is only emitted for the `link` intent —
+/// login / signup return the classic `{ user }` payload (with Set-Cookie
+/// session) directly, same shape as the password-login response, so
+/// the post-login bootstrap path is shared.
+export type PlexPollResult =
+  | { status: "pending" }
+  | { status: "expired" }
+  | { status: "unknown_handle" }
+  | { status: "not_linked"; plex_username: string }
+  | { status: "linked" }
+  // login + signup responses come back as the classic auth payload
+  // (no `status` field), so we surface it as a separate variant the
+  // caller hits via `if ("user" in result)`.
+  | AuthResponse;
+
+export interface PlexLinkSummary {
+  provider: string;
+  external_username: string | null;
+  external_email: string | null;
+  linked_at: number;
+  last_login_at: number | null;
+}
+
+export const plex = {
+  start: (input: PlexStartInput) =>
+    apiFetch<PlexStartResponse>("/auth/plex/start", {
+      method: "POST",
+      body: input,
+    }),
+  poll: (pin_handle: string) =>
+    apiFetch<PlexPollResult>("/auth/plex/poll", {
+      method: "POST",
+      body: { pin_handle },
+    }),
+  listLinks: () => apiFetch<PlexLinkSummary[]>("/auth/plex/link"),
+  unlink: () =>
+    apiFetch<{ removed: boolean }>("/auth/plex/link", { method: "DELETE" }),
+};
+
 export interface RatingResponse {
   rating: number | null;
 }

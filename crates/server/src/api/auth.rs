@@ -1931,7 +1931,7 @@ fn invalid_credentials() -> ApiError {
     ApiError::validation("invalid credentials")
 }
 
-async fn issue_session(
+pub(crate) async fn issue_session(
     state: &AppState,
     user: &User,
     headers: &HeaderMap,
@@ -1970,7 +1970,7 @@ async fn issue_session(
     Ok((session_cookie, csrf_cookie))
 }
 
-fn authed_response(
+pub(crate) fn authed_response(
     status: StatusCode,
     user: User,
     cookies: (String, String),

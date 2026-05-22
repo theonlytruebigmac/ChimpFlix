@@ -9800,9 +9800,13 @@ pub async fn upsert_trakt_tokens(
     expires_at: i64,
 ) -> Result<()> {
     let now = now_ms();
-    // Encrypt before insert. The plaintext columns are explicitly set
-    // to NULL on upsert so a refresh-token rotation never leaves the
-    // old plaintext value behind.
+    // Encrypt before insert. The plaintext columns get empty strings so
+    // a refresh-token rotation never leaves the old plaintext value
+    // behind. Empty strings rather than NULLs because the phase-15
+    // schema declared these columns as NOT NULL; phase 79 relaxes
+    // that, but binding `""` works under both schemas (and
+    // `decrypt_or_plaintext` ignores the plaintext column whenever the
+    // encrypted blob is present, so reads are unaffected).
     let access_blob = vault
         .encrypt_str(access_token)
         .context("encrypt trakt access_token")?;
@@ -9815,10 +9819,10 @@ pub async fn upsert_trakt_tokens(
              access_token_enc, access_token_nonce,
              refresh_token_enc, refresh_token_nonce,
              scope, expires_at, linked_at)
-         VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, '', '', ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
-            access_token = NULL,
-            refresh_token = NULL,
+            access_token = '',
+            refresh_token = '',
             access_token_enc = excluded.access_token_enc,
             access_token_nonce = excluded.access_token_nonce,
             refresh_token_enc = excluded.refresh_token_enc,
@@ -10010,6 +10014,315 @@ pub async fn list_trakt_linked_user_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
         .iter()
         .filter_map(|r| r.try_get("user_id").ok())
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Federated auth providers (Plex OAuth)
+// ---------------------------------------------------------------------------
+
+/// One row of `user_auth_providers`. Snapshot of an external identity
+/// (Plex today; Google later) bound to a ChimpFlix user.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserAuthProvider {
+    pub id: i64,
+    pub user_id: i64,
+    pub provider: String,
+    pub external_id: String,
+    pub external_email: Option<String>,
+    pub external_username: Option<String>,
+    pub linked_at: i64,
+    pub last_login_at: Option<i64>,
+}
+
+fn auth_provider_from_row(row: &SqliteRow) -> Result<UserAuthProvider> {
+    Ok(UserAuthProvider {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        provider: row.try_get("provider")?,
+        external_id: row.try_get("external_id")?,
+        external_email: row
+            .try_get::<Option<String>, _>("external_email")
+            .ok()
+            .flatten(),
+        external_username: row
+            .try_get::<Option<String>, _>("external_username")
+            .ok()
+            .flatten(),
+        linked_at: row.try_get("linked_at")?,
+        last_login_at: row
+            .try_get::<Option<i64>, _>("last_login_at")
+            .ok()
+            .flatten(),
+    })
+}
+
+/// Resolve a (provider, external_id) pair to the linked local user.
+/// Returns None when no link exists — the caller decides whether that
+/// means "auto-provision" (invite-bearing signup) or "reject"
+/// (invite-less login).
+pub async fn find_user_by_provider(
+    pool: &SqlitePool,
+    provider: &str,
+    external_id: &str,
+) -> Result<Option<(User, UserAuthProvider)>> {
+    let row = sqlx::query(
+        "SELECT users.*, p.id AS p_id, p.user_id AS p_user_id, p.provider AS p_provider,
+                p.external_id AS p_external_id, p.external_email AS p_external_email,
+                p.external_username AS p_external_username, p.linked_at AS p_linked_at,
+                p.last_login_at AS p_last_login_at
+         FROM user_auth_providers p
+         JOIN users ON users.id = p.user_id
+         WHERE p.provider = ? AND p.external_id = ?
+         LIMIT 1",
+    )
+    .bind(provider)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let user = User::from_row(&row)?;
+    let link = UserAuthProvider {
+        id: row.try_get("p_id")?,
+        user_id: row.try_get("p_user_id")?,
+        provider: row.try_get("p_provider")?,
+        external_id: row.try_get("p_external_id")?,
+        external_email: row
+            .try_get::<Option<String>, _>("p_external_email")
+            .ok()
+            .flatten(),
+        external_username: row
+            .try_get::<Option<String>, _>("p_external_username")
+            .ok()
+            .flatten(),
+        linked_at: row.try_get("p_linked_at")?,
+        last_login_at: row
+            .try_get::<Option<i64>, _>("p_last_login_at")
+            .ok()
+            .flatten(),
+    };
+    Ok(Some((user, link)))
+}
+
+/// List every external-identity link a user has. Used by the Settings
+/// → Account page to render "Linked accounts" + by `delete_auth_provider`
+/// to enforce "you can't unlink your last way to sign in".
+pub async fn list_user_auth_providers(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<UserAuthProvider>> {
+    let rows = sqlx::query(
+        "SELECT id, user_id, provider, external_id,
+                external_email, external_username, linked_at, last_login_at
+         FROM user_auth_providers WHERE user_id = ? ORDER BY linked_at ASC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(auth_provider_from_row).collect()
+}
+
+/// Insert a provider link. Returns an error wrapping the UNIQUE
+/// constraint violation when either (provider, external_id) is already
+/// bound to a different user OR (user_id, provider) already has a
+/// link — callers translate that into a 409 with a sensible message.
+pub async fn insert_auth_provider(
+    pool: &SqlitePool,
+    user_id: i64,
+    provider: &str,
+    external_id: &str,
+    external_email: Option<&str>,
+    external_username: Option<&str>,
+) -> Result<UserAuthProvider> {
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO user_auth_providers
+            (user_id, provider, external_id, external_email, external_username,
+             linked_at, last_login_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         RETURNING *",
+    )
+    .bind(user_id)
+    .bind(provider)
+    .bind(external_id)
+    .bind(external_email)
+    .bind(external_username)
+    .bind(now)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    auth_provider_from_row(&row)
+}
+
+/// Bump `last_login_at` after a successful provider-driven session
+/// issue. Best-effort — surfacing a failure here would needlessly fail
+/// the login.
+pub async fn touch_auth_provider_login(pool: &SqlitePool, link_id: i64) -> Result<()> {
+    sqlx::query("UPDATE user_auth_providers SET last_login_at = ? WHERE id = ?")
+        .bind(now_ms())
+        .bind(link_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Remove one provider link. Returns the number of rows deleted (0 if
+/// the link didn't exist). The "can the user still sign in?" guard
+/// lives in the API handler — this is a pure mutation.
+pub async fn delete_auth_provider(
+    pool: &SqlitePool,
+    user_id: i64,
+    provider: &str,
+) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM user_auth_providers WHERE user_id = ? AND provider = ?")
+        .bind(user_id)
+        .bind(provider)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Whether the given user has a non-NULL password_hash. Combined with
+/// `list_user_auth_providers` it answers "after this unlink, can the
+/// user still sign in by any means?"
+pub async fn user_has_password(pool: &SqlitePool, user_id: i64) -> Result<bool> {
+    let row =
+        sqlx::query("SELECT password_hash IS NOT NULL AS has_pw FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row
+        .and_then(|r| r.try_get::<i64, _>("has_pw").ok())
+        .map(|v| v != 0)
+        .unwrap_or(false))
+}
+
+/// Create a user without a local password. Used by the invite-bearing
+/// Plex signup flow: the new account starts with `password_hash = NULL`
+/// and a linked provider row. The user can later set a password via
+/// the forgot-password email flow if they ever want a password fallback.
+///
+/// Refuses to mint an `Owner` without a password — the existing Owner
+/// safety guarantee (plex.tv being down can't lock out the only admin)
+/// is enforced by callers passing `UserRole::User` here. Owner creation
+/// stays in [`create_user`] where a password is mandatory.
+pub async fn create_user_no_password(
+    pool: &SqlitePool,
+    username: &str,
+    role: UserRole,
+    display_name: Option<&str>,
+    email: Option<&str>,
+) -> Result<User> {
+    if matches!(role, UserRole::Owner) {
+        anyhow::bail!("create_user_no_password refuses to mint an Owner without a password");
+    }
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO users (username, password_hash, role, display_name, email, created_at, updated_at)
+         VALUES (?, NULL, ?, ?, ?, ?, ?)
+         RETURNING *",
+    )
+    .bind(username)
+    .bind(role.as_str())
+    .bind(display_name)
+    .bind(email)
+    .bind(now)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    User::from_row(&row)
+}
+
+/// Generate a username that won't collide with an existing row. The
+/// caller passes the *preferred* base (e.g. the Plex username);
+/// suffixes get appended only when needed. Returns the chosen string
+/// so the caller can pass it to `create_user_no_password`.
+///
+/// Plex usernames can contain characters our `validate_username` rule
+/// rejects (apostrophes, spaces). We sanitize first by replacing
+/// disallowed chars with `_`, then dedupe — so `Zach O'Connor` becomes
+/// `Zach_O_Connor` (and `Zach_O_Connor-2` if taken).
+pub async fn allocate_username_from_external(
+    pool: &SqlitePool,
+    preferred: &str,
+) -> Result<String> {
+    let base: String = preferred
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = if base.is_empty() || base.starts_with('_') {
+        format!("user{base}")
+    } else {
+        base
+    };
+    for suffix in 0..1000 {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", suffix + 1)
+        };
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
+        )
+        .bind(&candidate)
+        .fetch_optional(pool)
+        .await?;
+        if existing.is_none() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("could not allocate a unique username from {preferred:?}")
+}
+
+// ---------------------------------------------------------------------------
+// Plex client identifier (lazy-persisted in server_settings)
+// ---------------------------------------------------------------------------
+
+/// Return the stored Plex client identifier or generate-and-persist a
+/// fresh UUID on first read. Stable across restarts so re-launching
+/// the server doesn't break in-flight authorizations.
+pub async fn ensure_plex_client_identifier(pool: &SqlitePool) -> Result<String> {
+    if let Some(existing) =
+        sqlx::query_scalar::<_, Option<String>>("SELECT plex_client_identifier FROM server_settings")
+            .fetch_optional(pool)
+            .await?
+            .flatten()
+    {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    // Generate a UUID-shaped identifier without pulling in the `uuid`
+    // crate dependency just for one value. 16 random bytes formatted
+    // as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` is what Plex expects;
+    // we set the version + variant bits so the value is technically a
+    // v4 UUID, but Plex doesn't actually care.
+    let mut bytes = [0u8; 16];
+    {
+        use rand_core::{OsRng, RngCore};
+        OsRng.fill_bytes(&mut bytes);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let id = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    );
+    sqlx::query("UPDATE server_settings SET plex_client_identifier = ?")
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    Ok(id)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

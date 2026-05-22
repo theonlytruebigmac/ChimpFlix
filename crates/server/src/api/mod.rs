@@ -3,6 +3,7 @@
 pub(crate) mod access;
 pub(crate) mod admin;
 mod auth;
+mod auth_plex;
 mod collections;
 mod cors;
 mod csrf;
@@ -204,6 +205,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/items/{id}/tags/{tag_id}",
             axum::routing::delete(tags::remove_from_item),
+        )
+        // Plex OAuth: PIN-based device flow. Same start+poll pair
+        // covers login, invite-bearing signup, and linking from
+        // Settings → Account. See `auth_plex::StartInput` for intent
+        // dispatch.
+        .route("/auth/plex/start", post(auth_plex::start))
+        .route("/auth/plex/poll", post(auth_plex::poll))
+        .route(
+            "/auth/plex/link",
+            get(auth_plex::list_links).delete(auth_plex::unlink),
         )
         // Trakt link/sync
         .route("/trakt/link/start", post(trakt::link_start))

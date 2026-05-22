@@ -117,6 +117,35 @@ pub async fn layer(
         HeaderValue::from_static(API_CACHE_CONTROL),
     );
 
+    // Connection: close on JSON-API responses to eliminate the
+    // keep-alive race between Next.js's HTTP agent and Hyper.
+    //
+    // Symptom: Next.js's proxy logs `Error: socket hang up
+    // (ECONNRESET)` whenever it reuses a free socket that Hyper has
+    // closed but Node hasn't received the FIN packet for yet.
+    // Background polls (/admin/dashboard, /notifications/unread-count,
+    // /admin/logs, /admin/tasks) hit this constantly because they
+    // fire every few seconds.
+    //
+    // `Connection: close` tells Node not to pool the socket — it
+    // discards the connection after the response, so the next poll
+    // always opens a fresh TCP. Cost inside the Docker network is
+    // ~100 µs per request; for a polling app that's an irrelevant
+    // amount of CPU and totally invisible in latency terms.
+    //
+    // `set_if_absent` preserves handlers that legitimately need
+    // keep-alive — currently just the WebSocket upgrade at `/ws`,
+    // which axum's `WebSocketUpgrade` sets `Connection: Upgrade` on.
+    // HLS segment delivery still benefits from upstream's (Traefik /
+    // Cloudflare) keep-alive pool; closing the server-side socket
+    // doesn't affect the client-side connection because Traefik
+    // multiplexes user connections onto its own backend pool.
+    set_if_absent(
+        headers,
+        header::CONNECTION,
+        HeaderValue::from_static("close"),
+    );
+
     // HSTS only when we're sure the deployment is HTTPS — see auth/mod.rs
     // for how cookie_secure gets derived from APP_PUBLIC_ORIGIN. Sending
     // HSTS over plain HTTP would either be ignored (best case) or pin

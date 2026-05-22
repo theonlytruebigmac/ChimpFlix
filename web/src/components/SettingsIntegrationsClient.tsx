@@ -184,7 +184,7 @@ export function SettingsIntegrationsClient() {
         )}
 
         {pending && (
-          <div className="mt-3 rounded border border-(--color-accent)/40 bg-(--color-accent)/10 p-3">
+          <div className="mt-3 rounded border border-accent/40 bg-accent/10 p-3">
             <div className="text-xs text-white/65">
               Open Trakt in another tab and enter this code:
             </div>

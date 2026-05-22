@@ -16,6 +16,7 @@ pub mod anilist;
 pub mod anilist_cache;
 pub mod omdb;
 pub mod opensubtitles;
+pub mod plex_oauth;
 pub mod tmdb;
 pub mod trakt;
 pub mod tvdb;
@@ -35,6 +36,7 @@ pub use anilist_cache::{
 pub use anilist::{AniListClient, AniListEpisode, AniListShow};
 pub use omdb::{OmdbClient, OmdbRatings, OmdbTitle};
 pub use opensubtitles::{OpenSubtitlesClient, OpenSubtitlesCreds, SearchParams, SubtitleHit};
+pub use plex_oauth::{PinPollResult, PlexOAuthClient, PlexPin, PlexUser};
 pub use tmdb::{
     TmdbCandidate, TmdbCastMember, TmdbClient, TmdbCollection, TmdbCollectionPart,
     TmdbCollectionStub, TmdbCredits, TmdbCrewMember, TmdbEpisode, TmdbKind, TmdbMovie, TmdbPoster,

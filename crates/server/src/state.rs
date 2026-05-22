@@ -6,8 +6,8 @@ use std::sync::Arc;
 use chimpflix_common::Vault;
 use chimpflix_library::ServerSettings;
 use chimpflix_metadata::{
-    AniListClient, OmdbClient, OpenSubtitlesClient, TmdbClient, TraktClient, TvMazeClient,
-    TvdbClient,
+    AniListClient, OmdbClient, OpenSubtitlesClient, PlexOAuthClient, TmdbClient, TraktClient,
+    TvMazeClient, TvdbClient,
 };
 use chimpflix_transcoder::{FfmpegConfig, TranscodeManager, TranscoderCapabilities};
 use ipnet::IpNet;
@@ -53,6 +53,51 @@ pub type TraktHandle = Arc<RwLock<Option<TraktClient>>>;
 /// `fetch_external_ratings` per-item handler.
 pub type OmdbHandle = Arc<RwLock<Option<OmdbClient>>>;
 
+/// Hot-swappable Plex OAuth client. Built lazily from the per-install
+/// client identifier stored on `server_settings`; the `/auth/plex/start`
+/// endpoint ensures one is constructed on first use. Cleared by the
+/// admin "rotate identifier" action (not yet implemented) so future
+/// PINs use a fresh identity.
+pub type PlexOAuthHandle = Arc<RwLock<Option<PlexOAuthClient>>>;
+
+/// In-memory pending-PIN store. Plex returns a numeric PIN id we have
+/// to poll until the user approves; we keep an opaque handle around
+/// instead of returning the raw id to the browser. The handle expires
+/// alongside the underlying PIN (Plex defaults to 30 minutes for
+/// `strong=true` PINs).
+///
+/// One handle ⇒ one intent. The `intent` field tells the poll handler
+/// which side-effect to apply when the PIN flips to `Ready`:
+///
+///   * `Login`  — look up the linked ChimpFlix user, issue a session.
+///   * `Signup` — validate the invite, create a user + provider link,
+///                consume the invite, issue a session.
+///   * `Link`   — attach the Plex identity to an already-signed-in
+///                user's account. No session is issued (the existing
+///                one is preserved).
+pub type PlexPinCache = Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPlexPin>>>;
+
+#[derive(Debug, Clone)]
+pub struct PendingPlexPin {
+    pub plex_pin_id: i64,
+    pub intent: PlexPinIntent,
+    pub expires_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub enum PlexPinIntent {
+    Login,
+    /// Bound to a specific invite code. Only PINs created with this
+    /// intent can consume the invite — a stale Login handle can't be
+    /// upgraded to signup mid-flight.
+    Signup { invite_code_hash: String },
+    /// Attach the resulting Plex identity to this user_id. The handler
+    /// re-verifies the session at poll time so a logout between start
+    /// and poll cleanly rejects rather than linking under the wrong
+    /// account.
+    Link { user_id: i64 },
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -75,6 +120,14 @@ pub struct AppState {
     /// OMDb client for the `fetch_external_ratings` per-item handler.
     /// `None` until an OMDb API key is stored in the credential vault.
     pub omdb: OmdbHandle,
+    /// Plex OAuth client. Lazily constructed from
+    /// `server_settings.plex_client_identifier` on the first
+    /// `/auth/plex/start` call.
+    pub plex_oauth: PlexOAuthHandle,
+    /// Server-side cache of in-flight Plex PIN handles. Keyed by an
+    /// opaque random token the frontend polls on; never exposes the
+    /// raw Plex PIN id to the browser.
+    pub plex_pin_cache: PlexPinCache,
     /// TVMaze fallback provider for shows. Always constructed (no key
     /// required); `None` only if HTTP client init fails.
     pub tvmaze: Option<TvMazeClient>,
@@ -241,6 +294,60 @@ impl AppState {
 
     pub async fn set_omdb(&self, client: Option<OmdbClient>) {
         *self.omdb.write().await = client;
+    }
+
+    /// Return the live `PlexOAuthClient`, building it from the
+    /// persisted `plex_client_identifier` on first use. Subsequent
+    /// calls return the cached client.
+    pub async fn plex_oauth(&self) -> anyhow::Result<PlexOAuthClient> {
+        if let Some(client) = self.plex_oauth.read().await.clone() {
+            return Ok(client);
+        }
+        // Cold path: generate-or-load the identifier and build the
+        // client under the write lock. The double-check inside the
+        // write lock guards against two callers crossing the same
+        // boundary at the same time.
+        let identifier =
+            chimpflix_library::queries::ensure_plex_client_identifier(&self.pool).await?;
+        let mut guard = self.plex_oauth.write().await;
+        if let Some(existing) = guard.clone() {
+            return Ok(existing);
+        }
+        let client = PlexOAuthClient::new(&identifier)?;
+        *guard = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Stash a freshly-issued PIN under an opaque handle. The handle
+    /// is what we hand back to the browser; the underlying Plex PIN id
+    /// stays server-side so a hostile script can't poll someone else's
+    /// in-flight authorization.
+    pub async fn plex_pin_remember(&self, handle: String, pending: PendingPlexPin) {
+        let mut guard = self.plex_pin_cache.lock().await;
+        // Opportunistic GC — entries expire on `expires_at`, so a
+        // sweep at every insert keeps the map small without needing a
+        // background task.
+        let now = std::time::Instant::now();
+        guard.retain(|_, p| p.expires_at > now);
+        guard.insert(handle, pending);
+    }
+
+    /// Lookup a pending PIN by its opaque handle. Returns the entry
+    /// (cloned so the lock isn't held across the network call) or
+    /// `None` if the handle is unknown / expired.
+    pub async fn plex_pin_lookup(&self, handle: &str) -> Option<PendingPlexPin> {
+        let guard = self.plex_pin_cache.lock().await;
+        let entry = guard.get(handle)?;
+        if entry.expires_at <= std::time::Instant::now() {
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    /// Drop a PIN handle from the cache (called after a terminal
+    /// outcome — Ready, Expired, or hard error).
+    pub async fn plex_pin_forget(&self, handle: &str) {
+        self.plex_pin_cache.lock().await.remove(handle);
     }
 
     /// Try to acquire the scan lock for `library_id`. Returns true if

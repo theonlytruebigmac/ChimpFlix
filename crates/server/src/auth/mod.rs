@@ -6,7 +6,7 @@ pub mod secret;
 
 mod extractor;
 
-pub use extractor::{AdminAuth, AuthUser, OwnerAuth};
+pub use extractor::{AdminAuth, AuthUser, MaybeAuthUser, OwnerAuth};
 
 use chimpflix_library::UserRole;
 use std::sync::Arc;

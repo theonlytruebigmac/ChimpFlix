@@ -1,6 +1,7 @@
 import { server as serverApi } from "@/lib/chimpflix-api";
 import { requireUser } from "@/lib/chimpflix-server";
 import { SettingsEmailChangeClient } from "@/components/SettingsEmailChangeClient";
+import { SettingsLinkedAccountsClient } from "@/components/SettingsLinkedAccountsClient";
 import { SettingsPasswordClient } from "@/components/SettingsPasswordClient";
 import { SettingsProfileClient } from "@/components/SettingsProfileClient";
 import { SettingsSessionsClient } from "@/components/SettingsSessionsClient";
@@ -44,6 +45,10 @@ export default async function AccountSettingsPage() {
 
       <Section title="Two-factor">
         <SettingsTwoFactorClient />
+      </Section>
+
+      <Section title="Linked accounts">
+        <SettingsLinkedAccountsClient />
       </Section>
 
       <Section title="Sessions">

@@ -213,3 +213,29 @@ impl FromRequestParts<AppState> for AdminAuth {
         Ok(AdminAuth(user))
     }
 }
+
+/// "Optional auth" wrapper for handlers that behave differently for
+/// signed-in vs anonymous callers — instead of failing the whole
+/// request with 401 when no session is present, missing/invalid
+/// credentials yield `MaybeAuthUser(None)`.
+///
+/// Used by the Plex OAuth `start` / `poll` handlers: anonymous callers
+/// drive Login or Signup; signed-in callers drive Link. A single
+/// extractor lets one handler cover all three cases.
+#[derive(Debug, Clone)]
+pub struct MaybeAuthUser(pub Option<AuthUser>);
+
+impl FromRequestParts<AppState> for MaybeAuthUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        match AuthUser::from_request_parts(parts, state).await {
+            Ok(user) => Ok(MaybeAuthUser(Some(user))),
+            // 401 / 403 → anonymous. Any other error (DB failure,
+            // corrupt session row) should still surface so the caller
+            // sees a real 500 instead of silently auth-less.
+            Err(ApiError::Unauthorized) | Err(ApiError::Forbidden) => Ok(MaybeAuthUser(None)),
+            Err(other) => Err(other),
+        }
+    }
+}
