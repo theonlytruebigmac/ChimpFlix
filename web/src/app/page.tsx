@@ -1,6 +1,10 @@
 import { redirect } from "next/navigation";
 import { Suspense } from "react";
 import { CollectionsRail } from "@/components/CollectionsRail";
+import {
+  ComingSoonRail,
+  UpcomingMoviesRail,
+} from "@/components/ComingSoonRail";
 import { EmptyHomeClient } from "@/components/EmptyHomeClient";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
@@ -17,6 +21,7 @@ import {
   libraries as librariesApi,
   playState as playStateApi,
   prefs as prefsApi,
+  trakt as traktApi,
   type Library,
 } from "@/lib/chimpflix-api";
 import { adaptItem, adaptOnDeck } from "@/lib/chimpflix-adapt";
@@ -118,6 +123,41 @@ export default async function Home() {
         <RailErrorBoundary label="RecentlyAdded">
           <Suspense fallback={<RailSkeleton title="Recently Added" />}>
             <RecentlyAddedRail visibleLibIds={visibleLibIds} />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="ComingSoon">
+          <Suspense fallback={null}>
+            <ComingSoonRail />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="SeasonPremieres">
+          <Suspense fallback={null}>
+            <ComingSoonRail variant="premieres" title="New Seasons" days={30} />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="UpcomingMovies">
+          <Suspense fallback={null}>
+            <UpcomingMoviesRail />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="TraktRecsMovies">
+          <Suspense fallback={null}>
+            <TraktRecommendationsRail kind="movie" title="Recommended for You · Movies" />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="TraktRecsShows">
+          <Suspense fallback={null}>
+            <TraktRecommendationsRail kind="show" title="Recommended for You · Shows" />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="TraktFavorites">
+          <Suspense fallback={null}>
+            <TraktFavoritesRail />
+          </Suspense>
+        </RailErrorBoundary>
+        <RailErrorBoundary label="TraktLists">
+          <Suspense fallback={null}>
+            <TraktListsRails />
           </Suspense>
         </RailErrorBoundary>
         <RailErrorBoundary label="Top10Movies">
@@ -229,6 +269,63 @@ async function RecentlyAddedRail({
   return <Rail title="Recently Added" items={items} />;
 }
 
+async function TraktFavoritesRail() {
+  let res;
+  try {
+    res = await traktApi.favorites();
+  } catch {
+    return null;
+  }
+  const items = res.items.map(adaptItem);
+  if (items.length === 0) return null;
+  return <Rail title="Your Trakt Favorites" items={items} />;
+}
+
+async function TraktListsRails() {
+  let res;
+  try {
+    res = await traktApi.lists();
+  } catch {
+    return null;
+  }
+  if (res.lists.length === 0) return null;
+  return (
+    <>
+      {res.lists.map((list) => {
+        const items = list.items.map(adaptItem);
+        if (items.length === 0) return null;
+        return (
+          <Rail
+            key={`trakt-list-${list.id}`}
+            title={list.name}
+            items={items}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+async function TraktRecommendationsRail({
+  kind,
+  title,
+}: {
+  kind: "movie" | "show";
+  title: string;
+}) {
+  let res;
+  try {
+    res = await traktApi.recommendations(kind);
+  } catch {
+    // Not linked / Trakt outage — silent no-op so the rail just
+    // doesn't render. Other Trakt-driven UI handles hard errors.
+    return null;
+  }
+  const items = res.items.map(adaptItem);
+  if (items.length === 0) return null;
+  return <Rail title={title} items={items} />;
+}
+
 async function Top10TrendingRail({
   kind,
   title,
@@ -265,7 +362,7 @@ async function Top10TrendingRail({
     return null;
   }
   if (entries.length === 0) return null;
-  return <Top10Rail title={title} items={entries} />;
+  return <Top10Rail title={title} items={entries} href="/new-popular" />;
 }
 
 async function LibSectionRail({ lib }: { lib: Library }) {

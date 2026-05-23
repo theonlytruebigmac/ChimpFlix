@@ -277,28 +277,28 @@ async fn build_history_event(
 ) -> Option<chimpflix_metadata::HistoryPush> {
     let now_iso = trakt_sync::epoch_ms_to_iso(chimpflix_common::now_ms());
     if let Some(id) = item_id {
-        match trakt_sync::item_tmdb_id(&state.pool, id).await {
-            Some(tmdb_id) => Some(chimpflix_metadata::HistoryPush::Movie {
-                tmdb_id,
+        match trakt_sync::item_trakt_ids(&state.pool, id).await {
+            Some(ids) => Some(chimpflix_metadata::HistoryPush::Movie {
+                ids,
                 watched_at: now_iso,
             }),
             None => {
-                // Surface the skip so operators can tell "push fired but
-                // got 404" apart from "push never fired because we had
-                // no Trakt-compatible id". Anime libraries that only
-                // matched via AniList hit this path constantly.
+                // Anime libraries that only matched via AniList have
+                // no tmdb/imdb/tvdb on the items row and can never
+                // resolve on Trakt — surface the skip so operators
+                // know which items are silently dropped.
                 tracing::info!(
                     item_id = id,
-                    "Trakt push skipped: item has no tmdb_id"
+                    "Trakt push skipped: item has no Trakt-compatible ids"
                 );
                 None
             }
         }
     } else if let Some(id) = episode_id {
         match trakt_sync::episode_trakt_coords(&state.pool, id).await {
-            Ok(Some((tmdb_show_id, season, episode))) => {
+            Ok(Some((show_ids, season, episode))) => {
                 Some(chimpflix_metadata::HistoryPush::Episode {
-                    tmdb_show_id,
+                    show_ids,
                     season,
                     episode,
                     watched_at: now_iso,
@@ -307,7 +307,7 @@ async fn build_history_event(
             Ok(None) => {
                 tracing::info!(
                     episode_id = id,
-                    "Trakt push skipped: show has no tmdb_id"
+                    "Trakt push skipped: show has no Trakt-compatible ids"
                 );
                 None
             }

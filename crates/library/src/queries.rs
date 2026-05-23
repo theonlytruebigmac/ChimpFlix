@@ -1429,10 +1429,18 @@ pub async fn list_trending_in_library(
     accessible: Option<&[i64]>,
 ) -> Result<Vec<(i64, ListedItem)>> {
     let lib_filter = library_filter_sql("i.library_id", accessible);
-    // Mirrors ITEM_SELECT but adds `tc.rank` to the projection so the
-    // caller can render rank badges (and we keep the natural ORDER BY
-    // ranking). The shared ITEM_SELECT constant is geometry-locked for
-    // Item::from_row, so we re-spell it here rather than mutate it.
+    // Hybrid "Top 10": TMDB global weekly trending ranks first, then we
+    // top up to `limit` from local signals so the rail isn't bare when
+    // the library doesn't overlap TMDB much. Tie-breakers, in order:
+    //   1. tc.rank ASC (TMDB matches keep their global order)
+    //   2. play_count DESC (server-wide; episodes roll up to their show)
+    //   3. ps.last_played_at DESC (per-user; nudges things this viewer
+    //      has actually engaged with)
+    //   4. i.added_at DESC (final fallback so the slots fill predictably
+    //      with whatever was last imported)
+    // Rank is returned as the row position (1..N) rather than tc.rank,
+    // since fallback items have no tc.rank and the frontend renumbers
+    // anyway.
     let sql = format!(
         "SELECT i.*, \
             (SELECT source_url FROM images \
@@ -1445,17 +1453,33 @@ pub async fn list_trending_in_library(
             ps.duration_ms     AS ps_duration_ms, \
             ps.watched         AS ps_watched, \
             ps.view_count      AS ps_view_count, \
-            ps.last_played_at  AS ps_last_played_at, \
-            tc.rank            AS trending_rank \
+            ps.last_played_at  AS ps_last_played_at \
          FROM items i \
-         INNER JOIN trending_cache tc \
+         LEFT JOIN trending_cache tc \
            ON tc.tmdb_id = i.tmdb_id \
           AND tc.source = 'tmdb' \
           AND tc.media_kind = ? \
          LEFT JOIN play_state ps \
            ON ps.item_id = i.id AND ps.user_id = ? \
+         LEFT JOIN ( \
+            SELECT i2.id AS item_id, COUNT(*) AS play_count, MAX(occurred_at) AS last_at FROM ( \
+                SELECT pe.item_id AS rolled_id, pe.occurred_at \
+                FROM playback_events pe \
+                WHERE pe.event_type = 'start' AND pe.item_id IS NOT NULL \
+                UNION ALL \
+                SELECT s.show_id AS rolled_id, pe.occurred_at \
+                FROM playback_events pe \
+                JOIN episodes ep ON ep.id = pe.episode_id \
+                JOIN seasons s ON s.id = ep.season_id \
+                WHERE pe.event_type = 'start' AND pe.episode_id IS NOT NULL \
+            ) ev JOIN items i2 ON i2.id = ev.rolled_id \
+            GROUP BY i2.id \
+         ) pop ON pop.item_id = i.id \
          WHERE i.kind = ? AND {lib_filter} \
-         ORDER BY tc.rank ASC \
+         ORDER BY (tc.rank IS NULL), tc.rank ASC, \
+                  COALESCE(pop.play_count, 0) DESC, \
+                  COALESCE(ps.last_played_at, 0) DESC, \
+                  i.added_at DESC \
          LIMIT ?",
     );
     let rows = sqlx::query(&sql)
@@ -1466,11 +1490,10 @@ pub async fn list_trending_in_library(
         .fetch_all(pool)
         .await?;
     rows.iter()
-        .map(|row| -> Result<(i64, ListedItem)> {
-            use sqlx::Row;
-            let rank: i64 = row.try_get("trending_rank")?;
+        .enumerate()
+        .map(|(idx, row)| -> Result<(i64, ListedItem)> {
             Ok((
-                rank,
+                (idx as i64) + 1,
                 ListedItem {
                     item: Item::from_row(row)?,
                     play_state: PlayStateForItem::from_columns(row)?,
@@ -1642,6 +1665,47 @@ pub async fn list_items_for_person(
             })
         })
         .collect::<Result<Vec<_>>>()
+}
+
+/// Fetch full [`ListedItem`]s for a known list of item ids, preserving
+/// the input order. Inaccessible / unknown ids are silently dropped.
+/// Used by the Trakt recommendations rail to hydrate the matched
+/// local items with play_state in one query.
+pub async fn list_items_by_ids(
+    pool: &SqlitePool,
+    ids: &[i64],
+    user_id: i64,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<ListedItem>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lib_filter = library_filter_sql("i.library_id", accessible);
+    // IDs come from trusted server-side lookups, never user input, so
+    // direct interpolation is safe (mirrors `library_filter_sql`).
+    let id_list = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let active_files = has_active_files_clause();
+    let sql = format!(
+        "{ITEM_SELECT} \
+         WHERE i.id IN ({id_list}) \
+           AND {active_files} \
+           AND {lib_filter}"
+    );
+    let rows = sqlx::query(&sql).bind(user_id).fetch_all(pool).await?;
+    // Re-order to match input. Trakt recommendation order is
+    // signal-bearing (most-recommended first) so preserving it
+    // matters for the rail.
+    let mut by_id: std::collections::HashMap<i64, ListedItem> = std::collections::HashMap::new();
+    for row in &rows {
+        let item = Item::from_row(row)?;
+        let play_state = PlayStateForItem::from_columns(row)?;
+        by_id.insert(item.id, ListedItem { item, play_state });
+    }
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 async fn list_credits_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<Credit>> {
@@ -4188,6 +4252,54 @@ pub async fn on_deck(
         }
     }
 
+    // Next-episode augmentation. Plex/Netflix surface a show on
+    // Continue Watching for as long as you're mid-season — finish ep
+    // 13, see ep 14 ready to play, even if you never started 14.
+    // The in-progress loop above only catches *partially-played*
+    // episodes (`position_ms > 0`), so a fully-watched-then-stop
+    // pattern would drop the show off the rail entirely. This pass
+    // backfills that case: for each show the user has any play_state
+    // on (within the same recency cutoff as the in-progress filter),
+    // find the chronologically next episode with no play_state row
+    // and surface it. `seen_show_ids` already contains shows we
+    // emitted from the in-progress pass, so an active mid-watch
+    // takes precedence over its own "next up".
+    if out.len() < cap {
+        let next_ups = list_user_next_episode_in_show(pool, user_id, cutoff_ms).await?;
+        for (show_id, episode_id, last_played_at) in next_ups {
+            if out.len() >= cap {
+                break;
+            }
+            if !seen_show_ids.insert(show_id) {
+                continue;
+            }
+            let Some(detail) = get_episode_detail(pool, episode_id, user_id, accessible).await?
+            else {
+                continue;
+            };
+            let Some(show) = get_item(pool, show_id, user_id, accessible).await? else {
+                continue;
+            };
+            // Carry the *show's* most-recent last_played_at into the
+            // stub so the rail orders this tile by when the user
+            // last engaged with the show, not "now" — otherwise every
+            // next-up freshly-computed entry would race to the front
+            // ahead of genuine in-progress items on subsequent renders.
+            let play_state = PlayStateForItem {
+                position_ms: 0,
+                duration_ms: detail.episode.duration_ms,
+                watched: false,
+                view_count: 0,
+                last_played_at,
+            };
+            out.push(OnDeckEntry::Episode {
+                episode: detail.episode,
+                show,
+                play_state,
+            });
+        }
+    }
+
     // Season-premiere augmentation. For shows the user has watched
     // any episode of but isn't actively in-progress on right now,
     // surface the first episode of the next-up season if one exists
@@ -4230,6 +4342,91 @@ pub async fn on_deck(
     }
 
     Ok(OnDeckResponse { items: out })
+}
+
+/// For each show the user has touched (watched or in-progress on any
+/// episode), find the chronologically next episode that has *no*
+/// play_state row — the natural "next to watch" tile. Returns
+/// `(show_id, episode_id, last_played_at_of_show)` ordered by recency
+/// of the show's most-recent activity, so the Continue Watching rail
+/// can keep its DESC ordering.
+///
+/// Complements [`list_user_show_premieres`]: the premiere path only
+/// fires when the user is fully *between* seasons. This one covers the
+/// far more common mid-season case (finished ep N, ep N+1 is unstarted).
+///
+/// `cutoff_ms` mirrors the in-progress filter — shows whose latest
+/// play is older than the cutoff are excluded so long-since-finished
+/// shows don't reappear when the operator's max-age-weeks window
+/// changes.
+async fn list_user_next_episode_in_show(
+    pool: &SqlitePool,
+    user_id: i64,
+    cutoff_ms: i64,
+) -> Result<Vec<(i64, i64, i64)>> {
+    let rows = sqlx::query(
+        "WITH user_progress AS (
+             SELECT s.show_id AS show_id,
+                    ps.last_played_at AS last_played_at,
+                    s.season_number AS season,
+                    e.episode_number AS episode
+             FROM play_state ps
+             JOIN episodes e ON ps.episode_id = e.id
+             JOIN seasons s ON e.season_id = s.id
+             WHERE ps.user_id = ?1
+               AND (ps.watched = 1 OR ps.position_ms > 0)
+         ),
+         latest_per_show AS (
+             SELECT show_id, MAX(last_played_at) AS last_played_at
+             FROM user_progress
+             GROUP BY show_id
+         ),
+         tip AS (
+             SELECT up.show_id, up.last_played_at, up.season, up.episode
+             FROM user_progress up
+             JOIN latest_per_show lps
+               ON lps.show_id = up.show_id
+              AND lps.last_played_at = up.last_played_at
+         )
+         SELECT t.show_id AS show_id,
+                t.last_played_at AS last_played_at,
+                (SELECT e2.id
+                   FROM episodes e2
+                   JOIN seasons s2 ON e2.season_id = s2.id
+                   WHERE s2.show_id = t.show_id
+                     AND (s2.season_number > t.season
+                          OR (s2.season_number = t.season AND e2.episode_number > t.episode))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM play_state ps2
+                         WHERE ps2.user_id = ?1 AND ps2.episode_id = e2.id
+                     )
+                   ORDER BY s2.season_number ASC, e2.episode_number ASC
+                   LIMIT 1) AS episode_id
+         FROM tip t
+         WHERE t.last_played_at >= ?2
+         ORDER BY t.last_played_at DESC",
+    )
+    .bind(user_id)
+    .bind(cutoff_ms)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut seen = std::collections::HashSet::<i64>::new();
+    for r in rows {
+        let show_id: i64 = r.try_get("show_id")?;
+        // A show with two tied `last_played_at` rows would emit twice
+        // from the `tip` CTE — dedup here so the caller doesn't have
+        // to think about it.
+        if !seen.insert(show_id) {
+            continue;
+        }
+        let episode_id: Option<i64> = r.try_get("episode_id").ok().flatten();
+        let last_played_at: i64 = r.try_get("last_played_at")?;
+        if let Some(eid) = episode_id {
+            out.push((show_id, eid, last_played_at));
+        }
+    }
+    Ok(out)
 }
 
 /// For each show the user has started or finished any episode of,
@@ -10532,24 +10729,72 @@ pub async fn get_trakt_last_synced(pool: &SqlitePool, user_id: i64) -> Result<Op
     Ok(row.and_then(|r| r.try_get::<Option<i64>, _>("last_synced_at").ok().flatten()))
 }
 
+/// Read the user's last-observed `/sync/last_activities` `all`
+/// timestamp. The cursor is the raw ISO-8601 string Trakt returns;
+/// we never parse it. None means we've never checked.
+pub async fn get_trakt_last_activities_seen(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT last_activities_seen_at FROM user_trakt_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| {
+        r.try_get::<Option<String>, _>("last_activities_seen_at")
+            .ok()
+            .flatten()
+    }))
+}
+
+/// Persist the `all` timestamp from the user's most recent successful
+/// `/sync/last_activities` fetch.
+pub async fn update_trakt_last_activities_seen(
+    pool: &SqlitePool,
+    user_id: i64,
+    seen: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE user_trakt_tokens SET last_activities_seen_at = ? WHERE user_id = ?")
+        .bind(seen)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Locally-watched movies for a user. When `since_ms` is Some, only
 /// rows whose last_played_at falls in `(since_ms, now]` are returned —
 /// the typical "what's new since last Sync now" query. Returns
 /// (item_id, tmdb_id, watched_at_ms); rows whose item has no tmdb_id
 /// are skipped (Trakt is TMDB-keyed).
+#[derive(Debug, Clone)]
+pub struct WatchedMovieForPush {
+    pub item_id: i64,
+    pub tmdb_id: Option<i64>,
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<i64>,
+    pub watched_at: i64,
+}
+
 pub async fn list_watched_movies_for_push(
     pool: &SqlitePool,
     user_id: i64,
     since_ms: Option<i64>,
-) -> Result<Vec<(i64, i64, i64)>> {
+) -> Result<Vec<WatchedMovieForPush>> {
+    // Need *any* Trakt-compatible id to be useful. Anime libraries
+    // matched only via AniList have none of (tmdb / imdb / tvdb) on
+    // the items row — those will never resolve on Trakt regardless
+    // of how often we push, so we filter them out here rather than
+    // wasting a round-trip per cycle.
     let rows = if let Some(since) = since_ms {
         sqlx::query(
-            "SELECT ps.item_id AS item_id, i.tmdb_id AS tmdb_id, ps.last_played_at AS watched_at \
+            "SELECT ps.item_id AS item_id, i.tmdb_id, i.imdb_id, i.tvdb_id, \
+                    ps.last_played_at AS watched_at \
              FROM play_state ps \
              JOIN items i ON i.id = ps.item_id \
              WHERE ps.user_id = ? AND ps.watched = 1 \
                AND ps.item_id IS NOT NULL \
-               AND i.tmdb_id IS NOT NULL \
+               AND (i.tmdb_id IS NOT NULL OR i.imdb_id IS NOT NULL OR i.tvdb_id IS NOT NULL) \
                AND ps.last_played_at > ? \
              ORDER BY ps.last_played_at ASC",
         )
@@ -10559,12 +10804,13 @@ pub async fn list_watched_movies_for_push(
         .await?
     } else {
         sqlx::query(
-            "SELECT ps.item_id AS item_id, i.tmdb_id AS tmdb_id, ps.last_played_at AS watched_at \
+            "SELECT ps.item_id AS item_id, i.tmdb_id, i.imdb_id, i.tvdb_id, \
+                    ps.last_played_at AS watched_at \
              FROM play_state ps \
              JOIN items i ON i.id = ps.item_id \
              WHERE ps.user_id = ? AND ps.watched = 1 \
                AND ps.item_id IS NOT NULL \
-               AND i.tmdb_id IS NOT NULL \
+               AND (i.tmdb_id IS NOT NULL OR i.imdb_id IS NOT NULL OR i.tvdb_id IS NOT NULL) \
              ORDER BY ps.last_played_at ASC",
         )
         .bind(user_id)
@@ -10573,25 +10819,41 @@ pub async fn list_watched_movies_for_push(
     };
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
-        let item_id: i64 = r.try_get("item_id")?;
-        let tmdb_id: i64 = r.try_get("tmdb_id")?;
-        let watched_at: i64 = r.try_get("watched_at")?;
-        out.push((item_id, tmdb_id, watched_at));
+        out.push(WatchedMovieForPush {
+            item_id: r.try_get("item_id")?,
+            tmdb_id: r.try_get::<Option<i64>, _>("tmdb_id").ok().flatten(),
+            imdb_id: r.try_get::<Option<String>, _>("imdb_id").ok().flatten(),
+            tvdb_id: r.try_get::<Option<i64>, _>("tvdb_id").ok().flatten(),
+            watched_at: r.try_get("watched_at")?,
+        });
     }
     Ok(out)
 }
 
-/// Locally-watched episodes for a user, since `since_ms`. Returns
-/// (episode_id, show_tmdb_id, season_number, episode_number, watched_at_ms).
-/// Skips episodes whose show row has no tmdb_id.
+#[derive(Debug, Clone)]
+pub struct WatchedEpisodeForPush {
+    pub episode_id: i64,
+    pub show_tmdb_id: Option<i64>,
+    pub show_imdb_id: Option<String>,
+    pub show_tvdb_id: Option<i64>,
+    pub season: i32,
+    pub episode: i32,
+    pub watched_at: i64,
+}
+
+/// Locally-watched episodes for a user, since `since_ms`. Same
+/// id-fallback story as movies — anime shows matched only via AniList
+/// have none of (tmdb / imdb / tvdb) on the show row and are filtered
+/// out here.
 pub async fn list_watched_episodes_for_push(
     pool: &SqlitePool,
     user_id: i64,
     since_ms: Option<i64>,
-) -> Result<Vec<(i64, i64, i32, i32, i64)>> {
+) -> Result<Vec<WatchedEpisodeForPush>> {
     let rows = if let Some(since) = since_ms {
         sqlx::query(
-            "SELECT ps.episode_id AS episode_id, i.tmdb_id AS show_tmdb, \
+            "SELECT ps.episode_id AS episode_id, \
+                    i.tmdb_id AS show_tmdb, i.imdb_id AS show_imdb, i.tvdb_id AS show_tvdb, \
                     s.season_number AS season, e.episode_number AS episode, \
                     ps.last_played_at AS watched_at \
              FROM play_state ps \
@@ -10600,7 +10862,7 @@ pub async fn list_watched_episodes_for_push(
              JOIN items i    ON i.id = s.show_id \
              WHERE ps.user_id = ? AND ps.watched = 1 \
                AND ps.episode_id IS NOT NULL \
-               AND i.tmdb_id IS NOT NULL \
+               AND (i.tmdb_id IS NOT NULL OR i.imdb_id IS NOT NULL OR i.tvdb_id IS NOT NULL) \
                AND ps.last_played_at > ? \
              ORDER BY ps.last_played_at ASC",
         )
@@ -10610,7 +10872,8 @@ pub async fn list_watched_episodes_for_push(
         .await?
     } else {
         sqlx::query(
-            "SELECT ps.episode_id AS episode_id, i.tmdb_id AS show_tmdb, \
+            "SELECT ps.episode_id AS episode_id, \
+                    i.tmdb_id AS show_tmdb, i.imdb_id AS show_imdb, i.tvdb_id AS show_tvdb, \
                     s.season_number AS season, e.episode_number AS episode, \
                     ps.last_played_at AS watched_at \
              FROM play_state ps \
@@ -10619,7 +10882,7 @@ pub async fn list_watched_episodes_for_push(
              JOIN items i    ON i.id = s.show_id \
              WHERE ps.user_id = ? AND ps.watched = 1 \
                AND ps.episode_id IS NOT NULL \
-               AND i.tmdb_id IS NOT NULL \
+               AND (i.tmdb_id IS NOT NULL OR i.imdb_id IS NOT NULL OR i.tvdb_id IS NOT NULL) \
              ORDER BY ps.last_played_at ASC",
         )
         .bind(user_id)
@@ -10628,12 +10891,243 @@ pub async fn list_watched_episodes_for_push(
     };
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
-        let episode_id: i64 = r.try_get("episode_id")?;
+        out.push(WatchedEpisodeForPush {
+            episode_id: r.try_get("episode_id")?,
+            show_tmdb_id: r.try_get::<Option<i64>, _>("show_tmdb").ok().flatten(),
+            show_imdb_id: r.try_get::<Option<String>, _>("show_imdb").ok().flatten(),
+            show_tvdb_id: r.try_get::<Option<i64>, _>("show_tvdb").ok().flatten(),
+            season: r.try_get("season")?,
+            episode: r.try_get("episode")?,
+            watched_at: r.try_get("watched_at")?,
+        });
+    }
+    Ok(out)
+}
+
+/// Snapshot of the user's Trakt watchlist as we last observed it.
+/// Lets the watchlist reconcile propagate Trakt-side removes back to
+/// My List without us needing a separate "did the user remove this?"
+/// signal — we just diff this snapshot against the next pull.
+/// Returns `(movie_tmdb_ids, show_tmdb_ids)` as two HashSets.
+pub async fn list_trakt_watchlist_state(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<(
+    std::collections::HashSet<i64>,
+    std::collections::HashSet<i64>,
+)> {
+    use std::collections::HashSet;
+    let rows = sqlx::query(
+        "SELECT kind, tmdb_id FROM user_trakt_watchlist_state WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let mut movies = HashSet::new();
+    let mut shows = HashSet::new();
+    for r in &rows {
+        let kind: String = r.try_get("kind")?;
+        let tmdb_id: i64 = r.try_get("tmdb_id")?;
+        match kind.as_str() {
+            "movie" => {
+                movies.insert(tmdb_id);
+            }
+            "show" => {
+                shows.insert(tmdb_id);
+            }
+            _ => {}
+        }
+    }
+    Ok((movies, shows))
+}
+
+/// Atomically replace the per-user watchlist-state snapshot with the
+/// post-reconcile set. Same delete-then-bulk-insert pattern as
+/// `replace_trakt_collection_state`; partial state would make the
+/// next diff miss removes.
+pub async fn replace_trakt_watchlist_state(
+    pool: &SqlitePool,
+    user_id: i64,
+    movies: &[i64],
+    shows: &[i64],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_trakt_watchlist_state WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    let now = now_ms();
+    for tmdb_id in movies {
+        sqlx::query(
+            "INSERT INTO user_trakt_watchlist_state (user_id, kind, tmdb_id, seen_at)
+             VALUES (?, 'movie', ?, ?)",
+        )
+        .bind(user_id)
+        .bind(tmdb_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for tmdb_id in shows {
+        sqlx::query(
+            "INSERT INTO user_trakt_watchlist_state (user_id, kind, tmdb_id, seen_at)
+             VALUES (?, 'show', ?, ?)",
+        )
+        .bind(user_id)
+        .bind(tmdb_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Snapshot of what we previously pushed to Trakt's collection for
+/// this user, so the nightly reconcile can compute add/remove deltas
+/// without nuking items the user collected via another media server
+/// or by hand on the Trakt site. Returns `(movies, episodes)` where
+/// movies is the set of show_tmdb_ids and episodes is the set of
+/// (show_tmdb_id, season, episode) tuples.
+pub async fn list_trakt_collection_state(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<(
+    std::collections::HashSet<i64>,
+    std::collections::HashSet<(i64, i32, i32)>,
+)> {
+    use std::collections::HashSet;
+    let rows = sqlx::query(
+        "SELECT kind, tmdb_id, season, episode_num
+         FROM user_trakt_collection_state
+         WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let mut movies = HashSet::new();
+    let mut episodes = HashSet::new();
+    for r in &rows {
+        let kind: String = r.try_get("kind")?;
+        let tmdb_id: i64 = r.try_get("tmdb_id")?;
+        match kind.as_str() {
+            "movie" => {
+                movies.insert(tmdb_id);
+            }
+            "episode" => {
+                let season: i32 = r.try_get("season")?;
+                let episode_num: i32 = r.try_get("episode_num")?;
+                episodes.insert((tmdb_id, season, episode_num));
+            }
+            _ => {}
+        }
+    }
+    Ok((movies, episodes))
+}
+
+/// Atomically replace the per-user collection state snapshot with the
+/// post-push set. Called after a successful `/sync/collection` +
+/// `/sync/collection/remove` round-trip so the next nightly diff
+/// computes against the new known-pushed set. Delete + bulk-insert in
+/// a single transaction — partial state would make the next diff
+/// either re-push the world or miss removes.
+pub async fn replace_trakt_collection_state(
+    pool: &SqlitePool,
+    user_id: i64,
+    movies: &[i64],
+    episodes: &[(i64, i32, i32)],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_trakt_collection_state WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    let now = now_ms();
+    for tmdb_id in movies {
+        sqlx::query(
+            "INSERT INTO user_trakt_collection_state
+                (user_id, kind, tmdb_id, season, episode_num, pushed_at)
+             VALUES (?, 'movie', ?, 0, 0, ?)",
+        )
+        .bind(user_id)
+        .bind(tmdb_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for (show_tmdb, season, episode_num) in episodes {
+        sqlx::query(
+            "INSERT INTO user_trakt_collection_state
+                (user_id, kind, tmdb_id, season, episode_num, pushed_at)
+             VALUES (?, 'episode', ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(show_tmdb)
+        .bind(season)
+        .bind(episode_num)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Every movie that has at least one active (non-deleted) media file
+/// and a tmdb_id, scoped to the user's library access. Used to bulk-
+/// push the user's "collection" to Trakt — Trakt's `/sync/collection`
+/// dedupes by ids, so re-pushing on every nightly run is harmless.
+pub async fn list_collected_movies_for_user(
+    pool: &SqlitePool,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<i64>> {
+    let lib_clause = library_filter_sql("i.library_id", accessible);
+    let sql = format!(
+        "SELECT i.tmdb_id AS tmdb_id \
+         FROM items i \
+         WHERE i.kind = 'movie' \
+           AND i.tmdb_id IS NOT NULL \
+           AND EXISTS (
+               SELECT 1 FROM media_files mf
+               WHERE mf.item_id = i.id AND mf.removed_at IS NULL
+           ) \
+           AND ({lib_clause})"
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    rows.iter()
+        .map(|r| Ok(r.try_get::<i64, _>("tmdb_id")?))
+        .collect()
+}
+
+/// Every episode that has at least one active media file, with the
+/// parent show's tmdb_id. Like [`list_collected_movies_for_user`] but
+/// for shows — Trakt collection wants per-episode entries so
+/// "complete season" badges show correctly.
+pub async fn list_collected_episodes_for_user(
+    pool: &SqlitePool,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<(i64, i32, i32)>> {
+    let lib_clause = library_filter_sql("i.library_id", accessible);
+    let sql = format!(
+        "SELECT i.tmdb_id AS show_tmdb, s.season_number AS season, e.episode_number AS episode \
+         FROM episodes e \
+         JOIN seasons s ON s.id = e.season_id \
+         JOIN items i ON i.id = s.show_id \
+         WHERE i.tmdb_id IS NOT NULL \
+           AND EXISTS (
+               SELECT 1 FROM media_files mf
+               WHERE mf.episode_id = e.id AND mf.removed_at IS NULL
+           ) \
+           AND ({lib_clause}) \
+         ORDER BY i.tmdb_id, s.season_number, e.episode_number"
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
         let show_tmdb: i64 = r.try_get("show_tmdb")?;
         let season: i32 = r.try_get("season")?;
         let episode: i32 = r.try_get("episode")?;
-        let watched_at: i64 = r.try_get("watched_at")?;
-        out.push((episode_id, show_tmdb, season, episode, watched_at));
+        out.push((show_tmdb, season, episode));
     }
     Ok(out)
 }

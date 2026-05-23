@@ -70,3 +70,16 @@ export function useRecentlyAddedDays(): number {
   if (cfg == null) return DEFAULT_RECENTLY_ADDED_DAYS;
   return Math.max(0, Math.min(365, cfg.recently_added_days));
 }
+
+const DEFAULT_PLAYED_THRESHOLD_PCT = 90;
+
+/// Percentage (50–99) at which the server treats an item as
+/// "effectively watched" for auto-scrobble. Returns 90 (the server
+/// default) until the config fetch resolves. The Up-Next picker uses
+/// this so a near-complete-but-not-explicitly-watched episode isn't
+/// flagged as the next to play.
+export function usePlayedThresholdPct(): number {
+  const cfg = useServerConfig();
+  if (cfg == null) return DEFAULT_PLAYED_THRESHOLD_PCT;
+  return Math.max(50, Math.min(99, cfg.played_threshold_pct));
+}

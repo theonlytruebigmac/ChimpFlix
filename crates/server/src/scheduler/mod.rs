@@ -367,6 +367,18 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{}",
             cron_placeholder: "0 0 * * * *",
         },
+        // Daily collection push runs inside the maintenance window —
+        // bulk pushes can be hundreds-of-KB and Trakt rate-limits, so
+        // we deliberately keep this off the hot critical path. Idle
+        // installs (no Trakt links) no-op cheaply.
+        Seed {
+            kind: "trakt_collection_push",
+            name: "Trakt: push collection (\"I own this\")",
+            frequency: "daily",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 0 5 * * *",
+        },
     ];
     // Window snap requires the actual operator-configured window which
     // lives on the (yet-to-be-populated) settings cache. At seed time
@@ -874,6 +886,7 @@ async fn dispatch(
         "analyze_loudness" => analyze_loudness_task(state, task, log).await,
         "verify_backups" => verify_backups_task(state, log).await,
         "trakt_pull" => trakt_pull_task(state, log).await,
+        "trakt_collection_push" => trakt_collection_push_task(state, log).await,
         "refresh_trending" => refresh_trending_task(state, log).await,
         "refresh_logos" => refresh_logos_task(state, task, log).await,
         "scan_extras" => scan_extras_task(state, task, log).await,
@@ -1143,6 +1156,18 @@ pub fn registry() -> Vec<TaskKindInfo> {
             params_schema: r#"{}"#,
             default_frequency: "hourly",
             default_requires_maintenance_window: false,
+        },
+        TaskKindInfo {
+            kind: "trakt_collection_push",
+            display_name: "Trakt: push collection (\"I own this\")",
+            description: "Push the local library catalogue to each \
+                          linked user's Trakt collection. Trakt dedupes \
+                          server-side, so re-pushing nightly is harmless \
+                          — it just refreshes collected_at and surfaces \
+                          newly-scanned files.",
+            params_schema: r#"{}"#,
+            default_frequency: "daily",
+            default_requires_maintenance_window: true,
         },
         TaskKindInfo {
             kind: "refresh_trending",
@@ -1825,7 +1850,24 @@ async fn trakt_pull_task(state: &AppState, log: &Arc<std::sync::Mutex<String>>) 
     let mut total_movies = 0usize;
     let mut total_episodes = 0usize;
     let mut total_playback = 0usize;
+    let mut total_watchlist_added = 0usize;
+    let mut total_watchlist_removed = 0usize;
+    let mut skipped = 0usize;
     for uid in &user_ids {
+        // Cheap rollup check — skip the expensive pulls when
+        // /sync/last_activities reports nothing has changed since
+        // our last visit. Saves three HTTP round-trips per linked
+        // user per hour on idle installs.
+        match crate::trakt_sync::check_last_activities(state, *uid).await {
+            Ok(false) => {
+                skipped += 1;
+                continue;
+            }
+            Ok(true) => {}
+            Err(e) => {
+                warn!(user_id = uid, error = %format!("{e:#}"), "trakt last_activities check errored; running full pull");
+            }
+        }
         match crate::trakt_sync::pull_user_history(state, *uid).await {
             Ok((m, e)) => {
                 total_movies += m;
@@ -1837,15 +1879,75 @@ async fn trakt_pull_task(state: &AppState, log: &Arc<std::sync::Mutex<String>>) 
             Ok(n) => total_playback += n,
             Err(e) => warn!(user_id = uid, error = %format!("{e:#}"), "trakt pull playback failed"),
         }
+        match crate::trakt_sync::pull_user_watchlist(state, *uid).await {
+            Ok((a, r)) => {
+                total_watchlist_added += a;
+                total_watchlist_removed += r;
+            }
+            Err(e) => warn!(user_id = uid, error = %format!("{e:#}"), "trakt pull watchlist failed"),
+        }
     }
     append_log(
         log,
         format!(
-            "trakt pull: {} users, {} movies, {} episodes marked watched, {} resume points applied",
+            "trakt pull: {} users ({} skipped via last_activities), \
+             {} movies, {} episodes marked watched, \
+             {} resume points applied, \
+             +{} / -{} watchlist items",
             user_ids.len(),
+            skipped,
             total_movies,
             total_episodes,
             total_playback,
+            total_watchlist_added,
+            total_watchlist_removed,
+        ),
+    );
+    Ok(())
+}
+
+/// Daily collection push — for each Trakt-linked user, enumerate the
+/// items they can see and push the full list to Trakt's `/sync/collection`.
+/// Trakt dedupes by ids so re-pushing nightly is idempotent (it just
+/// refreshes `collected_at` on remote rows and surfaces newly-scanned
+/// files). Per-user failures are warn-logged but don't fail the task —
+/// one Trakt outage shouldn't block other linked users' pushes.
+async fn trakt_collection_push_task(
+    state: &AppState,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    if state.trakt_snapshot().await.is_none() {
+        append_log(log, "Trakt disabled — skipping collection push");
+        return Ok(());
+    }
+    let user_ids = queries::list_trakt_linked_user_ids(&state.pool).await?;
+    let mut total_added_movies = 0usize;
+    let mut total_added_episodes = 0usize;
+    let mut total_removed_movies = 0usize;
+    let mut total_removed_episodes = 0usize;
+    for uid in &user_ids {
+        match crate::trakt_sync::bulk_push_user_collection(state, *uid).await {
+            Ok((am, ae, rm, re)) => {
+                total_added_movies += am;
+                total_added_episodes += ae;
+                total_removed_movies += rm;
+                total_removed_episodes += re;
+            }
+            Err(e) => {
+                warn!(user_id = uid, error = %format!("{e:#}"), "trakt collection push failed")
+            }
+        }
+    }
+    append_log(
+        log,
+        format!(
+            "trakt collection reconcile: {} users, +{} movies / +{} episodes added, \
+             -{} movies / -{} episodes removed",
+            user_ids.len(),
+            total_added_movies,
+            total_added_episodes,
+            total_removed_movies,
+            total_removed_episodes,
         ),
     );
     Ok(())

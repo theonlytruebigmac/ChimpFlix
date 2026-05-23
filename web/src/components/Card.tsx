@@ -34,9 +34,24 @@ function recencyBadge(
   return "Recently Added";
 }
 
-export function Card({ item }: { item: MediaItem }) {
-  const img = plexImage(item.art ?? item.thumb, 480, 270);
-  const srcSet = plexSrcSet(item.art ?? item.thumb, 480, 270);
+export function Card({
+  item,
+  variant = "backdrop",
+}: {
+  item: MediaItem;
+  /// "backdrop" (default) renders the 16:9 backdrop the home rails use.
+  /// "poster" renders a portrait 2:3 poster for Netflix-style Top 10
+  /// rails where the giant numeral sits behind a narrow tile.
+  variant?: "backdrop" | "poster";
+}) {
+  const isPoster = variant === "poster";
+  const imgW = isPoster ? 240 : 480;
+  const imgH = isPoster ? 360 : 270;
+  const imgSrcPath = isPoster
+    ? (item.thumb ?? item.art)
+    : (item.art ?? item.thumb);
+  const img = plexImage(imgSrcPath, imgW, imgH);
+  const srcSet = plexSrcSet(imgSrcPath, imgW, imgH);
   const progress =
     item.viewOffset && item.duration
       ? Math.min(100, (item.viewOffset / item.duration) * 100)
@@ -79,7 +94,9 @@ export function Card({ item }: { item: MediaItem }) {
       // `focus-within` mirrors the hover state when the inner button
       // is focused via keyboard, so the user can see which card is
       // active without relying on the small default browser outline.
-      className="group relative w-44 flex-none has-focus-visible:z-50 sm:w-56 md:w-72 hover:z-50"
+      className={`group relative flex-none has-focus-visible:z-50 hover:z-50 ${
+        isPoster ? "w-28 sm:w-32 md:w-40" : "w-44 sm:w-56 md:w-72"
+      }`}
       onMouseEnter={() => prefetchModalData(modalKey)}
       onFocus={() => prefetchModalData(modalKey)}
     >
@@ -95,7 +112,11 @@ export function Card({ item }: { item: MediaItem }) {
             // which is sized to the entire card.
             className="block w-full cursor-pointer text-left focus:outline-none focus-visible:outline-none"
           >
-            <div className="relative aspect-video bg-black">
+            <div
+              className={`relative bg-black ${
+                isPoster ? "aspect-2/3" : "aspect-video"
+              }`}
+            >
               {img ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
@@ -116,13 +137,17 @@ export function Card({ item }: { item: MediaItem }) {
                 title the way Netflix's marketing art does, so we add a
                 gradient + text so viewers can identify the title at rest.
                 Anchored top-left so the bottom of the card stays clean for
-                the progress bar and any badges we add later.
+                the progress bar and any badges we add later. TMDB posters
+                already include the title baked in, so we skip the overlay
+                in poster variant to avoid double-titling.
               */}
-              <div className="pointer-events-none absolute inset-x-0 top-0 bg-linear-to-b from-black/85 via-black/40 to-transparent pb-10 transition-opacity duration-150 delay-200 group-hover:opacity-0">
-                <div className="line-clamp-2 px-3 pt-2.5 text-sm font-semibold leading-tight drop-shadow-lg">
-                  {label}
+              {!isPoster && (
+                <div className="pointer-events-none absolute inset-x-0 top-0 bg-linear-to-b from-black/85 via-black/40 to-transparent pb-10 transition-opacity duration-150 delay-200 group-hover:opacity-0">
+                  <div className="line-clamp-2 px-3 pt-2.5 text-sm font-semibold leading-tight drop-shadow-lg">
+                    {label}
+                  </div>
                 </div>
-              </div>
+              )}
               {badge && (
                 <div className="pointer-events-none absolute bottom-2 left-0 z-10 select-none rounded-r-sm bg-(--color-accent) px-2 py-1 text-[0.7rem] font-bold uppercase leading-none tracking-wide text-white shadow-md transition-opacity duration-150 delay-200 group-hover:opacity-0">
                   {badge}

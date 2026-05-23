@@ -6,6 +6,7 @@ import {
   type TraktLinkStart,
   type TraktStatus,
   type TraktSyncNowResult,
+  type TraktUserStats,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -20,6 +21,7 @@ export function SettingsIntegrationsClient() {
   >(null);
   const [error, setError] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<TraktSyncNowResult | null>(null);
+  const [stats, setStats] = useState<TraktUserStats | null>(null);
   const [askUnlink, setAskUnlink] = useState(false);
   const pollTimer = useRef<number | null>(null);
   // True while this component is mounted. The poll() callback runs on
@@ -41,7 +43,21 @@ export function SettingsIntegrationsClient() {
   async function refresh() {
     setBusy("load");
     try {
-      setStatus(await traktApi.status());
+      const s = await traktApi.status();
+      setStatus(s);
+      // Lazily pull stats only when we know we're linked. The endpoint
+      // gracefully returns null otherwise, but skipping the round-trip
+      // keeps the unlinked card snappy.
+      if (s.linked) {
+        try {
+          setStats(await traktApi.stats());
+        } catch {
+          // Stats are an optional surface — don't block the card on a
+          // Trakt rate-limit or transient error.
+        }
+      } else {
+        setStats(null);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -246,8 +262,34 @@ export function SettingsIntegrationsClient() {
                 <div>
                   Pulled {lastSync.movies_marked} movies,{" "}
                   {lastSync.episodes_marked} episodes,{" "}
-                  {lastSync.playback_applied} resume points.
+                  {lastSync.playback_applied} resume points,{" "}
+                  +{lastSync.watchlist_added}/-{lastSync.watchlist_removed}{" "}
+                  watchlist items.
                 </div>
+              </div>
+            )}
+            {stats && (
+              <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 rounded border border-white/10 bg-white/3 p-3 text-xs text-white/70 sm:grid-cols-4">
+                <StatTile
+                  label="Movies"
+                  value={stats.movies.watched.toLocaleString()}
+                  hint={`${formatMinutes(stats.movies.minutes)} watched`}
+                />
+                <StatTile
+                  label="Shows"
+                  value={stats.shows.watched.toLocaleString()}
+                  hint={`${stats.episodes.watched.toLocaleString()} eps`}
+                />
+                <StatTile
+                  label="Episodes"
+                  value={stats.episodes.plays.toLocaleString()}
+                  hint={`${formatMinutes(stats.episodes.minutes)} watched`}
+                />
+                <StatTile
+                  label="Ratings"
+                  value={stats.ratings.total.toLocaleString()}
+                  hint="given"
+                />
               </div>
             )}
           </div>
@@ -276,4 +318,37 @@ export function SettingsIntegrationsClient() {
       )}
     </div>
   );
+}
+
+function StatTile({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-white/40">
+        {label}
+      </div>
+      <div className="text-sm font-semibold text-white">{value}</div>
+      {hint && <div className="text-[10px] text-white/40">{hint}</div>}
+    </div>
+  );
+}
+
+function formatMinutes(minutes: number): string {
+  if (minutes <= 0) return "0 min";
+  const days = Math.floor(minutes / (60 * 24));
+  const hours = Math.floor((minutes % (60 * 24)) / 60);
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  return `${minutes} min`;
 }

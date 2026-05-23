@@ -8,6 +8,7 @@ import {
 } from "@/lib/chimpflix-api";
 import { formatRuntime, type MediaItem } from "@/lib/chimpflix-types";
 import { plexImage } from "@/lib/image";
+import { usePlayedThresholdPct } from "@/lib/server-config";
 import { MarkerEditor } from "./MarkerEditor";
 
 export function SeasonEpisodes({
@@ -174,17 +175,28 @@ export function SeasonEpisodes({
 
   // Identify the "Up Next" episode within the current season — the row
   // the show-level Play button would actually start. Priority:
-  //   1. The first in-progress episode (has viewOffset, not watched).
-  //   2. The first unwatched episode.
+  //   1. The first in-progress episode (has viewOffset, not watched,
+  //      and not past the server's "effectively watched" threshold —
+  //      otherwise an episode the user finished but where the scrobble
+  //      didn't fire would stay flagged forever).
+  //   2. The first unwatched episode (also past-threshold-aware).
   //   3. None (season is fully watched).
   // Highlighted with a faint background tint + "Up Next" chip so the
   // user can tell at a glance where playback will resume.
+  const thresholdPct = usePlayedThresholdPct();
+  const isEffectivelyWatched = (ep: MediaItem): boolean => {
+    if (ep.watched) return true;
+    const pos = ep.viewOffset ?? 0;
+    const dur = ep.duration ?? 0;
+    if (dur <= 0 || pos <= 0) return false;
+    return (pos / dur) * 100 >= thresholdPct;
+  };
   const upNextIdx = (() => {
     const inProgress = episodes.findIndex(
-      (ep) => !ep.watched && (ep.viewOffset ?? 0) > 0,
+      (ep) => !isEffectivelyWatched(ep) && (ep.viewOffset ?? 0) > 0,
     );
     if (inProgress !== -1) return inProgress;
-    const firstUnwatched = episodes.findIndex((ep) => !ep.watched);
+    const firstUnwatched = episodes.findIndex((ep) => !isEffectivelyWatched(ep));
     return firstUnwatched === -1 ? null : firstUnwatched;
   })();
 

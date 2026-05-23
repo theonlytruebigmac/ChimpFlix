@@ -1103,6 +1103,12 @@ export function ChimpFlixPlayer({
   useEffect(() => {
     let cancelled = false;
     let sessionId: string | null = null;
+    // Direct mode has no server-side session, so [stream.rs:delete_session]
+    // can't resolve the file from a session id alone. We hold the
+    // media_file_id locally and include it in the close beacon so the
+    // server can fire Trakt scrobble Stop. Null for transcode (the
+    // snapshot covers it) and for "no session created yet".
+    let directMediaFileId: number | null = null;
     let cleanup: () => void = () => {};
     let keepaliveTimer: number | null = null;
 
@@ -1227,6 +1233,11 @@ export function ChimpFlixPlayer({
 
       sessionId = resp.session.id !== "direct" ? resp.session.id : null;
       activeSessionIdRef.current = sessionId;
+      // For direct play, remember the file id so teardown can include
+      // it in the close beacon — without it the server can't fire
+      // Trakt scrobble Stop (no session snapshot to resolve from).
+      directMediaFileId =
+        resp.session.id === "direct" ? activeMediaFileId : null;
 
       // If the user navigated away or switched versions/tracks during
       // the round-trip, fire DELETE inline so the orphan transcoder
@@ -1685,9 +1696,19 @@ export function ChimpFlixPlayer({
     //     the server side (Origin + session-cookie + per-handler
     //     ownership check still apply).
     function teardownSession(opts?: { unload?: boolean }) {
-      if (!sessionId) return;
-      const closeUrl = `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/close`;
-      const deleteUrl = `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}`;
+      // Transcode → use the real session id. Direct → use literal
+      // "direct" and pass the file id so [stream.rs:delete_session]
+      // can fire Trakt scrobble Stop (without it the server can't
+      // resolve the owning item/episode and the live "YOU ARE
+      // WATCHING" banner stays up until Trakt times it out).
+      const idForClose = sessionId ?? (directMediaFileId !== null ? "direct" : null);
+      if (!idForClose) return;
+      const directQuery =
+        idForClose === "direct" && directMediaFileId !== null
+          ? `?media_file_id=${directMediaFileId}`
+          : "";
+      const closeUrl = `/api/v1/stream/sessions/${encodeURIComponent(idForClose)}/close${directQuery}`;
+      const deleteUrl = `/api/v1/stream/sessions/${encodeURIComponent(idForClose)}${directQuery}`;
       try {
         if (
           opts?.unload &&
@@ -2250,7 +2271,7 @@ export function ChimpFlixPlayer({
         : null;
 
     function report() {
-      if (!video || video.paused || video.ended) return;
+      if (!video) return;
       if (!target) return;
       // Persist source-time, not HLS media-time. video.duration is HLS
       // duration (truncated for transcode sessions) and isn't usable —
@@ -2260,13 +2281,27 @@ export function ChimpFlixPlayer({
       );
       const knownDurationMs =
         videoDuration > 0 ? Math.floor(videoDuration * 1000) : undefined;
-      playStateApi
-        .update({
-          ...target,
-          position_ms: positionMs,
-          duration_ms: knownDurationMs,
-        })
-        .catch(() => {});
+      // Position updates only while the user is actively watching.
+      // Paused/ended state has no new position to report (the pause /
+      // ended event handler captured the final position already) and
+      // we don't want to keep nudging `last_played_at` while the
+      // tile is sitting in the background.
+      if (!video.paused && !video.ended) {
+        playStateApi
+          .update({
+            ...target,
+            position_ms: positionMs,
+            duration_ms: knownDurationMs,
+          })
+          .catch(() => {});
+      }
+      // Threshold scrobble has to run regardless of play state. The
+      // common "binge to natural end → next episode auto-plays" path
+      // ends with `video.ended = true` *before* the next 10s tick
+      // ever fires — bailing here means the scrobble at 90% never
+      // gets sent, and the operator has to manually mark each
+      // finished episode. (This was the symptom users hit: "I
+      // watched the whole thing and it didn't mark watched.")
       if (!scrobbledRef.current && knownDurationMs) {
         // Threshold scrobble: position past the configured percentage.
         const pastThreshold =

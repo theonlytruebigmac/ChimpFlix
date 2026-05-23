@@ -614,6 +614,13 @@ async fn create_session_impl(
                 Some(ip),
                 None,
             );
+            spawn_scrobble(
+                state,
+                user.id,
+                req.media_file_id,
+                duration_ms,
+                chimpflix_metadata::ScrobbleAction::Start,
+            );
             Ok((
                 StatusCode::CREATED,
                 Json(CreateSessionResponse {
@@ -1070,6 +1077,13 @@ async fn create_session_impl(
                 Some(ip),
                 Some(session.id.clone()),
             );
+            spawn_scrobble(
+                state,
+                user.id,
+                req.media_file_id,
+                duration_ms,
+                chimpflix_metadata::ScrobbleAction::Start,
+            );
             let master_url = format!("/api/v1/stream/sessions/{}/master.m3u8", session.id);
             // Mirror the transcoder's outward-facing per-session
             // labels back to the response so the player can display
@@ -1110,6 +1124,73 @@ async fn create_session_impl(
     }
 }
 
+/// Direct-play equivalent of `emit_session_stop_event` — fires Trakt
+/// scrobble Stop using the media-file id the player sends in the
+/// close beacon. No playback-event row is written here: direct play
+/// already records its `start` event via `record_start_event`, and
+/// the `stop` event for direct play wasn't tracked before either
+/// (admin Stats only attributes bandwidth to transcode sessions).
+async fn emit_direct_stop_event(state: &AppState, user_id: i64, media_file_id: i64) {
+    let (item_id, episode_id) =
+        chimpflix_library::queries::media_file_owner(&state.pool, media_file_id)
+            .await
+            .unwrap_or((None, None));
+    // Duration lives on the media_files row (probed at scan time). Used
+    // by scrobble_event to compute progress = position / duration.
+    let duration_ms = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT duration_ms FROM media_files WHERE id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    crate::trakt_sync::scrobble_event(
+        state,
+        user_id,
+        chimpflix_metadata::ScrobbleAction::Stop,
+        item_id,
+        episode_id,
+        duration_ms,
+    )
+    .await;
+}
+
+/// Fire-and-forget Trakt scrobble for a session lifecycle event.
+/// Resolves the file's owning item/episode and posts the matching
+/// `/scrobble/{action}`. Spawned because the caller is a hot
+/// player-control path and Trakt latency must never gate it.
+///
+/// Trakt's scrobble model has only three endpoints: start, pause, stop.
+/// There's no "resume" endpoint — a `/scrobble/start` after a
+/// `/scrobble/pause` re-opens the live banner, which is exactly how
+/// [`resume_session`] is wired below.
+fn spawn_scrobble(
+    state: &AppState,
+    user_id: i64,
+    media_file_id: i64,
+    duration_ms: Option<i64>,
+    action: chimpflix_metadata::ScrobbleAction,
+) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let (item_id, episode_id) =
+            chimpflix_library::queries::media_file_owner(&state.pool, media_file_id)
+                .await
+                .unwrap_or((None, None));
+        crate::trakt_sync::scrobble_event(
+            &state,
+            user_id,
+            action,
+            item_id,
+            episode_id,
+            duration_ms,
+        )
+        .await;
+    });
+}
+
 /// Confirm the caller owns this session (or is admin/owner). Returns
 /// 404 (NOT 403) on mismatch so we don't leak whether the session id
 /// exists. Critical: without this, any authenticated user could
@@ -1127,11 +1208,38 @@ fn ensure_session_accessible(
     Ok(session)
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct DeleteSessionQuery {
+    /// Sent by the player on direct-play teardown so the server can
+    /// fire Trakt scrobble Stop. Direct sessions have no server-side
+    /// state (`id` is the literal "direct"), so the player is the
+    /// only source of truth for which file was just being played.
+    pub media_file_id: Option<i64>,
+}
+
 pub async fn delete_session(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteSessionQuery>,
 ) -> Result<StatusCode, ApiError> {
+    // Direct play has no server-side session — the only "playback ended"
+    // signal we ever get is the player explicitly hitting this endpoint
+    // on unmount. Fire scrobble Stop here so Trakt's live banner closes
+    // promptly instead of timing out only after the content's duration
+    // elapses. Without `media_file_id` we have no way to resolve the
+    // owning item/episode, so we silently no-op (the route still
+    // returns 204 to keep the player's beacon happy).
+    if id == "direct" {
+        if let Some(mf_id) = q.media_file_id {
+            let state_clone = state.clone();
+            let user_id = user.id;
+            tokio::spawn(async move {
+                emit_direct_stop_event(&state_clone, user_id, mf_id).await;
+            });
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
     // Verify ownership before destroying. Use the get-then-check
     // pattern rather than delete_returning so we can refuse to
     // operate on someone else's session.
@@ -1150,9 +1258,9 @@ pub async fn delete_session(
     // Reaper-driven closes go through the same `emit_session_stop_event`
     // helper via the hook registered in main.rs, so both paths agree.
     if let Some(snap) = state.transcoder.delete_returning(&id).await {
-        let pool = state.pool.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            crate::emit_session_stop_event(&pool, &snap).await;
+            crate::emit_session_stop_event(&state, &snap).await;
         });
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1170,6 +1278,13 @@ pub async fn pause_session(
 ) -> Result<StatusCode, ApiError> {
     let session = ensure_session_accessible(&state, &user, &id)?;
     let _ = session.pause();
+    spawn_scrobble(
+        &state,
+        session.user_id,
+        session.media_file_id,
+        session.duration_ms,
+        chimpflix_metadata::ScrobbleAction::Pause,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1184,6 +1299,17 @@ pub async fn resume_session(
 ) -> Result<StatusCode, ApiError> {
     let session = ensure_session_accessible(&state, &user, &id)?;
     let _ = session.resume();
+    // Trakt has no dedicated resume endpoint — re-fire `/scrobble/start`
+    // to re-open the live banner. Trakt is idempotent on this and
+    // returns 409 if the banner was never actually closed, which
+    // `TraktClient::scrobble` treats as success.
+    spawn_scrobble(
+        &state,
+        session.user_id,
+        session.media_file_id,
+        session.duration_ms,
+        chimpflix_metadata::ScrobbleAction::Start,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

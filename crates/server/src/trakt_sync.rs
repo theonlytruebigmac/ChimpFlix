@@ -14,7 +14,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use chimpflix_common::now_ms;
 use chimpflix_library::queries;
-use chimpflix_metadata::{HistoryPush, RatingPush, TraktClient};
+use chimpflix_metadata::{
+    HistoryPush, RatingPush, ScrobbleAction, ScrobblePush, TraktClient, TraktIdSet, WatchlistPush,
+};
 use chrono::{TimeZone, Utc};
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -138,15 +140,525 @@ pub async fn remove_history_event(state: &AppState, user_id: i64, event: History
     }
 }
 
+/// Fire a single scrobble lifecycle event (start / pause / stop) for
+/// the user's current playback session. Resolves the media-file owner
+/// to Trakt-keyed (tmdb_id) or (show_tmdb_id, season, episode) coords,
+/// reads the user's latest stored position to compute progress, and
+/// POSTs the right `/scrobble/{action}` endpoint.
+///
+/// Best-effort: anything that goes wrong is warn-logged so a Trakt
+/// outage can't break local playback. `/scrobble/stop` at progress
+/// ≥ 80% additionally writes the entry to Trakt's history, so an
+/// uninterrupted watch-through doesn't need a separate `/sync/history`
+/// call.
+pub async fn scrobble_event(
+    state: &AppState,
+    user_id: i64,
+    action: ScrobbleAction,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+    duration_ms: Option<i64>,
+) {
+    let progress = current_progress_pct(&state.pool, user_id, item_id, episode_id, duration_ms)
+        .await
+        .unwrap_or(0.0);
+    let Some(event) = build_scrobble_event(&state.pool, item_id, episode_id, progress).await
+    else {
+        return;
+    };
+    let label = describe_scrobble_event(action, &event);
+    let result = with_user_client(state, user_id, |client, token| async move {
+        client.scrobble(&token, action, event).await
+    })
+    .await;
+    match result {
+        Ok(Some(())) => {
+            tracing::info!(user_id, event = %label, "Trakt scrobble ok");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(user_id, event = %label, error = %format!("{e:#}"), "Trakt scrobble failed");
+        }
+    }
+}
+
+async fn build_scrobble_event(
+    pool: &SqlitePool,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+    progress: f64,
+) -> Option<ScrobblePush> {
+    if let Some(id) = item_id {
+        let ids = item_trakt_ids(pool, id).await?;
+        Some(ScrobblePush::Movie { ids, progress })
+    } else if let Some(id) = episode_id {
+        let (show_ids, season, episode) = episode_trakt_coords(pool, id).await.ok().flatten()?;
+        Some(ScrobblePush::Episode {
+            show_ids,
+            season,
+            episode,
+            progress,
+        })
+    } else {
+        None
+    }
+}
+
+fn describe_scrobble_event(action: ScrobbleAction, event: &ScrobblePush) -> String {
+    let action_label = match action {
+        ScrobbleAction::Start => "start",
+        ScrobbleAction::Pause => "pause",
+        ScrobbleAction::Stop => "stop",
+    };
+    match event {
+        ScrobblePush::Movie { ids, progress } => {
+            format!("{action_label} movie {} @ {progress:.1}%", describe_ids(ids))
+        }
+        ScrobblePush::Episode {
+            show_ids,
+            season,
+            episode,
+            progress,
+        } => format!(
+            "{action_label} show {} S{season:02}E{episode:02} @ {progress:.1}%",
+            describe_ids(show_ids)
+        ),
+    }
+}
+
+fn describe_ids(ids: &TraktIdSet) -> String {
+    if let Some(t) = ids.tmdb {
+        format!("tmdb={t}")
+    } else if let Some(t) = ids.tvdb {
+        format!("tvdb={t}")
+    } else if let Some(i) = ids.imdb.as_deref() {
+        format!("imdb={i}")
+    } else {
+        "ids=?".into()
+    }
+}
+
+/// Read the user's most recent stored position for the given item or
+/// episode and express it as a 0–100 percentage against `duration_ms`.
+/// Returns `None` when duration is unknown or zero — the caller falls
+/// back to 0% (a fresh play hasn't accrued progress yet anyway).
+async fn current_progress_pct(
+    pool: &SqlitePool,
+    user_id: i64,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+    duration_ms: Option<i64>,
+) -> Option<f64> {
+    let dur = duration_ms.filter(|d| *d > 0)?;
+    let position_ms: i64 = if let Some(id) = item_id {
+        sqlx::query_scalar(
+            "SELECT COALESCE(position_ms, 0) FROM play_state
+             WHERE user_id = ? AND item_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    } else if let Some(id) = episode_id {
+        sqlx::query_scalar(
+            "SELECT COALESCE(position_ms, 0) FROM play_state
+             WHERE user_id = ? AND episode_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    } else {
+        return None;
+    };
+    Some((position_ms as f64 / dur as f64 * 100.0).clamp(0.0, 100.0))
+}
+
 fn describe_history_event(event: &HistoryPush) -> String {
     match event {
-        HistoryPush::Movie { tmdb_id, .. } => format!("movie tmdb={tmdb_id}"),
+        HistoryPush::Movie { ids, .. } => format!("movie {}", describe_ids(ids)),
         HistoryPush::Episode {
-            tmdb_show_id,
+            show_ids,
             season,
             episode,
             ..
-        } => format!("show tmdb={tmdb_show_id} S{season:02}E{episode:02}"),
+        } => format!(
+            "show {} S{season:02}E{episode:02}",
+            describe_ids(show_ids)
+        ),
+    }
+}
+
+/// Push a single My-List add to the user's Trakt watchlist.
+/// Best-effort: a missing tmdb_id or Trakt outage just leaves the
+/// local list ahead of the remote until the next sync_now reconcile.
+pub async fn push_watchlist_event(state: &AppState, user_id: i64, item_id: i64) {
+    let Some(event) = build_watchlist_event(&state.pool, item_id).await else {
+        return;
+    };
+    let label = describe_watchlist_event(&event);
+    let result = with_user_client(state, user_id, |client, token| async move {
+        client.push_watchlist(&token, &[event]).await
+    })
+    .await;
+    match result {
+        Ok(Some(())) => {
+            tracing::info!(user_id, event = %label, "Trakt push_watchlist ok");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(user_id, event = %label, error = %format!("{e:#}"), "Trakt push_watchlist failed");
+        }
+    }
+}
+
+/// Mirror of [`push_watchlist_event`] for the My-List remove path.
+pub async fn remove_watchlist_event(state: &AppState, user_id: i64, item_id: i64) {
+    let Some(event) = build_watchlist_event(&state.pool, item_id).await else {
+        return;
+    };
+    let label = describe_watchlist_event(&event);
+    let result = with_user_client(state, user_id, |client, token| async move {
+        client.remove_watchlist(&token, &[event]).await
+    })
+    .await;
+    match result {
+        Ok(Some(())) => {
+            tracing::info!(user_id, event = %label, "Trakt remove_watchlist ok");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(user_id, event = %label, error = %format!("{e:#}"), "Trakt remove_watchlist failed");
+        }
+    }
+}
+
+/// Resolve an `items.id` into a [`WatchlistPush`] variant by reading
+/// the row's `kind` ('movie' or 'tv') + `tmdb_id`. Anime-only matches
+/// (no tmdb_id) skip with a single info log rather than an error
+/// because the same item won't ever sync regardless of how often the
+/// user clicks add/remove.
+async fn build_watchlist_event(pool: &SqlitePool, item_id: i64) -> Option<WatchlistPush> {
+    let row = sqlx::query(
+        "SELECT kind, tmdb_id FROM items WHERE id = ?",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    let kind: String = row.try_get("kind").ok()?;
+    let tmdb_id: Option<i64> = row.try_get("tmdb_id").ok().flatten();
+    let Some(tmdb_id) = tmdb_id else {
+        tracing::info!(item_id, "Trakt watchlist skipped: item has no tmdb_id");
+        return None;
+    };
+    match kind.as_str() {
+        "movie" => Some(WatchlistPush::Movie { tmdb_id }),
+        "tv" => Some(WatchlistPush::Show { tmdb_id }),
+        _ => None,
+    }
+}
+
+fn describe_watchlist_event(event: &WatchlistPush) -> String {
+    match event {
+        WatchlistPush::Movie { tmdb_id } => format!("movie tmdb={tmdb_id}"),
+        WatchlistPush::Show { tmdb_id } => format!("show tmdb={tmdb_id}"),
+    }
+}
+
+/// Reconcile the user's Trakt watchlist with their local My List.
+/// Two-way diff against the previously-seen snapshot in
+/// `user_trakt_watchlist_state`:
+///
+///   - In Trakt now, not in snapshot → user added on Trakt → add to
+///     local My List (idempotent against existing rows).
+///   - In snapshot, not in Trakt now → user removed on Trakt → remove
+///     from local My List.
+///
+/// Critical: a fresh-link user starts with an empty snapshot, so the
+/// first pull is all-adds, no removes. This matches the spirit of the
+/// previous additive-only behaviour for first-time syncs while still
+/// honouring Trakt-side removes on subsequent pulls.
+///
+/// Returns `(added, removed)`.
+pub async fn pull_user_watchlist(state: &AppState, user_id: i64) -> Result<(usize, usize)> {
+    let Some((current_movies, current_shows)) =
+        with_user_client(state, user_id, |client, token| async move {
+            let entries = client.pull_watchlist(&token).await?;
+            let mut movies = Vec::new();
+            let mut shows = Vec::new();
+            for entry in entries {
+                match entry.kind.as_str() {
+                    "movie" => {
+                        let Some(m) = entry.movie else { continue };
+                        if let Some(id) = m.ids.tmdb {
+                            movies.push(id);
+                        }
+                    }
+                    "show" => {
+                        let Some(s) = entry.show else { continue };
+                        if let Some(id) = s.ids.tmdb {
+                            shows.push(id);
+                        }
+                    }
+                    // season / episode entries don't map to My List
+                    _ => {}
+                }
+            }
+            Ok::<(Vec<i64>, Vec<i64>), anyhow::Error>((movies, shows))
+        })
+        .await?
+    else {
+        return Ok((0, 0));
+    };
+
+    let current_movie_set: std::collections::HashSet<i64> =
+        current_movies.iter().copied().collect();
+    let current_show_set: std::collections::HashSet<i64> =
+        current_shows.iter().copied().collect();
+    let (prev_movies, prev_shows) =
+        queries::list_trakt_watchlist_state(&state.pool, user_id).await?;
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+
+    // Adds: in current Trakt set but not in our snapshot.
+    for &tmdb_id in current_movie_set.difference(&prev_movies) {
+        if let Some(item_id) = find_local_item(&state.pool, tmdb_id, "movie").await {
+            if !is_in_my_list(&state.pool, user_id, item_id).await
+                && queries::add_to_my_list(&state.pool, user_id, item_id)
+                    .await
+                    .is_ok()
+            {
+                added += 1;
+            }
+        }
+    }
+    for &tmdb_id in current_show_set.difference(&prev_shows) {
+        if let Some(item_id) = find_local_item(&state.pool, tmdb_id, "tv").await {
+            if !is_in_my_list(&state.pool, user_id, item_id).await
+                && queries::add_to_my_list(&state.pool, user_id, item_id)
+                    .await
+                    .is_ok()
+            {
+                added += 1;
+            }
+        }
+    }
+
+    // Removes: in our snapshot but not in current Trakt set. Only
+    // touch items that are *currently* in the user's My List —
+    // anything they've already manually removed locally stays gone
+    // (no need to re-fire the local-remove path).
+    for &tmdb_id in prev_movies.difference(&current_movie_set) {
+        if let Some(item_id) = find_local_item(&state.pool, tmdb_id, "movie").await {
+            if is_in_my_list(&state.pool, user_id, item_id).await
+                && queries::remove_from_my_list(&state.pool, user_id, item_id)
+                    .await
+                    .is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    for &tmdb_id in prev_shows.difference(&current_show_set) {
+        if let Some(item_id) = find_local_item(&state.pool, tmdb_id, "tv").await {
+            if is_in_my_list(&state.pool, user_id, item_id).await
+                && queries::remove_from_my_list(&state.pool, user_id, item_id)
+                    .await
+                    .is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+
+    queries::replace_trakt_watchlist_state(
+        &state.pool,
+        user_id,
+        &current_movies,
+        &current_shows,
+    )
+    .await?;
+
+    Ok((added, removed))
+}
+
+async fn find_local_item(pool: &SqlitePool, tmdb_id: i64, kind: &str) -> Option<i64> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM items WHERE tmdb_id = ? AND kind = ? LIMIT 1")
+        .bind(tmdb_id)
+        .bind(kind)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn is_in_my_list(pool: &SqlitePool, user_id: i64, item_id: i64) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM user_my_list WHERE user_id = ? AND item_id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Cheap cursor check: fetch the user's `/sync/last_activities` and
+/// compare the rollup `all` timestamp against the previously-seen
+/// value. Returns `Ok(true)` when the pull workflow should continue
+/// (something changed since last sync) and `Ok(false)` when there's
+/// nothing new to pull — the caller is expected to skip every other
+/// pull endpoint in that case.
+///
+/// On a "continue" outcome we also persist the new `all` value so the
+/// next sync compares against the latest known state. Failures don't
+/// short-circuit anything (they return `true` so the rest of the
+/// pull still runs — a flaky last_activities endpoint shouldn't
+/// silently stall the sync).
+pub async fn check_last_activities(state: &AppState, user_id: i64) -> Result<bool> {
+    let previous = queries::get_trakt_last_activities_seen(&state.pool, user_id).await?;
+    let result = with_user_client(state, user_id, |client, token| async move {
+        client.pull_last_activities(&token).await
+    })
+    .await;
+    let activities = match result {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            warn!(user_id, error = %format!("{e:#}"), "Trakt last_activities check failed; falling back to full pull");
+            return Ok(true);
+        }
+    };
+    if previous.as_deref() == Some(activities.all.as_str()) {
+        // Skip the rest — nothing new on Trakt since our last visit.
+        tracing::info!(user_id, "Trakt last_activities unchanged; skipping pulls");
+        return Ok(false);
+    }
+    queries::update_trakt_last_activities_seen(&state.pool, user_id, &activities.all).await?;
+    Ok(true)
+}
+
+/// Reconcile the user's Trakt collection with the local catalogue.
+/// Diffs the previously-pushed snapshot (in
+/// `user_trakt_collection_state`) against what's currently on disk
+/// and pushes only the delta: newly-added files via `/sync/collection`
+/// and deletions via `/sync/collection/remove`. Returns
+/// `(movies_added, episodes_added, movies_removed, episodes_removed)`.
+///
+/// The state-table contract is what lets us safely call `/remove`
+/// without nuking items the user collected via another media server
+/// or directly on Trakt — we only ever remove rows *we* previously
+/// inserted. First-run for a freshly-linked user starts with an empty
+/// state row → everything currently on disk is treated as an add,
+/// nothing is removed.
+///
+/// Owners push the whole library; restricted users push only items in
+/// their accessible libraries — so a guest user's Trakt collection
+/// won't leak the existence of restricted-library content.
+pub async fn bulk_push_user_collection(
+    state: &AppState,
+    user_id: i64,
+) -> Result<(usize, usize, usize, usize)> {
+    let role = queries::find_user_by_id(&state.pool, user_id)
+        .await?
+        .map(|u| u.role)
+        .unwrap_or(chimpflix_library::UserRole::User);
+    let accessible = queries::user_library_filter(&state.pool, user_id, role).await?;
+    let current_movies =
+        queries::list_collected_movies_for_user(&state.pool, accessible.as_deref()).await?;
+    let current_episodes =
+        queries::list_collected_episodes_for_user(&state.pool, accessible.as_deref()).await?;
+    let (prev_movies, prev_episodes) =
+        queries::list_trakt_collection_state(&state.pool, user_id).await?;
+
+    let current_movie_set: std::collections::HashSet<i64> =
+        current_movies.iter().copied().collect();
+    let current_episode_set: std::collections::HashSet<(i64, i32, i32)> =
+        current_episodes.iter().copied().collect();
+
+    let movies_to_add: Vec<i64> = current_movie_set
+        .difference(&prev_movies)
+        .copied()
+        .collect();
+    let movies_to_remove: Vec<i64> = prev_movies
+        .difference(&current_movie_set)
+        .copied()
+        .collect();
+    let episodes_to_add: Vec<(i64, i32, i32)> = current_episode_set
+        .difference(&prev_episodes)
+        .copied()
+        .collect();
+    let episodes_to_remove: Vec<(i64, i32, i32)> = prev_episodes
+        .difference(&current_episode_set)
+        .copied()
+        .collect();
+
+    let (added_m, added_e, removed_m, removed_e) = (
+        movies_to_add.len(),
+        episodes_to_add.len(),
+        movies_to_remove.len(),
+        episodes_to_remove.len(),
+    );
+
+    if added_m + added_e + removed_m + removed_e == 0 {
+        return Ok((0, 0, 0, 0));
+    }
+
+    // We call Trakt twice in the same `with_user_client` so a single
+    // token refresh covers both legs. The closure does add → remove
+    // sequentially; failure of either bubbles up and we skip the
+    // state-table update so the next run retries the full delta.
+    let movies_add_clone = movies_to_add.clone();
+    let episodes_add_clone = episodes_to_add.clone();
+    let movies_remove_clone = movies_to_remove.clone();
+    let episodes_remove_clone = episodes_to_remove.clone();
+    let pushed = with_user_client(state, user_id, |client, token| async move {
+        if !movies_add_clone.is_empty() || !episodes_add_clone.is_empty() {
+            client
+                .push_collection(&token, &movies_add_clone, &episodes_add_clone)
+                .await?;
+        }
+        if !movies_remove_clone.is_empty() || !episodes_remove_clone.is_empty() {
+            client
+                .remove_collection(&token, &movies_remove_clone, &episodes_remove_clone)
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?;
+    if pushed.is_some() {
+        // Snapshot the post-push set so the next nightly diff is
+        // computed against what we just told Trakt — not the union of
+        // everything we've ever sent.
+        queries::replace_trakt_collection_state(
+            &state.pool,
+            user_id,
+            &current_movies,
+            &current_episodes,
+        )
+        .await?;
+        tracing::info!(
+            user_id,
+            added_movies = added_m,
+            added_episodes = added_e,
+            removed_movies = removed_m,
+            removed_episodes = removed_e,
+            "Trakt collection reconcile ok"
+        );
+        Ok((added_m, added_e, removed_m, removed_e))
+    } else {
+        Ok((0, 0, 0, 0))
     }
 }
 
@@ -195,18 +707,26 @@ pub async fn bulk_push_user_history(
         return Ok((0, 0));
     }
     let mut events: Vec<HistoryPush> = Vec::with_capacity(movies.len() + episodes.len());
-    for (_item_id, tmdb_id, watched_at) in &movies {
+    for m in &movies {
         events.push(HistoryPush::Movie {
-            tmdb_id: *tmdb_id,
-            watched_at: epoch_ms_to_iso(*watched_at),
+            ids: TraktIdSet {
+                tmdb: m.tmdb_id,
+                imdb: m.imdb_id.clone(),
+                tvdb: m.tvdb_id,
+            },
+            watched_at: epoch_ms_to_iso(m.watched_at),
         });
     }
-    for (_ep_id, show_tmdb, season, episode, watched_at) in &episodes {
+    for e in &episodes {
         events.push(HistoryPush::Episode {
-            tmdb_show_id: *show_tmdb,
-            season: *season,
-            episode: *episode,
-            watched_at: epoch_ms_to_iso(*watched_at),
+            show_ids: TraktIdSet {
+                tmdb: e.show_tmdb_id,
+                imdb: e.show_imdb_id.clone(),
+                tvdb: e.show_tvdb_id,
+            },
+            season: e.season,
+            episode: e.episode,
+            watched_at: epoch_ms_to_iso(e.watched_at),
         });
     }
     let pushed = with_user_client(state, user_id, |client, token| async move {
@@ -433,26 +953,41 @@ pub fn epoch_ms_to_iso(epoch_ms: i64) -> String {
         .to_string()
 }
 
-/// Look up a movie's tmdb_id by local item_id; returns None if missing.
-pub async fn item_tmdb_id(pool: &SqlitePool, item_id: i64) -> Option<i64> {
-    sqlx::query("SELECT tmdb_id FROM items WHERE id = ?")
+/// Look up every Trakt-compatible id we have for a movie. Returns
+/// `None` only when *no* id is populated — the typical anime-only-via-
+/// AniList row has neither tmdb nor tvdb nor imdb, in which case
+/// there's nothing Trakt can match against and we skip the push.
+pub async fn item_trakt_ids(pool: &SqlitePool, item_id: i64) -> Option<TraktIdSet> {
+    let row = sqlx::query("SELECT tmdb_id, imdb_id, tvdb_id FROM items WHERE id = ?")
         .bind(item_id)
         .fetch_optional(pool)
         .await
         .ok()
-        .flatten()
-        .and_then(|row| row.try_get::<Option<i64>, _>("tmdb_id").ok().flatten())
+        .flatten()?;
+    let ids = TraktIdSet {
+        tmdb: row.try_get::<Option<i64>, _>("tmdb_id").ok().flatten(),
+        imdb: row.try_get::<Option<String>, _>("imdb_id").ok().flatten(),
+        tvdb: row.try_get::<Option<i64>, _>("tvdb_id").ok().flatten(),
+    };
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
 }
 
-/// For an episode, look up (show_tmdb_id, season_number, episode_number)
-/// in a single query — Trakt's APIs always reference episodes through
-/// their parent show + season/episode coordinates.
+/// For an episode, look up the show's id set + season + episode
+/// number in a single query. Trakt's APIs always reference episodes
+/// through their parent show + season/episode coordinates, so we
+/// return the show's ids (not the episode's own ids — those aren't
+/// guaranteed to be populated in our schema).
 pub async fn episode_trakt_coords(
     pool: &SqlitePool,
     episode_id: i64,
-) -> Result<Option<(i64, i32, i32)>> {
+) -> Result<Option<(TraktIdSet, i32, i32)>> {
     let row = sqlx::query(
-        "SELECT i.tmdb_id AS show_tmdb, s.season_number AS season,
+        "SELECT i.tmdb_id AS show_tmdb, i.imdb_id AS show_imdb, i.tvdb_id AS show_tvdb,
+                s.season_number AS season,
                 e.episode_number AS episode
          FROM episodes e
          JOIN seasons s ON s.id = e.season_id
@@ -463,8 +998,16 @@ pub async fn episode_trakt_coords(
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    let show_tmdb: Option<i64> = row.try_get("show_tmdb").ok().flatten();
+    let ids = TraktIdSet {
+        tmdb: row.try_get::<Option<i64>, _>("show_tmdb").ok().flatten(),
+        imdb: row.try_get::<Option<String>, _>("show_imdb").ok().flatten(),
+        tvdb: row.try_get::<Option<i64>, _>("show_tvdb").ok().flatten(),
+    };
     let season: i32 = row.try_get("season")?;
     let episode: i32 = row.try_get("episode")?;
-    Ok(show_tmdb.map(|t| (t, season, episode)))
+    if ids.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((ids, season, episode)))
+    }
 }

@@ -320,30 +320,11 @@ async fn main() -> anyhow::Result<()> {
     // a read lock. Clamped defensively in case a hand-edited DB row
     // bypassed the schema CHECK.
     let job_workers = initial_settings.job_workers.clamp(1, 16) as usize;
-    // Reap orphaned sessions on the operator's configured idle window.
-    // The client sends a keepalive ping every 60s (and on every HLS
-    // manifest/segment request), so the default 90s floor catches a
-    // single missed beat plus reaper interval slack. Aggressive cleanup
-    // matters most on mobile, where force-closing the PWA doesn't
-    // reliably fire any unload event the server can observe — the only
-    // signal is the keepalive going silent. The threshold is a startup-
-    // time read (spawn_reaper takes an i64, not a settings handle);
-    // changing it via the admin UI takes effect on next restart.
-    // Reaper with a stats hook: every time the reaper kills an idle
-    // session, fan out a `stop` event to playback_events with the
-    // final cumulative bytes_served. Gives the admin Stats page
-    // per-stream bandwidth without any per-segment DB write.
-    let pool_for_reaper = pool.clone();
-    transcoder.spawn_reaper_with_hook(
-        initial_settings.transcoder_reaper_idle_threshold_ms,
-        15,
-        move |snap| {
-            let pool = pool_for_reaper.clone();
-            tokio::spawn(async move {
-                emit_session_stop_event(&pool, &snap).await;
-            });
-        },
-    );
+    // Reaper threshold captured here before `initial_settings` is moved
+    // into the Arc<RwLock>. The reaper itself is spawned *after* `state`
+    // is built so its hook can fan out the Trakt scrobble-stop alongside
+    // the playback-event insert.
+    let reaper_idle_threshold_ms = initial_settings.transcoder_reaper_idle_threshold_ms;
 
     // Broadcast capacity for the in-process event hub. Sized for the
     // worst-case burst: a freshly-dropped season pack (typically up to
@@ -420,6 +401,34 @@ async fn main() -> anyhow::Result<()> {
         // See `AppState::bulk_write_lock` for the rationale.
         bulk_write_lock: Arc::new(tokio::sync::Semaphore::new(1)),
     };
+
+    // Reap orphaned sessions on the operator's configured idle window.
+    // The client sends a keepalive ping every 60s (and on every HLS
+    // manifest/segment request), so the default 90s floor catches a
+    // single missed beat plus reaper interval slack. Aggressive cleanup
+    // matters most on mobile, where force-closing the PWA doesn't
+    // reliably fire any unload event the server can observe — the only
+    // signal is the keepalive going silent.
+    //
+    // Hook: every reaped session emits a `stop` playback-event (for
+    // admin Stats bandwidth attribution) *and* fires a Trakt scrobble
+    // stop so the live "YOU ARE WATCHING" banner closes when a player
+    // is force-closed or loses connectivity. Both are fire-and-forget
+    // and serialised onto a single spawned task per reap so the reaper
+    // loop itself doesn't block on Trakt latency.
+    {
+        let state_for_reaper = state.clone();
+        state.transcoder.spawn_reaper_with_hook(
+            reaper_idle_threshold_ms,
+            15,
+            move |snap| {
+                let state = state_for_reaper.clone();
+                tokio::spawn(async move {
+                    emit_session_stop_event(&state, &snap).await;
+                });
+            },
+        );
+    }
 
     // Scheduled tasks: flip orphaned `running` rows, seed defaults, spawn
     // the runner loop. We do this after AppState is fully assembled.
@@ -749,10 +758,19 @@ async fn shutdown_signal() {
 /// path so admin Stats reflects every terminated stream. Resolves the
 /// owning item / episode via `media_file_owner` — the same pattern
 /// the start-event recorder uses.
+///
+/// Also fires `/scrobble/stop` to Trakt so the live "YOU ARE WATCHING"
+/// banner closes on session teardown. Trakt automatically writes the
+/// entry to history when stop arrives at ≥ 80% progress, so an
+/// uninterrupted watch-through doesn't need a separate `/sync/history`
+/// push from the scrobble-threshold endpoint — that path is preserved
+/// only for the explicit "Mark as watched" UI action which has no
+/// session.
 pub(crate) async fn emit_session_stop_event(
-    pool: &SqlitePool,
+    state: &AppState,
     snap: &chimpflix_transcoder::SessionSnapshot,
 ) {
+    let pool = &state.pool;
     let (item_id, episode_id) =
         chimpflix_library::queries::media_file_owner(pool, snap.media_file_id)
             .await
@@ -783,4 +801,16 @@ pub(crate) async fn emit_session_stop_event(
             "record playback stop event",
         );
     }
+    // Trakt scrobble stop runs after the local stats write so a slow
+    // Trakt API can't delay the playback_events row — and a Trakt
+    // outage never blocks a session teardown the reaper just decided.
+    crate::trakt_sync::scrobble_event(
+        state,
+        snap.user_id,
+        chimpflix_metadata::ScrobbleAction::Stop,
+        item_id,
+        episode_id,
+        snap.duration_ms,
+    )
+    .await;
 }

@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::state::AppState;
+use crate::trakt_sync;
 
 #[derive(Debug, Serialize)]
 pub struct MyListResponse {
@@ -48,6 +49,13 @@ pub async fn add(
     queries::add_to_my_list(&state.pool, user.id, item_id)
         .await
         .map_err(ApiError::Internal)?;
+    // Fire-and-forget Trakt watchlist push. The local row is already
+    // committed, so a Trakt failure leaves us with a one-way divergence
+    // that the next sync_now reconcile catches.
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        trakt_sync::push_watchlist_event(&state_clone, user.id, item_id).await;
+    });
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -59,6 +67,10 @@ pub async fn remove(
     queries::remove_from_my_list(&state.pool, user.id, item_id)
         .await
         .map_err(ApiError::Internal)?;
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        trakt_sync::remove_watchlist_event(&state_clone, user.id, item_id).await;
+    });
     // Idempotent: deleting an already-absent row is fine.
     Ok(StatusCode::NO_CONTENT)
 }

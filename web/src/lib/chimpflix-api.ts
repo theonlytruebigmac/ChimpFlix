@@ -1727,6 +1727,56 @@ export interface TraktSyncNowResult {
    *  a network blip or for items matched after the hook fired. */
   movies_pushed: number;
   episodes_pushed: number;
+  /** Trakt watchlist entries newly added to local My List during
+   *  this sync. Movies + shows combined. */
+  watchlist_added: number;
+  /** My List entries removed because the user removed them from
+   *  their Trakt watchlist since the last sync. Always 0 on the
+   *  first sync after linking (the snapshot baseline is empty). */
+  watchlist_removed: number;
+}
+
+export interface TraktUserStats {
+  movies: {
+    plays: number;
+    watched: number;
+    minutes: number;
+    collected: number;
+  };
+  shows: { watched: number; collected: number };
+  episodes: {
+    plays: number;
+    watched: number;
+    minutes: number;
+    collected: number;
+  };
+  ratings: { total: number };
+}
+
+export interface TraktUpcomingEpisode {
+  show_item_id: number | null;
+  show_title: string;
+  season: number;
+  episode: number;
+  episode_title: string | null;
+  first_aired: string;
+  show_tmdb_id: number | null;
+}
+
+export interface TraktUpcomingResponse {
+  items: TraktUpcomingEpisode[];
+}
+
+export interface TraktUpcomingMovie {
+  movie_item_id: number | null;
+  title: string;
+  year: number | null;
+  released: string;
+  tmdb_id: number | null;
+}
+
+export interface TraktUpcomingMoviesResponse {
+  items: TraktUpcomingMovie[];
 }
 
 export const trakt = {
@@ -1738,7 +1788,57 @@ export const trakt = {
     apiFetch<{ removed: boolean }>("/trakt/unlink", { method: "POST" }),
   syncNow: () =>
     apiFetch<TraktSyncNowResult>("/trakt/sync-now", { method: "POST" }),
+  /** Upcoming episodes for shows the user has watched on Trakt.
+   *  `days` clamps to 1..=31 server-side; default 14. `variant`:
+   *    - "shows" (default): every upcoming episode
+   *    - "premieres": season premieres only
+   *    - "new": series premieres (brand-new shows)
+   *  Returns an empty list when the user hasn't linked Trakt. */
+  calendarShows: (
+    days = 14,
+    variant: "shows" | "premieres" | "new" = "shows",
+  ) =>
+    apiFetch<TraktUpcomingResponse>(
+      `/trakt/calendars/shows?days=${days}&variant=${variant}`,
+    ),
+  /** Upcoming movie releases for movies the user tracks on Trakt
+   *  (watchlist + collection). `days` defaults to 30 (movies dribble
+   *  out more sparsely than weekly episodes). */
+  calendarMovies: (days = 30) =>
+    apiFetch<TraktUpcomingMoviesResponse>(
+      `/trakt/calendars/movies?days=${days}`,
+    ),
+  /** Lifetime watch totals from `/users/me/stats`. Returns `null`
+   *  when the user hasn't linked Trakt. */
+  stats: () => apiFetch<TraktUserStats | null>("/trakt/stats"),
+  /** Personalized Trakt recommendations intersected with the user's
+   *  accessible local library. Pass `"movie"` or `"show"`. Returns an
+   *  empty list when the user hasn't linked Trakt. */
+  recommendations: (kind: "movie" | "show") =>
+    apiFetch<{ items: ListedItem[] }>(
+      `/trakt/recommendations?kind=${kind}`,
+    ),
+  /** The user's personal Trakt lists, each hydrated with the subset
+   *  of items in their accessible local library. Lists with no local
+   *  intersection are omitted server-side. */
+  lists: () => apiFetch<TraktListsResponse>("/trakt/lists"),
+  /** The user's Trakt favorites (their curated subset of the
+   *  watchlist), intersected with the local library. Read-only:
+   *  there's no local Favorites concept to write to. */
+  favorites: () => apiFetch<{ items: ListedItem[] }>("/trakt/favorites"),
 };
+
+export interface TraktListView {
+  id: number;
+  slug: string;
+  name: string;
+  description: string | null;
+  items: ListedItem[];
+}
+
+export interface TraktListsResponse {
+  lists: TraktListView[];
+}
 
 // ─── Plex OAuth (PIN flow) ────────────────────────────────────────────────
 

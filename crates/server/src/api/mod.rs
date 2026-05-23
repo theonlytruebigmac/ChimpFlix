@@ -223,6 +223,12 @@ pub fn router(state: AppState) -> Router {
         .route("/trakt/status", get(trakt::status))
         .route("/trakt/unlink", post(trakt::unlink))
         .route("/trakt/sync-now", post(trakt::sync_now))
+        .route("/trakt/calendars/shows", get(trakt::calendar_shows))
+        .route("/trakt/calendars/movies", get(trakt::calendar_movies))
+        .route("/trakt/stats", get(trakt::stats))
+        .route("/trakt/recommendations", get(trakt::recommendations))
+        .route("/trakt/lists", get(trakt::user_lists))
+        .route("/trakt/favorites", get(trakt::favorites))
         // Per-user ratings (Trakt-synced when linked)
         .route(
             "/items/{id}/rating",

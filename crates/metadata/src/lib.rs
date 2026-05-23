@@ -43,8 +43,12 @@ pub use tmdb::{
     TmdbReview, TmdbSeason, TmdbShow, TmdbUpstreamError, TmdbVideo, tmdb_image_url,
 };
 pub use trakt::{
-    DeviceCodeResponse, DevicePollResult, HistoryEntry, HistoryPush, PlaybackEntry, RatingEntry,
-    RatingPush, TokenPair, TraktClient, TraktCreds, TraktIds,
+    CalendarEpisodeEntry, CalendarMovieEntry, DeviceCodeResponse, DevicePollResult, HiddenEntry,
+    HistoryEntry, HistoryPush, LastActivities, PlaybackEntry, RatingEntry, RatingPush,
+    RecommendationEntry, RecommendationKind, ScrobbleAction, ScrobblePush, ShowCalendarKind,
+    TokenPair, TraktClient, TraktCreds, TraktIdSet, TraktIds, TraktList, TraktListIds,
+    TraktListItem, UserStats, UserStatsEpisodes, UserStatsMovies, UserStatsRatings, UserStatsShows,
+    WatchlistEntry, WatchlistPush,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisode, TvdbEpisodeCharacter, TvdbEpisodeExtended, TvdbMovie, TvdbShow,
