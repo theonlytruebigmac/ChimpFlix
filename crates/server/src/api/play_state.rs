@@ -1,16 +1,24 @@
 //! /api/v1/play-state handlers.
 
-use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::{Extension, Json};
 use chimpflix_library::queries;
 use chimpflix_library::{ListedItem, OnDeckResponse, PlayStateBatch, ScrobbleRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
+use crate::client_ip::EffectiveClientIp;
 use crate::state::AppState;
 use crate::trakt_sync;
+
+fn user_agent_from(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
 
 pub async fn update(
     State(state): State<AppState>,
@@ -116,6 +124,8 @@ pub async fn set_watched(
 pub async fn scrobble(
     State(state): State<AppState>,
     user: AuthUser,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
+    headers: HeaderMap,
     Json(req): Json<ScrobbleRequest>,
 ) -> Result<StatusCode, ApiError> {
     if req.item_id.is_none() && req.episode_id.is_none() {
@@ -144,6 +154,8 @@ pub async fn scrobble(
         req.item_id,
         req.episode_id,
         None,
+        Some(ip.to_string()),
+        user_agent_from(&headers),
     );
     Ok(StatusCode::NO_CONTENT)
 }
@@ -169,6 +181,8 @@ pub struct PlaybackEventInputDto {
 pub async fn event(
     State(state): State<AppState>,
     user: AuthUser,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
+    headers: HeaderMap,
     Json(req): Json<PlaybackEventInputDto>,
 ) -> Result<StatusCode, ApiError> {
     let kind = req.kind.trim();
@@ -183,21 +197,21 @@ pub async fn event(
             "event must not have both item_id and episode_id",
         ));
     }
-    // Use Box::leak alternative — the spawn helper accepts &str so we
-    // copy into a leaked-friendly &'static. Simpler: clone the kind
-    // and pass owned string into the spawned task via a closure that
-    // borrows from the captured String. Implemented inline:
     let pool = state.pool.clone();
     let user_id = user.id;
     let item_id = req.item_id;
     let episode_id = req.episode_id;
     let position_ms = req.position_ms;
     let kind_owned = kind.to_string();
+    let ip_str = ip.to_string();
+    let user_agent = user_agent_from(&headers);
     tokio::spawn(async move {
         let ev = queries::PlaybackEventInput {
             item_id,
             episode_id,
             position_ms,
+            ip: Some(ip_str.as_str()),
+            user_agent: user_agent.as_deref(),
             ..queries::PlaybackEventInput::new(user_id, kind_owned.as_str())
         };
         if let Err(e) = queries::record_playback_event(&pool, ev).await {
@@ -222,12 +236,16 @@ fn spawn_event(
     item_id: Option<i64>,
     episode_id: Option<i64>,
     position_ms: Option<i64>,
+    ip: Option<String>,
+    user_agent: Option<String>,
 ) {
     tokio::spawn(async move {
         let ev = queries::PlaybackEventInput {
             item_id,
             episode_id,
             position_ms,
+            ip: ip.as_deref(),
+            user_agent: user_agent.as_deref(),
             ..queries::PlaybackEventInput::new(user_id, event_type)
         };
         if let Err(e) = queries::record_playback_event(&state.pool, ev).await {

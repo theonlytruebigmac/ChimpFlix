@@ -395,7 +395,7 @@ export function AdminStatsClient({
       {/* ─── Recent activity feed ─── */}
       <Section
         title="Recent activity"
-        hint="Most recent 50 events. Refreshes on demand — pause + resume aren't tracked yet, so the feed is start / complete only for now."
+        hint="Most recent 50 events. Refreshes on demand."
         action={
           <button
             type="button"
