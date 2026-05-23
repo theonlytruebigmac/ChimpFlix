@@ -354,6 +354,19 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{\"succeeded_retention_days\":7,\"dead_retention_days\":30}",
             cron_placeholder: "0 30 4 * * *",
         },
+        // Hourly Trakt pull is a no-op until at least one user links
+        // their account, so seeding it for every fresh install is
+        // safe. Skipping the maintenance window because the work is
+        // tiny (an HTTP fetch + upsert per user) and a 24h delay on
+        // an empty incremental sync would be very confusing.
+        Seed {
+            kind: "trakt_pull",
+            name: "Trakt: pull history + playback",
+            frequency: "hourly",
+            requires_window: false,
+            params_json: "{}",
+            cron_placeholder: "0 0 * * * *",
+        },
     ];
     // Window snap requires the actual operator-configured window which
     // lives on the (yet-to-be-populated) settings cache. At seed time

@@ -15,6 +15,7 @@ mod libraries;
 pub(crate) mod markers;
 mod my_list;
 mod notifications;
+mod people;
 mod play_state;
 mod prefs;
 pub mod rate_limit;
@@ -294,6 +295,8 @@ pub fn router(state: AppState) -> Router {
         .route("/play-state/watched", post(play_state::set_watched))
         .route("/play-state/on-deck", get(play_state::on_deck))
         .route("/play-state/history", get(play_state::history))
+        // People (cast / crew detail + filmography across the user's libraries)
+        .route("/people/{id}", get(people::get_one))
         // Collections (movie franchises + admin-curated manual collections)
         .route("/collections", get(collections::list))
         .route("/collections/{id}", get(collections::get_one))

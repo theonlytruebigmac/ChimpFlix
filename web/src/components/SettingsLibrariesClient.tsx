@@ -403,7 +403,7 @@ function ScanHistoryView({
 
 function statusClass(s: ScanJob["status"]): string {
   switch (s) {
-    case "completed":
+    case "succeeded":
       return "bg-green-500/15 text-green-300";
     case "running":
       return "bg-blue-500/15 text-blue-300";

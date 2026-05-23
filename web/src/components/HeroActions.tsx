@@ -12,6 +12,7 @@ import { getPrefs } from "@/lib/prefs";
 export function HeroActions({
   playRatingKey,
   modalRatingKey,
+  modalEpisodeKey,
 }: {
   // What to play. For an episode-type hero this is the episode itself; for
   // a show/movie it's the title.
@@ -20,6 +21,9 @@ export function HeroActions({
   // grandparent show, so the user sees the season/episode list. Movies
   // and shows just use their own key.
   modalRatingKey: string;
+  // For an episode-type hero, the episode rating key (`e<id>`) so the
+  // modal can land on the right season + scroll the row in.
+  modalEpisodeKey?: string;
 }) {
   const router = useRouter();
 
@@ -88,7 +92,7 @@ export function HeroActions({
       </Link>
       <button
         type="button"
-        onClick={() => openModal(modalRatingKey)}
+        onClick={() => openModal(modalRatingKey, modalEpisodeKey)}
         className="inline-flex cursor-pointer items-center gap-2 rounded-md bg-white/25 px-7 py-2.5 text-base font-bold text-white backdrop-blur-sm transition-colors hover:bg-white/35"
       >
         <InfoIcon /> More Info

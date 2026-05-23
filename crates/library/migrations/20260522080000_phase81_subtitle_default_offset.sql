@@ -1,0 +1,21 @@
+-- Phase 81 — Server-level default subtitle sync offset.
+--
+-- Some source libraries (notably anime fansub re-encodes) ship with
+-- ASS / SRT tracks authored against a slightly differently-trimmed
+-- video master, producing a roughly constant cross-title sync drift
+-- (e.g. "subs are always ~1 s early"). The per-file offset stepper
+-- in the player handles the per-file case, but it gets tedious when
+-- the entire library shares the same drift.
+--
+-- This column lets the operator dial in a server-wide default. The
+-- session-creation path adds it to the client's `subtitle_offset_ms`
+-- before passing to the transcoder, so the player's per-file
+-- stepper still works as a relative tweak on top of the global
+-- baseline (positive bump = even further delayed; negative bump =
+-- closer to source timing).
+--
+-- 0 = no global shift (the previous behaviour). Bounded
+-- ±30_000 ms at the API layer so a typo can't make subtitles
+-- vanish entirely.
+ALTER TABLE server_settings
+    ADD COLUMN subtitle_default_offset_ms INTEGER NOT NULL DEFAULT 0;

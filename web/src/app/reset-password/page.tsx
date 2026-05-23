@@ -24,6 +24,14 @@ function ResetContent() {
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ sessionsRevoked: number } | null>(null);
 
+  // Clear the inline error the moment the user starts typing in
+  // either password field — without this the "passwords don't
+  // match" toast lingers while they're actively fixing it, which
+  // reads as "still wrong" even after they've corrected it.
+  function clearErrorOnEdit() {
+    if (error) setError(null);
+  }
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
@@ -101,13 +109,17 @@ function ResetContent() {
               <span className="mb-1 block text-sm text-white/70">New password</span>
               <input
                 type="password"
+                name="new-password"
                 autoComplete="new-password"
                 required
                 minLength={8}
                 maxLength={1024}
                 autoFocus
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  clearErrorOnEdit();
+                }}
                 className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
               />
               <span className="mt-1 block text-xs text-white/40">
@@ -119,12 +131,16 @@ function ResetContent() {
               <span className="mb-1 block text-sm text-white/70">Confirm password</span>
               <input
                 type="password"
+                name="confirm-password"
                 autoComplete="new-password"
                 required
                 minLength={8}
                 maxLength={1024}
                 value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
+                onChange={(e) => {
+                  setConfirm(e.target.value);
+                  clearErrorOnEdit();
+                }}
                 className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
               />
             </label>

@@ -7,6 +7,7 @@ import {
   type TraktStatus,
   type TraktSyncNowResult,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 /// Per-user integrations card. Right now the only integration here is
 /// Trakt — when more land (Trakt+anything-else), wrap each in its own
@@ -19,6 +20,7 @@ export function SettingsIntegrationsClient() {
   >(null);
   const [error, setError] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<TraktSyncNowResult | null>(null);
+  const [askUnlink, setAskUnlink] = useState(false);
   const pollTimer = useRef<number | null>(null);
   // True while this component is mounted. The poll() callback runs on
   // a Trakt-suggested interval (~5s) and lives across many awaits; if
@@ -108,12 +110,12 @@ export function SettingsIntegrationsClient() {
     }
   }
 
-  async function unlink() {
-    if (!confirm("Unlink your Trakt account?")) return;
+  async function unlinkConfirmed() {
     setBusy("unlink");
     try {
       await traktApi.unlink();
       await refresh();
+      setAskUnlink(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -228,7 +230,7 @@ export function SettingsIntegrationsClient() {
                 {busy === "sync" ? "Syncing…" : "Sync now"}
               </button>
               <button
-                onClick={unlink}
+                onClick={() => setAskUnlink(true)}
                 disabled={busy !== null}
                 className="rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50"
               >
@@ -236,19 +238,42 @@ export function SettingsIntegrationsClient() {
               </button>
             </div>
             {lastSync && (
-              <div className="text-xs text-emerald-300">
-                Pulled {lastSync.movies_marked} movies,{" "}
-                {lastSync.episodes_marked} episodes,{" "}
-                {lastSync.playback_applied} resume points.
+              <div className="space-y-0.5 text-xs text-emerald-300">
+                <div>
+                  Pushed {lastSync.movies_pushed} movies,{" "}
+                  {lastSync.episodes_pushed} episodes to Trakt.
+                </div>
+                <div>
+                  Pulled {lastSync.movies_marked} movies,{" "}
+                  {lastSync.episodes_marked} episodes,{" "}
+                  {lastSync.playback_applied} resume points.
+                </div>
               </div>
             )}
           </div>
         )}
 
         {error && (
-          <div className="mt-3 text-xs text-red-300">{error}</div>
+          <div
+            role="status"
+            aria-live="polite"
+            className="mt-3 text-xs text-red-300"
+          >
+            {error}
+          </div>
         )}
       </div>
+      {askUnlink && (
+        <ConfirmDialog
+          title="Unlink Trakt?"
+          body="Your scrobbles and watched markers stop syncing to Trakt. Local play state is unaffected — re-link any time to resume."
+          confirmLabel="Unlink"
+          destructive
+          busy={busy === "unlink"}
+          onConfirm={() => void unlinkConfirmed()}
+          onCancel={() => setAskUnlink(false)}
+        />
+      )}
     </div>
   );
 }

@@ -15,7 +15,6 @@
 //!     the operator can fix the source and re-scan or refresh.
 //!
 //! Remaining caveats:
-//!   * No removal of media_files for deleted-from-disk paths. Future work.
 //!   * Title-only matching for items (`UNIQUE (library_id, kind, sort_title)`);
 //!     two distinct movies with the same title in the same library collide.
 
@@ -328,14 +327,26 @@ async fn scan_inner(
     emitter: &ScanEmitter,
 ) -> Result<Counters> {
     let existing = queries::existing_media_files(pool, library_id).await?;
-    let candidates = collect_candidates(roots).await?;
+    let scan = collect_candidates(roots).await?;
+    let candidates = scan.files;
+    let reachable_roots = scan.reachable_roots;
     let agents = AgentChain::load(pool, library_id).await;
     info!(
         library_id,
         count = candidates.len(),
+        reachable_roots = reachable_roots.len(),
         enabled_agents = ?agents.order,
         "scan candidates collected"
     );
+
+    // Snapshot the paths we're about to process — the reconciliation pass
+    // at the end compares this set against the DB to discover what
+    // disappeared from disk. Done before we hand `candidates` to the
+    // streaming iterator because `into_iter()` consumes it.
+    let seen_paths: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|(_, p)| p.to_string_lossy().to_string())
+        .collect();
 
     let existing = Arc::new(existing);
     let agents = Arc::new(agents);
@@ -480,18 +491,88 @@ async fn scan_inner(
         }
     }
 
+    // Reconciliation pass: soft-delete media_files whose on-disk path
+    // disappeared. Scoped to the roots that were actually reachable this
+    // scan — partial unmounts MUST NOT eat the offline files. Re-appeared
+    // files are not touched here; the scanner's upsert already clears
+    // `removed_at = NULL` whenever it processes a candidate, so a file
+    // coming back online resurrects itself on the next scan automatically.
+    if reachable_roots.is_empty() {
+        warn!(
+            library_id,
+            "every library root is unreachable; skipping removal reconciliation"
+        );
+    } else {
+        match queries::list_media_files_for_verify(pool, library_id).await {
+            Ok(rows) => {
+                let mut to_remove: Vec<i64> = Vec::new();
+                for row in &rows {
+                    if row.removed_at.is_some() {
+                        continue; // already marked; nothing to do
+                    }
+                    if seen_paths.contains(&row.path) {
+                        continue; // we just processed it (or upserted it)
+                    }
+                    // Only reconcile files whose path sits under a root we
+                    // could actually walk this scan. Files under offline
+                    // roots stay as-is until that mount returns and a
+                    // subsequent scan reaches them.
+                    let p = Path::new(&row.path);
+                    if !reachable_roots.iter().any(|r| p.starts_with(r)) {
+                        continue;
+                    }
+                    to_remove.push(row.id);
+                }
+                if !to_remove.is_empty() {
+                    match queries::mark_media_files_removed(pool, &to_remove).await {
+                        Ok(n) => {
+                            counters.files_removed = n as i64;
+                            info!(
+                                library_id,
+                                removed = n,
+                                "scan reconciliation soft-deleted missing files"
+                            );
+                        }
+                        Err(e) => warn!(
+                            library_id,
+                            error = %format!("{e:#}"),
+                            "scan reconciliation: mark_media_files_removed failed",
+                        ),
+                    }
+                }
+            }
+            Err(e) => warn!(
+                library_id,
+                error = %format!("{e:#}"),
+                "scan reconciliation: list_media_files_for_verify failed; skipping removal pass",
+            ),
+        }
+    }
+
     Ok(counters)
 }
 
-async fn collect_candidates(roots: &[String]) -> Result<Vec<(PathBuf, PathBuf)>> {
+/// Output of [`collect_candidates`]. Carries the list of (root, file)
+/// pairs plus the subset of roots that were actually reachable on disk.
+/// The reachable list scopes the reconciliation pass so a partially
+/// unmounted library doesn't soft-delete files under roots that are
+/// just temporarily offline.
+struct CandidateScan {
+    files: Vec<(PathBuf, PathBuf)>,
+    reachable_roots: Vec<PathBuf>,
+}
+
+async fn collect_candidates(roots: &[String]) -> Result<CandidateScan> {
     let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
     tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
+        let mut reachable_roots = Vec::new();
         for root in &roots {
             if !root.exists() {
                 warn!(root = %root.display(), "library root does not exist");
                 continue;
             }
+            reachable_roots.push(root.clone());
             // `follow_links(false)` keeps us from descending through
             // symlinks, which handles the common cycle case (Library
             // -> Show -> ../). The `max_depth` cap is a belt: a
@@ -530,7 +611,10 @@ async fn collect_candidates(roots: &[String]) -> Result<Vec<(PathBuf, PathBuf)>>
                 out.push((root.clone(), path));
             }
         }
-        out
+        CandidateScan {
+            files: out,
+            reachable_roots,
+        }
     })
     .await
     .context("walk join failed")

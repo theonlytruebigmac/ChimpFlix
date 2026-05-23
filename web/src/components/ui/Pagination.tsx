@@ -1,19 +1,23 @@
 "use client";
 
-/// Reusable pagination footer for the admin tables. Pairs a
-/// page-size selector with a compact page-number row (first, last,
-/// current, and the two on either side; ellipses fill the gap).
+/// Shared pagination footer used by both admin tables and user-facing
+/// browse grids. Pairs a page-size selector with a compact
+/// page-number row (first, last, current, and the two on either
+/// side; ellipses fill the gap).
 ///
 /// The whole row is rendered server-component-safe (no client-state
 /// of its own) — page + page size are owned by the caller, so each
 /// table can decide whether to drive them from URL query params,
 /// local state, or somewhere else.
 ///
-/// Used by:
+/// Callers:
 ///   • Library → Scheduled Tasks → Job queue
 ///   • Library → Scheduled Tasks → Activity (recent runs)
 ///   • Maintenance → Logs → Audit trail
-///   • Library → /browse grid
+///   • /library/[id]/browse grid
+///   • /genre/[name]
+///   • /collection/[id]
+///   • /history
 
 import type { ReactNode } from "react";
 

@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   items as itemsApi,
   type ManualMarkerInput,
   type MarkerRow,
   type MediaFileMarkersResponse,
 } from "@/lib/chimpflix-api";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 interface Props {
   mediaFileId: number;
@@ -61,6 +62,12 @@ export function MarkerEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = "marker-editor-dialog-title";
+  // Escape + Tab focus cycling + restore-focus-on-close. Parent
+  // mounts/unmounts us when entering/exiting edit mode, so the hook
+  // runs for the dialog's lifetime — no need to gate on `open`.
+  useFocusTrap(dialogRef, { onClose });
   // Fetch on open. The parent unmounts us between sessions (via the
   // `open` gate at the top of the render), so this only fires once
   // per editor invocation — no need to reset loaded/error here.
@@ -146,18 +153,19 @@ export function MarkerEditor({
   return (
     <div
       className="fixed inset-0 z-80 flex items-start justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm sm:p-8"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Edit markers"
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         className="relative w-full max-w-2xl rounded-lg border border-white/10 bg-(--color-surface) shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <header className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
           <div className="min-w-0 flex-1">
-            <h2 className="m-0 truncate text-base font-semibold">
+            <h2 id={titleId} className="m-0 truncate text-base font-semibold">
               Edit markers
             </h2>
             <p className="m-0 mt-0.5 truncate text-xs text-white/55">

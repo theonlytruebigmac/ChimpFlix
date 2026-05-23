@@ -116,11 +116,17 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
                     <td className="whitespace-nowrap px-4 py-2">
                       {expiring ? (
                         <Pill tone="warn">
-                          {new Date(s.expires_at).toLocaleDateString()}
+                          {new Date(s.expires_at).toLocaleString(undefined, {
+                            dateStyle: "medium",
+                            timeStyle: "short",
+                          })}
                         </Pill>
                       ) : (
                         <span className="text-xs text-white/60">
-                          {new Date(s.expires_at).toLocaleDateString()}
+                          {new Date(s.expires_at).toLocaleString(undefined, {
+                            dateStyle: "medium",
+                            timeStyle: "short",
+                          })}
                         </span>
                       )}
                     </td>

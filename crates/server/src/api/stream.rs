@@ -210,10 +210,22 @@ pub struct CreateSessionRequest {
     pub subtitle_style: Option<String>,
     /// Explicit quality tier. When set, the session always transcodes
     /// (direct play can't reshape bitrate), and ffmpeg is configured
-    /// with the requested scale + video bitrate. Omit to use the
-    /// transcoder's defaults.
+    /// with the requested scale (and bitrate, if specified). Omit to
+    /// use the transcoder's source-derived defaults. As of the
+    /// bitrate-decouple change, `bitrate_bps` is optional: setting
+    /// just `height` lets the ladder default fill in the bitrate, so
+    /// the player can ship a pure "Resolution" picker alongside the
+    /// separate `bitrate_cap_bps` knob below.
     #[serde(default)]
     pub quality_target: Option<QualityTarget>,
+    /// User-controlled upper bound on the video bitrate, in bits per
+    /// second. Independent of resolution: lets a viewer pick "1080p
+    /// but cap at 3 Mbps for my mobile data plan." Applied after any
+    /// resolution-driven default and before the operator's server-
+    /// wide `transcoder_quality_ceiling_kbps` (which always wins).
+    /// Omit / null = no per-user cap.
+    #[serde(default)]
+    pub bitrate_cap_bps: Option<u64>,
     /// EBU R128 audio loudness normalization. `true` forces the
     /// audio path through ffmpeg's `loudnorm` filter (which in turn
     /// requires audio re-encode — we suppress the audio-copy fast
@@ -239,7 +251,13 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Deserialize)]
 pub struct QualityTarget {
     pub height: u32,
-    pub bitrate_bps: u64,
+    /// Explicit bitrate to target at this resolution. When `None`,
+    /// the ladder default for `height` is used (so the player can ship
+    /// a pure resolution picker without having to know the bitrate
+    /// numbers). Use the separate `bitrate_cap_bps` on the request
+    /// for a user-controlled bandwidth cap.
+    #[serde(default)]
+    pub bitrate_bps: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -381,8 +399,23 @@ async fn create_session_impl(
     // loudnorm filter — the player's per-session toggle can still
     // *opt in*, but cannot opt out of an admin-mandated default.
     // (Matching Plex's "Volume leveling" server setting.)
-    if state.settings.read().await.audio_normalize_enabled {
+    let settings = state.settings.read().await.clone();
+    if settings.audio_normalize_enabled {
         req.audio_normalize = true;
+    }
+    // Server-wide default subtitle sync offset. Added to the
+    // client-supplied per-file offset before passing to the transcoder
+    // so the player's per-file stepper is still meaningful as a
+    // relative tweak. Common use: an entire library shares the same
+    // ~1 s drift (often anime fansub re-encodes); operator sets the
+    // default to +1000 ms and the player stays at 0 for in-sync
+    // titles, ±N ms on outliers. Clamped to ±60 s since each side
+    // is already bounded ±30 s individually.
+    if settings.subtitle_default_offset_ms != 0 {
+        req.subtitle_offset_ms = req
+            .subtitle_offset_ms
+            .saturating_add(settings.subtitle_default_offset_ms)
+            .clamp(-60_000, 60_000);
     }
     ensure_file_accessible(state, user, req.media_file_id).await?;
     let locator = queries::get_media_file_locator(&state.pool, req.media_file_id)
@@ -832,16 +865,34 @@ async fn create_session_impl(
             }
 
             // Resolve the final (height, bitrate) the encoder will
-            // target. Precedence: explicit quality_target → smart
-            // default driven by source resolution → transcoder's
-            // built-in 720p baseline. The operator's quality ceiling
-            // (kbps) is applied last so it always wins.
-            let resolved_quality = req
-                .quality_target
-                .as_ref()
-                .map(|q| (q.height, q.bitrate_bps))
-                .or_else(|| auto_quality_for_source(source_height.unwrap_or(0)));
+            // target. Precedence:
+            //   1. explicit `quality_target.height` (with explicit
+            //      bitrate, or ladder default for that height when
+            //      bitrate omitted — the "Resolution picker" UX)
+            //   2. source-derived default via auto_quality_for_source
+            //   3. Nothing → transcoder uses its own 720p baseline
+            // After the height+bitrate is picked, we apply two caps
+            // in order: the user's per-session `bitrate_cap_bps`
+            // (their "max bitrate" knob in the player), then the
+            // operator's server-wide ceiling — operator always wins.
+            let resolved_quality = match req.quality_target.as_ref() {
+                Some(q) => {
+                    let bps = q.bitrate_bps.or_else(|| {
+                        // Ladder default for this height. auto_quality_for_source
+                        // snaps to the nearest rung at-or-below; for explicit
+                        // user picks of standard rungs (1080/720/480/240) it's
+                        // a 1:1 lookup.
+                        auto_quality_for_source(q.height as i64).map(|(_, bps)| bps)
+                    });
+                    bps.map(|bps| (q.height, bps))
+                }
+                None => auto_quality_for_source(source_height.unwrap_or(0)),
+            };
             let resolved_quality = resolved_quality.map(|(h, bps)| {
+                let bps = match req.bitrate_cap_bps {
+                    Some(cap) if cap > 0 => bps.min(cap),
+                    _ => bps,
+                };
                 let bps = match settings_snapshot.transcoder_quality_ceiling_kbps {
                     Some(ceiling_kbps) if ceiling_kbps > 0 => bps.min((ceiling_kbps as u64) * 1000),
                     _ => bps,
@@ -1920,6 +1971,7 @@ pub async fn prewarm_session(
         subtitle_index: None,
         subtitle_style: None,
         quality_target: None,
+        bitrate_cap_bps: None,
         audio_normalize: req.audio_normalize,
         subtitle_offset_ms: 0,
     };

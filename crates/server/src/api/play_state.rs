@@ -77,13 +77,16 @@ pub async fn set_watched(
         let episode_ids =
             queries::set_all_episodes_watched_for_show(&state.pool, user.id, show_id, req.watched)
                 .await?;
-        // Fan out Trakt history pushes — one per episode. Each call
-        // is already fire-and-forget; spawning N concurrent tasks is
-        // fine for typical season/show sizes. Skip on unwatched
-        // (symmetry with the single-item path).
-        if req.watched {
-            for ep_id in episode_ids {
+        // Fan out Trakt pushes — one per episode. Each call is
+        // already fire-and-forget; spawning N concurrent tasks is
+        // fine for typical season/show sizes. Same shape for the
+        // un-watch path; Trakt's /sync/history/remove accepts the
+        // same episode coordinates.
+        for ep_id in episode_ids {
+            if req.watched {
                 push_watched_to_trakt(state.clone(), user.id, None, Some(ep_id));
+            } else {
+                push_unwatched_to_trakt(state.clone(), user.id, None, Some(ep_id));
             }
         }
         return Ok(StatusCode::NO_CONTENT);
@@ -97,12 +100,15 @@ pub async fn set_watched(
         req.watched,
     )
     .await?;
-    // Fire-and-forget Trakt push when marking watched. Unwatch sync is
-    // intentionally one-way for now — the symmetric remove endpoint
-    // exists in the Trakt client but isn't wired here yet to avoid
-    // accidentally clobbering history during testing.
+    // True two-way sync — push the watched-state change to Trakt in
+    // either direction. The pull side already imports remote changes
+    // on the hourly schedule; this keeps the outbound half symmetric
+    // so an un-mark in the ChimpFlix UI is reflected in the user's
+    // Trakt history without manual cleanup.
     if req.watched {
         push_watched_to_trakt(state.clone(), user.id, req.item_id, req.episode_id);
+    } else {
+        push_unwatched_to_trakt(state.clone(), user.id, req.item_id, req.episode_id);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -241,34 +247,82 @@ fn push_watched_to_trakt(
     episode_id: Option<i64>,
 ) {
     tokio::spawn(async move {
-        let now_iso = trakt_sync::epoch_ms_to_iso(chimpflix_common::now_ms());
-        let event = if let Some(id) = item_id {
-            let Some(tmdb_id) = trakt_sync::item_tmdb_id(&state.pool, id).await else {
-                return;
-            };
-            chimpflix_metadata::HistoryPush::Movie {
-                tmdb_id,
-                watched_at: now_iso,
-            }
-        } else if let Some(id) = episode_id {
-            let coords = trakt_sync::episode_trakt_coords(&state.pool, id)
-                .await
-                .ok()
-                .flatten();
-            let Some((tmdb_show_id, season, episode)) = coords else {
-                return;
-            };
-            chimpflix_metadata::HistoryPush::Episode {
-                tmdb_show_id,
-                season,
-                episode,
-                watched_at: now_iso,
-            }
-        } else {
+        let Some(event) = build_history_event(&state, item_id, episode_id).await else {
             return;
         };
         trakt_sync::push_history_event(&state, user_id, event).await;
     });
+}
+
+/// Mirror of `push_watched_to_trakt` for the un-watch direction —
+/// posts to /sync/history/remove via [`trakt_sync::remove_history_event`].
+fn push_unwatched_to_trakt(
+    state: AppState,
+    user_id: i64,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+) {
+    tokio::spawn(async move {
+        let Some(event) = build_history_event(&state, item_id, episode_id).await else {
+            return;
+        };
+        trakt_sync::remove_history_event(&state, user_id, event).await;
+    });
+}
+
+async fn build_history_event(
+    state: &AppState,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+) -> Option<chimpflix_metadata::HistoryPush> {
+    let now_iso = trakt_sync::epoch_ms_to_iso(chimpflix_common::now_ms());
+    if let Some(id) = item_id {
+        match trakt_sync::item_tmdb_id(&state.pool, id).await {
+            Some(tmdb_id) => Some(chimpflix_metadata::HistoryPush::Movie {
+                tmdb_id,
+                watched_at: now_iso,
+            }),
+            None => {
+                // Surface the skip so operators can tell "push fired but
+                // got 404" apart from "push never fired because we had
+                // no Trakt-compatible id". Anime libraries that only
+                // matched via AniList hit this path constantly.
+                tracing::info!(
+                    item_id = id,
+                    "Trakt push skipped: item has no tmdb_id"
+                );
+                None
+            }
+        }
+    } else if let Some(id) = episode_id {
+        match trakt_sync::episode_trakt_coords(&state.pool, id).await {
+            Ok(Some((tmdb_show_id, season, episode))) => {
+                Some(chimpflix_metadata::HistoryPush::Episode {
+                    tmdb_show_id,
+                    season,
+                    episode,
+                    watched_at: now_iso,
+                })
+            }
+            Ok(None) => {
+                tracing::info!(
+                    episode_id = id,
+                    "Trakt push skipped: show has no tmdb_id"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    episode_id = id,
+                    error = %format!("{e:#}"),
+                    "Trakt push: episode coords lookup failed",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -341,12 +395,23 @@ pub async fn on_deck(
 
 #[derive(Debug, Deserialize)]
 pub struct HistoryQuery {
+    /// Page size. Defaults to 60. Capped at 200 to keep the SQL
+    /// LIMIT bounded; pagers that want every entry should walk
+    /// pages instead of dialing the limit way up.
     pub limit: Option<i64>,
+    /// 1-based page index. Combined with `limit` to produce the SQL
+    /// OFFSET. Older callers omit it and get the first page, which
+    /// preserves the pre-pagination behaviour.
+    pub page: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct HistoryResponse {
     pub items: Vec<ListedItem>,
+    /// Total distinct items in this user's history (honouring the
+    /// same library-access filter as `items`). Drives the
+    /// pagination footer's "X of Y titles" summary.
+    pub total: i64,
 }
 
 pub async fn history(
@@ -355,11 +420,17 @@ pub async fn history(
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
     let limit = q.limit.unwrap_or(60).clamp(1, 200);
+    let page = q.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
     let acc = queries::user_library_filter(&state.pool, user.id, user.role)
         .await
         .map_err(ApiError::Internal)?;
-    let items = queries::list_watch_history(&state.pool, user.id, limit, acc.as_deref())
+    let items =
+        queries::list_watch_history(&state.pool, user.id, limit, offset, acc.as_deref())
+            .await
+            .map_err(ApiError::Internal)?;
+    let total = queries::count_watch_history(&state.pool, user.id, acc.as_deref())
         .await
         .map_err(ApiError::Internal)?;
-    Ok(Json(HistoryResponse { items }))
+    Ok(Json(HistoryResponse { items, total }))
 }

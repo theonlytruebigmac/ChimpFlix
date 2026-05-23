@@ -232,6 +232,47 @@ impl TraktClient {
         Ok(())
     }
 
+    /// Remove watched entries from a user's Trakt history. Mirror of
+    /// [`push_history`] — same JSON shape, posted to `/sync/history/remove`.
+    /// Used by the un-mark-watched code path so the local + Trakt
+    /// states stay in lock-step (two-way sync).
+    pub async fn remove_history(
+        &self,
+        access_token: &str,
+        entries: &[HistoryPush],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut movies = Vec::new();
+        let mut episodes = Vec::new();
+        for e in entries {
+            match e {
+                HistoryPush::Movie { tmdb_id, .. } => movies.push(json!({
+                    "ids": { "tmdb": tmdb_id },
+                })),
+                HistoryPush::Episode {
+                    tmdb_show_id,
+                    season,
+                    episode,
+                    ..
+                } => {
+                    episodes.push(json!({
+                        "show": { "ids": { "tmdb": tmdb_show_id } },
+                        "seasons": [{
+                            "number": season,
+                            "episodes": [{ "number": episode }],
+                        }],
+                    }));
+                }
+            }
+        }
+        let body = json!({ "movies": movies, "shows": episodes });
+        self.user_post("/sync/history/remove", access_token, &body)
+            .await?;
+        Ok(())
+    }
+
     pub async fn pull_history(
         &self,
         access_token: &str,

@@ -13,6 +13,7 @@ import { plexImage } from "@/lib/image";
 import { openModal } from "@/lib/modal";
 import {
   getOrFetchModalData,
+  invalidateModalData,
   prefetchModalData,
   type ModalData,
 } from "@/lib/modal-cache";
@@ -21,20 +22,24 @@ import Link from "next/link";
 import {
   auth as authApi,
   collections as collectionsApi,
+  episodes as episodesApi,
   items as itemsApi,
   libraries as librariesApi,
   playState as playStateApi,
   ratings as ratingsApi,
   tags as tagsApi,
+  trakt as traktApi,
   type Collection,
   type CollectionDetail,
   type Credit,
   type Extra,
   type ItemDetail,
   type ListedItem,
+  type MediaFileSummary,
   type Review,
   type ReviewsSummary,
   type Tag,
+  type TraktStatus,
   type User,
 } from "@/lib/chimpflix-api";
 import { EditMetadataDialog } from "./EditMetadataDialog";
@@ -48,6 +53,40 @@ import { getPrefs } from "@/lib/prefs";
 import { TitleModalShell } from "./TitleModalShell";
 import { SeasonEpisodes } from "./SeasonEpisodes";
 import { TrailerPlayer } from "./TrailerPlayer";
+
+// Module-scope cache: every modal open used to be able to re-fetch
+// /trakt/status, but the status only changes when the user (un)links
+// — a single fetch per page load is plenty. First call kicks off the
+// fetch; later calls await the same promise. Errors clear the cache
+// so the next open retries instead of remembering the failure.
+let traktStatusPromise: Promise<TraktStatus> | null = null;
+function fetchTraktStatusOnce(): Promise<TraktStatus> {
+  if (!traktStatusPromise) {
+    traktStatusPromise = traktApi.status().catch((e) => {
+      traktStatusPromise = null;
+      throw e;
+    });
+  }
+  return traktStatusPromise;
+}
+
+function useTraktLinked(): boolean {
+  const [linked, setLinked] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetchTraktStatusOnce()
+      .then((s) => {
+        if (!cancelled) setLinked(s.linked);
+      })
+      .catch(() => {
+        // Best-effort — no badge is fine when status can't be read.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return linked;
+}
 
 function useTrailer(item: MediaItem): string | null {
   const [videoId, setVideoId] = useState<string | null>(null);
@@ -128,7 +167,18 @@ function useThemeMusic(tvdbId: number | null, enabled: boolean) {
   }, [tvdbId, enabled]);
 }
 
-export function TitleModalClient({ ratingKey }: { ratingKey: string }) {
+export function TitleModalClient({
+  ratingKey,
+  initialEpisodeKey,
+}: {
+  ratingKey: string;
+  /// Optional episode hint from the open event. When the user opens
+  /// the modal by clicking a Continue Watching tile for a TV episode,
+  /// this is the episode's rating key (`e<id>`); the modal lands on
+  /// that episode's season and scrolls the row into view rather than
+  /// always opening on season 1.
+  initialEpisodeKey?: string;
+}) {
   const [data, setData] = useState<ModalData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -164,7 +214,7 @@ export function TitleModalClient({ ratingKey }: { ratingKey: string }) {
   return (
     <TitleModalShell>
       {data ? (
-        <TitleModalView data={data} />
+        <TitleModalView data={data} initialEpisodeKey={initialEpisodeKey} />
       ) : error ? (
         <div className="flex aspect-video items-center justify-center text-white/60">
           {error}
@@ -182,10 +232,38 @@ function ModalSkeleton() {
   );
 }
 
-function TitleModalView({ data }: { data: ModalData }) {
+function TitleModalView({
+  data,
+  initialEpisodeKey,
+}: {
+  data: ModalData;
+  initialEpisodeKey?: string;
+}) {
   const [detail, setDetail] = useState<ItemDetail>(data.detail);
+  // Single landing pad for "the underlying item changed, mirror it
+  // into local state and drop the modal cache so the next open
+  // doesn't show stale state". Used by WatchedToggle / AdminActions
+  // for full ItemDetail responses and by SeasonEpisodes (via
+  // refreshDetail) when bulk / per-episode toggles change watch_stats
+  // that the show-level WatchedToggle reads from.
+  const handleDetailUpdated = useCallback((next: ItemDetail) => {
+    setDetail(next);
+    invalidateModalData(String(next.id));
+  }, []);
+  // Used as `onWatchStatsChange` for SeasonEpisodes — fetches a fresh
+  // ItemDetail so the show-level "Mark all as watched / unwatched"
+  // button reflects per-episode + bulk toggles immediately.
+  const refreshDetail = useCallback(async () => {
+    try {
+      const next = await itemsApi.get(detail.id);
+      handleDetailUpdated(next);
+    } catch {
+      // Best-effort — UI just stays stale.
+    }
+  }, [detail.id, handleDetailUpdated]);
   const { item, seasons, initialEpisodes, similar, credits, extras } = data;
   const isShow = item.type === "show";
+  const traktLinked = useTraktLinked();
   // Owner-only flag for the SeasonEpisodes per-episode "Edit markers"
   // button. Sub-components (TagBar, AdminActionsMenu) do their own
   // owner checks via authApi.me — we need a parallel one here because
@@ -410,11 +488,9 @@ function TitleModalView({ data }: { data: ModalData }) {
                 </svg>
               )}
             </button>
-            <WatchedToggle detail={detail} onUpdated={(next) => setDetail(next)} />
-            <AdminActions
-              detail={detail}
-              onUpdated={(next) => setDetail(next)}
-            />
+            <WatchedToggle detail={detail} onUpdated={handleDetailUpdated} />
+            {traktLinked && <TraktSyncBadge />}
+            <AdminActions detail={detail} onUpdated={handleDetailUpdated} />
           </div>
         </div>
       </div>
@@ -499,10 +575,12 @@ function TitleModalView({ data }: { data: ModalData }) {
           initialEpisodes={initialEpisodes}
           initialSeasonKey={firstSeason.ratingKey}
           isOwner={isOwnerView}
+          targetEpisodeKey={initialEpisodeKey}
+          onWatchStatsChange={refreshDetail}
         />
       )}
 
-      <FileInfoSection detail={detail} />
+      <FileInfoSection detail={detail} initialEpisodes={initialEpisodes} />
       <RatingBar itemId={detail.id} />
       <TagBar itemId={detail.id} />
       <ExternalLinks detail={detail} />
@@ -522,14 +600,29 @@ function TitleModalView({ data }: { data: ModalData }) {
 }
 
 function MoreLikeThis({ items }: { items: MediaItem[] }) {
+  const INITIAL_COUNT = 9;
+  const [expanded, setExpanded] = useState(false);
+  const visible = expanded ? items : items.slice(0, INITIAL_COUNT);
+  const canExpand = items.length > INITIAL_COUNT;
   return (
     <section className="border-t border-white/10 px-10 py-8">
       <h2 className="mb-6 text-2xl font-medium">More Like This</h2>
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-        {items.slice(0, 9).map((it) => (
+        {visible.map((it) => (
           <SimilarCard key={it.ratingKey} item={it} />
         ))}
       </div>
+      {canExpand && (
+        <div className="mt-6 flex justify-center">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="rounded-md border border-white/20 px-4 py-2 text-sm text-white/80 transition-colors hover:border-white/40 hover:text-white"
+          >
+            {expanded ? "Show less" : `Show all (${items.length})`}
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -584,10 +677,46 @@ function SimilarCard({ item }: { item: MediaItem }) {
 
 // Plex-style strip of technical details for the title's primary file:
 // resolution, codec, audio tracks, subtitle tracks, container, bit rate.
-// For movies this is the single media file; for shows we show whatever
-// counts the show has (episode-level files render in the per-episode UI).
-function FileInfoSection({ detail }: { detail: ItemDetail }) {
-  const file = detail.files[0];
+// For movies this is the single media file. Shows don't have a file
+// of their own — episodes do — so we lazy-fetch the first episode's
+// primary file and present it as a representative ("Typical Episode")
+// rather than rendering nothing.
+function FileInfoSection({
+  detail,
+  initialEpisodes,
+}: {
+  detail: ItemDetail;
+  initialEpisodes: MediaItem[];
+}) {
+  const isShow = detail.kind === "show";
+  // Episode files we fetch on demand for shows. Movies use detail.files
+  // directly. `loaded` distinguishes "fetch in flight" (null) from
+  // "fetch completed, no files" (empty array) so we can skip the
+  // section entirely in the latter case.
+  const [episodeFiles, setEpisodeFiles] = useState<MediaFileSummary[] | null>(
+    null,
+  );
+  const firstEpisodeKey = initialEpisodes[0]?.ratingKey;
+  useEffect(() => {
+    if (!isShow) return;
+    if (!firstEpisodeKey || !firstEpisodeKey.startsWith("e")) return;
+    const epId = Number.parseInt(firstEpisodeKey.slice(1), 10);
+    if (!Number.isFinite(epId)) return;
+    let cancelled = false;
+    episodesApi
+      .get(epId)
+      .then((d) => {
+        if (!cancelled) setEpisodeFiles(d.files);
+      })
+      .catch(() => {
+        if (!cancelled) setEpisodeFiles([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isShow, firstEpisodeKey]);
+
+  const file = isShow ? episodeFiles?.[0] : detail.files[0];
   if (!file) return null;
 
   const audio = file.streams.filter((s) => s.kind === "audio");
@@ -616,7 +745,7 @@ function FileInfoSection({ detail }: { detail: ItemDetail }) {
   return (
     <section className="border-t border-white/10 px-10 py-6">
       <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-white/55">
-        File Info
+        {isShow ? "Typical Episode" : "File Info"}
       </h2>
       <dl className="grid grid-cols-1 gap-x-8 gap-y-2 text-sm sm:grid-cols-2">
         {resolution && (
@@ -695,6 +824,27 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 // flips to "Mark all unwatched". This matches the Plex behaviour
 // where the ✓ on a show tile means "fully watched" but the per-show
 // detail page just offers the bulk toggle.
+
+// Tiny pill that appears next to WatchedToggle when the user has
+// linked Trakt. Communicates "this watched-state will sync upstream"
+// at the surface where they're about to flip it, instead of buried
+// in Settings → Integrations.
+function TraktSyncBadge() {
+  return (
+    <span
+      title="Watched state will sync to Trakt"
+      aria-label="Synced with Trakt"
+      className="inline-flex h-6 items-center gap-1 rounded-full border border-white/15 bg-white/5 px-2 text-[10px] font-semibold uppercase tracking-wider text-white/70"
+    >
+      <span
+        aria-hidden
+        className="inline-block h-1.5 w-1.5 rounded-full bg-(--color-accent)"
+      />
+      Trakt
+    </span>
+  );
+}
+
 function WatchedToggle({
   detail,
   onUpdated,
@@ -704,6 +854,11 @@ function WatchedToggle({
 }) {
   const isShow = detail.kind === "show";
   const [busy, setBusy] = useState(false);
+  // Ephemeral confirmation surfaced via aria-live for screen readers.
+  // Without this, flipping the watched state was completely silent —
+  // SR users only saw the (visually-changed) button without any
+  // confirmation that the mutation succeeded.
+  const [confirmation, setConfirmation] = useState<string | null>(null);
 
   // Movies use `play_state.watched`; shows derive "fully watched"
   // from the per-user watch_stats subquery the backend joins on
@@ -720,27 +875,45 @@ function WatchedToggle({
     if (busy) return;
     setBusy(true);
     try {
+      const willBeWatched = !watched;
       if (isShow) {
         await playStateApi.setWatched({
           show_id: detail.id,
-          watched: !watched,
+          watched: willBeWatched,
         });
       } else {
         await playStateApi.setWatched({
           item_id: detail.id,
-          watched: !watched,
+          watched: willBeWatched,
         });
       }
       // Refetch the detail so play_state / watch_stats / view_count
       // are in sync without us having to mirror the server's logic.
       const next = await itemsApi.get(detail.id);
       onUpdated(next);
+      setConfirmation(
+        isShow
+          ? willBeWatched
+            ? "All episodes marked as watched"
+            : "All episodes marked as unwatched"
+          : willBeWatched
+            ? "Marked as watched"
+            : "Marked as unwatched",
+      );
     } catch {
       // Best-effort.
     } finally {
       setBusy(false);
     }
   }
+
+  // Clear the SR confirmation after a few seconds so a SR user
+  // re-visiting the toggle doesn't hear stale state announced.
+  useEffect(() => {
+    if (!confirmation) return;
+    const t = window.setTimeout(() => setConfirmation(null), 3000);
+    return () => window.clearTimeout(t);
+  }, [confirmation]);
 
   const label = isShow
     ? watched
@@ -751,32 +924,41 @@ function WatchedToggle({
       : "Mark as watched";
 
   return (
-    <button
-      type="button"
-      onClick={toggle}
-      disabled={busy}
-      aria-label={label}
-      title={label}
-      className={`flex h-11 w-11 items-center justify-center rounded-full border-2 transition-colors disabled:opacity-50 ${
-        watched
-          ? "border-(--color-accent) bg-(--color-accent) text-white"
-          : "border-white/60 text-white hover:border-white"
-      }`}
-    >
-      <svg
-        width="18"
-        height="18"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        aria-hidden
+    <>
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={busy}
+        aria-label={label}
+        title={label}
+        className={`flex h-11 w-11 items-center justify-center rounded-full border-2 transition-colors disabled:opacity-50 ${
+          watched
+            ? "border-(--color-accent) bg-(--color-accent) text-white"
+            : "border-white/60 text-white hover:border-white"
+        }`}
       >
-        <polyline points="20 6 9 17 4 12" />
-      </svg>
-    </button>
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden
+        >
+          <polyline points="20 6 9 17 4 12" />
+        </svg>
+      </button>
+      {/* Visually-hidden polite live region for screen readers. The
+          visual change on the button itself is enough for sighted
+          users; this catches SR users so they hear "Marked as
+          watched" when the mutation lands. */}
+      <span aria-live="polite" className="sr-only">
+        {confirmation ?? ""}
+      </span>
+    </>
   );
 }
 
@@ -2042,18 +2224,24 @@ function CastAndCrew({ credits }: { credits: Credit[] }) {
 
 function CastTile({ credit }: { credit: Credit }) {
   const photo = credit.person.photo_url ?? null;
+  // `imgFailed` lets us swap to the initials fallback when the URL
+  // exists but the TMDB CDN returns 404 — without this the broken-
+  // image icon flashes for a frame before the parent's null check
+  // could ever fire (it can't, the URL string is non-null).
+  const [imgFailed, setImgFailed] = useState(false);
+  const showInitials = !photo || imgFailed;
+  // Clicking navigates to /person/[id]; the modal closes naturally
+  // because the ?modal= query param drops on navigation. The whole
+  // tile is one big clickable surface so the click target matches
+  // the visual affordance.
   return (
-    <div className="w-32 shrink-0 text-center">
-      <div className="relative mx-auto h-28 w-28 overflow-hidden rounded-full bg-white/5">
-        {photo ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={photo}
-            alt={credit.person.name}
-            loading="lazy"
-            className="h-full w-full object-cover"
-          />
-        ) : (
+    <Link
+      href={`/person/${credit.person.id}`}
+      className="group w-32 shrink-0 text-center outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-md"
+      aria-label={`Filmography for ${credit.person.name}`}
+    >
+      <div className="relative mx-auto h-28 w-28 overflow-hidden rounded-full bg-white/5 transition-transform duration-150 group-hover:scale-105">
+        {showInitials ? (
           <div className="flex h-full w-full items-center justify-center text-2xl font-bold text-white/40">
             {credit.person.name
               .split(" ")
@@ -2061,9 +2249,18 @@ function CastTile({ credit }: { credit: Credit }) {
               .slice(0, 2)
               .join("")}
           </div>
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={photo as string}
+            alt=""
+            loading="lazy"
+            onError={() => setImgFailed(true)}
+            className="h-full w-full object-cover"
+          />
         )}
       </div>
-      <div className="mt-2 line-clamp-2 text-sm font-medium text-white">
+      <div className="mt-2 line-clamp-2 text-sm font-medium text-white transition-colors group-hover:text-accent">
         {credit.person.name}
       </div>
       {credit.character_name && (
@@ -2071,7 +2268,7 @@ function CastTile({ credit }: { credit: Credit }) {
           {credit.character_name}
         </div>
       )}
-    </div>
+    </Link>
   );
 }
 

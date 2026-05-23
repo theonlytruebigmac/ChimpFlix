@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   prefs as prefsApi,
   type Library,
@@ -14,6 +14,19 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
   const [hidden, setHidden] = useState<Set<number> | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Auto-clear the "Saved" toast after 2s so it doesn't linger on the
+  // page indefinitely after the last toggle. Errors stay until the
+  // next toggle so the user can read them.
+  const okTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (okTimerRef.current !== null) {
+        window.clearTimeout(okTimerRef.current);
+        okTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,12 +50,19 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
     else next.add(id);
     setHidden(next);
     setBusy(true);
-    setMessage(null);
+    setError(null);
     try {
       await prefsApi.setHiddenLibraries([...next]);
+      setMessage("Saved.");
+      if (okTimerRef.current !== null) window.clearTimeout(okTimerRef.current);
+      okTimerRef.current = window.setTimeout(() => {
+        okTimerRef.current = null;
+        setMessage(null);
+      }, 2000);
     } catch {
-      setMessage("Failed to save. Try again.");
+      setError("Failed to save. Try again.");
       setHidden(hidden);
+      setMessage(null);
     } finally {
       setBusy(false);
     }
@@ -95,7 +115,13 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
           );
         })}
       </ul>
-      {message && <p className="mt-2 text-xs text-red-300">{message}</p>}
+      <p
+        role="status"
+        aria-live="polite"
+        className={`mt-2 text-xs ${error ? "text-red-300" : "text-white/55"}`}
+      >
+        {error ?? message ?? ""}
+      </p>
     </div>
   );
 }

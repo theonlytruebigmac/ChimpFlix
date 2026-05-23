@@ -40,15 +40,23 @@ export function SettingsEmailChangeClient({ initial }: Props) {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setAutoVerifying(true);
     (async () => {
+      let succeeded = false;
       try {
         const { email } = await authApi.confirmEmailChange(tokenFromQuery);
         setCurrentEmail(email);
         setVerifyStatus(`Email updated to ${email}.`);
+        succeeded = true;
       } catch (e) {
         setError(parseError(e));
       } finally {
-        // Strip the query so it doesn't persist in history or get re-run.
-        router.replace("/settings/account", { scroll: false });
+        // Strip the query only on success so a reload doesn't double-
+        // submit the token. On failure we keep `?verify_email=...` in
+        // the URL so the user can retry by reloading, or copy/share the
+        // link with support — without this the failed token is gone the
+        // moment they see the error.
+        if (succeeded) {
+          router.replace("/settings/account", { scroll: false });
+        }
       }
     })();
   }, [tokenFromQuery, autoVerifying, router]);

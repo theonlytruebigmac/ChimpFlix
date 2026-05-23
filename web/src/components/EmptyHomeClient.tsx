@@ -155,7 +155,7 @@ function LibraryScanRow({
   // window.location to invalidate every server-component cache
   // (router.refresh would also work but reuses the existing tree).
   useEffect(() => {
-    if (scan?.status === "completed" && (scan.files_added ?? 0) > 0) {
+    if (scan?.status === "succeeded" && (scan.files_added ?? 0) > 0) {
       const t = window.setTimeout(() => {
         window.location.reload();
       }, 1500);
@@ -177,7 +177,7 @@ function LibraryScanRow({
 
   const status = scan?.status ?? "queued";
   const isFinishedEmpty =
-    status === "completed" && (scan?.files_added ?? 0) === 0;
+    status === "succeeded" && (scan?.files_added ?? 0) === 0;
 
   return (
     <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
@@ -257,7 +257,7 @@ function Pill({ status }: { status: ScanJob["status"] }) {
       label: "Scanning…",
       cls: "bg-blue-500/15 text-blue-300 ring-blue-500/30",
     },
-    completed: {
+    succeeded: {
       label: "Done",
       cls: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30",
     },

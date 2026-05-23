@@ -7,6 +7,7 @@ import {
   ChimpFlixApiError,
   type AccessMatrixEntry,
   type AdminSessionSummary,
+  type AuditLogEntry,
   type User,
   type UserRole,
 } from "@/lib/chimpflix-api";
@@ -616,7 +617,9 @@ function UserDrawer({
           />
         )}
 
-        {tab === "audit" && <AuditTab username={user.username} />}
+        {tab === "audit" && (
+          <AuditTab userId={user.id} username={user.username} />
+        )}
       </DrawerBody>
       {askSendReset && (
         <ConfirmDialog
@@ -891,21 +894,127 @@ function DevicesTab({
   );
 }
 
-function AuditTab({ username }: { username: string }) {
+function AuditTab({
+  userId,
+  username,
+}: {
+  userId: number;
+  username: string;
+}) {
+  const [entries, setEntries] = useState<AuditLogEntry[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(20);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setEntries(null);
+    setError(null);
+    adminApi.audit
+      .list({ actor_user_id: userId, limit: pageSize, offset: 0 })
+      .then((res) => {
+        if (cancelled) return;
+        setEntries(res.entries);
+        setTotal(res.total);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setEntries([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, pageSize]);
+
+  if (entries === null) {
+    return <p className="text-[12.5px] text-white/55">Loading…</p>;
+  }
+  if (error) {
+    return (
+      <p className="text-[12.5px] text-red-300">
+        Couldn&rsquo;t load audit entries: {error}
+      </p>
+    );
+  }
+  if (entries.length === 0) {
+    return (
+      <p className="text-[12.5px] text-white/55">
+        No admin actions recorded for{" "}
+        <code className="font-mono text-white/75">@{username}</code> yet.
+      </p>
+    );
+  }
+
   return (
-    <p className="text-[12.5px] text-white/55">
-      Per-user audit timeline for{" "}
-      <code className="font-mono text-white/75">@{username}</code> is
-      not yet wired into this drawer. Until then, the global audit log
-      at{" "}
-      <a
-        href="/settings/admin/maintenance/logs/audit"
-        className="text-white/80 underline hover:text-white"
-      >
-        Maintenance → Logs → Audit trail
-      </a>{" "}
-      shows every admin action across the server.
-    </p>
+    <div className="space-y-2">
+      <div className="text-[11px] text-white/45">
+        {total === 1 ? "1 action" : `${total.toLocaleString()} actions`}
+        {entries.length < total && ` — showing latest ${entries.length}`}
+      </div>
+      <ol className="space-y-2">
+        {entries.map((e) => (
+          <AuditRow key={e.id} entry={e} />
+        ))}
+      </ol>
+      {entries.length < total && (
+        <button
+          type="button"
+          onClick={() => setPageSize((s) => s + 20)}
+          className="mt-2 w-full rounded border border-white/10 bg-white/2 px-2 py-1.5 text-[11.5px] text-white/65 hover:border-white/20 hover:text-white"
+        >
+          Load more
+        </button>
+      )}
+      <p className="pt-1 text-[11px] text-white/40">
+        Full server-wide log at{" "}
+        <a
+          href="/settings/admin/maintenance/logs/audit"
+          className="text-white/55 underline hover:text-white"
+        >
+          Maintenance → Logs → Audit trail
+        </a>
+        .
+      </p>
+    </div>
+  );
+}
+
+function AuditRow({ entry }: { entry: AuditLogEntry }) {
+  const when = new Date(entry.created_at);
+  return (
+    <li className="rounded-md border border-white/10 bg-white/2 p-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <code className="truncate font-mono text-[11.5px] text-white/85">
+          {entry.action}
+        </code>
+        <time
+          className="shrink-0 text-[10.5px] text-white/45"
+          dateTime={when.toISOString()}
+          title={when.toLocaleString()}
+        >
+          {when.toLocaleString(undefined, {
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          })}
+        </time>
+      </div>
+      {(entry.target_kind || entry.target_id) && (
+        <div className="mt-0.5 text-[11px] text-white/55">
+          {entry.target_kind ?? "—"}
+          {entry.target_id != null && (
+            <span className="text-white/35"> #{entry.target_id}</span>
+          )}
+        </div>
+      )}
+      {entry.ip && (
+        <div className="mt-0.5 font-mono text-[10.5px] text-white/40">
+          {entry.ip}
+        </div>
+      )}
+    </li>
   );
 }
 

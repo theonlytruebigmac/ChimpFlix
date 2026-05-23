@@ -6,9 +6,20 @@
 const OPEN = "app:modal:open";
 const CLOSE = "app:modal:close";
 
-export function openModal(ratingKey: string): void {
+export type OpenModalDetail = { ratingKey: string; episodeKey?: string };
+
+/// Opens the title modal for the given show / movie ratingKey. When
+/// `episodeKey` is provided (a row like `e123`) and the modal target
+/// is a show, the modal lands on the season containing that episode
+/// and scrolls the row into view — i.e. opening from a Continue
+/// Watching tile for S3E5 actually shows S3E5, not the show's S1.
+export function openModal(ratingKey: string, episodeKey?: string): void {
   if (typeof window === "undefined") return;
-  window.dispatchEvent(new CustomEvent(OPEN, { detail: ratingKey }));
+  window.dispatchEvent(
+    new CustomEvent<OpenModalDetail>(OPEN, {
+      detail: { ratingKey, episodeKey },
+    }),
+  );
 }
 
 export function closeModal(): void {

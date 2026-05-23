@@ -28,6 +28,7 @@ import {
   type DrawerTab,
   type PillTone,
 } from "./ui";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   initialLibraries: Library[];
@@ -235,6 +236,7 @@ function LibraryDrawer({
   } | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [purging, setPurging] = useState(false);
+  const [askPurge, setAskPurge] = useState<"grace" | "immediate" | null>(null);
   const [purgeResult, setPurgeResult] = useState<{
     files_purged: number;
     episodes_purged: number;
@@ -363,16 +365,7 @@ function LibraryDrawer({
       setVerifying(false);
     }
   }
-  async function runPurge(immediate: boolean) {
-    if (
-      !confirm(
-        immediate
-          ? "Immediately hard-delete every orphan file row for this library, plus any episodes/seasons/items left without children? This can't be undone."
-          : "Purge orphan files older than the 7-day grace window. Files marked removed today will stay.",
-      )
-    ) {
-      return;
-    }
+  async function runPurgeConfirmed(immediate: boolean) {
     setPurging(true);
     setError(null);
     try {
@@ -390,6 +383,7 @@ function LibraryDrawer({
       } catch {
         // best-effort refresh
       }
+      setAskPurge(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -747,10 +741,10 @@ function LibraryDrawer({
                 busy={purging}
                 busyLabel="Purging…"
                 disabled={orphanCount === 0}
-                onClick={() => runPurge(false)}
+                onClick={() => setAskPurge("grace")}
               />
               <button
-                onClick={() => runPurge(true)}
+                onClick={() => setAskPurge("immediate")}
                 disabled={purging || orphanCount === 0}
                 className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[12px] font-medium text-red-300 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                 title="Hard-delete every orphan row now. Skips the grace window."
@@ -809,6 +803,25 @@ function LibraryDrawer({
           </>
         )}
       </DrawerBody>
+      {askPurge && (
+        <ConfirmDialog
+          title={
+            askPurge === "immediate"
+              ? `Purge every orphan file in "${lib.name}" now?`
+              : `Purge orphan files past the 7-day grace?`
+          }
+          body={
+            askPurge === "immediate"
+              ? "This hard-deletes every media_file row marked as removed for this library, plus any episodes/seasons/items left without children. Cannot be undone. Files marked today will be wiped — use this only if you're sure the missing files won't come back."
+              : "Permanently removes media_files marked as removed more than 7 days ago, plus the episodes/seasons/items they were the last child of. Newly-removed files stay until they age out."
+          }
+          confirmLabel={askPurge === "immediate" ? "Purge all now" : "Purge expired"}
+          destructive
+          busy={purging}
+          onConfirm={() => void runPurgeConfirmed(askPurge === "immediate")}
+          onCancel={() => setAskPurge(null)}
+        />
+      )}
     </Drawer>
   );
 }

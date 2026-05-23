@@ -30,8 +30,20 @@ export function SettingsTwoFactorClient() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // Set while the RecoveryCodesPanel is up — drained into `message`
+  // when the user dismisses the panel, so the success toast appears
+  // *after* the codes are out of the way (not under them where it'd
+  // compete for attention).
+  const [pendingDismissMessage, setPendingDismissMessage] = useState<string | null>(
+    null,
+  );
   const [askDisable, setAskDisable] = useState(false);
   const [askRegenerate, setAskRegenerate] = useState(false);
+  // Toggled by the QR `<img onError>` so the manual-entry details
+  // section auto-opens (and the QR slot shows a hint) when the data
+  // URL fails to render — old browsers, broken CSP, image decoder
+  // hiccups all surface this way.
+  const [qrLoadFailed, setQrLoadFailed] = useState(false);
   // See SettingsProfileClient for rationale — track the auto-clear
   // timer so it can be cancelled on unmount.
   const messageTimerRef = useRef<number | null>(null);
@@ -96,6 +108,9 @@ export function SettingsTwoFactorClient() {
       const status = await authApi.twoFactor.status();
       setStage({ kind: "verified", status, recoveryCodes: recovery_codes });
       setCode("");
+      // Defer the toast until the codes panel is dismissed — the codes
+      // themselves are the success indicator while the panel is up.
+      setPendingDismissMessage("Two-factor authentication enabled.");
     } catch (e) {
       setError(parseError(e));
     } finally {
@@ -137,6 +152,7 @@ export function SettingsTwoFactorClient() {
       setPassword("");
       const status = await authApi.twoFactor.status();
       setStage({ kind: "verified", status, recoveryCodes: recovery_codes });
+      setPendingDismissMessage("Recovery codes regenerated.");
     } catch (e) {
       setError(parseError(e));
     } finally {
@@ -157,12 +173,20 @@ export function SettingsTwoFactorClient() {
       <StatusLine status={status} />
 
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
       )}
       {message && (
-        <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
+        >
           {message}
         </div>
       )}
@@ -199,18 +223,31 @@ export function SettingsTwoFactorClient() {
             app, scan this QR, then enter the current 6-digit code below.
           </p>
           <div className="flex flex-col items-start gap-4 sm:flex-row">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={stage.enrollment.qr_data_url}
-              alt="TOTP enrollment QR code"
-              width={200}
-              height={200}
-              className="rounded bg-white p-2"
-            />
+            {qrLoadFailed ? (
+              <div className="flex h-50 w-50 shrink-0 flex-col items-center justify-center rounded border border-amber-500/30 bg-amber-500/5 px-3 text-center text-[11px] leading-snug text-amber-200/80">
+                <span>QR code didn&apos;t load.</span>
+                <span className="mt-1">Use the manual entry secret below.</span>
+              </div>
+            ) : (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={stage.enrollment.qr_data_url}
+                alt="TOTP enrollment QR code"
+                width={200}
+                height={200}
+                onError={() => setQrLoadFailed(true)}
+                className="rounded bg-white p-2"
+              />
+            )}
             <div className="flex-1 space-y-3">
-              <details className="text-xs text-amber-200/80">
+              <details
+                className="text-xs text-amber-200/80"
+                open={qrLoadFailed}
+              >
                 <summary className="cursor-pointer text-amber-200 hover:text-amber-100">
-                  Can&apos;t scan? Use the manual entry secret
+                  {qrLoadFailed
+                    ? "Manual entry secret (use this instead of QR)"
+                    : "Can't scan? Use the manual entry secret"}
                 </summary>
                 <div className="mt-2 space-y-2">
                   <CopyBlock
@@ -253,7 +290,16 @@ export function SettingsTwoFactorClient() {
       {stage.kind === "verified" && (
         <RecoveryCodesPanel
           codes={stage.recoveryCodes}
-          onDismiss={() => void refresh()}
+          onDismiss={() => {
+            // Drain the deferred success toast — now that the codes are
+            // out of the way, the user sees the confirmation without it
+            // competing with the codes panel for attention.
+            if (pendingDismissMessage) {
+              setMessage(pendingDismissMessage);
+              setPendingDismissMessage(null);
+            }
+            void refresh();
+          }}
         />
       )}
 
@@ -375,8 +421,32 @@ function PasswordField({
 }
 
 function CopyBlock({ label, value }: { label: string; value: string }) {
+  // Tri-state lets us flip the button label between "Copy" / "Copied!" /
+  // "Copy failed" so the user knows the click landed (or didn't —
+  // permission-denied / insecure-context paths used to fail silently).
+  const [state, setState] = useState<"idle" | "ok" | "err">("idle");
+  const resetTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (resetTimerRef.current !== null) {
+        window.clearTimeout(resetTimerRef.current);
+        resetTimerRef.current = null;
+      }
+    };
+  }, []);
+  function flash(next: "ok" | "err") {
+    setState(next);
+    if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
+    resetTimerRef.current = window.setTimeout(() => {
+      resetTimerRef.current = null;
+      setState("idle");
+    }, 2000);
+  }
   function copy() {
-    void navigator.clipboard.writeText(value).catch(() => {});
+    navigator.clipboard
+      .writeText(value)
+      .then(() => flash("ok"))
+      .catch(() => flash("err"));
   }
   return (
     <div>
@@ -385,9 +455,10 @@ function CopyBlock({ label, value }: { label: string; value: string }) {
         <button
           type="button"
           onClick={copy}
+          aria-live="polite"
           className="rounded border border-white/20 px-2 py-0.5 text-white/80 hover:bg-white/10"
         >
-          Copy
+          {state === "ok" ? "Copied!" : state === "err" ? "Copy failed" : "Copy"}
         </button>
       </div>
       <code className="block break-all rounded bg-black/40 p-2 font-mono text-[11px] text-white/90">
@@ -404,8 +475,32 @@ function RecoveryCodesPanel({
   codes: string[];
   onDismiss: () => void;
 }) {
+  const [copyState, setCopyState] = useState<"idle" | "ok" | "err">("idle");
+  const copyTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
   function copyAll() {
-    void navigator.clipboard.writeText(codes.join("\n")).catch(() => {});
+    navigator.clipboard
+      .writeText(codes.join("\n"))
+      .then(() => {
+        setCopyState("ok");
+      })
+      .catch(() => {
+        setCopyState("err");
+      })
+      .finally(() => {
+        if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = window.setTimeout(() => {
+          copyTimerRef.current = null;
+          setCopyState("idle");
+        }, 2500);
+      });
   }
   return (
     <div className="space-y-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-4">
@@ -432,9 +527,14 @@ function RecoveryCodesPanel({
       <button
         type="button"
         onClick={copyAll}
+        aria-live="polite"
         className="rounded bg-emerald-500/30 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500/40"
       >
-        Copy all
+        {copyState === "ok"
+          ? "Copied to clipboard"
+          : copyState === "err"
+            ? "Copy failed — select and copy manually"
+            : "Copy all"}
       </button>
     </div>
   );

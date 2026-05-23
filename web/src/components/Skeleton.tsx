@@ -3,10 +3,14 @@
 // the page doesn't reflow when content arrives.
 
 export function CardSkeleton() {
+  // Width mirrors `Card` exactly: ~2 cards across a 360px mobile viewport,
+  // upscaling to the original 18rem at md+. Mismatched widths produce a
+  // hydration warning (real grid uses w-44 / sm:w-56 / md:w-72) and a
+  // visible layout shift when the placeholder swaps for the real card.
   return (
-    <div className="w-72 flex-none">
+    <div className="w-44 flex-none sm:w-56 md:w-72">
       <div className="aspect-video w-full overflow-hidden rounded-md bg-white/5">
-        <div className="h-full w-full animate-pulse bg-linear-to-br from-white/[0.04] to-white/[0.08]" />
+        <div className="h-full w-full animate-pulse bg-linear-to-br from-white/4 to-white/8" />
       </div>
     </div>
   );
@@ -30,17 +34,23 @@ export function RailSkeleton({ title }: { title?: string }) {
 }
 
 export function HeroSkeleton() {
+  // Visibility note: previous pulse used `from-white/4 via-white/2` which
+  // is so close to the background colour that the whole hero zone reads
+  // as a blank black rectangle on first paint. Users reported it looking
+  // like nothing was loading. Bumped to white/8 with `animate-pulse` on
+  // the title/description boxes so there's clearly *something* there
+  // while the data resolves.
   return (
-    <section className="relative h-[70vh] min-h-120 w-full overflow-hidden bg-linear-to-r from-white/[0.04] to-(--color-background)">
-      <div className="absolute inset-0 animate-pulse bg-linear-to-r from-(--color-background) via-white/[0.02] to-transparent" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-80 bg-linear-to-t from-(--color-background) via-(--color-background)/70 to-transparent" />
+    <section className="relative h-[70vh] min-h-120 w-full overflow-hidden bg-linear-to-r from-white/8 to-background">
+      <div className="absolute inset-0 animate-pulse bg-linear-to-r from-background via-white/5 to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-80 bg-linear-to-t from-background via-background/70 to-transparent" />
       <div className="relative z-10 flex h-full max-w-2xl flex-col justify-end px-4 sm:px-8 md:px-12 pb-36">
-        <div className="mb-5 h-14 w-2/3 rounded bg-white/10" />
-        <div className="mb-2 h-4 w-full rounded bg-white/5" />
-        <div className="mb-7 h-4 w-3/4 rounded bg-white/5" />
+        <div className="mb-5 h-14 w-2/3 animate-pulse rounded bg-white/15" />
+        <div className="mb-2 h-4 w-full animate-pulse rounded bg-white/10" />
+        <div className="mb-7 h-4 w-3/4 animate-pulse rounded bg-white/10" />
         <div className="flex gap-3">
-          <div className="h-11 w-32 rounded bg-white/10" />
-          <div className="h-11 w-32 rounded bg-white/5" />
+          <div className="h-11 w-32 animate-pulse rounded bg-white/15" />
+          <div className="h-11 w-32 animate-pulse rounded bg-white/10" />
         </div>
       </div>
     </section>

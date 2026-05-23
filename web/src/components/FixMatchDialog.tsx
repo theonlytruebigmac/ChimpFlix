@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   friendlyErrorMessage,
@@ -8,6 +8,7 @@ import {
   type ItemDetail,
   type MatchCandidate,
 } from "@/lib/chimpflix-api";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 const TMDB_IMAGE = "https://image.tmdb.org/t/p/w185";
 
@@ -31,14 +32,12 @@ export function FixMatchDialog({
   const [error, setError] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
   const [applying, setApplying] = useState<number | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = "fixmatch-dialog-title";
 
-  useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [onClose]);
+  // Escape + Tab cycling + restore-focus-on-close handled centrally
+  // by the shared hook (was a duplicated `keydown` listener here).
+  useFocusTrap(dialogRef, { onClose });
 
   // Run an initial search so the dialog opens with results already populated
   // for the existing title — matches Plex's UX where Fix Match shows the
@@ -99,12 +98,18 @@ export function FixMatchDialog({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         className="zf-modal-in w-full max-w-3xl overflow-hidden rounded-lg border border-white/10 bg-(--color-surface) shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
           <div>
-            <h2 className="text-lg font-semibold">Fix Match</h2>
+            <h2 id={titleId} className="text-lg font-semibold">
+              Fix Match
+            </h2>
             <p className="mt-0.5 text-xs text-white/55">
               Current: {detail.title}
               {detail.year != null && ` (${detail.year})`}

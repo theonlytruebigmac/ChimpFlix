@@ -26,6 +26,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const [baseline, setBaseline] = useState({
     scan_automatically: settings.scan_automatically,
     audio_normalize_enabled: settings.audio_normalize_enabled,
+    subtitle_default_offset_ms: settings.subtitle_default_offset_ms,
     scanner_nice_level: settings.scanner_nice_level,
     video_played_threshold_pct: settings.video_played_threshold_pct,
     video_completion_behaviour: settings.video_completion_behaviour,
@@ -40,6 +41,9 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const [scanAuto, setScanAuto] = useState(baseline.scan_automatically);
   const [audioNormalize, setAudioNormalize] = useState(
     baseline.audio_normalize_enabled,
+  );
+  const [subtitleDefaultOffsetMs, setSubtitleDefaultOffsetMs] = useState(
+    baseline.subtitle_default_offset_ms,
   );
   const [scannerNice, setScannerNice] = useState(baseline.scanner_nice_level);
   const [playedThreshold, setPlayedThreshold] = useState(
@@ -69,6 +73,8 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const dirtyFields: Record<string, boolean> = {
     "Auto-scan": scanAuto !== baseline.scan_automatically,
     "Audio normalize": audioNormalize !== baseline.audio_normalize_enabled,
+    "Subtitle default offset":
+      subtitleDefaultOffsetMs !== baseline.subtitle_default_offset_ms,
     "Scanner nice level": scannerNice !== baseline.scanner_nice_level,
     "Watched threshold":
       playedThreshold !== baseline.video_played_threshold_pct,
@@ -99,6 +105,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     const patch: ServerSettingsUpdate = {
       scan_automatically: scanAuto,
       audio_normalize_enabled: audioNormalize,
+      subtitle_default_offset_ms: subtitleDefaultOffsetMs,
       scanner_nice_level: scannerNice,
       video_played_threshold_pct: playedThreshold,
       video_completion_behaviour: completionBehaviour,
@@ -113,6 +120,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     setBaseline({
       scan_automatically: scanAuto,
       audio_normalize_enabled: audioNormalize,
+      subtitle_default_offset_ms: subtitleDefaultOffsetMs,
       scanner_nice_level: scannerNice,
       video_played_threshold_pct: playedThreshold,
       video_completion_behaviour: completionBehaviour,
@@ -128,6 +136,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   function discard() {
     setScanAuto(baseline.scan_automatically);
     setAudioNormalize(baseline.audio_normalize_enabled);
+    setSubtitleDefaultOffsetMs(baseline.subtitle_default_offset_ms);
     setScannerNice(baseline.scanner_nice_level);
     setPlayedThreshold(baseline.video_played_threshold_pct);
     setCompletionBehaviour(baseline.video_completion_behaviour);
@@ -410,6 +419,39 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
             />
             <span>Normalize loudness on every transcode session</span>
           </label>
+        </SettingsRow>
+      </SettingsCard>
+
+      <SettingsCard
+        title="Subtitles"
+        description="Server-wide adjustments that apply to every session."
+      >
+        <SettingsRow
+          label="Default sync offset"
+          help="Added to every session's subtitle offset before the WebVTT cue shift. Use this when your library has a consistent cross-title drift (common with anime fansub re-encodes whose ASS tracks were authored against a slightly differently-cut master). Positive = subs render later; negative = earlier. The player's per-file stepper still works as a relative tweak on top of this baseline. 0 disables (the previous behaviour)."
+          changed={dirtyFields["Subtitle default offset"]}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={-30000}
+              max={30000}
+              step={100}
+              value={subtitleDefaultOffsetMs}
+              onChange={(e) =>
+                setSubtitleDefaultOffsetMs(Number(e.target.value))
+              }
+              className={`w-28 tabular-nums ${
+                dirtyFields["Subtitle default offset"]
+                  ? INPUT_CHANGED_CLASS
+                  : INPUT_CLASS
+              }`}
+              required
+            />
+            <span className="text-sm text-white/55">
+              ms ({(subtitleDefaultOffsetMs / 1000).toFixed(2)} s)
+            </span>
+          </div>
         </SettingsRow>
       </SettingsCard>
 

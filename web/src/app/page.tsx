@@ -245,8 +245,22 @@ async function Top10TrendingRail({
   let entries: Array<{ rank: number; item: ReturnType<typeof adaptItem> }>;
   try {
     const res = await itemsApi.trending(kind, 10, visibleLibIds);
-    entries = res.items
-      .map(({ rank, ...item }) => ({ rank, item: adaptItem(item) }));
+    // Dedupe across libraries (same title in /anime and /movies
+    // would otherwise render twice) and re-rank to 1..N. The upstream
+    // ranks are global TMDB popularity; once we intersect with the
+    // local library we'd see gaps (3, 4, 5, 7, …) — Netflix shows a
+    // clean 1, 2, 3 sequence, and relative order is what matters.
+    const seen = new Set<number>();
+    const unique = res.items.filter((it) => {
+      if (it.tmdb_id == null) return true;
+      if (seen.has(it.tmdb_id)) return false;
+      seen.add(it.tmdb_id);
+      return true;
+    });
+    entries = unique.map(({ rank: _rank, ...item }, idx) => ({
+      rank: idx + 1,
+      item: adaptItem(item),
+    }));
   } catch {
     return null;
   }

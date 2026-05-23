@@ -777,7 +777,13 @@ export type ItemSort =
   | "title"
   | "year_desc"
   | "year_asc"
-  | "rating_desc";
+  | "rating_desc"
+  | "duration_desc"
+  | "duration_asc"
+  | "last_played"
+  | "random"
+  | "size_desc"
+  | "size_asc";
 
 export interface ItemFilter {
   library_id?: number;
@@ -800,6 +806,30 @@ export interface ItemFilter {
    *  fingerprint the filename. Omit for all items. Drives the
    *  "Unmatched files" admin surface. */
   auto_matched?: boolean;
+  /** Only items the current user has never started. */
+  unwatched_only?: boolean;
+  /** Only items the current user is in the middle of. */
+  in_progress_only?: boolean;
+  /** Only items the current user has finished. */
+  watched_only?: boolean;
+  /** Inclusive lower bound on item year. Decade chips translate to
+   *  `{year_min: 2020, year_max: 2029}` etc. */
+  year_min?: number;
+  year_max?: number;
+  /** Seed for the random sort. Stable pagination requires the same
+   *  seed across page requests in a session. */
+  random_seed?: number;
+  /** Resolution buckets: any of `sd` / `720` / `1080` / `4k`. An item
+   *  matches when ≥1 of its current files lands in any selected
+   *  bucket. CSV-encoded on the wire. */
+  resolutions?: ReadonlyArray<string>;
+  /** HDR formats: any of `sdr` / `hdr10` / `hlg`. SDR = absence of
+   *  an hdr_format tag — that's what the scanner stores today. */
+  hdr?: ReadonlyArray<string>;
+  /** Video codecs (ffprobe names): any of `hevc` / `h264` / `av1` /
+   *  `vp9` / `mpeg4` / `mpeg2video` / `other`. `other` matches any
+   *  codec outside the known list. */
+  codecs?: ReadonlyArray<string>;
 }
 
 export interface MediaStreamSummary {
@@ -947,6 +977,14 @@ export interface Credit {
   sort_order: number;
 }
 
+/// Returned by `peopleApi.get(id)` — the full Person row plus every
+/// item in the user's accessible libraries that credits them. Empty
+/// items array means "person exists in the catalog but you can't see
+/// any of their titles" (e.g. they only appear on hidden libraries).
+export interface PersonDetail extends Person {
+  items: ListedItem[];
+}
+
 export interface Extra {
   id: number;
   kind: string;
@@ -1064,7 +1102,7 @@ export interface OnDeckResponse {
 export type ScanStatus =
   | "queued"
   | "running"
-  | "completed"
+  | "succeeded"
   | "failed"
   | "canceled";
 
@@ -1105,10 +1143,18 @@ export interface CreateSessionInput {
   subtitle_style?: string;
   // Explicit quality target (omit = let the server decide). When set
   // the session always transcodes — direct play can't change bitrate.
+  // `bitrate_bps` is optional: the player ships a pure "Resolution"
+  // picker and lets the backend ladder fill in the bitrate. Use the
+  // separate `bitrate_cap_bps` below for a user-controlled cap.
   quality_target?: {
     height: number;
-    bitrate_bps: number;
+    bitrate_bps?: number;
   };
+  // User-controlled video bitrate cap in bits per second. Independent
+  // of resolution — lets a viewer pick "1080p but cap at 3 Mbps for
+  // my mobile plan." Applied after any resolution-driven default and
+  // before the operator's server-wide ceiling. Omit / 0 = no cap.
+  bitrate_cap_bps?: number;
   // EBU R128 audio loudness normalization. When true, the backend
   // forces audio re-encode and applies the `loudnorm` filter so this
   // title sits at the same perceived volume as other normalized
@@ -1356,6 +1402,13 @@ export interface ServerSettings {
    *  measurements when available, else generic targets). Per-session
    *  override possible via the player audio menu. */
   audio_normalize_enabled: boolean;
+  /** Server-wide default subtitle sync offset in ms, added to the
+   *  client-supplied per-file offset before the WebVTT cue shift.
+   *  Lets the operator paper over a library-wide source drift so the
+   *  player stepper stays a relative tweak. 0 = no global shift.
+   *  Positive delays subtitles, negative advances them. Clamped
+   *  ±30_000 ms server-side. */
+  subtitle_default_offset_ms: number;
   /** `nice -n N` wrapper around ffmpeg in background contexts
    *  (scheduled tasks, scanner probes). 0 disables. Restart required. */
   scanner_nice_level: number;
@@ -1443,6 +1496,7 @@ export interface ServerSettingsUpdate {
   maintenance_window_end?: string;
   scan_automatically?: boolean;
   audio_normalize_enabled?: boolean;
+  subtitle_default_offset_ms?: number;
   scanner_nice_level?: number;
   preroll_enabled?: boolean;
   preroll_volume?: number;
@@ -1668,6 +1722,11 @@ export interface TraktSyncNowResult {
   movies_marked: number;
   episodes_marked: number;
   playback_applied: number;
+  /** Locally-watched movies pushed up to Trakt in this sync. Typically
+   *  zero when the live mark-watched hook ran cleanly; non-zero after
+   *  a network blip or for items matched after the hook fired. */
+  movies_pushed: number;
+  episodes_pushed: number;
 }
 
 export const trakt = {
@@ -2691,11 +2750,24 @@ export const playState = {
   ) =>
     apiFetch<void>("/play-state/watched", { method: "POST", body: input }),
   onDeck: () => apiFetch<OnDeckResponse>("/play-state/on-deck"),
-  history: (limit?: number) =>
-    apiFetch<{ items: ListedItem[] }>("/play-state/history", {
-      query: limit ? { limit } : undefined,
+  history: (opts: { limit?: number; page?: number } = {}) =>
+    apiFetch<{ items: ListedItem[]; total: number }>("/play-state/history", {
+      query:
+        opts.limit || opts.page
+          ? {
+              ...(opts.limit ? { limit: opts.limit } : {}),
+              ...(opts.page ? { page: opts.page } : {}),
+            }
+          : undefined,
     }),
   config: () => apiFetch<PlayStateConfig>("/play-state/config"),
+};
+
+export const people = {
+  /// Fetch a person's full profile + the items in the user's
+  /// accessible libraries that credit them. 404s when the person id
+  /// doesn't exist in the catalog.
+  get: (id: number) => apiFetch<PersonDetail>(`/people/${id}`),
 };
 
 export const collections = {
@@ -3035,13 +3107,21 @@ export const admin = {
   },
   audit: {
     list: (
-      params: { before?: number; limit?: number; offset?: number } = {},
+      params: {
+        before?: number;
+        limit?: number;
+        offset?: number;
+        /** Filter to entries authored by this user id. Drives the
+         *  Audit tab in the user-management drawer. */
+        actor_user_id?: number;
+      } = {},
     ) =>
       apiFetch<AuditListResponse>("/admin/audit", {
         query: {
           before: params.before,
           limit: params.limit,
           offset: params.offset,
+          actor_user_id: params.actor_user_id,
         },
       }),
   },

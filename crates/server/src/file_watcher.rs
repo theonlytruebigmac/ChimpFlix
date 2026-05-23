@@ -10,7 +10,7 @@
 //! the watcher is built once at startup from current library paths.
 //! Adding/removing a library requires a server restart to re-arm.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use notify::{
 use sqlx::Row;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
@@ -65,7 +65,12 @@ async fn run(state: AppState) -> Result<()> {
     // Track currently-watched paths so the periodic re-poll only arms
     // newcomers and unwatches removed roots.
     let mut watched: HashMap<PathBuf, i64> = HashMap::new();
-    sync_watched(&state, &mut watcher, &mut watched).await;
+    // Paths we've already warned about being inaccessible. Throttle so
+    // a partially-mounted/permission-denied root doesn't spam WARN
+    // every 30s for the lifetime of the process. Cleared when the path
+    // recovers; if it goes missing again later, a fresh WARN fires.
+    let mut warned_missing: HashSet<PathBuf> = HashSet::new();
+    sync_watched(&state, &mut watcher, &mut watched, &mut warned_missing).await;
     let mut last_resync = Instant::now();
     const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -118,7 +123,7 @@ async fn run(state: AppState) -> Result<()> {
                     pending.clear();
                     if now.duration_since(last_resync) >= RESYNC_INTERVAL {
                         last_resync = now;
-                        sync_watched(&state, &mut watcher, &mut watched).await;
+                        sync_watched(&state, &mut watcher, &mut watched, &mut warned_missing).await;
                     }
                     continue;
                 }
@@ -147,7 +152,7 @@ async fn run(state: AppState) -> Result<()> {
                 }
                 if now.duration_since(last_resync) >= RESYNC_INTERVAL {
                     last_resync = now;
-                    sync_watched(&state, &mut watcher, &mut watched).await;
+                    sync_watched(&state, &mut watcher, &mut watched, &mut warned_missing).await;
                 }
             }
         }
@@ -161,6 +166,7 @@ async fn sync_watched(
     state: &AppState,
     watcher: &mut RecommendedWatcher,
     watched: &mut HashMap<PathBuf, i64>,
+    warned_missing: &mut HashSet<PathBuf>,
 ) {
     let current = match library_paths(state).await {
         Ok(v) => v,
@@ -180,24 +186,74 @@ async fn sync_watched(
     for path in removed {
         let _ = watcher.unwatch(&path);
         watched.remove(&path);
+        warned_missing.remove(&path);
         info!(path = %path.display(), "file watcher: unwatched");
     }
+    // Drop stale entries for paths that are no longer configured at all
+    // (operator deleted the library) so we don't carry orphan warnings.
+    warned_missing.retain(|p| current_set.contains_key(p));
 
-    // Arm new paths.
+    // Arm new paths. `std::fs::metadata` over `Path::exists()` so we can
+    // surface WHY the check failed (ENOENT vs EACCES vs broken symlink
+    // vs other I/O) — exists() collapses every error to false, which
+    // makes "skipping non-existent" misleading for permission and
+    // mount-namespace problems. Throttle the WARN: once per missing
+    // transition, then DEBUG on subsequent retries until the path
+    // recovers (at which point a fresh "watching for changes" INFO
+    // fires from the success branch below).
     for (path, id) in current_set {
         if watched.contains_key(&path) {
             continue;
         }
-        if !path.exists() {
-            warn!(path = %path.display(), "skipping non-existent library path");
-            continue;
-        }
-        match watcher.watch(&path, RecursiveMode::Recursive) {
-            Ok(()) => {
-                info!(path = %path.display(), library_id = id, "watching for changes");
-                watched.insert(path, id);
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                match watcher.watch(&path, RecursiveMode::Recursive) {
+                    Ok(()) => {
+                        if warned_missing.remove(&path) {
+                            info!(
+                                path = %path.display(),
+                                library_id = id,
+                                "watching for changes (path recovered)"
+                            );
+                        } else {
+                            info!(
+                                path = %path.display(),
+                                library_id = id,
+                                "watching for changes"
+                            );
+                        }
+                        watched.insert(path, id);
+                    }
+                    Err(e) => warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to watch library path"
+                    ),
+                }
             }
-            Err(e) => warn!(path = %path.display(), error = %e, "failed to watch library path"),
+            Err(e) => {
+                let kind = e.kind();
+                if warned_missing.insert(path.clone()) {
+                    // First time we've seen this path miss — loud WARN
+                    // with the actual error so the operator can fix
+                    // (perm denied? mount race? typo?).
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        error_kind = ?kind,
+                        "library path unavailable; will keep retrying every 30s"
+                    );
+                } else {
+                    // Already warned once; downgrade to DEBUG so we
+                    // don't spam the log every 30s for the lifetime
+                    // of an unmounted root.
+                    debug!(
+                        path = %path.display(),
+                        error_kind = ?kind,
+                        "library path still unavailable"
+                    );
+                }
+            }
         }
     }
 }

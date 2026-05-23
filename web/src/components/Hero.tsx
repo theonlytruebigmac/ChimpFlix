@@ -7,11 +7,15 @@ export function Hero({ item }: { item: MediaItem }) {
   const backdrop = plexImage(item.art ?? item.thumb, 1920, 1080);
   // For Continue Watching episodes the hero surfaces a specific episode but
   // the modal should open the parent show (so the season/episode list shows
-  // up). Mirror what Card.tsx does.
-  const modalRatingKey =
-    item.type === "episode" && item.grandparentRatingKey
-      ? item.grandparentRatingKey
-      : item.ratingKey;
+  // up). Mirror what Card.tsx does. The episode rating key is handed over
+  // separately so the modal can land on the right season and scroll the
+  // matching row into view.
+  const isEpisodeHero =
+    item.type === "episode" && item.grandparentRatingKey != null;
+  const modalRatingKey = isEpisodeHero
+    ? (item.grandparentRatingKey as string)
+    : item.ratingKey;
+  const modalEpisodeKey = isEpisodeHero ? item.ratingKey : undefined;
 
   return (
     <section className="relative h-[70vh] min-h-120 w-full overflow-hidden">
@@ -48,6 +52,7 @@ export function Hero({ item }: { item: MediaItem }) {
         <HeroActions
           playRatingKey={item.ratingKey}
           modalRatingKey={modalRatingKey}
+          modalEpisodeKey={modalEpisodeKey}
         />
       </div>
     </section>

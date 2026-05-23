@@ -18,4 +18,8 @@ export {
 export { HeroCard } from "./HeroCard";
 export { FilterChip } from "./FilterChip";
 export { AdminTabBar, type AdminTab } from "./TabBar";
-export { Pagination, DEFAULT_PAGE_SIZE } from "./Pagination";
+// Pagination lives in the shared ui/ folder so user-facing grids
+// (/library/[id]/browse, /genre, /collection, /history) can reuse it
+// without dipping into the admin namespace. Re-exported here so
+// existing `from "./ui"` admin imports keep working.
+export { Pagination, DEFAULT_PAGE_SIZE } from "@/components/ui/Pagination";

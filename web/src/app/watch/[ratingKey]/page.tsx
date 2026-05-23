@@ -571,8 +571,22 @@ export default async function WatchPage({
   );
 
   if (prerollUrl) {
+    // Identity for the binge-suppression check: every episode of a
+    // show shares `show:<id>` so back-to-back episodes don't replay
+    // the sting; movies key by item so re-watches inside the window
+    // also skip. Falls through to undefined (always-play) when we
+    // somehow lack both — defensive, shouldn't happen in practice.
+    const prerollKey = resolved.showId
+      ? `show:${resolved.showId}`
+      : resolved.itemId
+        ? `item:${resolved.itemId}`
+        : undefined;
     return (
-      <PrerollGate prerollUrl={prerollUrl} prerollVolume={prerollVolume}>
+      <PrerollGate
+        prerollUrl={prerollUrl}
+        prerollVolume={prerollVolume}
+        prerollKey={prerollKey}
+      >
         {player}
       </PrerollGate>
     );

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   episodes as episodesApi,
   playState as playStateApi,
@@ -15,6 +15,8 @@ export function SeasonEpisodes({
   initialEpisodes,
   initialSeasonKey,
   isOwner = false,
+  targetEpisodeKey,
+  onWatchStatsChange,
 }: {
   seasons: MediaItem[];
   initialEpisodes: MediaItem[];
@@ -24,10 +26,27 @@ export function SeasonEpisodes({
   /// manual marker on the file; misuse is destructive enough that
   /// it shouldn't be a co-editing surface.
   isOwner?: boolean;
+  /// When the modal was opened with a specific episode in mind (e.g.
+  /// clicking a Continue Watching tile for S3E5), this is its rating
+  /// key. We swap to the matching season if needed and scroll the row
+  /// into view so the user lands where they expected.
+  targetEpisodeKey?: string;
+  /// Called after per-episode / bulk watched toggles so the parent can
+  /// refresh `detail.watch_stats` — without this the show-level "Mark
+  /// all as watched" toggle stays in its pre-toggle state until the
+  /// modal is closed and reopened.
+  onWatchStatsChange?: () => void;
 }) {
   const [selectedKey, setSelectedKey] = useState(initialSeasonKey);
   const [episodes, setEpisodes] = useState(initialEpisodes);
   const [loading, setLoading] = useState(false);
+  // Ref to the row matching `targetEpisodeKey`, populated when it's in
+  // the current season's render. Used by the scroll effect below.
+  const targetRowRef = useRef<HTMLLIElement | null>(null);
+  // Once we've scrolled to the target episode, don't keep re-scrolling
+  // on subsequent renders (e.g. the parent re-rendering after a watched
+  // toggle). The flag resets if the target changes.
+  const scrolledToTargetRef = useRef<string | null>(null);
   // Marker-editor state. We track the episode whose markers are being
   // edited (id + label for the header) plus the resolved primary
   // media_file_id. The id is fetched on click via episodes.get; the
@@ -54,8 +73,9 @@ export function SeasonEpisodes({
     };
   }, []);
 
-  async function changeSeason(seasonKey: string) {
-    if (seasonKey === selectedKey) return;
+  const changeSeason = useCallback(async function changeSeason(
+    seasonKey: string,
+  ) {
     const myRequestId = ++requestIdRef.current;
     setSelectedKey(seasonKey);
     setLoading(true);
@@ -101,9 +121,72 @@ export function SeasonEpisodes({
         setLoading(false);
       }
     }
-  }
+  }, []);
+
+  // When the modal was opened with a target episode that lives in a
+  // different season than `initialSeasonKey`, fetch it to discover its
+  // season_id and switch. The scroll effect below picks up once the
+  // right season's episodes have rendered.
+  useEffect(() => {
+    if (!targetEpisodeKey || !targetEpisodeKey.startsWith("e")) return;
+    if (episodes.some((ep) => ep.ratingKey === targetEpisodeKey)) return;
+    const epId = Number.parseInt(targetEpisodeKey.slice(1), 10);
+    if (!Number.isFinite(epId)) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const detail = await episodesApi.get(epId);
+        if (cancelled) return;
+        const nextSeasonKey = `s${detail.season_id}`;
+        if (nextSeasonKey === selectedKey) return;
+        void changeSeason(nextSeasonKey);
+      } catch {
+        // Best-effort — leave the modal on the initial season.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // selectedKey + episodes are intentionally not deps: we only want
+    // this resolution pass on a fresh target. The scroll effect below
+    // handles the post-switch settle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetEpisodeKey, changeSeason]);
+
+  // Scroll the target row into view once the matching season is loaded.
+  // The ref-based gate prevents re-scrolling on benign re-renders (a
+  // watched toggle, marker edit, etc).
+  useEffect(() => {
+    if (!targetEpisodeKey) return;
+    if (scrolledToTargetRef.current === targetEpisodeKey) return;
+    if (!episodes.some((ep) => ep.ratingKey === targetEpisodeKey)) return;
+    const id = requestAnimationFrame(() => {
+      targetRowRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+      scrolledToTargetRef.current = targetEpisodeKey;
+    });
+    return () => cancelAnimationFrame(id);
+  }, [targetEpisodeKey, episodes]);
 
   const selectedSeason = seasons.find((s) => s.ratingKey === selectedKey);
+
+  // Identify the "Up Next" episode within the current season — the row
+  // the show-level Play button would actually start. Priority:
+  //   1. The first in-progress episode (has viewOffset, not watched).
+  //   2. The first unwatched episode.
+  //   3. None (season is fully watched).
+  // Highlighted with a faint background tint + "Up Next" chip so the
+  // user can tell at a glance where playback will resume.
+  const upNextIdx = (() => {
+    const inProgress = episodes.findIndex(
+      (ep) => !ep.watched && (ep.viewOffset ?? 0) > 0,
+    );
+    if (inProgress !== -1) return inProgress;
+    const firstUnwatched = episodes.findIndex((ep) => !ep.watched);
+    return firstUnwatched === -1 ? null : firstUnwatched;
+  })();
 
   // Per-episode watched toggle. Optimistic — flips local state
   // first, then fires the server call; on failure we revert so the
@@ -120,6 +203,7 @@ export function SeasonEpisodes({
     );
     try {
       await playStateApi.setWatched({ episode_id: episodeId, watched });
+      onWatchStatsChange?.();
     } catch {
       // Revert on failure.
       setEpisodes((prev) =>
@@ -154,6 +238,7 @@ export function SeasonEpisodes({
           playStateApi.setWatched({ episode_id: id, watched: target }),
         ),
       );
+      onWatchStatsChange?.();
     } catch {
       setEpisodes(snapshot);
     } finally {
@@ -247,12 +332,22 @@ export function SeasonEpisodes({
             ep.viewOffset && ep.duration
               ? Math.min(100, (ep.viewOffset / ep.duration) * 100)
               : null;
+          const remainingMs =
+            ep.viewOffset && ep.duration && ep.viewOffset < ep.duration
+              ? ep.duration - ep.viewOffset
+              : null;
+          const isUpNext = idx === upNextIdx;
 
           return (
-            <li key={ep.ratingKey}>
+            <li
+              key={ep.ratingKey}
+              ref={ep.ratingKey === targetEpisodeKey ? targetRowRef : undefined}
+            >
               <Link
                 href={`/watch/${ep.ratingKey}`}
-                className="group -mx-3 flex gap-4 rounded-md px-3 py-5 transition-colors hover:bg-white/5"
+                className={`group -mx-3 flex gap-4 rounded-md px-3 py-5 transition-colors hover:bg-white/5 ${
+                  isUpNext ? "bg-white/3" : ""
+                }`}
               >
                 <div className="flex w-8 shrink-0 items-start pt-2 text-2xl font-medium text-white/60">
                   {idx + 1}
@@ -314,10 +409,17 @@ export function SeasonEpisodes({
                           </svg>
                         </span>
                       )}
+                      {isUpNext && (
+                        <span className="rounded-sm border border-accent/40 bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-accent">
+                          Up Next
+                        </span>
+                      )}
                     </h3>
                     {ep.duration && (
                       <span className="shrink-0 text-sm text-white/60">
-                        {formatRuntime(ep.duration)}
+                        {remainingMs
+                          ? `${formatRuntime(remainingMs)} left`
+                          : formatRuntime(ep.duration)}
                       </span>
                     )}
                   </div>

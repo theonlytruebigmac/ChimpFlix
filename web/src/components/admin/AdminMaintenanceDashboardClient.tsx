@@ -8,6 +8,7 @@ import {
   type VacuumResult,
   type VerifyAllResult,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 /// Instance-wide maintenance dashboard. Each card maps 1:1 to a
 /// scheduled task so the operator can run any of them on demand and
@@ -84,22 +85,16 @@ function PurgeAllCard() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<MaintenancePurgeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [askImmediate, setAskImmediate] = useState(false);
 
   async function run(immediate: boolean) {
-    if (
-      immediate &&
-      !confirm(
-        "Immediately hard-delete every soft-deleted row across every library, plus cascade-sweep orphan episodes / seasons / items. This can't be undone.",
-      )
-    ) {
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
       setResult(
         await adminApi.maintenance.purgeAll(immediate ? 0 : undefined),
       );
+      if (immediate) setAskImmediate(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -108,32 +103,45 @@ function PurgeAllCard() {
   }
 
   return (
-    <Card
-      title="Purge orphan files"
-      description="Hard-delete media_file rows whose grace window has expired (default 7 days). Cascade-sweeps orphan episodes (no files), seasons (no episodes), and items (no files or seasons). Use 'now' to bypass the grace window — only after you've verified the files are gone for good."
-      action={
-        <div className="flex flex-wrap gap-2">
-          <ActionButton onClick={() => run(false)} busy={busy} label="Purge expired" />
-          <button
-            onClick={() => run(true)}
-            disabled={busy}
-            className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-          >
-            Purge all now
-          </button>
-        </div>
-      }
-      error={error}
-    >
-      {result && (
-        <StatGrid>
-          <Stat label="Files" value={result.files_purged} emphasis />
-          <Stat label="Episodes" value={result.episodes_purged} emphasis />
-          <Stat label="Seasons" value={result.seasons_purged} emphasis />
-          <Stat label="Items" value={result.items_purged} emphasis />
-        </StatGrid>
+    <>
+      <Card
+        title="Purge orphan files"
+        description="Hard-delete media_file rows whose grace window has expired (default 7 days). Cascade-sweeps orphan episodes (no files), seasons (no episodes), and items (no files or seasons). Use 'now' to bypass the grace window — only after you've verified the files are gone for good."
+        action={
+          <div className="flex flex-wrap gap-2">
+            <ActionButton onClick={() => run(false)} busy={busy} label="Purge expired" />
+            <button
+              onClick={() => setAskImmediate(true)}
+              disabled={busy}
+              className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-500/20 disabled:opacity-50"
+            >
+              Purge all now
+            </button>
+          </div>
+        }
+        error={error}
+      >
+        {result && (
+          <StatGrid>
+            <Stat label="Files" value={result.files_purged} emphasis />
+            <Stat label="Episodes" value={result.episodes_purged} emphasis />
+            <Stat label="Seasons" value={result.seasons_purged} emphasis />
+            <Stat label="Items" value={result.items_purged} emphasis />
+          </StatGrid>
+        )}
+      </Card>
+      {askImmediate && (
+        <ConfirmDialog
+          title="Purge every orphan row right now?"
+          body="This hard-deletes every soft-deleted media_file row across all libraries, plus cascade-sweeps orphan episodes / seasons / items left without children. The 7-day grace window is bypassed. Cannot be undone — use only after you've verified those files won't return (e.g. you removed the source for good)."
+          confirmLabel="Purge all now"
+          destructive
+          busy={busy}
+          onConfirm={() => void run(true)}
+          onCancel={() => setAskImmediate(false)}
+        />
       )}
-    </Card>
+    </>
   );
 }
 
@@ -141,19 +149,14 @@ function VacuumCard() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<VacuumResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [askVacuum, setAskVacuum] = useState(false);
 
   async function run() {
-    if (
-      !confirm(
-        "Vacuum holds an exclusive lock on the database for the duration. Most queries will pause until it finishes. Continue?",
-      )
-    ) {
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
       setResult(await adminApi.maintenance.vacuumDatabase());
+      setAskVacuum(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -162,28 +165,38 @@ function VacuumCard() {
   }
 
   return (
-    <Card
-      title="Vacuum database"
-      description="Rebuild the SQLite file from scratch, defragmenting pages and shrinking the on-disk size. Reclaims space after big deletions (purges, library removals). Blocks other queries while it runs — usually a few seconds at our scale."
-      action={
-        <ActionButton onClick={run} busy={busy} label="Vacuum" />
-      }
-      error={error}
-    >
-      {result && (
-        <StatGrid>
-          <Stat label="Before" value={result.before_bytes} format="bytes" />
-          <Stat label="After" value={result.after_bytes} format="bytes" />
-          <Stat
-            label="Reclaimed"
-            value={result.bytes_reclaimed}
-            format="bytes"
-            emphasis={result.bytes_reclaimed > 0}
-          />
-          <Stat label="Duration" value={result.duration_ms} format="ms" />
-        </StatGrid>
+    <>
+      <Card
+        title="Vacuum database"
+        description="Rebuild the SQLite file from scratch, defragmenting pages and shrinking the on-disk size. Reclaims space after big deletions (purges, library removals). Blocks other queries while it runs — usually a few seconds at our scale."
+        action={<ActionButton onClick={() => setAskVacuum(true)} busy={busy} label="Vacuum" />}
+        error={error}
+      >
+        {result && (
+          <StatGrid>
+            <Stat label="Before" value={result.before_bytes} format="bytes" />
+            <Stat label="After" value={result.after_bytes} format="bytes" />
+            <Stat
+              label="Reclaimed"
+              value={result.bytes_reclaimed}
+              format="bytes"
+              emphasis={result.bytes_reclaimed > 0}
+            />
+            <Stat label="Duration" value={result.duration_ms} format="ms" />
+          </StatGrid>
+        )}
+      </Card>
+      {askVacuum && (
+        <ConfirmDialog
+          title="Vacuum the database now?"
+          body="Vacuum holds an exclusive write lock on the database for the duration. Most queries (browse, search, scans) will pause until it finishes. Usually a few seconds at our scale; longer after a big purge."
+          confirmLabel="Vacuum"
+          busy={busy}
+          onConfirm={() => void run()}
+          onCancel={() => setAskVacuum(false)}
+        />
       )}
-    </Card>
+    </>
   );
 }
 
@@ -191,19 +204,14 @@ function ClearTranscodeCacheCard() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ClearTranscodeCacheResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [askClear, setAskClear] = useState(false);
 
   async function run() {
-    if (
-      !confirm(
-        "Remove every transcoder session directory on disk that's not currently in use. Active sessions are skipped. Continue?",
-      )
-    ) {
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
       setResult(await adminApi.maintenance.clearTranscodeCache());
+      setAskClear(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -212,30 +220,42 @@ function ClearTranscodeCacheCard() {
   }
 
   return (
-    <Card
-      title="Clear transcoder cache"
-      description="Wipe orphan session directories from /data/cache/sessions/. Active sessions skip — only directories left behind by previous crashes or unclean shutdowns get reaped. Useful when the cache disk is filling up and you've confirmed no one is mid-playback."
-      action={
-        <ActionButton onClick={run} busy={busy} label="Clear cache" />
-      }
-      error={error}
-    >
-      {result && (
-        <StatGrid>
-          <Stat
-            label="Sessions removed"
-            value={result.sessions_removed}
-            emphasis={result.sessions_removed > 0}
-          />
-          <Stat
-            label="Bytes freed"
-            value={result.bytes_freed}
-            format="bytes"
-            emphasis={result.bytes_freed > 0}
-          />
-        </StatGrid>
+    <>
+      <Card
+        title="Clear transcoder cache"
+        description="Wipe orphan session directories from /data/cache/sessions/. Active sessions skip — only directories left behind by previous crashes or unclean shutdowns get reaped. Useful when the cache disk is filling up and you've confirmed no one is mid-playback."
+        action={
+          <ActionButton onClick={() => setAskClear(true)} busy={busy} label="Clear cache" />
+        }
+        error={error}
+      >
+        {result && (
+          <StatGrid>
+            <Stat
+              label="Sessions removed"
+              value={result.sessions_removed}
+              emphasis={result.sessions_removed > 0}
+            />
+            <Stat
+              label="Bytes freed"
+              value={result.bytes_freed}
+              format="bytes"
+              emphasis={result.bytes_freed > 0}
+            />
+          </StatGrid>
+        )}
+      </Card>
+      {askClear && (
+        <ConfirmDialog
+          title="Clear orphan transcoder cache?"
+          body="Remove every transcoder session directory on disk that's not currently in use. Active sessions are detected by the manager and skipped, so this won't interrupt anyone mid-playback."
+          confirmLabel="Clear cache"
+          busy={busy}
+          onConfirm={() => void run()}
+          onCancel={() => setAskClear(false)}
+        />
       )}
-    </Card>
+    </>
   );
 }
 

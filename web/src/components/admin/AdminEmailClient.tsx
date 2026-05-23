@@ -6,6 +6,7 @@ import {
   type EmailStatusResponse,
   type SmtpSecurity,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Form {
   host: string;
@@ -40,6 +41,7 @@ export function AdminEmailClient({
   const [savingConfig, setSavingConfig] = useState(false);
   const [savingPassword, setSavingPassword] = useState(false);
   const [clearingPassword, setClearingPassword] = useState(false);
+  const [askClearPassword, setAskClearPassword] = useState(false);
   const [testing, setTesting] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const [testNotice, setTestNotice] = useState<string | null>(null);
@@ -100,10 +102,7 @@ export function AdminEmailClient({
     }
   }
 
-  async function clearPassword() {
-    if (!confirm("Remove the stored SMTP password? Outgoing email will fail until you set a new one.")) {
-      return;
-    }
+  async function clearPasswordConfirmed() {
     setError(null);
     setSavedNotice(null);
     setClearingPassword(true);
@@ -112,6 +111,7 @@ export function AdminEmailClient({
       const refreshed = await adminApi.email.status();
       setStatus(refreshed);
       setSavedNotice("Password cleared.");
+      setAskClearPassword(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -273,7 +273,7 @@ export function AdminEmailClient({
           {status.has_password && (
             <button
               disabled={clearingPassword}
-              onClick={clearPassword}
+              onClick={() => setAskClearPassword(true)}
               className="rounded border border-white/15 px-3 py-2 text-sm text-white/70 hover:bg-white/5 disabled:opacity-50"
             >
               {clearingPassword ? "Clearing…" : "Clear"}
@@ -316,6 +316,17 @@ export function AdminEmailClient({
           </div>
         )}
       </section>
+      {askClearPassword && (
+        <ConfirmDialog
+          title="Remove the stored SMTP password?"
+          body="Outgoing email will fail until you set a new password. Existing invites already sent are unaffected."
+          confirmLabel="Clear password"
+          destructive
+          busy={clearingPassword}
+          onConfirm={() => void clearPasswordConfirmed()}
+          onCancel={() => setAskClearPassword(false)}
+        />
+      )}
     </div>
   );
 }

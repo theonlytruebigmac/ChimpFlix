@@ -102,7 +102,7 @@ export function SearchBar() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKey}
-            placeholder="Titles, episodes, genres"
+            placeholder="Search titles"
             className="w-48 bg-transparent text-sm text-white placeholder:text-white/50 focus:outline-none sm:w-64"
             aria-label="Search"
           />

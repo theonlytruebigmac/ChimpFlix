@@ -7,6 +7,7 @@ import {
   type SecretsListResponse,
   type SecretTestResponse,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 /// Slots whose vault value is a JSON object on the wire. The UI renders
 /// one labeled input per field and serializes to JSON on save, so the
@@ -106,6 +107,7 @@ function SlotCard({
   const [fields, setFields] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<"save" | "test" | "clear" | null>(null);
   const [testResult, setTestResult] = useState<SecretTestResponse | null>(null);
+  const [askClear, setAskClear] = useState(false);
 
   const isSet = !!slot.stored;
   const last4 = slot.stored?.last4 ?? null;
@@ -151,14 +153,14 @@ function SlotCard({
     }
   }
 
-  async function clear() {
-    if (!confirm(`Clear the stored value for ${slot.display_name}?`)) return;
+  async function clearConfirmed() {
     setBusy("clear");
     onError(null);
     setTestResult(null);
     try {
       const next = await adminApi.secrets.clear(slot.name);
       onUpdated(next);
+      setAskClear(false);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -243,7 +245,7 @@ function SlotCard({
               )}
               {isSet && (
                 <button
-                  onClick={clear}
+                  onClick={() => setAskClear(true)}
                   disabled={busy !== null}
                   className="rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50"
                 >
@@ -336,6 +338,17 @@ function SlotCard({
         >
           {testResult.detail}
         </div>
+      )}
+      {askClear && (
+        <ConfirmDialog
+          title={`Clear ${slot.display_name}?`}
+          body={`The stored value for ${slot.display_name} will be removed from the credential vault. Anything depending on it will start failing until you set a new value.`}
+          confirmLabel="Clear"
+          destructive
+          busy={busy === "clear"}
+          onConfirm={() => void clearConfirmed()}
+          onCancel={() => setAskClear(false)}
+        />
       )}
     </section>
   );

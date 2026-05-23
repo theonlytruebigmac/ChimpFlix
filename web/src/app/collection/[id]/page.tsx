@@ -1,11 +1,10 @@
 import { notFound } from "next/navigation";
-import { Card } from "@/components/Card";
+import { CollectionBrowseClient } from "@/components/CollectionBrowseClient";
 import { ModalRoot } from "@/components/ModalRoot";
 import {
   ChimpFlixApiError,
   collections as collectionsApi,
 } from "@/lib/chimpflix-api";
-import { adaptItem } from "@/lib/chimpflix-adapt";
 import { requireUser } from "@/lib/chimpflix-server";
 
 export default async function CollectionPage({
@@ -26,7 +25,6 @@ export default async function CollectionPage({
     throw e;
   }
 
-  const items = detail.items.map(adaptItem);
   const backdrop = detail.backdrop_path ?? detail.poster_path ?? null;
 
   return (
@@ -64,13 +62,7 @@ export default async function CollectionPage({
       </section>
 
       <div className="relative z-20 px-4 sm:px-8 md:px-12 pb-24">
-        <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-          {items.map((it) => (
-            <li key={it.ratingKey}>
-              <Card item={it} />
-            </li>
-          ))}
-        </ul>
+        <CollectionBrowseClient items={detail.items} />
       </div>
       <ModalRoot />
     </main>

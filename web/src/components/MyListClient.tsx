@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Card } from "./Card";
+import { CardSkeleton } from "./Skeleton";
 import { MY_LIST_EVENT } from "@/lib/my-list";
 import { adaptItem } from "@/lib/chimpflix-adapt";
 import type { MediaItem } from "@/lib/chimpflix-types";
@@ -70,7 +71,18 @@ export function MyListClient() {
       <h1 className="mb-10 text-4xl font-bold tracking-tight">My List</h1>
 
       {items === null ? (
-        <p className="text-white/60">Loading…</p>
+        // Skeleton grid mirroring the loaded layout — every other browse
+        // surface uses CardSkeleton, so the bare "Loading…" used to read
+        // as broken on a slow first paint. 12 cards is enough to cover
+        // the typical above-the-fold viewport without flashing too much
+        // chrome on a small list.
+        <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+          {Array.from({ length: 12 }).map((_, i) => (
+            <li key={i}>
+              <CardSkeleton />
+            </li>
+          ))}
+        </ul>
       ) : items.length === 0 ? (
         <div className="max-w-xl">
           <p className="mb-3 text-base text-white/85">Your list is empty.</p>
@@ -89,9 +101,14 @@ export function MyListClient() {
           </Link>
         </div>
       ) : (
-        <ul className="flex flex-wrap gap-3">
+        // Match the grid layout used everywhere else (/search,
+        // /library/[id]/browse, /genre, /collection, /history). The
+        // previous flex/wrap layout left cards at their natural width,
+        // which produced ragged right edges and didn't line up with
+        // the other discovery surfaces.
+        <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {items.map((item) => (
-            <li key={item.ratingKey} className="flex-none">
+            <li key={item.ratingKey}>
               <Card item={item} />
             </li>
           ))}

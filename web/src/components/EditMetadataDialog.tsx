@@ -13,6 +13,7 @@ import {
   type TmdbPoster,
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 // All fields the user can edit on the General tab. Each row has an
 // optional "lock" indicator showing whether re-enrichment will overwrite
@@ -186,14 +187,12 @@ export function EditMetadataDialog({
     }
   }
 
-  // Close on Esc — feels like a native dialog.
-  useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [onClose]);
+  // Escape + Tab focus cycling + restore-focus-on-close. The shared
+  // hook replaces the prior `keydown`-only listener so this dialog
+  // now traps keyboard focus correctly (was a WCAG dialog gap).
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = "edit-metadata-dialog-title";
+  useFocusTrap(dialogRef, { onClose });
 
   function dirty(field: keyof ItemEditInput): boolean {
     const original = (() => {
@@ -293,11 +292,17 @@ export function EditMetadataDialog({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         className="zf-modal-in w-full max-w-3xl overflow-hidden rounded-lg border border-white/10 bg-(--color-surface) shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
-          <h2 className="text-lg font-semibold">Edit Metadata</h2>
+          <h2 id={titleId} className="text-lg font-semibold">
+            Edit Metadata
+          </h2>
           <button
             type="button"
             onClick={onClose}

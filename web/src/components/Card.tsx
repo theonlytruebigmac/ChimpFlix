@@ -58,10 +58,17 @@ export function Card({ item }: { item: MediaItem }) {
   const badge = now === null ? null : recencyBadge(item, recentlyAddedDays, now);
 
   const label = displayTitle(item);
-  const modalKey =
-    item.type === "episode" && item.grandparentRatingKey
-      ? item.grandparentRatingKey
-      : item.ratingKey;
+  // For episodes the modal target is the parent show (the modal renders
+  // the show detail), but we hand the episode rating key along as a
+  // hint so the modal lands on the right season and scrolls to the row
+  // that was clicked — Continue Watching → S3E5 should not drop the
+  // user on S1E1 anymore.
+  const isEpisodeCard =
+    item.type === "episode" && item.grandparentRatingKey != null;
+  const modalKey = isEpisodeCard
+    ? (item.grandparentRatingKey as string)
+    : item.ratingKey;
+  const episodeKeyHint = isEpisodeCard ? item.ratingKey : undefined;
 
   return (
     <div
@@ -69,17 +76,24 @@ export function Card({ item }: { item: MediaItem }) {
       // original 18rem (288px) sizing. Tailwind's `hover:` variant
       // already gates on `(hover: hover)` in v4 so the scale-up only
       // fires on devices with real hover — touch taps won't stick.
-      className="group relative w-44 flex-none sm:w-56 md:w-72 hover:z-50"
+      // `focus-within` mirrors the hover state when the inner button
+      // is focused via keyboard, so the user can see which card is
+      // active without relying on the small default browser outline.
+      className="group relative w-44 flex-none has-focus-visible:z-50 sm:w-56 md:w-72 hover:z-50"
       onMouseEnter={() => prefetchModalData(modalKey)}
       onFocus={() => prefetchModalData(modalKey)}
     >
-      <div className="card-scaler origin-center transition-transform duration-200 ease-out delay-200 group-hover:scale-125">
-        <div className="overflow-hidden rounded-md bg-(--color-surface) shadow-md group-hover:shadow-2xl">
+      <div className="card-scaler origin-center transition-transform duration-200 ease-out delay-200 group-hover:scale-125 group-has-focus-visible:scale-125">
+        <div className="overflow-hidden rounded-md bg-(--color-surface) shadow-md group-hover:shadow-2xl group-has-focus-visible:shadow-2xl group-has-focus-visible:ring-2 group-has-focus-visible:ring-accent group-has-focus-visible:ring-offset-2 group-has-focus-visible:ring-offset-background">
           <button
             type="button"
-            onClick={() => openModal(modalKey)}
+            onClick={() => openModal(modalKey, episodeKeyHint)}
             aria-label={label}
-            className="block w-full cursor-pointer text-left"
+            // Suppress the default browser outline on the inner
+            // button — the outer wrapper renders an accent ring
+            // via `group-has-[:focus-visible]:ring-2` instead,
+            // which is sized to the entire card.
+            className="block w-full cursor-pointer text-left focus:outline-none focus-visible:outline-none"
           >
             <div className="relative aspect-video bg-black">
               {img ? (
@@ -127,7 +141,12 @@ export function Card({ item }: { item: MediaItem }) {
 
           <div className="grid grid-rows-[0fr] transition-[grid-template-rows] duration-200 ease-out delay-200 group-hover:grid-rows-[1fr]">
             <div className="overflow-hidden">
-              <HoverPanel item={item} modalKey={modalKey} label={label} />
+              <HoverPanel
+                item={item}
+                modalKey={modalKey}
+                episodeKeyHint={episodeKeyHint}
+                label={label}
+              />
             </div>
           </div>
         </div>
@@ -139,10 +158,12 @@ export function Card({ item }: { item: MediaItem }) {
 function HoverPanel({
   item,
   modalKey,
+  episodeKeyHint,
   label,
 }: {
   item: MediaItem;
   modalKey: string;
+  episodeKeyHint?: string;
   label: string;
 }) {
   const isShow = item.type === "show";
@@ -206,7 +227,7 @@ function HoverPanel({
         <CircleButton
           className="ml-auto"
           aria-label="More info"
-          onClick={() => openModal(modalKey)}
+          onClick={() => openModal(modalKey, episodeKeyHint)}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
             <polyline points="6 9 12 15 18 9" />

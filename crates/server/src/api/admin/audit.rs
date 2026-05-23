@@ -25,6 +25,10 @@ pub struct ListParams {
     /// consumers stay working.
     #[serde(default)]
     pub offset: Option<i64>,
+    /// When set, filter to only entries authored by this user id.
+    /// Drives the per-user Audit tab in the user-management drawer.
+    #[serde(default)]
+    pub actor_user_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,18 +47,32 @@ pub async fn list(
     Query(params): Query<ListParams>,
 ) -> Result<Json<ListResponse>, ApiError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
-    let entries = if let Some(offset) = params.offset {
-        queries::list_audit_paged(&state.pool, limit, offset)
+    let offset = params.offset.unwrap_or(0);
+    let (entries, total) = if let Some(actor) = params.actor_user_id {
+        let entries = queries::list_audit_for_user(&state.pool, actor, limit, offset)
             .await
-            .map_err(ApiError::Internal)?
+            .map_err(ApiError::Internal)?;
+        let total = queries::count_audit_for_user(&state.pool, actor)
+            .await
+            .map_err(ApiError::Internal)?;
+        (entries, total)
+    } else if params.offset.is_some() {
+        let entries = queries::list_audit_paged(&state.pool, limit, offset)
+            .await
+            .map_err(ApiError::Internal)?;
+        let total = queries::count_audit(&state.pool)
+            .await
+            .map_err(ApiError::Internal)?;
+        (entries, total)
     } else {
-        queries::list_audit(&state.pool, params.before, limit)
+        let entries = queries::list_audit(&state.pool, params.before, limit)
             .await
-            .map_err(ApiError::Internal)?
+            .map_err(ApiError::Internal)?;
+        let total = queries::count_audit(&state.pool)
+            .await
+            .map_err(ApiError::Internal)?;
+        (entries, total)
     };
-    let total = queries::count_audit(&state.pool)
-        .await
-        .map_err(ApiError::Internal)?;
     let next_before = entries.last().map(|e| e.id);
     Ok(Json(ListResponse {
         entries,

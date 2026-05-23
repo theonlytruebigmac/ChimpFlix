@@ -757,6 +757,13 @@ pub(crate) async fn emit_session_stop_event(
         chimpflix_library::queries::media_file_owner(pool, snap.media_file_id)
             .await
             .unwrap_or((None, None));
+    // The transcoder snapshot doesn't carry the client's IP / UA. Pull
+    // them from the matching start row so the activity feed shows the
+    // same origin for both events instead of rendering stop as "unknown".
+    let (ip, user_agent) =
+        chimpflix_library::queries::lookup_session_origin(pool, snap.id.as_str())
+            .await
+            .unwrap_or((None, None));
     let ev = chimpflix_library::queries::PlaybackEventInput {
         item_id,
         episode_id,
@@ -765,6 +772,8 @@ pub(crate) async fn emit_session_stop_event(
         decision: Some("transcode"),
         bytes_sent: Some(snap.bytes_served),
         session_token: Some(snap.id.as_str()),
+        ip: ip.as_deref(),
+        user_agent: user_agent.as_deref(),
         ..chimpflix_library::queries::PlaybackEventInput::new(snap.user_id, "stop")
     };
     if let Err(e) = chimpflix_library::queries::record_playback_event(pool, ev).await {

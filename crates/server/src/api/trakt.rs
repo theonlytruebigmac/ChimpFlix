@@ -213,12 +213,28 @@ pub struct SyncNowResponse {
     pub movies_marked: usize,
     pub episodes_marked: usize,
     pub playback_applied: usize,
+    /// Number of locally-watched movies pushed up to Trakt during this
+    /// sync. Includes anything since `last_synced_at` — typically zero
+    /// when the fire-and-forget mark-watched hook ran cleanly, non-zero
+    /// after a token expiry, network blip, or for items matched only
+    /// after the hook fired.
+    pub movies_pushed: usize,
+    pub episodes_pushed: usize,
 }
 
 pub async fn sync_now(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<SyncNowResponse>, ApiError> {
+    // Capture the cursor *before* pulling so the push step doesn't
+    // miss rows the pull just upserted.
+    let since = chimpflix_library::queries::get_trakt_last_synced(&state.pool, user.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    let (movies_pushed, episodes_pushed) =
+        trakt_sync::bulk_push_user_history(&state, user.id, since)
+            .await
+            .map_err(ApiError::Internal)?;
     let (movies, episodes) = trakt_sync::pull_user_history(&state, user.id)
         .await
         .map_err(ApiError::Internal)?;
@@ -229,6 +245,8 @@ pub async fn sync_now(
         movies_marked: movies,
         episodes_marked: episodes,
         playback_applied: playback,
+        movies_pushed,
+        episodes_pushed,
     }))
 }
 

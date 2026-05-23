@@ -39,6 +39,17 @@ export function SettingsProfileClient({ initial }: Props) {
   const [notifyEmail, setNotifyEmail] = useState(initial.notify_via_email);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+
+  // Compare against the most-recent server state (`user`, not the
+  // immutable `initial` prop) so the Save button correctly disables
+  // again right after a successful save — `user` is what the next save
+  // would actually no-op against.
+  const hasChanges =
+    displayName !== (user.display_name ?? "") ||
+    avatarUrl !== (user.avatar_url ?? "") ||
+    audioLang !== (user.default_audio_lang ?? "") ||
+    subtitleLang !== (user.default_subtitle_lang ?? "") ||
+    notifyEmail !== user.notify_via_email;
   // Holds the auto-clear timer so we can cancel it on unmount and
   // avoid setState-on-unmounted warnings (and a small leak) if the
   // user navigates away inside the 2.5s window.
@@ -182,12 +193,18 @@ export function SettingsProfileClient({ initial }: Props) {
       <div className="flex items-center gap-3 pt-1">
         <button
           type="submit"
-          disabled={busy}
+          disabled={busy || !hasChanges}
           className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs transition disabled:opacity-50"
         >
           {busy ? "Saving…" : "Save changes"}
         </button>
-        {message && <span className="text-xs text-white/70">{message}</span>}
+        <span
+          role="status"
+          aria-live="polite"
+          className="text-xs text-white/70"
+        >
+          {message ?? ""}
+        </span>
       </div>
     </form>
   );

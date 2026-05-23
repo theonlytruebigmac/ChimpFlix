@@ -77,7 +77,12 @@ impl ItemKind {
 pub enum ScanStatus {
     Queued,
     Running,
-    Completed,
+    /// Stored as `'succeeded'` to match the convention every other status
+    /// table in the schema uses (job_runs, task_runs, etc.). The phase84
+    /// migration renamed historical `'completed'` rows; the from-db
+    /// parser below also accepts the legacy spelling so a partially
+    /// rolled-back DB still loads cleanly.
+    Succeeded,
     Failed,
     Canceled,
 }
@@ -87,7 +92,7 @@ impl ScanStatus {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
-            Self::Completed => "completed",
+            Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
         }
@@ -717,7 +722,10 @@ impl ScanJob {
         let status = match status_str {
             "queued" => ScanStatus::Queued,
             "running" => ScanStatus::Running,
-            "completed" => ScanStatus::Completed,
+            // Accept both spellings on read so a DB that hasn't yet
+            // applied phase84 (e.g. operator downgraded the binary)
+            // still loads — writes always emit `succeeded`.
+            "succeeded" | "completed" => ScanStatus::Succeeded,
             "failed" => ScanStatus::Failed,
             "canceled" => ScanStatus::Canceled,
             other => anyhow::bail!("unknown scan status: {other}"),
@@ -849,19 +857,77 @@ pub enum ItemSort {
     YearDesc,
     YearAsc,
     RatingDesc,
+    DurationDesc,
+    DurationAsc,
+    /// Items the current user played most recently first. Items the user
+    /// has never touched sort to the bottom.
+    LastPlayed,
+    /// Deterministic shuffle driven by `ItemFilter.random_seed` so paging
+    /// stays stable within a single browsing session.
+    Random,
+    /// Total bytes on disk across every file backing the title (for shows:
+    /// summed across all episode files). Subquery — keep an eye on
+    /// list-page latency if libraries balloon past ~20k items.
+    SizeDesc,
+    SizeAsc,
 }
 
 impl ItemSort {
     /// Map to an `ORDER BY` clause. Always include a stable tiebreaker
     /// (`i.id`) so paginated results don't shuffle within ties.
-    pub fn order_by(&self) -> &'static str {
+    /// `random_seed` is only consulted for [`ItemSort::Random`]; other
+    /// variants ignore it.
+    pub fn order_by(&self, random_seed: Option<i64>) -> String {
         match self {
-            Self::RecentlyAdded => "i.added_at DESC, i.id DESC",
-            Self::Title => "i.sort_title COLLATE NOCASE ASC, i.id ASC",
-            Self::YearDesc => "i.year IS NULL, i.year DESC, i.sort_title COLLATE NOCASE ASC",
-            Self::YearAsc => "i.year IS NULL, i.year ASC, i.sort_title COLLATE NOCASE ASC",
+            Self::RecentlyAdded => "i.added_at DESC, i.id DESC".into(),
+            Self::Title => "i.sort_title COLLATE NOCASE ASC, i.id ASC".into(),
+            Self::YearDesc => {
+                "i.year IS NULL, i.year DESC, i.sort_title COLLATE NOCASE ASC".into()
+            }
+            Self::YearAsc => {
+                "i.year IS NULL, i.year ASC, i.sort_title COLLATE NOCASE ASC".into()
+            }
             Self::RatingDesc => {
-                "i.rating_audience IS NULL, i.rating_audience DESC, i.sort_title COLLATE NOCASE ASC"
+                "i.rating_audience IS NULL, i.rating_audience DESC, \
+                 i.sort_title COLLATE NOCASE ASC"
+                    .into()
+            }
+            Self::DurationDesc => "i.duration_ms IS NULL, i.duration_ms DESC, i.id DESC".into(),
+            Self::DurationAsc => "i.duration_ms IS NULL, i.duration_ms ASC, i.id ASC".into(),
+            Self::LastPlayed => {
+                "ps.last_played_at IS NULL, ps.last_played_at DESC, i.id DESC".into()
+            }
+            // Total bytes on disk for the title — for shows this fans out
+            // across every episode's files via the seasons/episodes join.
+            // The subquery runs per result row; `idx_media_files_item` and
+            // `idx_media_files_episode` keep each lookup index-bound.
+            // `removed_at IS NULL` excludes pending-cleanup rows so the
+            // surface reflects what the user can actually play right now.
+            Self::SizeDesc => {
+                "(SELECT COALESCE(SUM(mf.size_bytes), 0) FROM media_files mf \
+                 LEFT JOIN episodes e ON e.id = mf.episode_id \
+                 LEFT JOIN seasons s ON s.id = e.season_id \
+                 WHERE COALESCE(s.show_id, mf.item_id) = i.id \
+                   AND mf.removed_at IS NULL) DESC, i.id DESC"
+                    .into()
+            }
+            Self::SizeAsc => {
+                "(SELECT COALESCE(SUM(mf.size_bytes), 0) FROM media_files mf \
+                 LEFT JOIN episodes e ON e.id = mf.episode_id \
+                 LEFT JOIN seasons s ON s.id = e.season_id \
+                 WHERE COALESCE(s.show_id, mf.item_id) = i.id \
+                   AND mf.removed_at IS NULL) ASC, i.id ASC"
+                    .into()
+            }
+            Self::Random => {
+                // Knuth-style multiplicative hash on the row id, seeded by the
+                // caller. The seed is a parsed i64 (validated by serde), so
+                // interpolating it is safe — no SQL injection vector. 100000007
+                // is a prime that buckets the ids into roughly even pseudo-
+                // random positions; the `i.id` tiebreaker keeps within-bucket
+                // ordering deterministic so pagination doesn't shuffle.
+                let seed = random_seed.unwrap_or(1).max(1);
+                format!("((i.id * {seed}) % 100000007), i.id")
             }
         }
     }
@@ -894,6 +960,43 @@ pub struct ItemFilter {
     /// couldn't fingerprint the filename. Omit for "all items
     /// regardless of match status."
     pub auto_matched: Option<bool>,
+    /// True → only items the current user has never started (no
+    /// play_state row, or watched=0 with no recorded position).
+    /// Mutually exclusive with [`in_progress_only`] / [`watched_only`]
+    /// at the UI layer; passing two of them simply intersects.
+    pub unwatched_only: Option<bool>,
+    /// True → only items the current user has started but not finished
+    /// (play_state row with position > 0 and watched=0).
+    pub in_progress_only: Option<bool>,
+    /// True → only items the current user has finished (watched=1).
+    pub watched_only: Option<bool>,
+    /// Inclusive lower bound on `items.year`. Items with NULL year are
+    /// excluded when either bound is set. Decade chips on the browse UI
+    /// translate to `(year_min, year_max) = (decade, decade+9)`.
+    pub year_min: Option<i32>,
+    pub year_max: Option<i32>,
+    /// Seed for [`ItemSort::Random`]. Stable across pagination within a
+    /// session when the client passes the same seed each request.
+    /// Ignored by non-random sorts.
+    pub random_seed: Option<i64>,
+    /// Resolution buckets: any of `sd` (<720), `720`, `1080`, `4k`
+    /// (≥2160). An item matches when at least one of its current
+    /// (non-removed) files lands in any selected bucket. Wire format:
+    /// `?resolutions=1080,4k`. Unknown values are silently dropped.
+    #[serde(default, deserialize_with = "deserialize_csv_strings")]
+    pub resolutions: Option<Vec<String>>,
+    /// HDR formats: any of `sdr` (NULL hdr_format), `hdr10`, `hlg`.
+    /// Item matches when at least one current file matches any
+    /// selected format. Dolby Vision is not yet detected by the
+    /// scanner so it's deliberately omitted from the wire enum.
+    #[serde(default, deserialize_with = "deserialize_csv_strings")]
+    pub hdr: Option<Vec<String>>,
+    /// Video codecs (ffprobe codec_name): any of `hevc`, `h264`,
+    /// `av1`, `vp9`, `mpeg4`, `mpeg2video`. Item matches when at
+    /// least one current file has a video stream in any selected
+    /// codec. Requires a JOIN to media_streams.
+    #[serde(default, deserialize_with = "deserialize_csv_strings")]
+    pub codecs: Option<Vec<String>>,
 }
 
 /// Serde deserializer for `?key=1,2,3` query-string fields. Empty string
@@ -921,6 +1024,31 @@ where
         }
         out.push(p.parse::<i64>().map_err(D::Error::custom)?);
     }
+    Ok(Some(out))
+}
+
+/// Serde deserializer for `?key=foo,bar,baz` query-string fields. Each
+/// token is trimmed + lower-cased so case-insensitive whitelists can
+/// match without normalizing again at every call site. Empty string
+/// yields `Some(vec![])` so the "passed but empty" case is
+/// distinguishable from the missing-field case.
+pub fn deserialize_csv_strings<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let out: Vec<String> = trimmed
+        .split(',')
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
     Ok(Some(out))
 }
 
@@ -1790,6 +1918,16 @@ pub struct ServerSettings {
     /// Per-session override still possible via the player. Off by
     /// default.
     pub audio_normalize_enabled: bool,
+    /// Server-wide default subtitle sync offset in milliseconds, added
+    /// to the client-supplied `subtitle_offset_ms` on every session
+    /// before the WebVTT cue shift. Lets the operator paper over a
+    /// library-wide source drift (common with anime fansub
+    /// re-encodes whose ASS tracks were authored against a slightly
+    /// different video master) so the player's per-file stepper still
+    /// works as a relative tweak. 0 = no global shift. Positive
+    /// delays subtitles relative to the video; negative advances
+    /// them. Bounded ±30_000 ms.
+    pub subtitle_default_offset_ms: i64,
     /// `nice -n <level>` wrapper for ffmpeg/ffprobe invocations from
     /// the scanner and scheduled tasks (previews, chapter thumbs,
     /// loudness, marker detection). 0 disables the wrapper. Range
@@ -2020,6 +2158,12 @@ impl ServerSettings {
                 .flatten()
                 .unwrap_or(0)
                 != 0,
+            subtitle_default_offset_ms: row
+                .try_get::<Option<i64>, _>("subtitle_default_offset_ms")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                .clamp(-30_000, 30_000),
             scanner_nice_level: row
                 .try_get::<Option<i64>, _>("scanner_nice_level")
                 .ok()
@@ -2229,6 +2373,8 @@ pub struct ServerSettingsUpdate {
     pub database_cache_size_mb: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_normalize_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_default_offset_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanner_nice_level: Option<i64>,
     /// Outer Option = whether to update; inner = the value (None

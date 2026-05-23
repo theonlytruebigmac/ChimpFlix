@@ -489,7 +489,13 @@ function TmdbStep({
 
       <Field label="TMDB v4 read-token">
         <input
-          type="password"
+          // `type="text"` rather than "password" so the operator can
+          // visually verify the paste (TMDB JWTs are long; getting a
+          // wrong/truncated paste with no way to see it is the
+          // common failure mode). `autoComplete="off"` keeps the
+          // browser's password manager out of it.
+          type="text"
+          name="tmdb-token"
           autoComplete="off"
           spellCheck={false}
           value={token}
@@ -663,7 +669,7 @@ function ScanProgressCard({
   const status = scan?.status ?? "queued";
   const isRunning = status === "queued" || status === "running";
   const tone =
-    status === "completed"
+    status === "succeeded"
       ? "ok"
       : status === "failed"
         ? "bad"
@@ -687,7 +693,7 @@ function ScanProgressCard({
           <div className="text-[11.5px] text-white/55">
             {isRunning
               ? "Walking the directory tree and adding files to the queue. Metadata fetches happen as items finish."
-              : status === "completed"
+              : status === "succeeded"
                 ? "Initial pass finished. The file watcher keeps things in sync from here."
                 : status === "failed"
                   ? "Scan failed — check the path and permissions, then try again from Library → Libraries."
@@ -734,7 +740,7 @@ function ScanStatusPill({ status }: { status: ScanJob["status"] }) {
       label: "Scanning…",
       cls: "bg-blue-500/15 text-blue-300 ring-blue-500/30",
     },
-    completed: {
+    succeeded: {
       label: "Done",
       cls: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30",
     },

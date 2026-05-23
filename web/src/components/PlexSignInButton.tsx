@@ -90,18 +90,31 @@ export function PlexSignInButton({
     //      to round-trip Plex's `/pins` endpoint is hidden behind a
     //      blank tab the user sees pop up immediately — no perceived
     //      "click did nothing" lag.
-    // If `window.open` returns null (true popup blocker, not the
-    // `noopener` false-positive we used to hit), we fall back to a
-    // same-tab redirect after the URL is ready.
     const placeholder = window.open("about:blank", "_blank");
+    if (!placeholder) {
+      // True popup-blocker hit. The previous fallback (same-tab
+      // redirect) was broken — navigating away unmounts this component
+      // and the in-memory pin handle / polling state is lost, so on
+      // return the user lands on /login with no recovery path. Better
+      // to surface the block as an actionable error than to pretend
+      // we succeeded.
+      finish(() =>
+        onError?.(
+          "Popups are blocked for this site. Allow popups, then click Sign in with Plex again.",
+        ),
+      );
+      return;
+    }
     try {
       const start = await plex.start(intent);
-      if (placeholder && !placeholder.closed) {
+      if (!placeholder.closed) {
         placeholder.location.href = start.auth_url;
       } else {
-        // Popup actually blocked. Keep the user in flow by navigating
-        // the current tab; on return, polling resumes the link state.
-        window.location.href = start.auth_url;
+        // User closed the placeholder while we were minting the
+        // handle. Treat as a cancellation rather than re-opening
+        // a tab they explicitly dismissed.
+        finish(() => onError?.("Plex sign-in was cancelled."));
+        return;
       }
       setPhase("polling");
       const tick = async () => {

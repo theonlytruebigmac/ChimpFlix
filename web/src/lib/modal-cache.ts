@@ -70,3 +70,11 @@ export function getOrFetchModalData(
   }
   return p;
 }
+
+/// Drops the cached modal payload for this ratingKey so the next open
+/// re-fetches from /api/modal. Call this after any mutation that the
+/// cached payload would otherwise lie about — watched toggles, marker
+/// edits, metadata fixes, tag changes, deletions.
+export function invalidateModalData(ratingKey: string): void {
+  cache.delete(ratingKey);
+}

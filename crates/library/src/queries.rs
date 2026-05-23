@@ -22,7 +22,7 @@ use sqlx::{Row, SqlitePool};
 use crate::models::{
     AccessGroup, AccessGroupDetail, AccessGroupUpdate, AuditLogEntry, Credit, Episode,
     EpisodeDetail, EpisodeListed, ExternalSubtitle, Extra, Invite, Item, ItemDetail, ItemEdit,
-    ItemFilter, ItemKind, ItemPage, JobRow, JobStatus, JobSummary, Library, LibraryAgent,
+    ItemFilter, ItemKind, ItemPage, ItemSort, JobRow, JobStatus, JobSummary, Library, LibraryAgent,
     LibraryUpdate, ListedItem, Marker, MediaFileLocator, MediaFileSummary, MediaStreamSummary,
     NewAccessGroup, NewAuditEntry, NewExternalSubtitle, NewLibrary, NewOptimizedVersion,
     NewScheduledTask, NewTranscoderPreset, NewWebhook, Notification, OnDeckEntry, OnDeckResponse,
@@ -451,9 +451,16 @@ pub async fn mark_scan_completed(
     files_removed: i64,
 ) -> Result<()> {
     let now = now_ms();
+    // `succeeded` (not `completed`) matches the convention every other
+    // place in the codebase reads — `mark_scan_completed` was an
+    // outlier writing `completed` while stats / dashboard / purge
+    // queries all filter on `succeeded`. That mismatch is why the
+    // admin drawer's "Last scanned" rendered as "never" forever even
+    // after successful scans. See the phase84 migration which renames
+    // existing rows so historical scans surface correctly too.
     sqlx::query(
         "UPDATE scan_jobs
-         SET status = 'completed', finished_at = ?,
+         SET status = 'succeeded', finished_at = ?,
              files_seen = ?, files_added = ?, files_updated = ?, files_removed = ?
          WHERE id = ?",
     )
@@ -539,6 +546,169 @@ fn fts_match_query(q: &str) -> Option<String> {
     }
 }
 
+/// EXISTS clause used by the base [`list_items`] WHERE to hide items
+/// whose every backing file is soft-deleted. Without this, titles the
+/// scanner has marked `removed_at` linger in the browse grid until the
+/// next purge cycle (default 7-day grace), which surfaces as "I
+/// deleted those files but they're still in the UI."
+///
+/// Performance note: the previous shape used
+/// `COALESCE(s.show_id, mf.item_id) = i.id` as a unified join. SQLite's
+/// planner can't push that into either `idx_media_files_item_active`
+/// or `idx_media_files_episode_active` (those partials are keyed on a
+/// raw column, not a COALESCE expression), so every items.list COUNT
+/// degraded to ~1.2s on a real-size library. The kind-gated form below
+/// uses two narrow EXISTS clauses — movie items take only the first,
+/// shows take only the second — each able to use its own partial
+/// index seek. Verified: COUNT path drops from ~1.2s to <50ms on a
+/// 1k-item library.
+fn has_active_files_clause() -> &'static str {
+    "(\
+        (i.kind = 'movie' AND EXISTS ( \
+            SELECT 1 FROM media_files mf \
+            WHERE mf.item_id = i.id AND mf.removed_at IS NULL \
+        )) \
+        OR (i.kind = 'show' AND EXISTS ( \
+            SELECT 1 FROM media_files mf \
+            JOIN episodes e ON e.id = mf.episode_id \
+            JOIN seasons s ON s.id = e.season_id \
+            WHERE s.show_id = i.id AND mf.removed_at IS NULL \
+        )) \
+    )"
+}
+
+/// Wrap a per-file WHERE fragment in an EXISTS subquery that resolves
+/// the right item for both movies (`mf.item_id`) and TV/anime episodes
+/// (`mf.episode_id` → seasons → show item). `removed_at IS NULL` keeps
+/// pending-cleanup files out of the match so the browse grid reflects
+/// what the user can actually play right now.
+fn file_exists_clause(inner: &str) -> String {
+    format!(
+        "EXISTS (\
+            SELECT 1 FROM media_files mf \
+            LEFT JOIN episodes e ON e.id = mf.episode_id \
+            LEFT JOIN seasons s ON s.id = e.season_id \
+            WHERE COALESCE(s.show_id, mf.item_id) = i.id \
+              AND mf.removed_at IS NULL \
+              AND ({inner}) \
+        )"
+    )
+}
+
+/// Codec filtering needs `media_streams` joined on top of the standard
+/// file-exists shape because codec lives per-stream, not per-file.
+/// `codec_predicate` is a self-contained, parenthesized predicate that
+/// references `ms.codec` directly — built from a validated whitelist,
+/// no user-supplied SQL flows through.
+fn codec_exists_clause(codec_predicate: &str) -> String {
+    format!(
+        "EXISTS (\
+            SELECT 1 FROM media_files mf \
+            JOIN media_streams ms ON ms.media_file_id = mf.id \
+            LEFT JOIN episodes e ON e.id = mf.episode_id \
+            LEFT JOIN seasons s ON s.id = e.season_id \
+            WHERE COALESCE(s.show_id, mf.item_id) = i.id \
+              AND mf.removed_at IS NULL \
+              AND ms.kind = 'video' \
+              AND {codec_predicate} \
+        )"
+    )
+}
+
+/// Translate the resolution bucket enum to a height-range WHERE
+/// fragment. Returns `None` when every input is unrecognised (treat as
+/// "no filter" rather than rejecting the request — the UI may evolve
+/// faster than the wire spec).
+fn resolution_height_clause(values: &[String]) -> Option<String> {
+    let buckets: Vec<&'static str> = values
+        .iter()
+        .filter_map(|v| match v.as_str() {
+            "sd" => Some("(mf.height IS NOT NULL AND mf.height < 720)"),
+            "720" => Some("(mf.height >= 720 AND mf.height < 1080)"),
+            "1080" => Some("(mf.height >= 1080 AND mf.height < 2160)"),
+            "4k" => Some("(mf.height >= 2160)"),
+            _ => None,
+        })
+        .collect();
+    if buckets.is_empty() {
+        None
+    } else {
+        Some(buckets.join(" OR "))
+    }
+}
+
+/// HDR fragment. `sdr` means `hdr_format IS NULL` (the scanner stores
+/// SDR as the absence of a tag); `hdr10` / `hlg` match by literal.
+/// Dolby Vision detection is on the roadmap but not yet wired in
+/// transcoder/probe.rs, so it's deliberately not exposed.
+fn hdr_format_clause(values: &[String]) -> Option<String> {
+    let parts: Vec<&'static str> = values
+        .iter()
+        .filter_map(|v| match v.as_str() {
+            "sdr" => Some("(mf.hdr_format IS NULL)"),
+            "hdr10" => Some("(mf.hdr_format = 'hdr10')"),
+            "hlg" => Some("(mf.hdr_format = 'hlg')"),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" OR "))
+    }
+}
+
+/// Build the parenthesised codec predicate plugged into
+/// [`codec_exists_clause`]. References `ms.codec` directly so it stays
+/// self-contained — no operator-precedence surprises when concatenated
+/// into the outer AND chain. `other` matches anything not in the known
+/// whitelist (covers obscure codecs without exposing every ffprobe
+/// name through the UI).
+fn codec_in_list(values: &[String]) -> Option<String> {
+    const KNOWN: &[&str] = &["hevc", "h264", "av1", "vp9", "mpeg4", "mpeg2video"];
+    let mut wanted: Vec<&'static str> = Vec::new();
+    let mut wants_other = false;
+    for v in values {
+        match v.as_str() {
+            "hevc" | "h265" => wanted.push("'hevc'"),
+            "h264" | "avc" => wanted.push("'h264'"),
+            "av1" => wanted.push("'av1'"),
+            "vp9" => wanted.push("'vp9'"),
+            "mpeg4" => wanted.push("'mpeg4'"),
+            "mpeg2" | "mpeg2video" => wanted.push("'mpeg2video'"),
+            "other" => wants_other = true,
+            _ => {}
+        }
+    }
+    wanted.sort();
+    wanted.dedup();
+    if wanted.is_empty() && !wants_other {
+        return None;
+    }
+    let codec_expr = "LOWER(COALESCE(ms.codec, ''))";
+    if wants_other && wanted.is_empty() {
+        let known_csv = KNOWN
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        return Some(format!("({codec_expr} NOT IN ({known_csv}))"));
+    }
+    let csv = wanted.join(",");
+    if wants_other {
+        let known_csv = KNOWN
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!(
+            "({codec_expr} IN ({csv}) OR {codec_expr} NOT IN ({known_csv}))"
+        ))
+    } else {
+        Some(format!("({codec_expr} IN ({csv}))"))
+    }
+}
+
 pub async fn list_items(
     pool: &SqlitePool,
     filter: ItemFilter,
@@ -567,10 +737,13 @@ pub async fn list_items(
         );
     }
     if filter.q.is_some() {
-        // Full-text via items_fts. The MATCH query is built below from the
-        // user input with each token quoted to defang FTS5 operators.
-        where_clauses
-            .push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".to_string());
+        // Full-text via items_fts. When q is set we INNER JOIN items_fts
+        // (see list_sql below) so the MATCH lives directly on the joined
+        // virtual table — that's what makes `bm25(items_fts, ...)`
+        // available to ORDER BY for relevance ranking. The MATCH query
+        // itself is built by [`fts_match_query`] with each token quoted
+        // to defang FTS5 operators.
+        where_clauses.push("items_fts MATCH ?".to_string());
     }
     if let Some(matched) = filter.auto_matched {
         where_clauses.push(format!(
@@ -578,16 +751,119 @@ pub async fn list_items(
             if matched { "1" } else { "0" }
         ));
     }
+    // Per-user watch-status filters. play_state is LEFT JOINed in ITEM_SELECT,
+    // but the COUNT query has to JOIN itself — see count_sql below.
+    if filter.unwatched_only.unwrap_or(false) {
+        where_clauses.push(
+            "(ps.watched IS NULL OR ps.watched = 0) \
+             AND COALESCE(ps.position_ms, 0) = 0"
+                .into(),
+        );
+    }
+    if filter.in_progress_only.unwrap_or(false) {
+        where_clauses.push("ps.watched = 0 AND ps.position_ms > 0".into());
+    }
+    if filter.watched_only.unwrap_or(false) {
+        where_clauses.push("ps.watched = 1".into());
+    }
+    if filter.year_min.is_some() {
+        where_clauses.push("i.year IS NOT NULL AND i.year >= ?".into());
+    }
+    if filter.year_max.is_some() {
+        where_clauses.push("i.year IS NOT NULL AND i.year <= ?".into());
+    }
+    // File-attribute filters. All values are validated against a static
+    // whitelist below and inlined as SQL literals — no binds — so we don't
+    // perturb the carefully-ordered bind sequence for the existing
+    // filters. Each becomes an EXISTS over media_files keyed by
+    // `COALESCE(s.show_id, mf.item_id) = i.id` so the same shape works
+    // for both movies (mf.item_id direct) and shows (via episodes/seasons).
+    if let Some(clause) = filter
+        .resolutions
+        .as_deref()
+        .and_then(resolution_height_clause)
+    {
+        where_clauses.push(file_exists_clause(&clause));
+    }
+    if let Some(clause) = filter.hdr.as_deref().and_then(hdr_format_clause) {
+        where_clauses.push(file_exists_clause(&clause));
+    }
+    if let Some(clause) = filter.codecs.as_deref().and_then(codec_in_list) {
+        where_clauses.push(codec_exists_clause(&clause));
+    }
+    // Hide ghost items whose every file the scanner already soft-deleted.
+    // Always-on — there's no operator surface that needs to see items with
+    // zero playable files, and the row sticks around in the DB during the
+    // 7-day purge grace anyway (so legitimate transient unmounts still
+    // recover when files come back, since the upsert clears removed_at).
+    where_clauses.push(has_active_files_clause().to_string());
     where_clauses.push(library_filter_sql("i.library_id", accessible));
     let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
 
-    let order_by = filter.sort.unwrap_or_default().order_by();
-    let count_sql = format!("SELECT COUNT(*) AS n FROM items i {where_sql}");
-    let list_sql = format!("{ITEM_SELECT} {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?");
+    // Ranking precedence: an explicit `?sort=...` always wins (the user
+    // asked for it). With no explicit sort *and* a search query, default
+    // to FTS bm25 relevance — searching "Breaking Bad" used to lose to
+    // any movie added more recently because the previous default sort was
+    // recently_added, which is backwards for search. Column weights tuned
+    // for the common case: title=10 outweighs original_title=5 (foreign
+    // re-runs of the same show), cast_names=3 outranks summary=1 (people
+    // searching an actor name expect the actor's titles first, not films
+    // that mention them in passing). bm25 returns negative scores so
+    // smaller (more negative) = better match → ASC sorts best-first.
+    let order_by = match (&filter.sort, filter.q.is_some()) {
+        (Some(s), _) => s.order_by(filter.random_seed),
+        (None, true) => "bm25(items_fts, 10.0, 5.0, 1.0, 3.0) ASC".to_string(),
+        (None, false) => ItemSort::default().order_by(None),
+    };
+
+    // FTS5 path uses an INNER JOIN so the MATCH clause references the
+    // virtual table directly + the `bm25()` function works in ORDER BY.
+    // The non-search path keeps the simpler shape — no JOIN cost when
+    // FTS isn't in play.
+    let fts_join = if filter.q.is_some() {
+        " JOIN items_fts ON items_fts.rowid = i.id"
+    } else {
+        ""
+    };
+
+    // The list SELECT already LEFT JOINs play_state; the COUNT path needs
+    // the same join whenever watch-status filters OR the LastPlayed sort
+    // reference `ps.*`. Cheap to always include the join — the user_id
+    // bind is added below.
+    let count_sql = format!(
+        "SELECT COUNT(*) AS n FROM items i{fts_join} \
+         LEFT JOIN play_state ps ON ps.item_id = i.id AND ps.user_id = ? \
+         {where_sql}"
+    );
+    let list_sql = if filter.q.is_some() {
+        // SELECT mirrors ITEM_SELECT but with the items_fts JOIN so
+        // `bm25(items_fts, ...)` is in scope for the ORDER BY clause.
+        format!(
+            "SELECT i.*, \
+                (SELECT source_url FROM images \
+                    WHERE item_id = i.id AND kind = 'poster' \
+                    ORDER BY is_primary DESC, id ASC LIMIT 1) AS poster_path, \
+                (SELECT source_url FROM images \
+                    WHERE item_id = i.id AND kind = 'backdrop' \
+                    ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path, \
+                ps.position_ms     AS ps_position_ms, \
+                ps.duration_ms     AS ps_duration_ms, \
+                ps.watched         AS ps_watched, \
+                ps.view_count      AS ps_view_count, \
+                ps.last_played_at  AS ps_last_played_at \
+             FROM items i \
+             JOIN items_fts ON items_fts.rowid = i.id \
+             LEFT JOIN play_state ps \
+                 ON ps.item_id = i.id AND ps.user_id = ? \
+             {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?"
+        )
+    } else {
+        format!("{ITEM_SELECT} {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?")
+    };
 
     let fts_query = filter.q.as_ref().and_then(|s| fts_match_query(s));
 
-    let mut count_q = sqlx::query(&count_sql);
+    let mut count_q = sqlx::query(&count_sql).bind(user_id);
     if let Some(lib) = filter.library_id {
         count_q = count_q.bind(lib);
     }
@@ -599,6 +875,12 @@ pub async fn list_items(
     }
     if let Some(ref fts) = fts_query {
         count_q = count_q.bind(fts);
+    }
+    if let Some(ymin) = filter.year_min {
+        count_q = count_q.bind(ymin);
+    }
+    if let Some(ymax) = filter.year_max {
+        count_q = count_q.bind(ymax);
     }
     let total: i64 = count_q.fetch_one(pool).await?.try_get("n")?;
 
@@ -614,6 +896,12 @@ pub async fn list_items(
     }
     if let Some(ref fts) = fts_query {
         list_q = list_q.bind(fts);
+    }
+    if let Some(ymin) = filter.year_min {
+        list_q = list_q.bind(ymin);
+    }
+    if let Some(ymax) = filter.year_max {
+        list_q = list_q.bind(ymax);
     }
     list_q = list_q.bind(page_size as i64).bind(offset);
     let rows = list_q.fetch_all(pool).await?;
@@ -658,10 +946,11 @@ pub async fn list_watch_history(
     pool: &SqlitePool,
     user_id: i64,
     limit: i64,
+    offset: i64,
     accessible: Option<&[i64]>,
 ) -> Result<Vec<ListedItem>> {
     let filter = library_filter_sql("i.library_id", accessible);
-    // Note: `?1` and `?2` bind by position — SQLite's positional
+    // Note: `?1` / `?2` / `?3` bind by position — SQLite's positional
     // parameters let us reference `user_id` repeatedly without
     // re-binding. The user_id appears in both branches of the UNION
     // (movie + show), so the alternative would be three identical
@@ -721,11 +1010,12 @@ pub async fn list_watch_history(
           JOIN items i ON i.id = eff.item_id
          WHERE eff.rn = 1 AND {filter}
          ORDER BY eff.last_played_at DESC
-         LIMIT ?2",
+         LIMIT ?2 OFFSET ?3",
     );
     let rows = sqlx::query(&sql)
         .bind(user_id)
         .bind(limit)
+        .bind(offset.max(0))
         .fetch_all(pool)
         .await?;
     rows.iter()
@@ -736,6 +1026,49 @@ pub async fn list_watch_history(
             })
         })
         .collect()
+}
+
+/// Total number of distinct items in the user's watch history,
+/// honouring the same library-access filter as `list_watch_history`.
+/// Drives the pagination footer on `/history` so the user can see
+/// "1–60 of 240 titles" rather than wondering whether there's more.
+pub async fn count_watch_history(
+    pool: &SqlitePool,
+    user_id: i64,
+    accessible: Option<&[i64]>,
+) -> Result<i64> {
+    let filter = library_filter_sql("i.library_id", accessible);
+    let sql = format!(
+        "WITH effective AS (
+            SELECT
+                src.item_id AS item_id,
+                row_number() OVER (
+                    PARTITION BY src.item_id
+                    ORDER BY src.last_played_at DESC
+                ) AS rn
+            FROM (
+                SELECT ps.item_id AS item_id, ps.last_played_at
+                  FROM play_state ps
+                 WHERE ps.user_id = ?1
+                   AND ps.item_id IS NOT NULL
+                   AND ps.last_played_at IS NOT NULL
+                UNION ALL
+                SELECT s.show_id AS item_id, ps.last_played_at
+                  FROM play_state ps
+                  JOIN episodes e ON e.id = ps.episode_id
+                  JOIN seasons s ON s.id = e.season_id
+                 WHERE ps.user_id = ?1
+                   AND ps.episode_id IS NOT NULL
+                   AND ps.last_played_at IS NOT NULL
+            ) AS src
+        )
+        SELECT COUNT(*) AS n
+          FROM effective eff
+          JOIN items i ON i.id = eff.item_id
+         WHERE eff.rn = 1 AND {filter}",
+    );
+    let row = sqlx::query(&sql).bind(user_id).fetch_one(pool).await?;
+    Ok(row.try_get::<i64, _>("n")?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,6 +1569,79 @@ async fn show_watch_stats(pool: &SqlitePool, show_id: i64, user_id: i64) -> Resu
         total_episodes: row.try_get("total")?,
         watched_episodes: row.try_get("watched")?,
     })
+}
+
+/// Fetch a single person's full profile by local id. Returns None when
+/// the row doesn't exist (route should 404). Person rows survive even
+/// after every item they're credited on is removed, so this isn't
+/// gated on the cast being non-empty — the empty filmography is the
+/// caller's signal to show "no titles in your library".
+pub async fn get_person(pool: &SqlitePool, id: i64) -> Result<Option<Person>> {
+    let row = sqlx::query(
+        "SELECT id, name, tmdb_id, imdb_id, photo_url, \
+                biography, birthday, deathday, place_of_birth, \
+                known_for_department \
+         FROM people \
+         WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Person {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        tmdb_id: row.try_get("tmdb_id")?,
+        imdb_id: row.try_get("imdb_id")?,
+        photo_url: row.try_get("photo_url")?,
+        biography: row.try_get("biography")?,
+        birthday: row.try_get("birthday")?,
+        deathday: row.try_get("deathday")?,
+        place_of_birth: row.try_get("place_of_birth")?,
+        known_for_department: row.try_get("known_for_department")?,
+    }))
+}
+
+/// All items the user can access that credit this person. Movies +
+/// shows; for shows, the credit lives on `item_credits` (series-level)
+/// rather than `episode_credits` (per-episode guest appearances) so
+/// this is the natural "what is this person known for in my library"
+/// surface. Caller renders empty result as "no titles in your
+/// library."
+pub async fn list_items_for_person(
+    pool: &SqlitePool,
+    person_id: i64,
+    user_id: i64,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<ListedItem>> {
+    let lib_filter = library_filter_sql("i.library_id", accessible);
+    let active_files = has_active_files_clause();
+    // Most-recent first by year; sort_title alphabetic tiebreaker so
+    // multi-year overlaps (re-releases, restorations) don't jitter.
+    let sql = format!(
+        "{ITEM_SELECT} \
+         WHERE EXISTS (SELECT 1 FROM item_credits ic \
+                       WHERE ic.item_id = i.id AND ic.person_id = ?) \
+           AND {active_files} \
+           AND {lib_filter} \
+         ORDER BY i.year IS NULL, i.year DESC, \
+                  i.sort_title COLLATE NOCASE ASC, i.id ASC"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(person_id)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| -> Result<ListedItem> {
+            Ok(ListedItem {
+                item: Item::from_row(row)?,
+                play_state: PlayStateForItem::from_columns(row)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 async fn list_credits_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<Credit>> {
@@ -3451,6 +3857,62 @@ pub async fn revoke_invite_by_id(pool: &SqlitePool, invite_id: i64) -> Result<bo
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
+}
+
+/// Write a resume-point sourced from an external provider (Trakt's
+/// `/sync/playback`) without touching the row's watched flag. The
+/// live-player batch path defaults `watched` to false on missing
+/// updates, which is correct for "user is actively watching" but
+/// destructive when applied to a row the user already marked watched
+/// — pulling a Trakt playback entry would silently un-watch the item.
+///
+/// Use this from any external-sync code path where you only want to
+/// nudge position; the local watched/in-progress decision should
+/// remain authoritative.
+pub async fn upsert_external_position(
+    pool: &SqlitePool,
+    user_id: i64,
+    item_id: Option<i64>,
+    episode_id: Option<i64>,
+    position_ms: i64,
+) -> Result<()> {
+    let now = now_ms();
+    match (item_id, episode_id) {
+        (Some(id), None) => {
+            sqlx::query(
+                "INSERT INTO play_state
+                    (user_id, item_id, position_ms, duration_ms, watched, view_count, last_played_at)
+                 VALUES (?, ?, ?, NULL, 0, 0, ?)
+                 ON CONFLICT (user_id, item_id) WHERE item_id IS NOT NULL DO UPDATE SET
+                    position_ms     = excluded.position_ms,
+                    last_played_at  = excluded.last_played_at",
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(position_ms)
+            .bind(now)
+            .execute(pool)
+            .await?;
+        }
+        (None, Some(id)) => {
+            sqlx::query(
+                "INSERT INTO play_state
+                    (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
+                 VALUES (?, ?, ?, NULL, 0, 0, ?)
+                 ON CONFLICT (user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
+                    position_ms     = excluded.position_ms,
+                    last_played_at  = excluded.last_played_at",
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(position_ms)
+            .bind(now)
+            .execute(pool)
+            .await?;
+        }
+        _ => anyhow::bail!("upsert_external_position requires exactly one of item_id or episode_id"),
+    }
+    Ok(())
 }
 
 pub async fn apply_play_state_batch(
@@ -8765,6 +9227,12 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.subtitle_default_offset_ms {
+        sqlx::query("UPDATE server_settings SET subtitle_default_offset_ms = ? WHERE id = 1")
+            .bind(v.clamp(-30_000, 30_000))
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.scanner_nice_level {
         sqlx::query("UPDATE server_settings SET scanner_nice_level = ? WHERE id = 1")
             .bind(v.clamp(0, 19))
@@ -9003,10 +9471,45 @@ pub async fn list_audit_paged(
     rows.iter().map(AuditLogEntry::from_row).collect()
 }
 
+/// Per-actor variant for the user drawer's Audit tab. Filters by
+/// `actor_user_id` so an admin can see what one user has done across
+/// the server. Offset/limit shape matches [`list_audit_paged`]; the
+/// drawer doesn't expose jump-to-page but the consistent shape lets
+/// callers swap freely.
+pub async fn list_audit_for_user(
+    pool: &SqlitePool,
+    actor_user_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AuditLogEntry>> {
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
+    let rows = sqlx::query(
+        "SELECT * FROM audit_log \
+         WHERE actor_user_id = ? \
+         ORDER BY id DESC LIMIT ? OFFSET ?",
+    )
+    .bind(actor_user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(AuditLogEntry::from_row).collect()
+}
+
 /// Total audit_log rows. Companion to [`list_audit_paged`] for the
 /// pagination footer.
 pub async fn count_audit(pool: &SqlitePool) -> Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) AS n FROM audit_log")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("n").unwrap_or(0))
+}
+
+/// Count of audit_log rows attributed to a specific actor.
+pub async fn count_audit_for_user(pool: &SqlitePool, actor_user_id: i64) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM audit_log WHERE actor_user_id = ?")
+        .bind(actor_user_id)
         .fetch_one(pool)
         .await?;
     Ok(row.try_get("n").unwrap_or(0))
@@ -10014,6 +10517,125 @@ pub async fn list_trakt_linked_user_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
         .iter()
         .filter_map(|r| r.try_get("user_id").ok())
         .collect())
+}
+
+/// Read the cursor used by the bidirectional sync. Same column the
+/// pull-side already drives off — the push step uses it as a "what
+/// counts as new locally" lower bound so a Sync now after marking
+/// items watched picks them up even when the fire-and-forget hook
+/// failed (token expiry, transient HTTP error, etc).
+pub async fn get_trakt_last_synced(pool: &SqlitePool, user_id: i64) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT last_synced_at FROM user_trakt_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<i64>, _>("last_synced_at").ok().flatten()))
+}
+
+/// Locally-watched movies for a user. When `since_ms` is Some, only
+/// rows whose last_played_at falls in `(since_ms, now]` are returned —
+/// the typical "what's new since last Sync now" query. Returns
+/// (item_id, tmdb_id, watched_at_ms); rows whose item has no tmdb_id
+/// are skipped (Trakt is TMDB-keyed).
+pub async fn list_watched_movies_for_push(
+    pool: &SqlitePool,
+    user_id: i64,
+    since_ms: Option<i64>,
+) -> Result<Vec<(i64, i64, i64)>> {
+    let rows = if let Some(since) = since_ms {
+        sqlx::query(
+            "SELECT ps.item_id AS item_id, i.tmdb_id AS tmdb_id, ps.last_played_at AS watched_at \
+             FROM play_state ps \
+             JOIN items i ON i.id = ps.item_id \
+             WHERE ps.user_id = ? AND ps.watched = 1 \
+               AND ps.item_id IS NOT NULL \
+               AND i.tmdb_id IS NOT NULL \
+               AND ps.last_played_at > ? \
+             ORDER BY ps.last_played_at ASC",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT ps.item_id AS item_id, i.tmdb_id AS tmdb_id, ps.last_played_at AS watched_at \
+             FROM play_state ps \
+             JOIN items i ON i.id = ps.item_id \
+             WHERE ps.user_id = ? AND ps.watched = 1 \
+               AND ps.item_id IS NOT NULL \
+               AND i.tmdb_id IS NOT NULL \
+             ORDER BY ps.last_played_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let item_id: i64 = r.try_get("item_id")?;
+        let tmdb_id: i64 = r.try_get("tmdb_id")?;
+        let watched_at: i64 = r.try_get("watched_at")?;
+        out.push((item_id, tmdb_id, watched_at));
+    }
+    Ok(out)
+}
+
+/// Locally-watched episodes for a user, since `since_ms`. Returns
+/// (episode_id, show_tmdb_id, season_number, episode_number, watched_at_ms).
+/// Skips episodes whose show row has no tmdb_id.
+pub async fn list_watched_episodes_for_push(
+    pool: &SqlitePool,
+    user_id: i64,
+    since_ms: Option<i64>,
+) -> Result<Vec<(i64, i64, i32, i32, i64)>> {
+    let rows = if let Some(since) = since_ms {
+        sqlx::query(
+            "SELECT ps.episode_id AS episode_id, i.tmdb_id AS show_tmdb, \
+                    s.season_number AS season, e.episode_number AS episode, \
+                    ps.last_played_at AS watched_at \
+             FROM play_state ps \
+             JOIN episodes e ON e.id = ps.episode_id \
+             JOIN seasons s  ON s.id = e.season_id \
+             JOIN items i    ON i.id = s.show_id \
+             WHERE ps.user_id = ? AND ps.watched = 1 \
+               AND ps.episode_id IS NOT NULL \
+               AND i.tmdb_id IS NOT NULL \
+               AND ps.last_played_at > ? \
+             ORDER BY ps.last_played_at ASC",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT ps.episode_id AS episode_id, i.tmdb_id AS show_tmdb, \
+                    s.season_number AS season, e.episode_number AS episode, \
+                    ps.last_played_at AS watched_at \
+             FROM play_state ps \
+             JOIN episodes e ON e.id = ps.episode_id \
+             JOIN seasons s  ON s.id = e.season_id \
+             JOIN items i    ON i.id = s.show_id \
+             WHERE ps.user_id = ? AND ps.watched = 1 \
+               AND ps.episode_id IS NOT NULL \
+               AND i.tmdb_id IS NOT NULL \
+             ORDER BY ps.last_played_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let episode_id: i64 = r.try_get("episode_id")?;
+        let show_tmdb: i64 = r.try_get("show_tmdb")?;
+        let season: i32 = r.try_get("season")?;
+        let episode: i32 = r.try_get("episode")?;
+        let watched_at: i64 = r.try_get("watched_at")?;
+        out.push((episode_id, show_tmdb, season, episode, watched_at));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -11080,6 +11702,37 @@ impl<'a> PlaybackEventInput<'a> {
             user_agent: None,
             session_token: None,
         }
+    }
+}
+
+/// Look up the IP + user-agent of an earlier event for the same
+/// transcoder session token. Used by the stop-event emitter — the
+/// transcoder doesn't carry the client's IP through to its
+/// `SessionSnapshot`, but the matching `start` event recorded the
+/// values at request time, so reusing them keeps the activity feed
+/// consistent (previously every stop row rendered as `unknown`).
+///
+/// Returns the most recent non-null pair seen for the token; the
+/// caller treats `(None, None)` as "no info" and the partial cases
+/// preserve whatever the start row had.
+pub async fn lookup_session_origin(
+    pool: &SqlitePool,
+    session_token: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    let row = sqlx::query(
+        "SELECT ip, user_agent FROM playback_events \
+         WHERE session_token = ? AND (ip IS NOT NULL OR user_agent IS NOT NULL) \
+         ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(session_token)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok((
+            r.try_get::<Option<String>, _>("ip").unwrap_or(None),
+            r.try_get::<Option<String>, _>("user_agent").unwrap_or(None),
+        )),
+        None => Ok((None, None)),
     }
 }
 

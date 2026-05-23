@@ -14,6 +14,7 @@ import {
 import type Hls from "hls.js";
 import {
   ChimpFlixApiError,
+  auth as authApi,
   stream as streamApi,
   playState as playStateApi,
   seasons as seasonsApi,
@@ -29,24 +30,47 @@ import {
   usePrefs,
 } from "@/lib/prefs";
 import { consumePrewarm } from "@/lib/prewarm";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 export interface QualityChoice {
   label: string;
-  /// `null` = let the server decide (defaults). Otherwise the player
-  /// will ask the transcoder to scale to this height and target this
-  /// video bitrate (audio bitrate is fixed at 192k regardless).
+  /// `null` = let the server decide (auto, derived from source).
+  /// Any other value forces transcode to scale to this height. The
+  /// per-rung bitrate is no longer baked in here — the backend's
+  /// ladder fills in a default for the chosen height, and the
+  /// independent [`BitrateCapChoice`] applies a user-controlled
+  /// upper bound regardless of resolution.
   height: number | null;
-  bitrate_bps: number | null;
 }
 
 /// Fixed quality ladder, ordered high → low. "Auto" sits at the top so
 /// picker scrolling matches user expectations.
 const QUALITY_OPTIONS: QualityChoice[] = [
-  { label: "Auto", height: null, bitrate_bps: null },
-  { label: "1080p", height: 1080, bitrate_bps: 5_000_000 },
-  { label: "720p", height: 720, bitrate_bps: 2_500_000 },
-  { label: "480p", height: 480, bitrate_bps: 1_200_000 },
-  { label: "240p", height: 240, bitrate_bps: 400_000 },
+  { label: "Auto", height: null },
+  { label: "1080p", height: 1080 },
+  { label: "720p", height: 720 },
+  { label: "480p", height: 480 },
+  { label: "240p", height: 240 },
+];
+
+/// User-controlled video bitrate cap. Independent of resolution so a
+/// viewer can pick "1080p but cap at 3 Mbps for my mobile plan" without
+/// downsampling to 720p just to save bandwidth. `null` = no cap (use
+/// the resolution's ladder default).
+export interface BitrateCapChoice {
+  label: string;
+  bps: number | null;
+}
+
+const BITRATE_CAP_OPTIONS: BitrateCapChoice[] = [
+  { label: "No cap", bps: null },
+  { label: "10 Mbps", bps: 10_000_000 },
+  { label: "5 Mbps", bps: 5_000_000 },
+  { label: "3 Mbps", bps: 3_000_000 },
+  { label: "2 Mbps", bps: 2_000_000 },
+  { label: "1 Mbps", bps: 1_000_000 },
+  { label: "500 Kbps", bps: 500_000 },
+  { label: "250 Kbps", bps: 250_000 },
 ];
 
 /// Subtitle appearance preferences. Applied via injected `<style>`
@@ -277,6 +301,126 @@ function markerLabel(m: PlayerMarker): string {
   return "Skip Intro";
 }
 
+/// Keyboard nav for a `role="menu"` container that holds
+/// `role="menuitemradio"` buttons. ArrowDown / ArrowUp cycle through
+/// items (wrapping at the ends); Home / End jump to first / last.
+/// Matches the WAI-ARIA menu pattern so keyboard users can drive
+/// the audio / subtitle / quality pickers without Tab-bouncing
+/// through every disabled row.
+function handleMenuArrowKeys(e: React.KeyboardEvent<HTMLDivElement>) {
+  if (
+    e.key !== "ArrowDown"
+    && e.key !== "ArrowUp"
+    && e.key !== "Home"
+    && e.key !== "End"
+  ) {
+    return;
+  }
+  const items = Array.from(
+    e.currentTarget.querySelectorAll<HTMLButtonElement>(
+      '[role="menuitemradio"]',
+    ),
+  ).filter((el) => !el.disabled);
+  if (items.length === 0) return;
+  e.preventDefault();
+  const active = document.activeElement;
+  const idx = items.findIndex((el) => el === active);
+  let next = 0;
+  if (e.key === "ArrowDown") {
+    next = idx < 0 ? 0 : (idx + 1) % items.length;
+  } else if (e.key === "ArrowUp") {
+    next = idx <= 0 ? items.length - 1 : idx - 1;
+  } else if (e.key === "End") {
+    next = items.length - 1;
+  }
+  items[next]?.focus();
+}
+
+/// Subtitle codec names ffprobe emits for picture-based formats. These
+/// can't be soft-rendered — the transcoder has to overlay-burn them
+/// into the video, which means the user's subtitle-appearance panel
+/// (font, color, background) is ignored and changing the selection
+/// rerolls the session. Surface that in the picker so the user
+/// understands why their styling didn't take. Keep this list in sync
+/// with the watch-page auto-picker's exclusion set.
+const PICTURE_SUBTITLE_CODECS = new Set([
+  "hdmv_pgs_subtitle",
+  "pgs",
+  "dvd_subtitle",
+  "dvdsub",
+  "dvb_subtitle",
+  "vobsub",
+  "xsub",
+]);
+
+function isPictureSubtitle(codec: string | null | undefined): boolean {
+  return codec ? PICTURE_SUBTITLE_CODECS.has(codec.toLowerCase()) : false;
+}
+
+/// Brief top-anchored pill shown when the player mounts mid-file (i.e.
+/// the user is resuming). Plex-style: communicates the resume position
+/// and offers a one-click "Start over". Fades in on mount, auto-hides
+/// after 6 s, dismissable via the close button.
+function ResumePill({
+  resumeSec,
+  onStartOver,
+  onDismiss,
+}: {
+  resumeSec: number;
+  onStartOver: () => void;
+  onDismiss: () => void;
+}) {
+  const [appear, setAppear] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setAppear(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+  return (
+    <div
+      className={`pointer-events-auto absolute inset-x-0 top-[max(4.5rem,calc(env(safe-area-inset-top)+3.5rem))] z-30 flex justify-center px-4 transition-all duration-200 ${
+        appear ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-2"
+      }`}
+    >
+      <div className="flex items-center gap-3 rounded-full border border-white/15 bg-black/75 px-4 py-2 text-sm text-white/90 shadow-2xl backdrop-blur-md">
+        <span className="text-white/70">
+          Resumed from{" "}
+          <span className="font-medium text-white tabular-nums">
+            {formatTime(resumeSec)}
+          </span>
+        </span>
+        <button
+          type="button"
+          onClick={onStartOver}
+          className="rounded-full border border-white/30 px-3 py-0.5 text-xs font-semibold text-white transition-colors hover:border-white hover:bg-white hover:text-black"
+        >
+          Start over
+        </button>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          title="Dismiss"
+          className="text-white/55 transition-colors hover:text-white"
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            aria-hidden
+          >
+            <line x1="6" y1="6" x2="18" y2="18" />
+            <line x1="18" y1="6" x2="6" y2="18" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /// Skip-marker pill with a live countdown so the operator sees how
 /// long they have to act. The countdown updates from a local rAF tick
 /// rather than re-rendering the whole player every 250ms — keeps the
@@ -285,10 +429,12 @@ function SkipMarkerButton({
   marker,
   currentMs,
   onSkip,
+  onDismiss,
 }: {
   marker: PlayerMarker;
   currentMs: number;
   onSkip: (m: PlayerMarker) => void;
+  onDismiss: () => void;
 }) {
   const remaining = Math.max(0, Math.ceil((marker.end_ms - currentMs) / 1000));
   // Fade-in once on mount so the pill animates in rather than popping.
@@ -302,26 +448,48 @@ function SkipMarkerButton({
     return () => cancelAnimationFrame(id);
   }, []);
   return (
-    <button
-      type="button"
-      onClick={() => onSkip(marker)}
-      // Sits just above the control bar; on mobile we keep it closer
-      // to the right edge but reachable (smaller padding, 12rem from
-      // bottom to clear the wider mobile control row).
-      className={`pointer-events-auto absolute bottom-28 right-3 z-30 inline-flex items-center gap-2 rounded-md border border-white/30 bg-white/95 px-4 py-2 text-sm font-semibold text-black shadow-2xl transition-all duration-200 hover:scale-[1.03] hover:bg-white sm:bottom-32 sm:right-8 sm:px-6 sm:py-2.5 ${
+    <div
+      className={`pointer-events-auto absolute bottom-28 right-3 z-30 flex items-stretch shadow-2xl transition-all duration-200 sm:bottom-32 sm:right-8 ${
         appear ? "opacity-100 translate-y-0" : "opacity-0 translate-y-2"
       }`}
     >
-      <span>{markerLabel(marker)}</span>
-      {remaining > 0 && (
-        <span
+      <button
+        type="button"
+        onClick={() => onSkip(marker)}
+        className="inline-flex items-center gap-2 rounded-l-md border border-r-0 border-white/30 bg-white/95 px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-white sm:px-6 sm:py-2.5"
+      >
+        <span>{markerLabel(marker)}</span>
+        {remaining > 0 && (
+          <span
+            aria-hidden
+            className="tabular-nums text-[0.78em] text-black/55"
+          >
+            {remaining}s
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss"
+        title="Dismiss"
+        className="inline-flex items-center justify-center rounded-r-md border border-white/30 bg-white/95 px-2.5 text-black/55 transition-colors hover:bg-white hover:text-black"
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
           aria-hidden
-          className="tabular-nums text-[0.78em] text-black/55"
         >
-          {remaining}s
-        </span>
-      )}
-    </button>
+          <line x1="6" y1="6" x2="18" y2="18" />
+          <line x1="18" y1="6" x2="6" y2="18" />
+        </svg>
+      </button>
+    </div>
   );
 }
 
@@ -430,6 +598,19 @@ export function ChimpFlixPlayer({
   // consumption; if null, falls back to liveTimeMsRef (mount-time
   // resume path).
   const pendingRestartTargetMsRef = useRef<number | null>(null);
+  // Snapshot of the last audio/subtitle/quality combo that produced a
+  // working session. If session creation fails after the user changed
+  // one of those axes, the catch path reverts to this snapshot so the
+  // player isn't stuck on a broken selection with no recovery — the
+  // state update triggers another session-create with the known-good
+  // combo. Reset on file/episode change so we don't try to restore
+  // indices that don't exist on the new file.
+  const lastGoodTracksRef = useRef<{
+    audio: number | undefined;
+    subtitle: number | null | undefined;
+    quality: QualityChoice;
+    bitrateCap: BitrateCapChoice;
+  } | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -484,6 +665,13 @@ export function ChimpFlixPlayer({
   /// new tier re-rolls ffmpeg.
   const [qualitySel, setQualitySel] = useState<QualityChoice>(
     QUALITY_OPTIONS[0],
+  );
+  /// User-controlled bitrate cap, independent of [`qualitySel`]. Sits
+  /// next to the resolution picker in the Quality popover. "No cap"
+  /// (the default) means the backend uses the ladder default for
+  /// whatever resolution we end up at.
+  const [bitrateCapSel, setBitrateCapSel] = useState<BitrateCapChoice>(
+    BITRATE_CAP_OPTIONS[0],
   );
   /// Snapshot of what the server actually decided to run for the
   /// current session. Surfaced in the Quality picker so a user with
@@ -827,6 +1015,13 @@ export function ChimpFlixPlayer({
   /// it carries no cost when closed.
   const [statsOpen, setStatsOpen] = useState(false);
   const [hotkeysOpen, setHotkeysOpen] = useState(false);
+  // Resume-pill state. When the player mounts at >30s into the file the
+  // user is resuming, so we surface a brief "Resumed from 1:23:45 ·
+  // Start over" affordance instead of silently dropping them mid-scene
+  // (Plex's pattern). Auto-hides after 6s; manual dismiss via the X.
+  const [resumePillVisible, setResumePillVisible] = useState(
+    startPositionMs > 30_000,
+  );
   // Derived: the marker (if any) that contains the current playback time.
   const activeMarkerOverlay = activeMarker(currentTime * 1000, markers);
   // Track the intro markers we've already auto-skipped this session so
@@ -834,6 +1029,24 @@ export function ChimpFlixPlayer({
   // forward again. Keyed by the intro's start_ms which is stable
   // across renders.
   const skippedIntrosRef = useRef<Set<number>>(new Set());
+  // The user's "no thanks" on the skip pill stores the rejected
+  // marker's identity here. When the active marker changes (we leave
+  // the region or the next ep loads a fresh one) the dismissal clears
+  // and the pill is eligible to render again. Key includes kind so an
+  // intro at the same start_ms as a credits marker isn't suppressed
+  // by the wrong dismissal.
+  const activeMarkerKey = activeMarkerOverlay
+    ? `${activeMarkerOverlay.kind}:${activeMarkerOverlay.start_ms}`
+    : null;
+  const [dismissedMarkerKey, setDismissedMarkerKey] = useState<string | null>(
+    null,
+  );
+  useEffect(() => {
+    if (dismissedMarkerKey !== null && dismissedMarkerKey !== activeMarkerKey) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setDismissedMarkerKey(null);
+    }
+  }, [activeMarkerKey, dismissedMarkerKey]);
 
   // Tracks shown in the picker follow the active version. Versions can
   // differ in stream layout (4K with 3 audio dubs, 1080p with 1), so
@@ -948,7 +1161,7 @@ export function ChimpFlixPlayer({
           audioSel === undefined &&
           (subtitleSel === undefined || subtitleSel === null) &&
           qualitySel.height === null &&
-          qualitySel.bitrate_bps === null;
+          bitrateCapSel.bps === null;
         const prewarmed = noCustomSelection
           ? consumePrewarm(activeMediaFileId, resumeMs)
           : null;
@@ -962,12 +1175,10 @@ export function ChimpFlixPlayer({
             subtitle_index: subtitleSel === null ? undefined : subtitleSel,
             subtitle_style: subtitleStyle,
             quality_target:
-              qualitySel.height !== null && qualitySel.bitrate_bps !== null
-                ? {
-                    height: qualitySel.height,
-                    bitrate_bps: qualitySel.bitrate_bps,
-                  }
+              qualitySel.height !== null
+                ? { height: qualitySel.height }
                 : undefined,
+            bitrate_cap_bps: bitrateCapSel.bps ?? undefined,
             // Only send when on — omitting matches Rust's `#[serde(default)]`
             // and keeps the request payload small on the (default) off case.
             audio_normalize: livePrefs.audioNormalize ? true : undefined,
@@ -988,6 +1199,28 @@ export function ChimpFlixPlayer({
           );
           return;
         }
+        // If we had a working session and the user just changed an
+        // audio/subtitle/quality axis, revert to the last known-good
+        // combo so they aren't stuck staring at the error overlay.
+        // The state update re-runs this effect with the previous
+        // selection, which we know works.
+        const lastGood = lastGoodTracksRef.current;
+        if (
+          lastGood &&
+          (lastGood.audio !== audioSel ||
+            lastGood.subtitle !== subtitleSel ||
+            lastGood.quality.height !== qualitySel.height ||
+            lastGood.bitrateCap.bps !== bitrateCapSel.bps)
+        ) {
+          console.warn(
+            "[player] track/quality switch failed; reverting to last working selection",
+          );
+          setAudioSel(lastGood.audio);
+          setSubtitleSel(lastGood.subtitle);
+          setQualitySel(lastGood.quality);
+          setBitrateCapSel(lastGood.bitrateCap);
+          return;
+        }
         setError("Could not start playback");
         return;
       }
@@ -998,14 +1231,21 @@ export function ChimpFlixPlayer({
       // If the user navigated away or switched versions/tracks during
       // the round-trip, fire DELETE inline so the orphan transcoder
       // doesn't keep encoding. The cleanup closure already ran before
-      // we got here, so it can't see this sessionId.
+      // we got here, so it can't see this sessionId. Must include the
+      // CSRF token — the server's middleware 403s un-tokened DELETEs
+      // and the same orphan-session bug the documented teardown path
+      // fixes would otherwise repeat here.
       if (cancelled) {
         if (sessionId) {
           const id = sessionId;
+          const csrf = readCsrfToken();
+          const headers: Record<string, string> = {};
+          if (csrf) headers["X-CSRF-Token"] = csrf;
           fetch(`/api/v1/stream/sessions/${encodeURIComponent(id)}`, {
             method: "DELETE",
             keepalive: true,
             credentials: "include",
+            headers,
           }).catch(() => {});
         }
         return;
@@ -1046,6 +1286,15 @@ export function ChimpFlixPlayer({
         videoTreatment: resp.session.video_treatment ?? null,
         audioTreatment: resp.session.audio_treatment ?? null,
       });
+
+      // Snapshot the combo that just worked. If a subsequent track or
+      // quality change fails, the catch branch reverts to this.
+      lastGoodTracksRef.current = {
+        audio: audioSel,
+        subtitle: subtitleSel,
+        quality: qualitySel,
+        bitrateCap: bitrateCapSel,
+      };
 
       // Transcode sessions have ffmpeg fast-seek to its
       // start_position_ms and HLS.js renders that as media-time 0.
@@ -1551,7 +1800,15 @@ export function ChimpFlixPlayer({
     // current session's start — the HLS stream doesn't include those
     // segments, so we need a fresh ffmpeg rooted at the new position.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeMediaFileId, audioSel, subtitleSel, subtitleOffsetMs, qualitySel, resumeEpoch]);
+  }, [
+    activeMediaFileId,
+    audioSel,
+    subtitleSel,
+    subtitleOffsetMs,
+    qualitySel,
+    bitrateCapSel,
+    resumeEpoch,
+  ]);
 
   // ── Video state subscriptions ────────────────────────────────────────────
   useEffect(() => {
@@ -1818,12 +2075,32 @@ export function ChimpFlixPlayer({
     setPlaybackRate(saved.playbackRate);
   }, []);
 
-  // Fullscreen tracking.
+  // Fullscreen tracking. iOS Safari (and standalone PWAs) doesn't
+  // dispatch `fullscreenchange` because it doesn't implement the
+  // standard Element.requestFullscreen API — it uses the older
+  // `webkitEnterFullscreen` on HTMLVideoElement, which fires
+  // `webkitbeginfullscreen` / `webkitendfullscreen` ON THE VIDEO
+  // element. Without those listeners, the controls' fullscreen icon
+  // would never flip to "exit" on iPhone, leaving keyboard / a11y
+  // users with no clear out-of-fullscreen signal.
   useEffect(() => {
     const onChange = () =>
       setIsFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener("fullscreenchange", onChange);
-    return () => document.removeEventListener("fullscreenchange", onChange);
+    const video = videoRef.current;
+    const onWebkitBegin = () => setIsFullscreen(true);
+    const onWebkitEnd = () => setIsFullscreen(false);
+    if (video) {
+      video.addEventListener("webkitbeginfullscreen", onWebkitBegin);
+      video.addEventListener("webkitendfullscreen", onWebkitEnd);
+    }
+    return () => {
+      document.removeEventListener("fullscreenchange", onChange);
+      if (video) {
+        video.removeEventListener("webkitbeginfullscreen", onWebkitBegin);
+        video.removeEventListener("webkitendfullscreen", onWebkitEnd);
+      }
+    };
   }, []);
 
   // PiP tracking.
@@ -2134,6 +2411,21 @@ export function ChimpFlixPlayer({
     return () => video.removeEventListener("ended", onEnded);
   }, [nextHref, router, autoNextCancelled, prefs.autoplayNext]);
 
+  // Reset session-bound refs when the file or episode changes. Without
+  // this, the second episode in a binge session never scrobbles
+  // (scrobbledRef stays true after the first ep's scrobble) and any
+  // intro whose start_ms collides with one we've already auto-skipped
+  // this mount goes un-skipped (very plausible on shows that put the
+  // intro at the same offset each episode). lastGoodTracksRef also
+  // resets because audio/subtitle indices are file-scoped — reverting
+  // to an old file's index on the new file would land on a different
+  // language or stream.
+  useEffect(() => {
+    scrobbledRef.current = false;
+    skippedIntrosRef.current = new Set<number>();
+    lastGoodTracksRef.current = null;
+  }, [activeMediaFileId, episodeId]);
+
   // Idle-hide controls. Always shows + (re-)arms the auto-hide timer.
   // Idempotent: calling it multiple times in a row from cascading event
   // handlers (pointerdown → click) just keeps the controls visible and
@@ -2146,6 +2438,28 @@ export function ChimpFlixPlayer({
       if (v && !v.paused) setShowControls(false);
     }, 3000);
   }, []);
+
+  // Clear the auto-hide timer on unmount. resetHide() schedules a
+  // window timeout that holds setShowControls + videoRef in scope; a
+  // tab close / route transition mid-window would otherwise leak the
+  // closure until the browser GCs it.
+  useEffect(() => {
+    return () => {
+      if (hideTimerRef.current !== null) {
+        window.clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Auto-hide the resume pill after 6 seconds. Long enough for the user
+  // to register the message and act on it, short enough to clear the
+  // chrome before the opening scene matters.
+  useEffect(() => {
+    if (!resumePillVisible) return;
+    const t = window.setTimeout(() => setResumePillVisible(false), 6000);
+    return () => window.clearTimeout(t);
+  }, [resumePillVisible]);
 
   // Imperative controls.
   const togglePlay = useCallback(() => {
@@ -2440,12 +2754,10 @@ export function ChimpFlixPlayer({
           audio_index: audioSel,
           subtitle_index: subtitleSel === null ? undefined : subtitleSel,
           quality_target:
-            qualitySel.height !== null && qualitySel.bitrate_bps !== null
-              ? {
-                  height: qualitySel.height,
-                  bitrate_bps: qualitySel.bitrate_bps,
-                }
+            qualitySel.height !== null
+              ? { height: qualitySel.height }
               : undefined,
+          bitrate_cap_bps: bitrateCapSel.bps ?? undefined,
           audio_normalize: livePrefs.audioNormalize ? true : undefined,
           subtitle_offset_ms:
             subtitleOffsetMs !== 0 ? subtitleOffsetMs : undefined,
@@ -2460,7 +2772,14 @@ export function ChimpFlixPlayer({
           // takes the normal cold-start path.
         });
     },
-    [activeMediaFileId, audioSel, subtitleSel, qualitySel, subtitleOffsetMs],
+    [
+      activeMediaFileId,
+      audioSel,
+      subtitleSel,
+      qualitySel,
+      bitrateCapSel,
+      subtitleOffsetMs,
+    ],
   );
 
   // Auto-skip intros. Fires once per intro per session: when the
@@ -2511,57 +2830,74 @@ export function ChimpFlixPlayer({
     tryWebkitVideoFullscreen(videoRef.current);
   }, []);
 
-  const togglePip = useCallback(async () => {
+  const togglePip = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
     // PiP can be force-disabled per-element by extensions / a11y tools.
-    // Clearing this defensively before the request keeps the button
-    // working even if something else flipped the flag mid-session.
+    // Clear defensively before the request so the button works even if
+    // something else flipped the flag mid-session.
     if (v.disablePictureInPicture) {
       v.disablePictureInPicture = false;
     }
-    try {
-      if (document.pictureInPictureElement) {
-        await document.exitPictureInPicture();
-        return;
-      }
-      if (!document.pictureInPictureEnabled) {
-        console.warn("[player] picture-in-picture not supported in this browser");
-        return;
-      }
-      if (typeof v.requestPictureInPicture !== "function") {
-        console.warn("[player] video element has no requestPictureInPicture");
-        return;
-      }
-      // Some browsers reject if `readyState < HAVE_METADATA`. Nudge the
-      // pipeline by awaiting metadata once if we're not there yet — the
-      // user clicked, so they expect *something* to happen.
-      if (v.readyState < 1) {
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            v.removeEventListener("loadedmetadata", done);
-            resolve();
-          };
-          v.addEventListener("loadedmetadata", done, { once: true });
-          // Safety timeout — don't hang forever.
-          setTimeout(done, 1500);
-        });
-      }
-      await v.requestPictureInPicture();
-    } catch (err) {
-      console.warn("[player] picture-in-picture toggle failed", err);
+    // Stay synchronous until requestPictureInPicture() is called so
+    // the user gesture grant is still in scope. Firefox + Safari
+    // reject PiP requests made *after* an await in the same handler
+    // ("Document is not focused" / "must be handling a user gesture"),
+    // and Chromium has been tightening this too. Use .then/.catch
+    // for follow-up work instead of async/await.
+    if (document.pictureInPictureElement) {
+      document
+        .exitPictureInPicture()
+        .catch((err) =>
+          console.warn("[player] exit picture-in-picture failed", err),
+        );
+      return;
     }
+    if (!document.pictureInPictureEnabled) {
+      console.warn(
+        "[player] picture-in-picture not supported in this browser",
+      );
+      return;
+    }
+    if (typeof v.requestPictureInPicture !== "function") {
+      console.warn(
+        "[player] video element has no requestPictureInPicture",
+      );
+      return;
+    }
+    v.requestPictureInPicture().catch((err) => {
+      console.warn("[player] picture-in-picture request failed", err);
+    });
   }, []);
 
   // Audio/subtitle selection causes a fresh session (the transcoder burns
   // subtitles in, so there's no in-stream switch).
-  const selectAudio = useCallback((idx: number) => {
-    setAudioSel(idx);
-  }, []);
+  //
+  // We also persist the picked language as the user's default so the
+  // next title auto-selects the same audio / subtitle language without
+  // them re-picking. Fire-and-forget — a failed save is fine, the
+  // in-session selection still applies; only the cross-title memory
+  // misses. Skip the save when the track has no language tag (e.g.
+  // "Commentary" with `und`) because saving "und" would clobber the
+  // user's English default with garbage.
+  const selectAudio = useCallback(
+    (idx: number) => {
+      setAudioSel(idx);
+      const picked = activeAudioTracks.find((t) => t.idx === idx);
+      const lang = picked?.language;
+      if (lang && lang !== "und") {
+        authApi.updateMe({ default_audio_lang: lang }).catch(() => {});
+      }
+    },
+    [activeAudioTracks],
+  );
 
   const selectSubtitle = useCallback((track: StreamChoice | null) => {
     if (track === null) {
-      // Explicitly off — clear both surfaces.
+      // Explicitly off — clear both surfaces but DON'T clobber the
+      // saved language preference. The user might be turning subs off
+      // for this scene only; the auto-picker can still kick in next
+      // title. Clearing the default lives in Settings → Profile.
       setSubtitleSel(null);
       setExternalSub(null);
       return;
@@ -2573,10 +2909,14 @@ export function ChimpFlixPlayer({
         url: track.externalUrl,
         language: track.language ?? null,
       });
-      return;
+    } else {
+      setExternalSub(null);
+      setSubtitleSel(track.idx);
     }
-    setExternalSub(null);
-    setSubtitleSel(track.idx);
+    const lang = track.language;
+    if (lang && lang !== "und") {
+      authApi.updateMe({ default_subtitle_lang: lang }).catch(() => {});
+    }
   }, []);
 
   const toggleSubtitles = useCallback(() => {
@@ -2703,6 +3043,32 @@ export function ChimpFlixPlayer({
           setHotkeysOpen((v) => !v);
           resetHide();
           break;
+        case "n":
+        case "N":
+          if (nextHref) {
+            e.preventDefault();
+            router.push(nextHref);
+          }
+          break;
+        case "0":
+        case "1":
+        case "2":
+        case "3":
+        case "4":
+        case "5":
+        case "6":
+        case "7":
+        case "8":
+        case "9": {
+          // YouTube-style jump-to-percent: 0 = start, 5 = midpoint,
+          // 9 = 90%. Useful for power-skipping through known content.
+          if (videoDuration > 0) {
+            e.preventDefault();
+            seekTo(videoDuration * (Number.parseInt(e.key, 10) / 10));
+            resetHide();
+          }
+          break;
+        }
         case ">":
         case ".":
           if (e.shiftKey || e.key === ">") {
@@ -2737,6 +3103,8 @@ export function ChimpFlixPlayer({
     setSpeed,
     resetHide,
     videoDuration,
+    nextHref,
+    router,
   ]);
 
   return (
@@ -2763,6 +3131,18 @@ export function ChimpFlixPlayer({
             src={externalSub.url}
             srcLang={externalSub.language ?? "und"}
             default
+            onError={() => {
+              // External subtitle 404 / network blip would otherwise
+              // leave the picker showing the row as "active" while no
+              // cues render — a silent failure. Clear the selection
+              // so the UI reflects the real state and the user can
+              // pick another row.
+              console.warn(
+                "[player] external subtitle failed to load",
+                externalSub.url,
+              );
+              selectSubtitle(null);
+            }}
           />
         )}
       </video>
@@ -2810,13 +3190,25 @@ export function ChimpFlixPlayer({
         </div>
       )}
 
-      {activeMarkerOverlay && (
+      {activeMarkerOverlay && dismissedMarkerKey !== activeMarkerKey && (
         <SkipMarkerButton
           marker={activeMarkerOverlay}
           currentMs={currentTime * 1000}
           onSkip={(m) => {
             seekTo(m.end_ms / 1000);
           }}
+          onDismiss={() => setDismissedMarkerKey(activeMarkerKey)}
+        />
+      )}
+
+      {resumePillVisible && (
+        <ResumePill
+          resumeSec={startPositionMs / 1000}
+          onStartOver={() => {
+            seekTo(0);
+            setResumePillVisible(false);
+          }}
+          onDismiss={() => setResumePillVisible(false)}
         />
       )}
 
@@ -2999,6 +3391,9 @@ export function ChimpFlixPlayer({
                 qualityOptions={QUALITY_OPTIONS}
                 qualitySel={qualitySel}
                 onQualitySelect={setQualitySel}
+                bitrateCapOptions={BITRATE_CAP_OPTIONS}
+                bitrateCapSel={bitrateCapSel}
+                onBitrateCapSelect={setBitrateCapSel}
                 sessionStatus={sessionStatus}
                 open={tracksOpen}
                 onToggle={() => setTracksOpen((o) => !o)}
@@ -3098,6 +3493,9 @@ function TracksControl({
   qualityOptions,
   qualitySel,
   onQualitySelect,
+  bitrateCapOptions,
+  bitrateCapSel,
+  onBitrateCapSelect,
   sessionStatus,
   open,
   onToggle,
@@ -3116,6 +3514,9 @@ function TracksControl({
   qualityOptions: QualityChoice[];
   qualitySel: QualityChoice;
   onQualitySelect: (q: QualityChoice) => void;
+  bitrateCapOptions: BitrateCapChoice[];
+  bitrateCapSel: BitrateCapChoice;
+  onBitrateCapSelect: (q: BitrateCapChoice) => void;
   sessionStatus: {
     height: number | null;
     sourceHeight: number | null;
@@ -3167,6 +3568,7 @@ function TracksControl({
       {open && (
         <div
           role="menu"
+          onKeyDown={handleMenuArrowKeys}
           // Bottom-sheet on phones: full-width minus 0.5rem margin,
           // pinned to the bottom of the viewport, scrollable if the
           // contents overflow. Reverts to the anchored popover at sm+
@@ -3184,6 +3586,9 @@ function TracksControl({
             options={qualityOptions}
             active={qualitySel}
             onSelect={onQualitySelect}
+            bitrateCapOptions={bitrateCapOptions}
+            bitrateCapActive={bitrateCapSel}
+            onBitrateCapSelect={onBitrateCapSelect}
             sessionStatus={sessionStatus}
           />
           <StreamColumn
@@ -3210,6 +3615,7 @@ function TracksControl({
             }
             onSelect={(t) => onSubtitleSelect(t)}
             offOption={true}
+            badgeFor={(t) => (isPictureSubtitle(t.codec) ? "Burn-in" : null)}
           />
         </div>
       )}
@@ -3221,11 +3627,17 @@ function QualityColumn({
   options,
   active,
   onSelect,
+  bitrateCapOptions,
+  bitrateCapActive,
+  onBitrateCapSelect,
   sessionStatus,
 }: {
   options: QualityChoice[];
   active: QualityChoice;
   onSelect: (q: QualityChoice) => void;
+  bitrateCapOptions: BitrateCapChoice[];
+  bitrateCapActive: BitrateCapChoice;
+  onBitrateCapSelect: (b: BitrateCapChoice) => void;
   sessionStatus: {
     height: number | null;
     sourceHeight: number | null;
@@ -3255,9 +3667,9 @@ function QualityColumn({
   return (
     <div className="border-r border-white/10">
       <div className="border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
-        Quality
+        Resolution
       </div>
-      <ul className="max-h-72 overflow-y-auto py-2">
+      <ul className="max-h-48 overflow-y-auto py-2">
         {options.map((q) => (
           <TrackRow
             key={q.label}
@@ -3266,14 +3678,29 @@ function QualityColumn({
                 ? `Auto · ${autoSubLabel}`
                 : q.label
             }
-            active={
-              active.height === q.height && active.bitrate_bps === q.bitrate_bps
-            }
+            active={active.height === q.height}
             disabled={isImpractical(q)}
             onClick={() => {
               if (isImpractical(q)) return;
               onSelect(q);
             }}
+          />
+        ))}
+      </ul>
+      {/* Independent bitrate cap. Stacked in the same column so we
+          don't have to widen the popover for a fifth column — most
+          users never touch this, but mobile-data viewers really
+          want it. */}
+      <div className="border-t border-b border-white/10 px-4 py-3 text-[0.7rem] font-semibold uppercase tracking-wider text-white/60">
+        Max bitrate
+      </div>
+      <ul className="max-h-48 overflow-y-auto py-2">
+        {bitrateCapOptions.map((b) => (
+          <TrackRow
+            key={b.label}
+            label={b.label}
+            active={bitrateCapActive.bps === b.bps}
+            onClick={() => onBitrateCapSelect(b)}
           />
         ))}
       </ul>
@@ -3378,6 +3805,7 @@ function SubtitleSettingsControl({
       {open && (
         <div
           role="menu"
+          onKeyDown={handleMenuArrowKeys}
           // Landscape phones are short — 75vh used to leave the menu
           // taller than the viewport, anchored at the bottom, with the
           // top (sync offset section) clipped off-screen. Anchor with
@@ -3596,6 +4024,7 @@ function StreamColumn({
   offSelected,
   onSelect,
   offOption,
+  badgeFor,
 }: {
   label: string;
   tracks: StreamChoice[];
@@ -3603,6 +4032,10 @@ function StreamColumn({
   offSelected: boolean;
   onSelect: (track: StreamChoice | null) => void;
   offOption: boolean;
+  /// When set, called for each row to compute an optional per-track
+  /// badge (e.g. "Burn-in" for picture-based subtitle codecs). Returning
+  /// null produces no badge.
+  badgeFor?: (t: StreamChoice) => string | null;
 }) {
   return (
     <div className="border-r border-white/10 last:border-r-0">
@@ -3623,6 +4056,7 @@ function StreamColumn({
             label={t.label}
             active={isActive(t)}
             onClick={() => onSelect(t)}
+            badge={badgeFor?.(t) ?? null}
           />
         ))}
         {tracks.length === 0 && !offOption && (
@@ -3638,6 +4072,7 @@ function TrackRow({
   active,
   onClick,
   disabled = false,
+  badge = null,
 }: {
   label: string;
   active: boolean;
@@ -3646,6 +4081,10 @@ function TrackRow({
   /// Quality column to indicate tiers above source resolution that
   /// won't actually produce sharper output.
   disabled?: boolean;
+  /// Optional secondary tag appended after the label (e.g. "Burn-in"
+  /// for picture-based subtitles). Right-aligned in amber so it reads
+  /// as informational warning rather than label noise.
+  badge?: string | null;
 }) {
   return (
     <li>
@@ -3684,6 +4123,11 @@ function TrackRow({
           </svg>
         </span>
         <span className="truncate">{label}</span>
+        {badge && (
+          <span className="ml-auto shrink-0 rounded-sm border border-amber-500/30 bg-amber-500/15 px-1 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+            {badge}
+          </span>
+        )}
       </button>
     </li>
   );
@@ -3854,6 +4298,7 @@ function SpeedControl({
       {open && (
         <div
           role="menu"
+          onKeyDown={handleMenuArrowKeys}
           className="fixed inset-x-2 bottom-2 z-50 overflow-hidden rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:w-32"
         >
           <ul className="py-2">
@@ -4016,6 +4461,7 @@ function EpisodesControl({
       {open && (
         <div
           role="menu"
+          onKeyDown={handleMenuArrowKeys}
           className="fixed inset-x-2 bottom-2 z-50 max-h-[75vh] overflow-y-auto rounded-md border border-white/10 bg-black/95 shadow-2xl backdrop-blur-sm sm:absolute sm:inset-x-auto sm:bottom-full sm:right-0 sm:mb-3 sm:max-h-none sm:w-md sm:overflow-hidden"
         >
           {pickerOpen ? (
@@ -4258,19 +4704,13 @@ function EpisodeRow({
 }
 
 function HotkeysOverlay({ onClose }: { onClose: () => void }) {
-  // Esc to dismiss. The player's global keyboard handler also has a
-  // `?` toggle so opening + closing with the same key works without
-  // needing a second listener here.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  // Esc + Tab focus cycling + restore-focus-on-close handled by
+  // the shared hook. The player's global keyboard handler also
+  // has a `?` toggle so opening + closing with the same key
+  // works without needing a separate listener here.
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = "hotkeys-dialog-title";
+  useFocusTrap(dialogRef, { onClose });
   // Two columns of {keys, action} for the hotkey reference. Keep the
   // action labels short — this overlay isn't documentation, it's a
   // glance-and-go reminder. `?` toggles itself so the user can
@@ -4283,7 +4723,9 @@ function HotkeysOverlay({ onClose }: { onClose: () => void }) {
         ["←  /  →", "Seek 10s back / fwd"],
         ["j  /  l", "Seek 10s back / fwd"],
         ["Home / End", "Seek to start / end"],
+        ["0 – 9", "Jump to 0 – 90%"],
         [".  /  ,", "Speed up / slow down"],
+        ["n", "Next episode"],
       ],
     },
     {
@@ -4307,18 +4749,21 @@ function HotkeysOverlay({ onClose }: { onClose: () => void }) {
   ];
   return (
     <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Keyboard shortcuts"
       className="absolute inset-0 z-40 flex items-center justify-center bg-black/80 p-4"
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         className="max-h-full w-full max-w-2xl overflow-y-auto rounded-lg border border-white/20 bg-neutral-950/95 p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-baseline justify-between gap-2">
-          <h2 className="text-lg font-semibold">Keyboard shortcuts</h2>
+          <h2 id={titleId} className="text-lg font-semibold">
+            Keyboard shortcuts
+          </h2>
           <button
             type="button"
             onClick={onClose}
@@ -4889,6 +5334,26 @@ function ProgressBar({
             </div>
           );
         })()
+      )}
+      {/*
+        Time bubble visible during scrub. Covers the gap on touch
+        devices where there is no hover, and also makes desktop drag
+        clearer (the existing fill + thumb don't show a numeric
+        target). Sized large + tabular-nums so a thumb on mobile
+        doesn't obscure it. Anchored to bottom of the bar with a
+        wider offset so the user's finger doesn't sit on top of it.
+      */}
+      {scrubbing && scrubTime !== null && duration > 0 && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute -translate-x-1/2 rounded-md border border-white/20 bg-black/90 px-2.5 py-1 text-sm font-semibold tabular-nums text-white shadow-2xl"
+          style={{
+            left: `${progress}%`,
+            bottom: "calc(100% + 1.25rem)",
+          }}
+        >
+          {formatTime(scrubTime)}
+        </div>
       )}
     </div>
   );

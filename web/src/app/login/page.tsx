@@ -48,15 +48,34 @@ function LoginContent() {
   // First-run detection. The invite-present path is handled at useState
   // init above; here we only need the async server status check when
   // mode is still null (no invite, server hasn't replied yet).
+  //
+  // Also catches "already signed in" — bookmarking /login while
+  // authenticated used to land on the login form regardless, which
+  // looks broken. We redirect to `next` instead. Invite-bearing links
+  // are an exception: the user is being asked to register a new
+  // account, so we keep the form even if a different session is
+  // already active (the server will reject the conflict with a clear
+  // message if they actually submit).
   useEffect(() => {
     if (mode !== null) return;
     let cancelled = false;
-    auth
-      .status()
-      .then((s) => {
+    (async () => {
+      if (!invite) {
+        try {
+          const me = await auth.me();
+          if (!cancelled && me) {
+            router.replace(next);
+            return;
+          }
+        } catch {
+          // 401 (no session) is the expected case here; fall through
+          // to the setup/login decision below.
+        }
+      }
+      try {
+        const s = await auth.status();
         if (!cancelled) setMode(s.setup_needed ? "setup" : "login");
-      })
-      .catch((e) => {
+      } catch (e) {
         if (!cancelled) {
           setError(
             e instanceof ChimpFlixApiError
@@ -65,11 +84,12 @@ function LoginContent() {
           );
           setMode("login");
         }
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, [mode, invite, next, router]);
 
   function setModeAndReset(next: Mode) {
     setMode(next);
@@ -176,14 +196,19 @@ function LoginContent() {
                 </span>
                 <input
                   type="text"
+                  name={useRecovery ? "recovery-code" : "otp"}
                   inputMode={useRecovery ? "text" : "numeric"}
                   autoComplete="one-time-code"
                   autoFocus
                   required
                   value={totpCode}
                   onChange={(e) => setTotpCode(e.target.value)}
-                  placeholder={useRecovery ? "xxxx-xxxx-xxxx-xxxx" : "123 456"}
-                  maxLength={useRecovery ? 32 : 8}
+                  placeholder={useRecovery ? "xxxx-xxxx-xxxx-xxxx" : "123456"}
+                  // 64 covers both 6-digit TOTPs and the longest
+                  // single-use recovery codes (8 groups of 4 chars
+                  // joined by dashes = 39 chars, plus slack for any
+                  // future format change).
+                  maxLength={64}
                   className="w-full rounded bg-white/10 px-3 py-3 text-center text-lg font-mono tracking-widest outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                 />
                 <span className="mt-1 block text-xs text-white/40">
@@ -198,6 +223,7 @@ function LoginContent() {
               <span className="mb-1 block text-sm text-white/70">Email</span>
               <input
                 type="email"
+                name="email"
                 autoComplete="email"
                 required
                 autoFocus
@@ -216,6 +242,7 @@ function LoginContent() {
                 <span className="mb-1 block text-sm text-white/70">Username</span>
                 <input
                   type="text"
+                  name="username"
                   autoComplete="username"
                   required
                   autoFocus
@@ -233,6 +260,8 @@ function LoginContent() {
                   </span>
                   <input
                     type="text"
+                    name="display_name"
+                    autoComplete="name"
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
                     maxLength={64}
@@ -248,6 +277,7 @@ function LoginContent() {
                   </span>
                   <input
                     type="email"
+                    name="email"
                     autoComplete="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -264,6 +294,7 @@ function LoginContent() {
                 <span className="mb-1 block text-sm text-white/70">Password</span>
                 <input
                   type="password"
+                  name="password"
                   autoComplete={
                     mode === "setup" || mode === "register"
                       ? "new-password"

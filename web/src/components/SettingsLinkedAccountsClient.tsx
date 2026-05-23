@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { plex, type PlexLinkSummary } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { PlexSignInButton } from "./PlexSignInButton";
 
 /// Per-user "Linked accounts" card. Today this is Plex-only; when we
@@ -11,6 +12,7 @@ export function SettingsLinkedAccountsClient() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [askUnlink, setAskUnlink] = useState(false);
 
   async function load() {
     try {
@@ -33,14 +35,7 @@ export function SettingsLinkedAccountsClient() {
 
   const plexLink = links?.find((l) => l.provider === "plex");
 
-  async function onUnlink() {
-    if (busy) return;
-    if (
-      !confirm(
-        "Unlink your Plex account? You'll still be able to sign in with your password (or, if you haven't set one, use \"Forgot password\" to set one first).",
-      )
-    )
-      return;
+  async function unlinkConfirmed() {
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -48,6 +43,7 @@ export function SettingsLinkedAccountsClient() {
       await plex.unlink();
       setNotice("Plex account unlinked.");
       await load();
+      setAskUnlink(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -85,7 +81,7 @@ export function SettingsLinkedAccountsClient() {
           {plexLink && (
             <button
               type="button"
-              onClick={onUnlink}
+              onClick={() => setAskUnlink(true)}
               disabled={busy}
               className="rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50"
             >
@@ -108,14 +104,33 @@ export function SettingsLinkedAccountsClient() {
       </div>
 
       {notice && (
-        <div className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
+        >
           {notice}
         </div>
       )}
       {error && (
-        <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
+      )}
+      {askUnlink && (
+        <ConfirmDialog
+          title="Unlink Plex?"
+          body="You can sign in again later with your password. If you haven't set one, use 'Forgot password' first to recover access."
+          confirmLabel="Unlink"
+          destructive
+          busy={busy}
+          onConfirm={() => void unlinkConfirmed()}
+          onCancel={() => setAskUnlink(false)}
+        />
       )}
     </div>
   );

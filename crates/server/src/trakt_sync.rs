@@ -91,14 +91,62 @@ where
 
 /// Push a single watched event to Trakt for every linked user (used by
 /// the play_state hooks). Best-effort: per-user failures are warned and
-/// don't bubble up to the caller.
+/// don't bubble up to the caller. INFO-logs on success so an operator
+/// tailing the log can see pushes hitting Trakt (previously this was
+/// completely silent — "did my mark-watched actually push?" had no
+/// answer without poking Trakt directly).
 pub async fn push_history_event(state: &AppState, user_id: i64, event: HistoryPush) {
+    let label = describe_history_event(&event);
     let result = with_user_client(state, user_id, |client, token| async move {
         client.push_history(&token, &[event]).await
     })
     .await;
-    if let Err(e) = result {
-        warn!(user_id, error = %format!("{e:#}"), "Trakt push_history hook failed");
+    match result {
+        Ok(Some(())) => {
+            tracing::info!(user_id, event = %label, "Trakt push_history ok");
+        }
+        Ok(None) => {
+            tracing::info!(
+                user_id,
+                event = %label,
+                "Trakt push_history skipped: user not linked",
+            );
+        }
+        Err(e) => {
+            warn!(user_id, event = %label, error = %format!("{e:#}"), "Trakt push_history failed");
+        }
+    }
+}
+
+/// Mirror of [`push_history_event`] for the un-watch path. Posts to
+/// Trakt's `/sync/history/remove` so the user's Trakt history reflects
+/// the local un-mark. Best-effort.
+pub async fn remove_history_event(state: &AppState, user_id: i64, event: HistoryPush) {
+    let label = describe_history_event(&event);
+    let result = with_user_client(state, user_id, |client, token| async move {
+        client.remove_history(&token, &[event]).await
+    })
+    .await;
+    match result {
+        Ok(Some(())) => {
+            tracing::info!(user_id, event = %label, "Trakt remove_history ok");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(user_id, event = %label, error = %format!("{e:#}"), "Trakt remove_history failed");
+        }
+    }
+}
+
+fn describe_history_event(event: &HistoryPush) -> String {
+    match event {
+        HistoryPush::Movie { tmdb_id, .. } => format!("movie tmdb={tmdb_id}"),
+        HistoryPush::Episode {
+            tmdb_show_id,
+            season,
+            episode,
+            ..
+        } => format!("show tmdb={tmdb_show_id} S{season:02}E{episode:02}"),
     }
 }
 
@@ -119,6 +167,63 @@ pub async fn push_rating_remove(state: &AppState, user_id: i64, event: RatingPus
     .await;
     if let Err(e) = result {
         warn!(user_id, error = %format!("{e:#}"), "Trakt remove_rating hook failed");
+    }
+}
+
+/// Bulk-push every locally-watched item that has accrued since
+/// `since_ms` (or all of them when `since_ms` is None) in a single
+/// `/sync/history` POST. Used by `sync_now` so an operator pressing
+/// "Sync now" actually closes the loop — without this, items the
+/// fire-and-forget hook missed (network blip, token expiry, item
+/// matched after first hook fired) stayed local forever.
+///
+/// Trakt deduplicates by tmdb_id + watched_at-within-window, so
+/// re-pushing items that already exist on Trakt is harmless. We
+/// still cap the response at the actual number of rows we sent,
+/// not what Trakt accepted, so the UI's "Pushed N" matches the
+/// operator's intent rather than Trakt's dedup math.
+pub async fn bulk_push_user_history(
+    state: &AppState,
+    user_id: i64,
+    since_ms: Option<i64>,
+) -> Result<(usize, usize)> {
+    let movies =
+        queries::list_watched_movies_for_push(&state.pool, user_id, since_ms).await?;
+    let episodes =
+        queries::list_watched_episodes_for_push(&state.pool, user_id, since_ms).await?;
+    if movies.is_empty() && episodes.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut events: Vec<HistoryPush> = Vec::with_capacity(movies.len() + episodes.len());
+    for (_item_id, tmdb_id, watched_at) in &movies {
+        events.push(HistoryPush::Movie {
+            tmdb_id: *tmdb_id,
+            watched_at: epoch_ms_to_iso(*watched_at),
+        });
+    }
+    for (_ep_id, show_tmdb, season, episode, watched_at) in &episodes {
+        events.push(HistoryPush::Episode {
+            tmdb_show_id: *show_tmdb,
+            season: *season,
+            episode: *episode,
+            watched_at: epoch_ms_to_iso(*watched_at),
+        });
+    }
+    let pushed = with_user_client(state, user_id, |client, token| async move {
+        client.push_history(&token, &events).await
+    })
+    .await?;
+    if pushed.is_some() {
+        tracing::info!(
+            user_id,
+            movies = movies.len(),
+            episodes = episodes.len(),
+            since_ms,
+            "Trakt bulk push ok",
+        );
+        Ok((movies.len(), episodes.len()))
+    } else {
+        Ok((0, 0))
     }
 }
 
@@ -258,19 +363,12 @@ async fn apply_position(
     episode_id: Option<i64>,
     position_ms: i64,
 ) -> Result<()> {
-    // Reuse the batch path so we get the same merge semantics as the
-    // live player updates.
-    let batch = chimpflix_library::PlayStateBatch {
-        updates: vec![chimpflix_library::PlayStateUpdate {
-            item_id,
-            episode_id,
-            position_ms,
-            duration_ms: None,
-            watched: None,
-        }],
-    };
-    queries::apply_play_state_batch(pool, user_id, batch).await?;
-    Ok(())
+    // Use the watched-preserving upsert. The previous code reused the
+    // live-player batch path, whose `watched.unwrap_or(false)` default
+    // un-watched any row Trakt's /sync/playback reported as in-progress
+    // — exactly the "sync makes things unwatched or partially watched"
+    // symptom users hit.
+    queries::upsert_external_position(pool, user_id, item_id, episode_id, position_ms).await
 }
 
 async fn find_local_item_by_tmdb(pool: &SqlitePool, tmdb_id: i64, kind: &str) -> Option<i64> {
