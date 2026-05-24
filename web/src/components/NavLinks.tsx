@@ -279,11 +279,11 @@ function NavLink({ item, active }: { item: NavItem; active: boolean }) {
     <Link
       href={item.href}
       aria-current={active ? "page" : undefined}
-      className={
+      className={`rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-(--color-accent) focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
         active
           ? "font-medium text-white"
           : "text-white/70 transition-colors hover:text-white"
-      }
+      }`}
     >
       {item.label}
     </Link>

@@ -92,8 +92,29 @@ export function PersonBrowseClient({
 
   if (rawItems.length === 0) {
     return (
-      <div className="rounded-lg border border-dashed border-white/15 bg-white/2 px-6 py-16 text-center text-sm text-white/55">
-        No titles featuring this person in your library.
+      <div className="mx-auto max-w-md py-10 text-center">
+        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/55">
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <circle cx="12" cy="8" r="4" />
+            <path d="M4 21v-1a8 8 0 0 1 16 0v1" />
+          </svg>
+        </div>
+        <h2 className="text-base font-semibold text-white">
+          No matching titles in your library
+        </h2>
+        <p className="mt-1.5 text-sm text-white/60">
+          When a title featuring this person is added, it&apos;ll show up here.
+        </p>
       </div>
     );
   }

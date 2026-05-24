@@ -216,6 +216,7 @@ export function SeasonEpisodes({
     try {
       await playStateApi.setWatched({ episode_id: episodeId, watched });
       onWatchStatsChange?.();
+      setConfirmation(watched ? "Marked as watched" : "Marked as unwatched");
     } catch {
       // Revert on failure.
       setEpisodes((prev) =>
@@ -225,6 +226,7 @@ export function SeasonEpisodes({
             : ep,
         ),
       );
+      setConfirmation("Couldn't update. Try again.");
     }
   }
 
@@ -234,6 +236,17 @@ export function SeasonEpisodes({
   // revert pattern, but the revert path snapshots the full list so a
   // partial-failure mid-loop doesn't leave the UI in a torn state.
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Ephemeral aria-live confirmation for screen readers. Sighted users
+  // see the row update optimistically; SR users were getting no audible
+  // feedback that the watched flip landed. Auto-clears after 3s so a
+  // user who tabs back to the row a moment later doesn't hear stale
+  // state announced again.
+  const [confirmation, setConfirmation] = useState<string | null>(null);
+  useEffect(() => {
+    if (!confirmation) return;
+    const t = window.setTimeout(() => setConfirmation(null), 3000);
+    return () => window.clearTimeout(t);
+  }, [confirmation]);
   async function bulkToggleSeason() {
     if (bulkBusy || episodes.length === 0) return;
     const allWatched = episodes.every((ep) => ep.watched);
@@ -251,8 +264,14 @@ export function SeasonEpisodes({
         ),
       );
       onWatchStatsChange?.();
+      setConfirmation(
+        target
+          ? "Season marked as watched"
+          : "Season marked as unwatched",
+      );
     } catch {
       setEpisodes(snapshot);
+      setConfirmation("Couldn't update the season. Try again.");
     } finally {
       setBulkBusy(false);
     }
@@ -282,6 +301,12 @@ export function SeasonEpisodes({
 
   return (
     <section className="border-t border-white/10 px-4 sm:px-8 md:px-12 py-8">
+      {/* Visually-hidden live region — SR announces "Marked as
+          watched" etc. after each toggle. Sighted users get the
+          optimistic row update; this is purely for accessibility. */}
+      <span aria-live="polite" className="sr-only">
+        {confirmation ?? ""}
+      </span>
       <div className="mb-6 flex items-center justify-between gap-3">
         <h2 className="text-2xl font-medium">Episodes</h2>
         <div className="flex items-center gap-3">

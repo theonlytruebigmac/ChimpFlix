@@ -10,6 +10,7 @@ import {
   type User,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 interface Props {
   initialGroups: AccessGroup[];
@@ -170,9 +171,7 @@ export function AdminAccessGroupsClient({
             Select a group on the left, or create a new one to get started.
           </p>
         )}
-        {activeId && loadingDetail && (
-          <p className="text-sm text-white/55">Loading…</p>
-        )}
+        {activeId && loadingDetail && <LoadingPlaceholder />}
         {detail && (
           <GroupEditor
             detail={detail}
@@ -456,7 +455,15 @@ function parseError(e: unknown): string {
     } catch {
       // fall through
     }
-    return `HTTP ${e.status}`;
+    // No structured body — fall back to a human-friendly synonym keyed
+    // off the status class. Operators still get the precise code in the
+    // browser network panel; the message just stops reading as a raw
+    // HTTP probe.
+    if (e.status === 401 || e.status === 403)
+      return "You don't have permission to do that.";
+    if (e.status === 404) return "Not found.";
+    if (e.status >= 500) return "Server error. Try again in a moment.";
+    return "Couldn't save. Try again.";
   }
-  return e instanceof Error ? e.message : String(e);
+  return "Network error. Check your connection and try again.";
 }

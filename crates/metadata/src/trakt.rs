@@ -555,6 +555,7 @@ impl TraktClient {
     ///   - `Shows`: every upcoming episode of every show the user tracks.
     ///   - `NewShows`: series premieres (E1 of a brand-new series).
     ///   - `SeasonPremieres`: S(N+1)E1 of any show the user tracks.
+    ///
     /// The date window (`start_date` YYYY-MM-DD, `days` 1-31) gates all
     /// three. Trakt returns the entries ordered by `first_aired` asc.
     pub async fn pull_calendar_shows(

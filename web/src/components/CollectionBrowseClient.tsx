@@ -11,6 +11,7 @@
 /// order; for manual collections it's the operator's curation. We
 /// never overwrite that without an explicit user pick.
 
+import Link from "next/link";
 import { useMemo, useState } from "react";
 
 import { Card } from "@/components/Card";
@@ -118,13 +119,48 @@ export function CollectionBrowseClient({
         </div>
       )}
 
-      <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-        {adapted.map((it) => (
-          <li key={it.ratingKey}>
-            <Card item={it} />
-          </li>
-        ))}
-      </ul>
+      {adapted.length === 0 ? (
+        <div className="mx-auto max-w-md py-10 text-center">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/55">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <rect x="3" y="3" width="7" height="7" rx="1.5" />
+              <rect x="14" y="3" width="7" height="7" rx="1.5" />
+              <rect x="3" y="14" width="7" height="7" rx="1.5" />
+              <rect x="14" y="14" width="7" height="7" rx="1.5" />
+            </svg>
+          </div>
+          <h2 className="text-base font-semibold text-white">
+            No titles in this collection yet
+          </h2>
+          <p className="mt-1.5 text-sm text-white/60">
+            Items will show up here once they&apos;re added to the library.
+          </p>
+          <Link
+            href="/"
+            className="mt-5 inline-block text-sm text-white underline underline-offset-4 hover:text-(--color-accent)"
+          >
+            Browse titles
+          </Link>
+        </div>
+      ) : (
+        <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+          {adapted.map((it) => (
+            <li key={it.ratingKey}>
+              <Card item={it} />
+            </li>
+          ))}
+        </ul>
+      )}
 
       {total > DEFAULT_PAGE_SIZE && (
         <Pagination

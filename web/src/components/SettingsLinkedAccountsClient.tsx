@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { plex, type PlexLinkSummary } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PlexSignInButton } from "./PlexSignInButton";
+import { SettingsFeedback } from "./ui/SettingsFeedback";
 
 /// Per-user "Linked accounts" card. Today this is Plex-only; when we
 /// add Google OAuth the same surface will list both providers.
@@ -103,24 +104,7 @@ export function SettingsLinkedAccountsClient() {
         )}
       </div>
 
-      {notice && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
-        >
-          {notice}
-        </div>
-      )}
-      {error && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
-        >
-          {error}
-        </div>
-      )}
+      <SettingsFeedback variant="block" message={notice} error={error} />
       {askUnlink && (
         <ConfirmDialog
           title="Unlink Plex?"

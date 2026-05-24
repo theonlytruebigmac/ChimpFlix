@@ -799,12 +799,43 @@ async fn legacy_kind_detail(
 #[derive(Debug, Serialize)]
 pub struct ActivityResponse {
     pub per_kind: Vec<KindHealth>,
+    /// Currently-running jobs with their resolved target title.
+    /// Capped at 50 — the header activity popover only displays a
+    /// handful, but the cap is generous so the admin tasks page can
+    /// reuse the same payload for a "live now" panel without a
+    /// second fetch. Sorted oldest-first so the longest-running job
+    /// reads at the top.
+    pub running_jobs: Vec<RunningJob>,
     /// Newest-first across the whole pool — last 50 completed
     /// runs, regardless of kind.
     pub recent_runs: Vec<RecentRun>,
     /// Currently-dead jobs (`status = 'dead'`), capped at 50,
     /// newest-first. Drives the failure panel.
     pub failed: Vec<FailedJob>,
+}
+
+/// One currently-running job with enough context for the header
+/// activity popover to render "Detecting markers: WIND BREAKER S01".
+/// The `title` is resolved server-side by following the payload's
+/// `item_id` or `file_id` through media_files → episodes → seasons
+/// → items so the client doesn't need per-kind payload knowledge.
+#[derive(Debug, Serialize)]
+pub struct RunningJob {
+    pub id: i64,
+    pub kind: String,
+    pub display_name: String,
+    /// Resolved item / episode title. `None` when the payload
+    /// targets something the JOIN couldn't resolve (rare — usually
+    /// scan jobs that operate on a library, not a specific item).
+    pub title: Option<String>,
+    /// "S02E04"-style suffix when the target is an episode. Empty
+    /// for movie / non-episodic targets. Kept separate from `title`
+    /// so the client can render it as muted secondary text.
+    pub episode_code: Option<String>,
+    /// Epoch-ms when the job started running. `None` for queued
+    /// rows — but this list only includes `status = 'running'` so
+    /// in practice always set.
+    pub started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -979,6 +1010,75 @@ pub async fn activity(
     all_recent.sort_unstable_by(|a, b| b.finished_at_ms.cmp(&a.finished_at_ms));
     all_recent.truncate(200);
 
+    // Currently-running jobs with their target item title resolved.
+    // SQLite's `json_extract` reads `item_id` or `file_id` out of the
+    // opaque payload; the CASE collapses both shapes into one title
+    // column so the client gets a flat row per job regardless of
+    // which handler emitted it. Capped at 50 — bigger than the header
+    // popover needs but cheap enough to send so admin pages can reuse
+    // the payload without a second fetch.
+    let running_rows = sqlx::query(
+        "SELECT
+            j.id,
+            j.kind,
+            j.started_at,
+            CASE
+                WHEN json_extract(j.payload, '$.item_id') IS NOT NULL THEN (
+                    SELECT i.title FROM items i
+                    WHERE i.id = json_extract(j.payload, '$.item_id')
+                )
+                WHEN json_extract(j.payload, '$.file_id') IS NOT NULL THEN (
+                    SELECT COALESCE(show.title, mfi.title)
+                    FROM media_files mf
+                    LEFT JOIN items mfi ON mfi.id = mf.item_id
+                    LEFT JOIN episodes ep ON ep.id = mf.episode_id
+                    LEFT JOIN seasons s ON s.id = ep.season_id
+                    LEFT JOIN items show ON show.id = s.show_id
+                    WHERE mf.id = json_extract(j.payload, '$.file_id')
+                )
+            END AS title,
+            CASE
+                WHEN json_extract(j.payload, '$.file_id') IS NOT NULL THEN (
+                    SELECT
+                        CASE WHEN s.season_number IS NOT NULL
+                            THEN printf('S%02dE%02d', s.season_number, ep.episode_number)
+                            ELSE NULL
+                        END
+                    FROM media_files mf
+                    LEFT JOIN episodes ep ON ep.id = mf.episode_id
+                    LEFT JOIN seasons s ON s.id = ep.season_id
+                    WHERE mf.id = json_extract(j.payload, '$.file_id')
+                )
+            END AS episode_code
+         FROM jobs j
+         WHERE j.status = 'running'
+         ORDER BY j.started_at ASC NULLS LAST, j.id ASC
+         LIMIT 50",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let running_jobs: Vec<RunningJob> = running_rows
+        .iter()
+        .map(|r| {
+            let kind: String = r.try_get("kind").unwrap_or_default();
+            let display_name = registry::find_kind(&kind)
+                .map(|k| k.display_name.to_string())
+                .unwrap_or_else(|| kind.clone());
+            RunningJob {
+                id: r.try_get("id").unwrap_or(0),
+                display_name,
+                kind,
+                title: r.try_get::<Option<String>, _>("title").ok().flatten(),
+                episode_code: r
+                    .try_get::<Option<String>, _>("episode_code")
+                    .ok()
+                    .flatten(),
+                started_at_ms: r.try_get::<Option<i64>, _>("started_at").ok().flatten(),
+            }
+        })
+        .collect();
+
     // Last 50 dead jobs, newest first.
     let failed_rows = sqlx::query(
         "SELECT id, kind, last_error, error_class, finished_at
@@ -1003,6 +1103,7 @@ pub async fn activity(
 
     Ok(Json(ActivityResponse {
         per_kind,
+        running_jobs,
         recent_runs: all_recent,
         failed,
     }))

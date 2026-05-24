@@ -18,6 +18,7 @@ import {
   type ModalData,
 } from "@/lib/modal-cache";
 import { useMyListItem } from "@/lib/my-list";
+import { notifyRatingChanged } from "@/lib/likes";
 import Link from "next/link";
 import {
   auth as authApi,
@@ -201,9 +202,13 @@ export function TitleModalClient({
         }
         setData(d);
       })
-      .catch((e) => {
+      .catch(() => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        // The underlying error is always either a fetch failure or a
+        // non-2xx status — both worth showing as a generic "try again"
+        // rather than leaking the raw `modal: 500` string the cache
+        // layer produces.
+        setError("Couldn't load title details. Try again in a moment.");
       });
 
     return () => {
@@ -1102,9 +1107,12 @@ function RatingBar({ itemId }: { itemId: number }) {
         // Clicking the current value clears the rating.
         await ratingsApi.deleteItem(itemId);
         setRating(null);
+        notifyRatingChanged(itemId, null);
       } else {
         const r = await ratingsApi.putItem(itemId, value);
-        setRating(r.rating ?? value);
+        const finalRating = r.rating ?? value;
+        setRating(finalRating);
+        notifyRatingChanged(itemId, finalRating);
       }
     } catch {
       // ignore — UI just stays as-is
@@ -1469,8 +1477,13 @@ function AdminActions({
           : `Marker detection queued for ${queued} file${queued === 1 ? "" : "s"}.`,
       );
     } catch (e) {
+      // String(e) leaks "[object Object]" when the rejection isn't an
+      // Error instance — defensive funnel through the same friendly
+      // pattern used elsewhere in this file.
       showActionToast(
-        e instanceof Error ? `Failed: ${e.message}` : `Failed: ${String(e)}`,
+        e instanceof Error
+          ? `Couldn't queue markers: ${e.message}`
+          : "Couldn't queue marker detection. Try again.",
       );
     } finally {
       setDetectingMarkers(false);

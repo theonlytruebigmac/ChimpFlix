@@ -108,14 +108,14 @@ pub fn router(state: AppState) -> Router {
         // Auth (non-rate-limited surface: status read, logout, identity)
         .route("/auth/status", get(auth::status))
         .route("/auth/logout", post(auth::logout))
-        .route(
-            "/auth/sessions/revoke-others",
-            post(auth::revoke_other_sessions),
-        )
         .route("/auth/me/sessions", get(auth::list_my_sessions))
         .route(
             "/auth/me/sessions/{id}",
             axum::routing::delete(auth::revoke_my_session),
+        )
+        .route(
+            "/auth/me/sessions/revoke-others",
+            post(auth::revoke_other_sessions),
         )
         .route("/auth/me", get(auth::me).patch(auth::update_me))
         .route("/auth/me/password", post(auth::change_password))
@@ -124,17 +124,17 @@ pub fn router(state: AppState) -> Router {
             post(auth::request_email_change),
         )
         .route("/auth/me/email/confirm", post(auth::confirm_email_change))
-        .route("/auth/users", get(auth::list_users))
+        .route("/admin/users", get(auth::list_users))
         .route(
-            "/auth/users/{id}",
+            "/admin/users/{id}",
             axum::routing::patch(auth::update_user).delete(auth::delete_user),
         )
         .route(
-            "/auth/invites",
+            "/admin/invites",
             get(auth::list_invites).post(auth::create_invite),
         )
         .route(
-            "/auth/invites/{id}",
+            "/admin/invites/{id}",
             axum::routing::delete(auth::revoke_invite),
         )
         // 2FA management (authenticated user — own account)
@@ -400,17 +400,18 @@ pub fn router(state: AppState) -> Router {
         // My List
         .route("/my-list", get(my_list::list))
         .route(
-            "/my-list/{item_id}",
+            "/my-list/{id}",
             post(my_list::add).delete(my_list::remove),
         )
-        // Prefs
         .route(
-            "/prefs/hidden-libraries",
+            "/auth/me/hidden-libraries",
             get(prefs::get_hidden_libraries).put(prefs::put_hidden_libraries),
         )
         // Admin (owner-only)
-        .route("/admin/backup", post(admin::backup::backup))
-        .route("/admin/backups", get(admin::backup::list))
+        .route(
+            "/admin/backups",
+            get(admin::backup::list).post(admin::backup::backup),
+        )
         .route(
             "/admin/backups/cancel-restore",
             post(admin::backup::cancel_restore),
@@ -429,7 +430,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/dashboard", get(admin::dashboard::get))
         .route("/admin/stats/overview", get(admin::stats::overview))
-        .route("/admin/stats/activity", get(admin::stats::activity))
+        .route("/admin/stats/recent-plays", get(admin::stats::activity))
         .route("/admin/stats/top-users", get(admin::stats::top_users))
         .route("/admin/stats/top-items", get(admin::stats::top_items))
         .route(
@@ -473,19 +474,13 @@ pub fn router(state: AppState) -> Router {
             "/admin/libraries/{id}/agents",
             get(admin::agents::get_for_library).put(admin::agents::set_for_library),
         )
-        .route(
-            "/admin/tasks",
-            get(admin::tasks::list).post(admin::tasks::create),
-        )
-        .route(
-            "/admin/tasks/{id}",
-            axum::routing::patch(admin::tasks::update).delete(admin::tasks::delete),
-        )
-        .route("/admin/tasks/{id}/run", post(admin::tasks::run_now))
-        .route("/admin/tasks/{id}/runs", get(admin::tasks::list_runs))
-        // Registry-driven overview (new admin UI in Phase 7). Sibling
-        // to the legacy `/admin/tasks` CRUD surface; the existing
-        // advanced-editor view still uses the row-based endpoints.
+        // List of scheduled-task rows — kept for the Admin Home
+        // dashboard's "Up next" / "Recently run" cards. Mutating
+        // endpoints (create/update/delete/run/runs) were retired
+        // when the advanced editor was folded into the registry-
+        // driven surface below; PATCH per-kind via /admin/tasks/kind.
+        .route("/admin/tasks", get(admin::tasks::list))
+        // Registry-driven overview (new admin UI).
         .route(
             "/admin/tasks/overview",
             get(admin::tasks_overview::overview),
@@ -567,7 +562,7 @@ pub fn router(state: AppState) -> Router {
             post(admin::users::unlock_login_attempts),
         )
         .route(
-            "/admin/access",
+            "/admin/access-matrix",
             get(admin::users::get_access_matrix).put(admin::users::put_access_matrix),
         )
         .route(
@@ -593,11 +588,11 @@ pub fn router(state: AppState) -> Router {
             get(admin::access_groups::get_user_groups).put(admin::access_groups::set_user_groups),
         )
         .route(
-            "/admin/optimized",
+            "/admin/versions",
             get(admin::optimized::list).post(admin::optimized::create),
         )
         .route(
-            "/admin/optimized/{id}",
+            "/admin/versions/{id}",
             axum::routing::delete(admin::optimized::delete),
         )
         .route("/admin/logs", get(admin::maintenance::logs))

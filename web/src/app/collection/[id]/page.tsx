@@ -34,10 +34,14 @@ export default async function CollectionPage({
           modal hero treatment but at page scale. */}
       <section className="relative h-[40vh] min-h-72 w-full overflow-hidden">
         {backdrop && (
+          // Collection page LCP — same eager + high-priority treatment
+          // as the home Hero so the banner doesn't lag the title text.
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={backdrop}
             alt=""
+            fetchPriority="high"
+            decoding="async"
             className="zf-fade-in absolute inset-0 h-full w-full object-cover"
           />
         )}

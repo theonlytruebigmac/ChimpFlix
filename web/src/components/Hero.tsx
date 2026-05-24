@@ -20,10 +20,15 @@ export function Hero({ item }: { item: MediaItem }) {
   return (
     <section className="relative h-[70vh] min-h-120 w-full overflow-hidden">
       {backdrop && (
+        // The hero is the LCP candidate on the home page — eager
+        // load + high priority so the browser pulls it down before
+        // lower-priority rail thumbs.
         // eslint-disable-next-line @next/next/no-img-element
         <img
           src={backdrop}
           alt=""
+          fetchPriority="high"
+          decoding="async"
           className="zf-fade-in absolute inset-0 h-full w-full object-cover"
         />
       )}

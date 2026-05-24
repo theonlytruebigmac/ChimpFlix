@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { downloadBackup } from "@/lib/chimpflix-api";
 
-// Owner-only "Download backup" button. Hits POST /admin/backup which
+// Owner-only "Download backup" button. Hits POST /admin/backups which
 // runs VACUUM INTO server-side and streams back the resulting .db file.
 // The browser handles the save dialog via a Blob download.
 export function SettingsBackupClient() {

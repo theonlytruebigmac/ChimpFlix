@@ -5,12 +5,14 @@ import { useEffect, useState } from "react";
 import {
   displayTitle,
   formatRuntime,
+  qualityChipLabel,
   type MediaItem,
 } from "@/lib/chimpflix-types";
 import { plexImage, plexSrcSet } from "@/lib/image";
 import { openModal } from "@/lib/modal";
 import { prefetchModalData } from "@/lib/modal-cache";
 import { useMyListItem } from "@/lib/my-list";
+import { useItemLike } from "@/lib/likes";
 import { prefetchPlay } from "@/lib/play-prefetch";
 import { useRecentlyAddedDays } from "@/lib/server-config";
 
@@ -149,7 +151,12 @@ export function Card({
                 </div>
               )}
               {badge && (
-                <div className="pointer-events-none absolute bottom-2 left-0 z-10 select-none rounded-r-sm bg-(--color-accent) px-2 py-1 text-[0.7rem] font-bold uppercase leading-none tracking-wide text-white shadow-md transition-opacity duration-150 delay-200 group-hover:opacity-0">
+                // Badge stays visible through the hover state — the
+                // information ("Recently Added" / "New Season") is
+                // exactly what helps the user decide whether to click,
+                // so fading it out at the moment of intent was the
+                // wrong default.
+                <div className="pointer-events-none absolute bottom-2 left-0 z-10 select-none rounded-r-sm bg-(--color-accent) px-2 py-1 text-[0.7rem] font-bold uppercase leading-none tracking-wide text-white shadow-md">
                   {badge}
                 </div>
               )}
@@ -194,6 +201,18 @@ function HoverPanel({
   const isShow = item.type === "show";
   const seasonCount = isShow ? item.childCount : undefined;
   const { inList, toggle: toggleMyList } = useMyListItem(modalKey);
+  const { liked, toggle: toggleLike } = useItemLike(modalKey);
+
+  // Ephemeral aria-live confirmation for screen readers. The icon
+  // swap (filled ↔ outline) is enough for sighted users, but SR users
+  // were getting nothing audible when these binary toggles flipped.
+  // Auto-clears after 3s so revisiting the row doesn't re-announce.
+  const [confirmation, setConfirmation] = useState<string | null>(null);
+  useEffect(() => {
+    if (!confirmation) return;
+    const t = window.setTimeout(() => setConfirmation(null), 3000);
+    return () => window.clearTimeout(t);
+  }, [confirmation]);
 
   return (
     <div className="space-y-2 bg-(--color-surface) px-3 py-3">
@@ -227,10 +246,13 @@ function HoverPanel({
         </Link>
         <CircleButton
           aria-label={inList ? "Remove from My List" : "Add to My List"}
+          aria-pressed={inList}
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
+            const next = !inList;
             toggleMyList();
+            setConfirmation(next ? "Added to My List" : "Removed from My List");
           }}
         >
           {inList ? (
@@ -244,8 +266,26 @@ function HoverPanel({
             </svg>
           )}
         </CircleButton>
-        <CircleButton aria-label="Mark as liked">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+        <CircleButton
+          aria-label={liked ? "Remove your like" : "I like this"}
+          aria-pressed={liked}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const next = !liked;
+            toggleLike();
+            setConfirmation(next ? "Added to your ratings" : "Removed from your ratings");
+          }}
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill={liked ? "currentColor" : "none"}
+            stroke="currentColor"
+            strokeWidth="2"
+            aria-hidden
+          >
             <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3" />
           </svg>
         </CircleButton>
@@ -275,9 +315,14 @@ function HoverPanel({
           <span>{seasonCount} Season{seasonCount > 1 ? "s" : ""}</span>
         ) : null}
         {!isShow && item.duration && <span>{formatRuntime(item.duration)}</span>}
-        <span className="rounded border border-white/40 px-1.5 py-px text-[0.65rem] font-semibold tracking-wider">
-          HD
-        </span>
+        {(() => {
+          const q = qualityChipLabel(item);
+          return q ? (
+            <span className="rounded border border-white/40 px-1.5 py-px text-[0.65rem] font-semibold tracking-wider">
+              {q}
+            </span>
+          ) : null;
+        })()}
       </div>
 
       {/*
@@ -296,6 +341,9 @@ function HoverPanel({
           ))}
         </div>
       )}
+      <span aria-live="polite" className="sr-only">
+        {confirmation ?? ""}
+      </span>
     </div>
   );
 }

@@ -7,7 +7,7 @@ import {
 import { requireOwner } from "@/lib/chimpflix-server";
 
 export default async function AdminGroupsPage() {
-  await requireOwner("/settings/admin/users/groups");
+  await requireOwner("/settings/admin/users/access-groups");
   const [{ groups }, { users }, { libraries }] = await Promise.all([
     adminApi.accessGroups.list(),
     authApi.listUsers(),

@@ -5,7 +5,7 @@ const USERS_TABS = [
   { href: "/settings/admin/users", label: "People" },
   { href: "/settings/admin/users/invites", label: "Invites" },
   { href: "/settings/admin/users/access", label: "Access" },
-  { href: "/settings/admin/users/groups", label: "Groups" },
+  { href: "/settings/admin/users/access-groups", label: "Groups" },
   { href: "/settings/admin/users/devices", label: "Devices" },
 ];
 

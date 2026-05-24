@@ -259,25 +259,6 @@ export interface ScheduledTask {
   updated_at: number;
 }
 
-export interface NewScheduledTaskInput {
-  kind: string;
-  name: string;
-  cron_expr?: string;
-  frequency?: TaskFrequency;
-  requires_maintenance_window?: boolean;
-  params_json?: string;
-  enabled?: boolean;
-}
-
-export interface ScheduledTaskUpdate {
-  name?: string;
-  cron_expr?: string;
-  frequency?: TaskFrequency;
-  requires_maintenance_window?: boolean;
-  params_json?: string;
-  enabled?: boolean;
-}
-
 export interface TaskKindInfo {
   kind: string;
   display_name: string;
@@ -287,16 +268,6 @@ export interface TaskKindInfo {
   default_frequency: TaskFrequency;
   /** Pre-filled when creating a new task of this kind. */
   default_requires_maintenance_window: boolean;
-}
-
-export interface TaskRun {
-  id: number;
-  task_id: number;
-  started_at: number;
-  finished_at: number | null;
-  status: "success" | "failed" | "running";
-  error: string | null;
-  log: string | null;
 }
 
 export interface TasksListResponse {
@@ -417,8 +388,25 @@ export interface ActivityFailedJob {
   finished_at_ms: number | null;
 }
 
+/// One currently-running job — drives the per-row entry in the
+/// header ActivityIndicator popover ("Detecting markers: WIND
+/// BREAKER" style). `title` is server-resolved from the payload's
+/// `item_id` or `file_id` so the client never touches per-handler
+/// payload shapes.
+export interface ActivityRunningJob {
+  id: number;
+  kind: string;
+  display_name: string;
+  title: string | null;
+  /// "S02E04"-style suffix when the job targets an episode; null for
+  /// movie / non-episodic targets.
+  episode_code: string | null;
+  started_at_ms: number | null;
+}
+
 export interface TasksActivityResponse {
   per_kind: ActivityKindHealth[];
+  running_jobs: ActivityRunningJob[];
   recent_runs: ActivityRecentRun[];
   failed: ActivityFailedJob[];
 }
@@ -763,7 +751,15 @@ export interface PlayStateForItem {
 }
 
 // `ListedItem` flattens `Item` + `play_state`, so TS sees a single object.
-export type ListedItem = Item & { play_state: PlayStateForItem | null };
+// `best_quality_height` + `best_hdr_format` come from list-query subqueries
+// over media_files (max height + best HDR variant across the item's files).
+// Both are optional — some narrower endpoints (e.g. trakt-derived rails)
+// don't populate them, in which case the UI just hides the quality chip.
+export type ListedItem = Item & {
+  play_state: PlayStateForItem | null;
+  best_quality_height?: number | null;
+  best_hdr_format?: string | null;
+};
 
 export interface ItemPage {
   items: ListedItem[];
@@ -2374,7 +2370,7 @@ export const auth = {
   /// Wipe every OTHER session for this user — keeps the current one
   /// alive. Returns the count of sessions that were terminated.
   revokeOtherSessions: () =>
-    apiFetch<{ revoked: number }>("/auth/sessions/revoke-others", {
+    apiFetch<{ revoked: number }>("/auth/me/sessions/revoke-others", {
       method: "POST",
     }),
   /// Live sessions for the current user, newest activity first. The
@@ -2432,14 +2428,14 @@ export const auth = {
     display_name?: string;
   }) => apiFetch<AuthResponse>("/auth/register", { method: "POST", body: input }),
   listInvites: () =>
-    apiFetch<{ invites: InviteListEntry[] }>("/auth/invites"),
+    apiFetch<{ invites: InviteListEntry[] }>("/admin/invites"),
   createInvite: (input: CreateInviteInput) =>
-    apiFetch<CreatedInvite>("/auth/invites", { method: "POST", body: input }),
+    apiFetch<CreatedInvite>("/admin/invites", { method: "POST", body: input }),
   revokeInvite: (id: number) =>
-    apiFetch<void>(`/auth/invites/${id}`, { method: "DELETE" }),
-  listUsers: () => apiFetch<{ users: User[] }>("/auth/users"),
+    apiFetch<void>(`/admin/invites/${id}`, { method: "DELETE" }),
+  listUsers: () => apiFetch<{ users: User[] }>("/admin/users"),
   deleteUser: (id: number) =>
-    apiFetch<void>(`/auth/users/${id}`, { method: "DELETE" }),
+    apiFetch<void>(`/admin/users/${id}`, { method: "DELETE" }),
   // ── 2FA / TOTP (Phase 24) ──────────────────────────────────────
   twoFactor: {
     status: () => apiFetch<TotpStatusResponse>("/auth/2fa/status"),
@@ -2487,7 +2483,7 @@ export const auth = {
       }),
   },
   setUserRole: (id: number, role: UserRole) =>
-    apiFetch<{ user: User }>(`/auth/users/${id}`, {
+    apiFetch<{ user: User }>(`/admin/users/${id}`, {
       method: "PATCH",
       body: { role },
     }),
@@ -2503,9 +2499,9 @@ export const myList = {
 
 export const prefs = {
   hiddenLibraries: () =>
-    apiFetch<{ library_ids: number[] }>("/prefs/hidden-libraries"),
+    apiFetch<{ library_ids: number[] }>("/auth/me/hidden-libraries"),
   setHiddenLibraries: (library_ids: number[]) =>
-    apiFetch<void>("/prefs/hidden-libraries", {
+    apiFetch<void>("/auth/me/hidden-libraries", {
       method: "PUT",
       body: { library_ids },
     }),
@@ -2698,8 +2694,15 @@ export const items = {
       body: { target_id },
     }),
   // ─── Reviews (read-only: top reviews from the metadata provider) ───────
-  listReviews: (id: number) =>
-    apiFetch<{ reviews: Review[] }>(`/items/${id}/reviews`),
+  listReviews: (id: number, opts?: { limit?: number; offset?: number }) => {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return apiFetch<{ reviews: Review[]; total: number }>(
+      `/items/${id}/reviews${qs ? `?${qs}` : ""}`,
+    );
+  },
   // ─── Cast & Crew (owner-only) ──────────────────────────────────────────
   patchCredits: (id: number, credits: CreditEditInput[]) =>
     apiFetch<ItemDetail>(`/items/${id}/credits`, {
@@ -3123,7 +3126,7 @@ export const admin = {
       if (opts.before != null) qs.set("before", String(opts.before));
       if (opts.user_id != null) qs.set("user_id", String(opts.user_id));
       const suffix = qs.toString() ? `?${qs}` : "";
-      return apiFetch<{ events: StatsActivityRow[] }>(`/admin/stats/activity${suffix}`);
+      return apiFetch<{ events: StatsActivityRow[] }>(`/admin/stats/recent-plays${suffix}`);
     },
     /// Daily series for the activity chart — gap-free across the
     /// requested window so a quiet day shows up as a zero bar
@@ -3337,16 +3340,16 @@ export const admin = {
     apiFetch<AlertsResponse>("/admin/alerts", {
       query: params as Record<string, string | number | undefined>,
     }),
-  optimized: {
+  versions: {
     list: () =>
-      apiFetch<{ versions: OptimizedVersion[] }>("/admin/optimized"),
+      apiFetch<{ versions: OptimizedVersion[] }>("/admin/versions"),
     enqueue: (input: NewOptimizedVersionInput) =>
-      apiFetch<OptimizedVersion>("/admin/optimized", {
+      apiFetch<OptimizedVersion>("/admin/versions", {
         method: "POST",
         body: input,
       }),
     delete: (id: number) =>
-      apiFetch<void>(`/admin/optimized/${id}`, { method: "DELETE" }),
+      apiFetch<void>(`/admin/versions/${id}`, { method: "DELETE" }),
   },
   sessions: {
     list: () =>
@@ -3364,9 +3367,9 @@ export const admin = {
   },
   access: {
     get: () =>
-      apiFetch<{ entries: AccessMatrixEntry[] }>("/admin/access"),
+      apiFetch<{ entries: AccessMatrixEntry[] }>("/admin/access-matrix"),
     put: (libraries: LibraryAccessAssignment[]) =>
-      apiFetch<{ entries: AccessMatrixEntry[] }>("/admin/access", {
+      apiFetch<{ entries: AccessMatrixEntry[] }>("/admin/access-matrix", {
         method: "PUT",
         body: { libraries },
       }),
@@ -3426,28 +3429,11 @@ export const admin = {
       apiFetch<void>(`/admin/transcoder/presets/${id}`, { method: "DELETE" }),
   },
   tasks: {
+    /// Row-based list of scheduled tasks. Kept only for the Admin
+    /// Home dashboard's "Up next" / "Recently run" cards; per-kind
+    /// editing now lives in `updateKindSchedule` below.
     list: () => apiFetch<TasksListResponse>("/admin/tasks"),
-    create: (input: NewScheduledTaskInput) =>
-      apiFetch<{ task: ScheduledTask }>("/admin/tasks", {
-        method: "POST",
-        body: input,
-      }),
-    update: (id: number, patch: ScheduledTaskUpdate) =>
-      apiFetch<{ task: ScheduledTask }>(`/admin/tasks/${id}`, {
-        method: "PATCH",
-        body: patch,
-      }),
-    delete: (id: number) =>
-      apiFetch<void>(`/admin/tasks/${id}`, { method: "DELETE" }),
-    runNow: (id: number) =>
-      apiFetch<void>(`/admin/tasks/${id}/run`, { method: "POST" }),
-    listRuns: (id: number, limit?: number) =>
-      apiFetch<{ runs: TaskRun[] }>(`/admin/tasks/${id}/runs`, {
-        query: limit ? { limit } : undefined,
-      }),
-    /// Registry-driven views backing the rebuilt tasks UI. Sibling to
-    /// the row-based CRUD above (which still drives the legacy
-    /// advanced editor at /admin/tasks).
+    /// Registry-driven views backing the rebuilt tasks UI.
     overview: () =>
       apiFetch<TasksOverviewResponse>("/admin/tasks/overview"),
     summary: () =>
@@ -3543,7 +3529,7 @@ export interface ClearTranscodeCacheResult {
 /// in a Blob and synthesize a click on a hidden <a> to surface the
 /// browser's native save dialog.
 export async function downloadBackup(): Promise<void> {
-  const res = await fetch("/api/v1/admin/backup", {
+  const res = await fetch("/api/v1/admin/backups", {
     method: "POST",
     credentials: "include",
   });

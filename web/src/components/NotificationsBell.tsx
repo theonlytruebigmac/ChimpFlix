@@ -118,7 +118,7 @@ export function NotificationsBell() {
         onClick={() => (open ? setOpen(false) : openAndLoad())}
         aria-label={unread > 0 ? `Notifications (${unread} unread)` : "Notifications"}
         aria-expanded={open}
-        className="relative flex h-8 w-8 items-center justify-center rounded-full text-white/80 transition-colors hover:text-white"
+        className="relative flex h-8 w-8 items-center justify-center rounded-full text-white/80 transition-colors hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-(--color-accent) focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         <BellIcon />
         {unread > 0 && (
@@ -144,7 +144,7 @@ export function NotificationsBell() {
               <button
                 type="button"
                 onClick={markAll}
-                className="text-[11px] text-white/60 underline-offset-2 hover:text-white hover:underline"
+                className="rounded text-[11px] text-white/60 underline-offset-2 transition-colors hover:text-white hover:underline focus:outline-none focus-visible:text-white focus-visible:underline focus-visible:ring-1 focus-visible:ring-(--color-accent)"
               >
                 Mark all read
               </button>
@@ -215,7 +215,7 @@ function NotificationRow({
       <Link
         href={href}
         onClick={onMarkRead}
-        className="block transition-colors hover:bg-white/5"
+        className="block transition-colors hover:bg-white/5 focus:outline-none focus-visible:bg-white/10"
       >
         {inner}
       </Link>
@@ -225,7 +225,7 @@ function NotificationRow({
     <button
       type="button"
       onClick={onMarkRead}
-      className="block w-full text-left transition-colors hover:bg-white/5"
+      className="block w-full text-left transition-colors hover:bg-white/5 focus:outline-none focus-visible:bg-white/10"
     >
       {inner}
     </button>

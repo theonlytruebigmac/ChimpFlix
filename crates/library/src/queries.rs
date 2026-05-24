@@ -522,7 +522,43 @@ const ITEM_SELECT: &str = "
         ps.duration_ms     AS ps_duration_ms,
         ps.watched         AS ps_watched,
         ps.view_count      AS ps_view_count,
-        ps.last_played_at  AS ps_last_played_at
+        ps.last_played_at  AS ps_last_played_at,
+        (CASE i.kind
+            WHEN 'movie' THEN (
+                SELECT MAX(height) FROM media_files
+                WHERE item_id = i.id AND removed_at IS NULL AND height IS NOT NULL
+            )
+            WHEN 'show' THEN (
+                SELECT MAX(mf.height) FROM media_files mf
+                JOIN episodes e ON e.id = mf.episode_id
+                JOIN seasons s  ON s.id = e.season_id
+                WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.height IS NOT NULL
+            )
+         END) AS best_height,
+        (CASE i.kind
+            WHEN 'movie' THEN (
+                SELECT mf.hdr_format FROM media_files mf
+                WHERE mf.item_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL
+                ORDER BY
+                    (mf.hdr_format = 'dolby_vision') DESC,
+                    (mf.hdr_format LIKE 'hdr10_plus%') DESC,
+                    (mf.hdr_format LIKE 'hdr10%') DESC,
+                    (mf.hdr_format = 'hlg') DESC
+                LIMIT 1
+            )
+            WHEN 'show' THEN (
+                SELECT mf.hdr_format FROM media_files mf
+                JOIN episodes e ON e.id = mf.episode_id
+                JOIN seasons s  ON s.id = e.season_id
+                WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL
+                ORDER BY
+                    (mf.hdr_format = 'dolby_vision') DESC,
+                    (mf.hdr_format LIKE 'hdr10_plus%') DESC,
+                    (mf.hdr_format LIKE 'hdr10%') DESC,
+                    (mf.hdr_format = 'hlg') DESC
+                LIMIT 1
+            )
+         END) AS best_hdr_format
     FROM items i
     LEFT JOIN play_state ps
         ON ps.item_id = i.id AND ps.user_id = ?
@@ -850,7 +886,31 @@ pub async fn list_items(
                 ps.duration_ms     AS ps_duration_ms, \
                 ps.watched         AS ps_watched, \
                 ps.view_count      AS ps_view_count, \
-                ps.last_played_at  AS ps_last_played_at \
+                ps.last_played_at  AS ps_last_played_at, \
+                (CASE i.kind \
+                    WHEN 'movie' THEN (SELECT MAX(height) FROM media_files \
+                        WHERE item_id = i.id AND removed_at IS NULL AND height IS NOT NULL) \
+                    WHEN 'show' THEN (SELECT MAX(mf.height) FROM media_files mf \
+                        JOIN episodes e ON e.id = mf.episode_id \
+                        JOIN seasons s  ON s.id = e.season_id \
+                        WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.height IS NOT NULL) \
+                 END) AS best_height, \
+                (CASE i.kind \
+                    WHEN 'movie' THEN (SELECT mf.hdr_format FROM media_files mf \
+                        WHERE mf.item_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL \
+                        ORDER BY (mf.hdr_format = 'dolby_vision') DESC, \
+                                 (mf.hdr_format LIKE 'hdr10_plus%') DESC, \
+                                 (mf.hdr_format LIKE 'hdr10%') DESC, \
+                                 (mf.hdr_format = 'hlg') DESC LIMIT 1) \
+                    WHEN 'show' THEN (SELECT mf.hdr_format FROM media_files mf \
+                        JOIN episodes e ON e.id = mf.episode_id \
+                        JOIN seasons s  ON s.id = e.season_id \
+                        WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL \
+                        ORDER BY (mf.hdr_format = 'dolby_vision') DESC, \
+                                 (mf.hdr_format LIKE 'hdr10_plus%') DESC, \
+                                 (mf.hdr_format LIKE 'hdr10%') DESC, \
+                                 (mf.hdr_format = 'hlg') DESC LIMIT 1) \
+                 END) AS best_hdr_format \
              FROM items i \
              JOIN items_fts ON items_fts.rowid = i.id \
              LEFT JOIN play_state ps \
@@ -909,9 +969,13 @@ pub async fn list_items(
     let items = rows
         .iter()
         .map(|row| -> Result<ListedItem> {
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(row);
             Ok(ListedItem {
                 item: Item::from_row(row)?,
                 play_state: PlayStateForItem::from_columns(row)?,
+                best_quality_height,
+                best_hdr_format,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1005,7 +1069,31 @@ pub async fn list_watch_history(
             eff.duration_ms     AS ps_duration_ms,
             eff.watched         AS ps_watched,
             eff.view_count      AS ps_view_count,
-            eff.last_played_at  AS ps_last_played_at
+            eff.last_played_at  AS ps_last_played_at,
+            (CASE i.kind
+                WHEN 'movie' THEN (SELECT MAX(height) FROM media_files
+                    WHERE item_id = i.id AND removed_at IS NULL AND height IS NOT NULL)
+                WHEN 'show' THEN (SELECT MAX(mf.height) FROM media_files mf
+                    JOIN episodes e ON e.id = mf.episode_id
+                    JOIN seasons s  ON s.id = e.season_id
+                    WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.height IS NOT NULL)
+             END) AS best_height,
+            (CASE i.kind
+                WHEN 'movie' THEN (SELECT mf.hdr_format FROM media_files mf
+                    WHERE mf.item_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL
+                    ORDER BY (mf.hdr_format = 'dolby_vision') DESC,
+                             (mf.hdr_format LIKE 'hdr10_plus%') DESC,
+                             (mf.hdr_format LIKE 'hdr10%') DESC,
+                             (mf.hdr_format = 'hlg') DESC LIMIT 1)
+                WHEN 'show' THEN (SELECT mf.hdr_format FROM media_files mf
+                    JOIN episodes e ON e.id = mf.episode_id
+                    JOIN seasons s  ON s.id = e.season_id
+                    WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL
+                    ORDER BY (mf.hdr_format = 'dolby_vision') DESC,
+                             (mf.hdr_format LIKE 'hdr10_plus%') DESC,
+                             (mf.hdr_format LIKE 'hdr10%') DESC,
+                             (mf.hdr_format = 'hlg') DESC LIMIT 1)
+             END) AS best_hdr_format
           FROM effective eff
           JOIN items i ON i.id = eff.item_id
          WHERE eff.rn = 1 AND {filter}
@@ -1020,9 +1108,13 @@ pub async fn list_watch_history(
         .await?;
     rows.iter()
         .map(|row| -> Result<ListedItem> {
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(row);
             Ok(ListedItem {
                 item: Item::from_row(row)?,
                 play_state: PlayStateForItem::from_columns(row)?,
+                best_quality_height,
+                best_hdr_format,
             })
         })
         .collect()
@@ -1311,9 +1403,13 @@ pub async fn list_my_list(
         .await?;
     rows.iter()
         .map(|row| -> Result<ListedItem> {
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(row);
             Ok(ListedItem {
                 item: Item::from_row(row)?,
                 play_state: PlayStateForItem::from_columns(row)?,
+                best_quality_height,
+                best_hdr_format,
             })
         })
         .collect()
@@ -1371,9 +1467,13 @@ pub async fn find_listed_items_by_tmdb_ids(
     let rows = q.fetch_all(pool).await?;
     rows.iter()
         .map(|row| -> Result<ListedItem> {
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(row);
             Ok(ListedItem {
                 item: Item::from_row(row)?,
                 play_state: PlayStateForItem::from_columns(row)?,
+                best_quality_height,
+                best_hdr_format,
             })
         })
         .collect()
@@ -1453,7 +1553,31 @@ pub async fn list_trending_in_library(
             ps.duration_ms     AS ps_duration_ms, \
             ps.watched         AS ps_watched, \
             ps.view_count      AS ps_view_count, \
-            ps.last_played_at  AS ps_last_played_at \
+            ps.last_played_at  AS ps_last_played_at, \
+            (CASE i.kind \
+                WHEN 'movie' THEN (SELECT MAX(height) FROM media_files \
+                    WHERE item_id = i.id AND removed_at IS NULL AND height IS NOT NULL) \
+                WHEN 'show' THEN (SELECT MAX(mf.height) FROM media_files mf \
+                    JOIN episodes e ON e.id = mf.episode_id \
+                    JOIN seasons s  ON s.id = e.season_id \
+                    WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.height IS NOT NULL) \
+             END) AS best_height, \
+            (CASE i.kind \
+                WHEN 'movie' THEN (SELECT mf.hdr_format FROM media_files mf \
+                    WHERE mf.item_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL \
+                    ORDER BY (mf.hdr_format = 'dolby_vision') DESC, \
+                             (mf.hdr_format LIKE 'hdr10_plus%') DESC, \
+                             (mf.hdr_format LIKE 'hdr10%') DESC, \
+                             (mf.hdr_format = 'hlg') DESC LIMIT 1) \
+                WHEN 'show' THEN (SELECT mf.hdr_format FROM media_files mf \
+                    JOIN episodes e ON e.id = mf.episode_id \
+                    JOIN seasons s  ON s.id = e.season_id \
+                    WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL \
+                    ORDER BY (mf.hdr_format = 'dolby_vision') DESC, \
+                             (mf.hdr_format LIKE 'hdr10_plus%') DESC, \
+                             (mf.hdr_format LIKE 'hdr10%') DESC, \
+                             (mf.hdr_format = 'hlg') DESC LIMIT 1) \
+             END) AS best_hdr_format \
          FROM items i \
          LEFT JOIN trending_cache tc \
            ON tc.tmdb_id = i.tmdb_id \
@@ -1492,11 +1616,15 @@ pub async fn list_trending_in_library(
     rows.iter()
         .enumerate()
         .map(|(idx, row)| -> Result<(i64, ListedItem)> {
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(row);
             Ok((
                 (idx as i64) + 1,
                 ListedItem {
                     item: Item::from_row(row)?,
                     play_state: PlayStateForItem::from_columns(row)?,
+                    best_quality_height,
+                    best_hdr_format,
                 },
             ))
         })
@@ -1659,9 +1787,13 @@ pub async fn list_items_for_person(
         .await?;
     rows.iter()
         .map(|row| -> Result<ListedItem> {
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(row);
             Ok(ListedItem {
                 item: Item::from_row(row)?,
                 play_state: PlayStateForItem::from_columns(row)?,
+                best_quality_height,
+                best_hdr_format,
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -1703,7 +1835,17 @@ pub async fn list_items_by_ids(
     for row in &rows {
         let item = Item::from_row(row)?;
         let play_state = PlayStateForItem::from_columns(row)?;
-        by_id.insert(item.id, ListedItem { item, play_state });
+        let (best_quality_height, best_hdr_format) =
+            ListedItem::quality_from_columns(row);
+        by_id.insert(
+            item.id,
+            ListedItem {
+                item,
+                play_state,
+                best_quality_height,
+                best_hdr_format,
+            },
+        );
     }
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
@@ -6352,7 +6494,14 @@ pub async fn list_items_in_collection(
         .map(|r| {
             let item = Item::from_row(r)?;
             let play_state = PlayStateForItem::from_columns(r)?;
-            Ok(ListedItem { item, play_state })
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(r);
+            Ok(ListedItem {
+                item,
+                play_state,
+                best_quality_height,
+                best_hdr_format,
+            })
         })
         .collect()
 }
@@ -6391,7 +6540,14 @@ async fn list_items_via_smart_rule(
         .map(|r| {
             let item = Item::from_row(r)?;
             let play_state = PlayStateForItem::from_columns(r)?;
-            Ok(ListedItem { item, play_state })
+            let (best_quality_height, best_hdr_format) =
+                ListedItem::quality_from_columns(r);
+            Ok(ListedItem {
+                item,
+                play_state,
+                best_quality_height,
+                best_hdr_format,
+            })
         })
         .collect()
 }
@@ -8570,15 +8726,29 @@ pub async fn set_all_episodes_watched_for_show(
     Ok(episode_ids)
 }
 
-pub async fn list_reviews_for_item(pool: &SqlitePool, item_id: i64) -> Result<Vec<Review>> {
+/// Top reviews for one item, ordered by rating desc then recency.
+/// Paginated so popular items (TMDB hands back hundreds of rows for
+/// blockbusters) don't dump megabytes of JSON on every modal open.
+/// `limit` is clamped to `1..=100`; `offset` is clamped to `>= 0`.
+pub async fn list_reviews_for_item(
+    pool: &SqlitePool,
+    item_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Review>> {
+    let limit = limit.clamp(1, 100);
+    let offset = offset.max(0);
     let rows = sqlx::query(
         "SELECT id, item_id, source, author, author_url, avatar_url,
                 rating, body, created_at
          FROM item_reviews
          WHERE item_id = ?
-         ORDER BY (rating IS NULL) ASC, rating DESC, created_at DESC",
+         ORDER BY (rating IS NULL) ASC, rating DESC, created_at DESC
+         LIMIT ? OFFSET ?",
     )
     .bind(item_id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -8596,6 +8766,16 @@ pub async fn list_reviews_for_item(pool: &SqlitePool, item_id: i64) -> Result<Ve
             })
         })
         .collect()
+}
+
+/// Total review count for one item — drives the pagination footer on
+/// the reviews response so the client can render "Showing 12 of 240".
+pub async fn count_reviews_for_item(pool: &SqlitePool, item_id: i64) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM item_reviews WHERE item_id = ?")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("n")?)
 }
 
 /// Replace one source's reviews for an item. Source-scoped DELETE so

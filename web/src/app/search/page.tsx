@@ -100,11 +100,32 @@ async function SearchResults({
           pageSize={pageSize}
           total={res.total}
         />
-        <p className="text-white/70">
-          {kind === "all"
-            ? "No results. Try a different title or check your spelling."
-            : `No ${kind === "movie" ? "movies" : "shows"} match — try "All" to broaden the search.`}
-        </p>
+        <div className="mx-auto max-w-md py-10 text-center">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/55">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <circle cx="11" cy="11" r="7" />
+              <line x1="16.5" y1="16.5" x2="21" y2="21" />
+            </svg>
+          </div>
+          <h2 className="text-base font-semibold text-white">
+            No results for &ldquo;{query}&rdquo;
+          </h2>
+          <p className="mt-1.5 text-sm text-white/60">
+            {kind === "all"
+              ? "Try a different title or check your spelling."
+              : `No ${kind === "movie" ? "movies" : "shows"} match — try "All" to broaden the search.`}
+          </p>
+        </div>
       </div>
     );
   }

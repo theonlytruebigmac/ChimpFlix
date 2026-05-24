@@ -22,7 +22,7 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
 
   async function refresh() {
     try {
-      const r = await adminApi.optimized.list();
+      const r = await adminApi.versions.list();
       setVersions(r.versions);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -37,7 +37,7 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
     if (askDeleteId == null) return;
     setDeleteBusy(true);
     try {
-      await adminApi.optimized.delete(askDeleteId);
+      await adminApi.versions.delete(askDeleteId);
       await refresh();
       setAskDeleteId(null);
     } catch (e) {
@@ -170,7 +170,7 @@ function NewOptimizedForm({
     setBusy(true);
     onError(null);
     try {
-      await adminApi.optimized.enqueue({
+      await adminApi.versions.enqueue({
         source_file_id: Number(sourceFileId),
         preset_id: presetId,
       });

@@ -1627,7 +1627,7 @@ export function ChimpFlixPlayer({
                   break;
               }
               setReconnecting(false);
-              setError(`${data.type} / ${data.details}`);
+              setError(friendlyHlsError(data));
             });
             cleanup = () => {
               hlsRef.current = null;
@@ -4130,7 +4130,7 @@ function TrackRow({
         aria-checked={active}
         aria-disabled={disabled}
         disabled={disabled}
-        className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm transition-colors ${
+        className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm transition-colors focus:outline-none focus-visible:bg-white/10 ${
           disabled
             ? "cursor-not-allowed text-white/30"
             : active
@@ -4349,7 +4349,7 @@ function SpeedControl({
                     }}
                     role="menuitemradio"
                     aria-checked={active}
-                    className={`flex w-full items-center gap-2 px-4 py-1.5 text-left text-sm transition-colors ${
+                    className={`flex w-full items-center gap-2 px-4 py-1.5 text-left text-sm transition-colors focus:outline-none focus-visible:bg-white/10 ${
                       active ? "text-white" : "text-white/75 hover:text-white"
                     }`}
                   >
@@ -5104,9 +5104,65 @@ function ErrorOverlay({ message }: { message: string }) {
           Common causes: server unreachable, transcoder busy, or the file
           can&apos;t be HLS-streamed.
         </p>
+        <div className="mt-5 flex items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="rounded-md bg-white px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-white/85"
+          >
+            Try again
+          </button>
+          <button
+            type="button"
+            onClick={() => window.history.back()}
+            className="rounded-md border border-white/20 px-4 py-2 text-sm font-medium text-white/80 transition-colors hover:border-white/40 hover:text-white"
+          >
+            Go back
+          </button>
+        </div>
       </div>
     </div>
   );
+}
+
+/// Map HLS.js's structured fatal-error payload to a user-readable
+/// sentence. Falls back to a generic "Something went wrong" when the
+/// detail isn't one we've seen — better than leaking `networkError /
+/// fragLoadError` to the overlay.
+function friendlyHlsError(data: { type?: string; details?: string }): string {
+  const details = data.details ?? "";
+  switch (details) {
+    case "manifestLoadError":
+    case "manifestLoadTimeOut":
+    case "manifestParsingError":
+      return "Couldn't load the stream. The transcoder may still be warming up — try again.";
+    case "levelLoadError":
+    case "levelLoadTimeOut":
+      return "Lost the stream playlist. Try again in a moment.";
+    case "fragLoadError":
+    case "fragLoadTimeOut":
+      return "A video segment didn't load. Your connection may have dropped.";
+    case "bufferStalledError":
+      return "Playback stalled. Your connection may be too slow for the current quality.";
+    case "internalException":
+    case "bufferAppendError":
+    case "bufferAppendingError":
+      return "The browser couldn't decode the stream. Try lowering the quality.";
+    case "audioTrackLoadError":
+    case "audioTrackLoadTimeOut":
+      return "Audio track failed to load. Try switching audio or refreshing.";
+    case "subtitleTrackLoadError":
+    case "subtitleTrackLoadTimeOut":
+      return "Subtitle track failed to load. Disable subtitles or try again.";
+    default:
+      if (data.type === "networkError") {
+        return "Network problem. Check your connection and try again.";
+      }
+      if (data.type === "mediaError") {
+        return "The browser couldn't decode the stream. Try lowering the quality.";
+      }
+      return "Something went wrong with playback. Try refreshing.";
+  }
 }
 
 function ProgressBar({

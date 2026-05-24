@@ -290,6 +290,28 @@ export function LibraryBrowseClient({
   const activeFileFilterCount =
     initialResolutions.length + initialHdr.length + initialCodecs.length;
 
+  /// Wipe every filter (match / status / decade / file filters / search).
+  /// Drives the empty-state "Clear all filters" button so a user staring
+  /// at "No results" doesn't have to undo five chips by hand.
+  const clearAllFilters = () =>
+    updateParam((p) => {
+      p.delete("filter");
+      p.delete("status");
+      p.delete("decade");
+      p.delete("resolutions");
+      p.delete("hdr");
+      p.delete("codecs");
+      p.delete("q");
+      p.delete("page");
+    });
+
+  const hasAnyFilter =
+    activeFileFilterCount > 0 ||
+    initialFilter !== "all" ||
+    initialStatus !== "all" ||
+    initialDecade !== "all" ||
+    Boolean(query);
+
   const items = initialItems.map(adaptItem);
 
   return (
@@ -414,10 +436,39 @@ export function LibraryBrowseClient({
       )}
 
       {items.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-white/15 bg-white/2 px-6 py-16 text-center text-sm text-white/55">
-          {query
-            ? `No results for "${query}".`
-            : emptyMessage(initialFilter, initialStatus, initialDecade)}
+        <div className="mx-auto max-w-md py-10 text-center">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/55">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M3 6h18M6 12h12M10 18h4" />
+            </svg>
+          </div>
+          <h2 className="text-base font-semibold text-white">
+            {query ? `No results for "${query}"` : "Nothing matches"}
+          </h2>
+          <p className="mt-1.5 text-sm text-white/60">
+            {query
+              ? "Try a different title or broaden your filters."
+              : emptyMessage(initialFilter, initialStatus, initialDecade)}
+          </p>
+          {hasAnyFilter && (
+            <button
+              type="button"
+              onClick={clearAllFilters}
+              className="mt-5 inline-block rounded-md border border-white/20 px-3 py-1.5 text-sm text-white/80 transition-colors hover:border-white/40 hover:text-white"
+            >
+              Clear all filters
+            </button>
+          )}
         </div>
       ) : (
         <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">

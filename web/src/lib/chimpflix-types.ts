@@ -66,6 +66,14 @@ export type MediaItem = {
   // /library/parts/<partId> endpoints (subtitle download, file info). Plex
   // exposes it on every leaf metadata item.
   partId?: number;
+  /// Max video height across the item's active files. Drives the Card
+  /// hover quality chip (4K / 1080p / 720p / SD). Undefined when the
+  /// source endpoint didn't ship the hint.
+  bestQualityHeight?: number;
+  /// Best HDR format across the item's files: "dolby_vision" /
+  /// "hdr10_plus" / "hdr10" / "hlg". Undefined for SDR or for endpoints
+  /// that don't carry it. Renders as a tiny suffix on the quality chip.
+  bestHdrFormat?: string;
 };
 
 export type Section = {
@@ -239,6 +247,24 @@ export function displayTitle(item: MediaItem): string {
     return item.parentTitle;
   }
   return item.title;
+}
+
+/// Label for the small quality chip in the Card hover panel. Bucketed
+/// to keep the chip narrow (a literal "1234p" looks fussy in a 3-card
+/// row). Suffix with HDR/DV when present. Returns null when we have no
+/// height data — caller hides the chip rather than fabricating "HD".
+export function qualityChipLabel(item: MediaItem): string | null {
+  const h = item.bestQualityHeight;
+  if (!h || h <= 0) return null;
+  let base: string;
+  if (h >= 2000) base = "4K";
+  else if (h >= 1000) base = "1080p";
+  else if (h >= 700) base = "720p";
+  else base = "SD";
+  const hdr = item.bestHdrFormat;
+  if (hdr === "dolby_vision") return `${base} · DV`;
+  if (hdr && hdr !== "sdr") return `${base} · HDR`;
+  return base;
 }
 
 export function formatRuntime(durationMs: number | undefined): string {

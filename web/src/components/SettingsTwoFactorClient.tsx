@@ -8,6 +8,8 @@ import {
   type TotpStatusResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
+import { SettingsFeedback } from "./ui/SettingsFeedback";
 
 type Stage =
   | { kind: "loading" }
@@ -161,7 +163,7 @@ export function SettingsTwoFactorClient() {
   }
 
   if (stage.kind === "loading") {
-    return <p className="text-sm text-white/60">Loading…</p>;
+    return <LoadingPlaceholder />;
   }
 
   const status = stage.status;
@@ -172,24 +174,7 @@ export function SettingsTwoFactorClient() {
     <div className="space-y-4">
       <StatusLine status={status} />
 
-      {error && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
-        >
-          {error}
-        </div>
-      )}
-      {message && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
-        >
-          {message}
-        </div>
-      )}
+      <SettingsFeedback variant="block" message={message} error={error} />
 
       {/* Step 1 — enrollment kickoff. Shown when no verified enrollment exists. */}
       {!status.verified && stage.kind === "idle" && !enforcementBlocked && (

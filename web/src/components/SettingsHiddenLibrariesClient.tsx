@@ -5,6 +5,8 @@ import {
   prefs as prefsApi,
   type Library,
 } from "@/lib/chimpflix-api";
+import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
+import { SettingsFeedback } from "./ui/SettingsFeedback";
 
 interface Props {
   libraries: Library[];
@@ -15,7 +17,7 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Auto-clear the "Saved" toast after 2s so it doesn't linger on the
+  // Auto-clear the "Saved" pill after 2.5s so it doesn't linger on the
   // page indefinitely after the last toggle. Errors stay until the
   // next toggle so the user can read them.
   const okTimerRef = useRef<number | null>(null);
@@ -53,14 +55,14 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
     setError(null);
     try {
       await prefsApi.setHiddenLibraries([...next]);
-      setMessage("Saved.");
+      setMessage("Saved");
       if (okTimerRef.current !== null) window.clearTimeout(okTimerRef.current);
       okTimerRef.current = window.setTimeout(() => {
         okTimerRef.current = null;
         setMessage(null);
-      }, 2000);
+      }, 2500);
     } catch {
-      setError("Failed to save. Try again.");
+      setError("Couldn't save. Try again.");
       setHidden(hidden);
       setMessage(null);
     } finally {
@@ -69,7 +71,7 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
   }
 
   if (hidden === null) {
-    return <p className="text-sm text-white/60">Loading…</p>;
+    return <LoadingPlaceholder />;
   }
 
   if (libraries.length === 0) {
@@ -115,13 +117,9 @@ export function SettingsHiddenLibrariesClient({ libraries }: Props) {
           );
         })}
       </ul>
-      <p
-        role="status"
-        aria-live="polite"
-        className={`mt-2 text-xs ${error ? "text-red-300" : "text-white/55"}`}
-      >
-        {error ?? message ?? ""}
-      </p>
+      <div className="mt-3">
+        <SettingsFeedback message={message} error={error} />
+      </div>
     </div>
   );
 }

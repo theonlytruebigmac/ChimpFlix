@@ -38,6 +38,7 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
       { href: "/settings/admin/server/network", label: "Network" },
       { href: "/settings/admin/server/transcoder", label: "Transcoder" },
       { href: "/settings/admin/server/credentials", label: "Credentials" },
+      { href: "/settings/admin/server/preroll", label: "Pre-roll" },
       {
         href: "/settings/admin/server/notifications",
         label: "Notifications",
@@ -57,7 +58,7 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
         label: "Scheduled Tasks",
       },
       {
-        href: "/settings/admin/library/optimized",
+        href: "/settings/admin/library/versions",
         label: "Optimized Versions",
       },
     ],
@@ -73,6 +74,7 @@ const GROUPS: Array<NavGroup & { disabled?: string[] }> = [
     items: [
       { href: "/settings/admin/maintenance", label: "Overview" },
       { href: "/settings/admin/maintenance/backup", label: "Backup" },
+      { href: "/settings/admin/maintenance/bulk", label: "Bulk operations" },
       { href: "/settings/admin/maintenance/logs", label: "Logs" },
     ],
     disabled: [],

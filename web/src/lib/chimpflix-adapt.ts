@@ -39,6 +39,10 @@ export function adaptItem(item: Item | ListedItem): MediaItem {
   if (ps && ps.position_ms > 0) {
     media.viewOffset = ps.position_ms;
   }
+  const h = (item as ListedItem).best_quality_height;
+  if (typeof h === "number") media.bestQualityHeight = h;
+  const hdr = (item as ListedItem).best_hdr_format;
+  if (hdr) media.bestHdrFormat = hdr;
   return media;
 }
 

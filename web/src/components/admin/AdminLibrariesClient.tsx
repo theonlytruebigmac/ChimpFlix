@@ -844,8 +844,31 @@ function DrawerAction({
       type="button"
       onClick={onClick}
       disabled={busy || disabled}
-      className="rounded-md border border-white/15 bg-white/4 px-3 py-1.5 text-[12px] font-medium text-white/85 hover:bg-white/8 disabled:cursor-not-allowed disabled:opacity-50"
+      className="inline-flex items-center justify-center gap-1.5 rounded-md border border-white/15 bg-white/4 px-3 py-1.5 text-[12px] font-medium text-white/85 transition-colors hover:bg-white/8 focus:outline-none focus-visible:ring-2 focus-visible:ring-(--color-accent) focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50"
     >
+      {busy && (
+        <svg
+          className="h-3 w-3 animate-spin"
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden
+        >
+          <circle
+            cx="12"
+            cy="12"
+            r="10"
+            stroke="currentColor"
+            strokeOpacity="0.25"
+            strokeWidth="3"
+          />
+          <path
+            d="M22 12a10 10 0 0 0-10-10"
+            stroke="currentColor"
+            strokeWidth="3"
+            strokeLinecap="round"
+          />
+        </svg>
+      )}
       {busy ? (busyLabel ?? "Working…") : label}
     </button>
   );

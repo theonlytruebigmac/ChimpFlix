@@ -162,6 +162,22 @@ pub async fn scrobble_event(
     let progress = current_progress_pct(&state.pool, user_id, item_id, episode_id, duration_ms)
         .await
         .unwrap_or(0.0);
+    // Trakt's API rejects /scrobble/stop and /scrobble/pause at progress
+    // below 1.0% with `422 — Progress should be at least 1.0% to pause.`
+    // This guard avoids the cascade of WARN logs (and a useless HTTP
+    // round-trip per session) when a user opens a title and immediately
+    // closes the player, which is a common interaction. /scrobble/start
+    // is allowed at 0% — Trakt uses it to set the "now watching" banner
+    // — so the skip only applies to the terminal actions.
+    if matches!(action, ScrobbleAction::Stop | ScrobbleAction::Pause) && progress < 1.0 {
+        tracing::debug!(
+            user_id,
+            progress = format!("{progress:.2}"),
+            action = ?action,
+            "Trakt scrobble skipped — below 1% threshold"
+        );
+        return;
+    }
     let Some(event) = build_scrobble_event(&state.pool, item_id, episode_id, progress).await
     else {
         return;

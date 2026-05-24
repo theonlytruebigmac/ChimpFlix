@@ -9,6 +9,7 @@ import {
 } from "@/lib/chimpflix-api";
 import { Pill } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse }) {
   const [webhooks, setWebhooks] = useState(initial.webhooks);
@@ -313,7 +314,7 @@ function WebhookRow({
               Recent deliveries
             </div>
             {deliveries == null ? (
-              <div className="text-sm text-white/40">Loading…</div>
+              <LoadingPlaceholder />
             ) : deliveries.length === 0 ? (
               <div className="text-sm text-white/40">No deliveries yet.</div>
             ) : (

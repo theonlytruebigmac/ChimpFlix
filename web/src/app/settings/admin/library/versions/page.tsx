@@ -2,9 +2,9 @@ import { admin as adminApi } from "@/lib/chimpflix-api";
 import { AdminOptimizedClient } from "@/components/admin/AdminOptimizedClient";
 import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 
-export default async function AdminOptimizedPage() {
+export default async function AdminVersionsPage() {
   const [versions, presets] = await Promise.all([
-    adminApi.optimized.list(),
+    adminApi.versions.list(),
     adminApi.transcoder.listPresets(),
   ]);
   return (

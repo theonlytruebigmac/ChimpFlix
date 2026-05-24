@@ -1065,6 +1065,19 @@ pub struct ListedItem {
     #[serde(flatten)]
     pub item: Item,
     pub play_state: Option<PlayStateForItem>,
+    /// Max video height across the item's active media files. For movies
+    /// this is the single file's height; for shows it's the highest
+    /// across every episode. Optional so card surfaces that don't ship
+    /// the hint (history, smart collections) can leave it None without
+    /// breaking the existing JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_quality_height: Option<i32>,
+    /// "Best" HDR format across the item's files, with Dolby Vision
+    /// outranking HDR10+ outranking HDR10 outranking HLG. None when no
+    /// file carries an HDR tag (SDR content). Drives the small chip in
+    /// the Card hover panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_hdr_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1089,6 +1102,21 @@ impl PlayStateForItem {
             view_count: row.try_get("ps_view_count")?,
             last_played_at: row.try_get("ps_last_played_at")?,
         }))
+    }
+}
+
+impl ListedItem {
+    /// Populate `best_quality_height` and `best_hdr_format` from the
+    /// `best_height` and `best_hdr_format` aliases that ITEM_SELECT
+    /// produces. Tolerates rows that don't include those columns (e.g.
+    /// list_watch_history's bespoke SELECT) — returns `(None, None)` so
+    /// the caller can still construct a valid `ListedItem`.
+    pub(crate) fn quality_from_columns(
+        row: &SqliteRow,
+    ) -> (Option<i32>, Option<String>) {
+        let height: Option<i32> = row.try_get("best_height").ok().flatten();
+        let hdr: Option<String> = row.try_get("best_hdr_format").ok().flatten();
+        (height, hdr)
     }
 }
 

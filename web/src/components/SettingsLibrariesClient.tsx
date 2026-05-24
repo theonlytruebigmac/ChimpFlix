@@ -10,6 +10,7 @@ import {
 } from "@/lib/chimpflix-api";
 import { LibraryAccessClient } from "./LibraryAccessClient";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
 
 interface Props {
   initial: Library[];
@@ -362,7 +363,7 @@ function ScanHistoryView({
         </button>
       </div>
       {loading ? (
-        <p className="text-xs text-white/55">Loading…</p>
+        <LoadingPlaceholder variant="inline" />
       ) : scans.length === 0 ? (
         <p className="text-xs text-white/55">No scans yet.</p>
       ) : (

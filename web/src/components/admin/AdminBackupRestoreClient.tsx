@@ -7,6 +7,7 @@ import {
   type ListBackupsResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 /// Admin surface for the persisted auto-backup snapshots
 /// (`<data_dir>/backups/auto/`). Lists every snapshot with size +
@@ -188,7 +189,7 @@ export function AdminBackupRestoreClient() {
         </div>
 
         {loading ? (
-          <div className="px-4 py-6 text-center text-sm text-white/50">Loading…</div>
+          <LoadingPlaceholder />
         ) : !data || data.backups.length === 0 ? (
           <div className="px-4 py-6 text-center text-sm text-white/50">
             No backups yet. The <code className="font-mono text-white/65">backup_db</code> scheduled task

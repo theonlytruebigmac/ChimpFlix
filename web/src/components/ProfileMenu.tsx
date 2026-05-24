@@ -122,7 +122,7 @@ export function ProfileMenu() {
         aria-label={user ? `Signed in as ${label}` : "Account"}
         aria-haspopup="menu"
         aria-expanded={open}
-        className="flex items-center gap-1.5 text-white/85 transition-colors hover:text-white"
+        className="flex items-center gap-1.5 rounded-md text-white/85 transition-colors hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-(--color-accent) focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         {user?.avatar_url ? (
           // eslint-disable-next-line @next/next/no-img-element
@@ -169,7 +169,7 @@ export function ProfileMenu() {
             href="/history"
             role="menuitem"
             onClick={() => setOpen(false)}
-            className="block px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white"
+            className="block px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:bg-white/10 focus-visible:text-white"
           >
             Watch history
           </Link>
@@ -177,7 +177,7 @@ export function ProfileMenu() {
             href="/settings"
             role="menuitem"
             onClick={() => setOpen(false)}
-            className="block px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white"
+            className="block px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:bg-white/10 focus-visible:text-white"
           >
             Settings
           </Link>
@@ -186,7 +186,7 @@ export function ProfileMenu() {
               href="/settings/admin"
               role="menuitem"
               onClick={() => setOpen(false)}
-              className="flex items-center justify-between border-t border-white/10 px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white"
+              className="flex items-center justify-between border-t border-white/10 px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:bg-white/10 focus-visible:text-white"
             >
               <span>Admin</span>
               <span className="rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
@@ -198,7 +198,7 @@ export function ProfileMenu() {
             type="button"
             role="menuitem"
             onClick={onSignOut}
-            className="block w-full cursor-pointer px-4 py-2.5 text-left text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white"
+            className="block w-full cursor-pointer px-4 py-2.5 text-left text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:bg-white/10 focus-visible:text-white"
           >
             Sign out
           </button>

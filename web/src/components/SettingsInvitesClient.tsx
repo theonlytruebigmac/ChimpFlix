@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
+import { SettingsFeedback } from "./ui/SettingsFeedback";
 import {
   admin as adminApi,
   auth as authApi,
@@ -169,7 +171,7 @@ export function SettingsInvitesClient() {
   }
 
   if (invites === null) {
-    return <p className="text-sm text-white/60">Loading…</p>;
+    return <LoadingPlaceholder />;
   }
 
   const open = invites.filter((i) => !i.consumed_at);
@@ -306,12 +308,12 @@ export function SettingsInvitesClient() {
         </div>
       </div>
 
-      {error && (
-        <div className="mb-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
-      {message && <p className="mb-3 text-xs text-white/70">{message}</p>}
+      <SettingsFeedback
+        variant="block"
+        message={message}
+        error={error}
+        className="mb-3"
+      />
 
       {open.length === 0 && used.length === 0 && (
         <p className="text-sm text-white/60">

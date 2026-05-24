@@ -48,7 +48,7 @@ pub struct PlexOAuthClient {
     http: reqwest::Client,
     base_url: String,
     /// Stable per-install UUID. Provided by the operator (we generate
-    /// + persist it on first enable). Identifies *this* ChimpFlix
+    /// and persist it on first enable). Identifies *this* ChimpFlix
     /// deployment to plex.tv — any two PINs issued with the same
     /// identifier are linked together by Plex's idea of "device".
     client_identifier: String,

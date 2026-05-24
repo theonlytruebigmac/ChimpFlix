@@ -71,10 +71,10 @@ pub type PlexOAuthHandle = Arc<RwLock<Option<PlexOAuthClient>>>;
 ///
 ///   * `Login`  — look up the linked ChimpFlix user, issue a session.
 ///   * `Signup` — validate the invite, create a user + provider link,
-///                consume the invite, issue a session.
+///     consume the invite, issue a session.
 ///   * `Link`   — attach the Plex identity to an already-signed-in
-///                user's account. No session is issued (the existing
-///                one is preserved).
+///     user's account. No session is issued (the existing
+///     one is preserved).
 pub type PlexPinCache = Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPlexPin>>>;
 
 #[derive(Debug, Clone)]

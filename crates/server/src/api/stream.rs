@@ -2172,6 +2172,7 @@ mod tests {
             subtitle_index,
             subtitle_style: None,
             quality_target: None,
+            bitrate_cap_bps: None,
             audio_normalize: false,
             subtitle_offset_ms: 0,
         }
@@ -2213,7 +2214,7 @@ mod tests {
         let mut r = req(Some(1), None);
         r.quality_target = Some(QualityTarget {
             height: 720,
-            bitrate_bps: 2_500_000,
+            bitrate_bps: Some(2_500_000),
         });
         assert_eq!(
             pick_video_treatment(

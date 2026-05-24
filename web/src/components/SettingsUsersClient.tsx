@@ -9,6 +9,7 @@ import {
   type UserRole,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
 
 interface Props {
   currentUserId: number;
@@ -93,16 +94,7 @@ export function SettingsUsersClient({
       await authApi.setUserRole(id, role);
       await refresh();
     } catch (e) {
-      if (e instanceof ChimpFlixApiError) {
-        try {
-          const parsed = JSON.parse(e.body) as { error?: { message?: string } };
-          setMessage(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
-        } catch {
-          setMessage(`Failed: HTTP ${e.status}`);
-        }
-      } else {
-        setMessage("Failed: network error");
-      }
+      setMessage(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -122,21 +114,13 @@ export function SettingsUsersClient({
       await adminApi.resetUserTwoFactor(id);
       setMessage(`2FA reset for "${label}".`);
     } catch (e) {
-      if (e instanceof ChimpFlixApiError) {
-        if (e.status === 404) {
-          setMessage(`"${label}" had no 2FA enrolled.`);
-        } else {
-          try {
-            const parsed = JSON.parse(e.body) as {
-              error?: { message?: string };
-            };
-            setMessage(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
-          } catch {
-            setMessage(`Failed: HTTP ${e.status}`);
-          }
-        }
+      // 404 has a specific meaning here — the user never enrolled — so
+      // keep the targeted message; everything else goes through the
+      // generic friendlyError mapping.
+      if (e instanceof ChimpFlixApiError && e.status === 404) {
+        setMessage(`"${label}" had no 2FA enrolled.`);
       } else {
-        setMessage("Failed: network error");
+        setMessage(friendlyError(e));
       }
     } finally {
       setBusy(null);
@@ -161,16 +145,7 @@ export function SettingsUsersClient({
       const r = await adminApi.sendUserPasswordReset(id);
       setMessage(r.message);
     } catch (e) {
-      if (e instanceof ChimpFlixApiError) {
-        try {
-          const parsed = JSON.parse(e.body) as { error?: { message?: string } };
-          setMessage(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
-        } catch {
-          setMessage(`Failed: HTTP ${e.status}`);
-        }
-      } else {
-        setMessage("Failed: network error");
-      }
+      setMessage(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -191,22 +166,13 @@ export function SettingsUsersClient({
       setMessage(`Removed "${label}".`);
       await refresh();
     } catch (e) {
-      if (e instanceof ChimpFlixApiError) {
-        try {
-          const parsed = JSON.parse(e.body) as { error?: { message?: string } };
-          setMessage(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
-        } catch {
-          setMessage(`Failed: HTTP ${e.status}`);
-        }
-      } else {
-        setMessage("Failed: network error");
-      }
+      setMessage(friendlyError(e));
     } finally {
       setBusy(null);
     }
   }
 
-  if (users === null) return <p className="text-sm text-white/60">Loading…</p>;
+  if (users === null) return <LoadingPlaceholder />;
 
   if (users.length === 0) {
     return (
@@ -368,4 +334,28 @@ export function SettingsUsersClient({
       )}
     </div>
   );
+}
+
+/// Map a failed user-admin API call to user-facing text. Prefers the
+/// server's structured error message when present (e.g. "you can't
+/// delete the last owner"); otherwise picks a generic synonym keyed
+/// off the HTTP status class. Mirrors AdminUsersUnifiedClient so
+/// operators see consistent error wording across the two users
+/// surfaces.
+function friendlyError(e: unknown): string {
+  if (e instanceof ChimpFlixApiError) {
+    try {
+      const parsed = JSON.parse(e.body) as { error?: { message?: string } };
+      if (parsed.error?.message) return parsed.error.message;
+    } catch {
+      /* fall through */
+    }
+    if (e.status === 401 || e.status === 403)
+      return "You don't have permission to do that.";
+    if (e.status === 404) return "Not found.";
+    if (e.status === 409) return "Conflicting state — try refreshing.";
+    if (e.status >= 500) return "Server error. Try again in a moment.";
+    return "Couldn't save. Try again.";
+  }
+  return "Network error. Check your connection and try again.";
 }

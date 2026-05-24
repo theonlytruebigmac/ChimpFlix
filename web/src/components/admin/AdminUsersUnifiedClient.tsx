@@ -24,6 +24,7 @@ import {
   type PillTone,
 } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 interface Props {
   currentUserId: number;
@@ -177,7 +178,7 @@ export function AdminUsersUnifiedClient({
   }
 
   if (users === null) {
-    return <p className="text-sm text-white/60">Loading…</p>;
+    return <LoadingPlaceholder />;
   }
   if (users.length === 0) {
     return (
@@ -463,16 +464,7 @@ function UserDrawer({
       const r = await fn();
       return r;
     } catch (e) {
-      if (e instanceof ChimpFlixApiError) {
-        try {
-          const parsed = JSON.parse(e.body) as { error?: { message?: string } };
-          setError(`Failed: ${parsed.error?.message ?? `HTTP ${e.status}`}`);
-        } catch {
-          setError(`Failed: HTTP ${e.status}`);
-        }
-      } else {
-        setError("Failed: network error");
-      }
+      setError(friendlyError(e));
       throw e;
     } finally {
       setBusy(null);
@@ -908,6 +900,11 @@ function AuditTab({
 
   useEffect(() => {
     let cancelled = false;
+    // Intentional: reset to loading state when the user/page filter
+    // changes so the skeleton reads correctly between fetches. The
+    // alternative (showing the prior user's entries during the refetch)
+    // would be confusing in the per-user audit drawer.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEntries(null);
     setError(null);
     adminApi.audit
@@ -928,7 +925,7 @@ function AuditTab({
   }, [userId, pageSize]);
 
   if (entries === null) {
-    return <p className="text-[12.5px] text-white/55">Loading…</p>;
+    return <LoadingPlaceholder variant="inline" />;
   }
   if (error) {
     return (
@@ -1042,6 +1039,29 @@ function DrawerAction({
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
+
+/// Map a failed admin API call to user-facing text. Prefers the
+/// server's structured error message when present (validation surface,
+/// e.g. "you can't demote the last owner"); otherwise picks a generic
+/// synonym keyed off the HTTP status class so operators stop seeing
+/// raw "HTTP 500" strings.
+function friendlyError(e: unknown): string {
+  if (e instanceof ChimpFlixApiError) {
+    try {
+      const parsed = JSON.parse(e.body) as { error?: { message?: string } };
+      if (parsed.error?.message) return parsed.error.message;
+    } catch {
+      /* fall through */
+    }
+    if (e.status === 401 || e.status === 403)
+      return "You don't have permission to do that.";
+    if (e.status === 404) return "Not found.";
+    if (e.status === 409) return "Conflicting state — try refreshing.";
+    if (e.status >= 500) return "Server error. Try again in a moment.";
+    return "Couldn't save. Try again.";
+  }
+  return "Network error. Check your connection and try again.";
+}
 
 function formatRelative(diffMs: number): string {
   if (diffMs < 60_000) return "just now";

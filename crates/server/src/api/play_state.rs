@@ -229,6 +229,7 @@ pub async fn event(
 /// task. Used by `scrobble` (complete) and could be reused by other
 /// server-emitted event sites — keeps the spawn + warn pattern in one
 /// place.
+#[allow(clippy::too_many_arguments)]
 fn spawn_event(
     state: AppState,
     user_id: i64,

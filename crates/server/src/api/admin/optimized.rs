@@ -1,4 +1,4 @@
-//! `/admin/optimized*` — queue + completed list for Optimized Versions.
+//! `/admin/versions*` — queue + completed list for Optimized Versions.
 
 use axum::Json;
 use axum::extract::{Path, State};

@@ -4,15 +4,15 @@
 //! by the body of `/auth/plex/start`:
 //!
 //!   * **login**  (anonymous): poll yields a session if the resulting
-//!                Plex identity is already linked to a local user;
-//!                otherwise the response is `not_linked` and the
-//!                browser shows "ask for an invite".
+//!     Plex identity is already linked to a local user;
+//!     otherwise the response is `not_linked` and the
+//!     browser shows "ask for an invite".
 //!   * **signup** (anonymous, requires invite): poll provisions a
-//!                fresh local user, links the Plex identity, consumes
-//!                the invite, and issues a session.
+//!     fresh local user, links the Plex identity, consumes
+//!     the invite, and issues a session.
 //!   * **link**   (authenticated): poll attaches the Plex identity to
-//!                the requesting user's account. No new session is
-//!                issued; the existing one stays valid.
+//!     the requesting user's account. No new session is
+//!     issued; the existing one stays valid.
 //!
 //! The frontend never sees the raw Plex PIN id — `start` returns an
 //! opaque `pin_handle` we generate, and `poll` looks the underlying

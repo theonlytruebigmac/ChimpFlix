@@ -1,9 +1,8 @@
-//! /admin/users*, /admin/sessions*, /admin/access — Phase 8 surface.
+//! /admin/users*, /admin/sessions*, /admin/access-matrix — Phase 8 surface.
 //!
-//! User CRUD + invites are also reachable at /auth/users and /auth/invites
-//! (existing). These mirrors live under /admin so the admin shell can
-//! address everything from one namespace; the underlying handlers reuse
-//! the same logic.
+//! User CRUD + invites live under `/admin/users*` and `/admin/invites*`;
+//! handlers are defined in the `auth` module but mounted under `/admin`
+//! since both endpoints are admin-only.
 
 use axum::Extension;
 use axum::Json;

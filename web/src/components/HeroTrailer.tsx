@@ -33,7 +33,12 @@ export function HeroTrailer({
           if (!cancelled) setVideoId(data.video_id ?? null);
         }, delayMs);
       })
-      .catch(() => {});
+      .catch(() => {
+        // Trailer lookup is best-effort polish — TMDB outages or
+        // 4xxs shouldn't break the hero. Fall through to the
+        // backdrop-only hero (videoId stays null → component
+        // renders nothing).
+      });
 
     return () => {
       cancelled = true;

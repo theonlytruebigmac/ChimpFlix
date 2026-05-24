@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { brandNameUpper } from "@/lib/env";
+import { ActivityIndicator } from "./ActivityIndicator";
 import { MobileNavTrigger, NavLinks } from "./NavLinks";
 import { NotificationsBell } from "./NotificationsBell";
 import { ProfileMenu } from "./ProfileMenu";
@@ -48,6 +49,7 @@ export function TopNav() {
           <Suspense fallback={null}>
             <SearchBar />
           </Suspense>
+          <ActivityIndicator />
           <NotificationsBell />
           <ProfileMenu />
         </div>

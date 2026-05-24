@@ -733,7 +733,7 @@ fn normalize_tvdb_image(raw: Option<String>) -> Option<String> {
 /// "eng" so episode-list fetches always hit a real endpoint.
 pub fn bcp47_to_iso639_3(tag: &str) -> &'static str {
     let primary = tag
-        .split(|c: char| c == '-' || c == '_')
+        .split(['-', '_'])
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();

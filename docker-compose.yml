@@ -141,7 +141,16 @@ services:
       - "/etc/localtime:/etc/localtime:ro"
       - "/etc/timezone:/etc/timezone:ro"
     depends_on:
-      - server
+      # `service_healthy` (not just `service_started`) so Next.js doesn't
+      # boot until the Rust API is actually accepting connections. Next
+      # is "Ready in 0ms" but the server still has migrations + the
+      # scheduler bring-up to do — without this gate the first 10-30 s
+      # of frontend requests proxy through to a not-listening port and
+      # the log fills with `ECONNREFUSED 172.x.x.x:8080`. The server
+      # already declares a `/health` healthcheck above; this just
+      # consumes it.
+      server:
+        condition: service_healthy
     env_file:
       - path: ./.env.local
         required: false

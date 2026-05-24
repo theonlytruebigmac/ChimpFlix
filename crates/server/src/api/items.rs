@@ -1011,23 +1011,37 @@ pub async fn report_issue(
 
 // ─── Reviews (read-only: top reviews ingested from the metadata provider) ─
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ReviewsQuery {
+    /// Page size. Server clamps to 1..=100; default 12 (modal shows up to
+    /// 6 — extra buffer covers any future "see more reviews" surface
+    /// without a second round-trip).
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReviewsResponse {
     pub reviews: Vec<Review>,
+    pub total: i64,
 }
 
 pub async fn list_reviews(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<i64>,
+    Query(q): Query<ReviewsQuery>,
 ) -> Result<Json<ReviewsResponse>, ApiError> {
     let acc = access(&state, &user).await?;
     // Ensure the user can see the item before exposing its reviews.
     queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
-    let reviews = queries::list_reviews_for_item(&state.pool, id).await?;
-    Ok(Json(ReviewsResponse { reviews }))
+    let limit = q.limit.unwrap_or(12);
+    let offset = q.offset.unwrap_or(0);
+    let reviews = queries::list_reviews_for_item(&state.pool, id, limit, offset).await?;
+    let total = queries::count_reviews_for_item(&state.pool, id).await?;
+    Ok(Json(ReviewsResponse { reviews, total }))
 }
 
 // ─── Poster / backdrop upload + serve ──────────────────────────────────────

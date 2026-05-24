@@ -288,10 +288,6 @@ pub async fn enqueue_for_season(
     show_id: i64,
     season_number: i32,
 ) -> Result<bool> {
-    let payload = serde_json::json!({
-        "show_id": show_id,
-        "season_number": season_number,
-    });
     // The dedup column on job_queue is an i64; pack (show_id,
     // season_number) into one. Show ids fit in 47 bits (way more
     // than any reasonable install will reach); season numbers are
@@ -301,8 +297,22 @@ pub async fn enqueue_for_season(
     // distinctly from season=65535 (which doesn't exist in
     // practice but defends the dedup key shape against a future
     // exotic season-numbering scheme).
+    //
+    // The packed key is also stamped onto the payload as
+    // `show_season` so `enqueue_job_unique`'s
+    // `json_extract(payload, '$.show_season')` dedup lookup
+    // actually matches a field in the row. Without that field
+    // present, dedup always misses and every enqueue inserts a
+    // new job — observed in the wild as 7-8 concurrent
+    // bootstrap runs fingerprinting the same season in parallel,
+    // saturating the SQLite writer.
     let season_lo = (season_number as i64).rem_euclid(1 << 16);
     let dedup_key = (show_id << 16) | season_lo;
+    let payload = serde_json::json!({
+        "show_id": show_id,
+        "season_number": season_number,
+        "show_season": dedup_key,
+    });
     let res = queries::enqueue_job_unique(
         pool,
         queries::JobInput::new(KIND, payload),

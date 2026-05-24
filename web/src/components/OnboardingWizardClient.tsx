@@ -138,12 +138,19 @@ export function OnboardingWizardClient({ initialSettings }: Props) {
 function Progress({ current }: { current: StepId }) {
   const currentIdx = STEP_ORDER.indexOf(current);
   return (
-    <ol className="mt-6 flex items-center gap-3 text-[12px]">
+    <ol
+      aria-label="Setup steps"
+      className="mt-6 flex items-center gap-3 text-[12px]"
+    >
       {STEP_ORDER.map((s, i) => {
         const done = i < currentIdx;
         const active = i === currentIdx;
         return (
-          <li key={s} className="flex items-center gap-3">
+          <li
+            key={s}
+            aria-current={active ? "step" : undefined}
+            className="flex items-center gap-3"
+          >
             <span
               className={`flex h-6 w-6 items-center justify-center rounded-full border text-[11px] font-semibold ${
                 active
@@ -153,6 +160,9 @@ function Progress({ current }: { current: StepId }) {
                     : "border-white/15 bg-white/4 text-white/45"
               }`}
             >
+              <span className="sr-only">
+                {done ? "Completed: " : active ? "Current step: " : "Upcoming: "}
+              </span>
               {done ? "✓" : i + 1}
             </span>
             <span

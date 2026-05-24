@@ -6,6 +6,7 @@ import {
   ChimpFlixApiError,
   type User,
 } from "@/lib/chimpflix-api";
+import { SettingsFeedback } from "./ui/SettingsFeedback";
 
 interface Props {
   initial: User;
@@ -39,6 +40,7 @@ export function SettingsProfileClient({ initial }: Props) {
   const [notifyEmail, setNotifyEmail] = useState(initial.notify_via_email);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // Compare against the most-recent server state (`user`, not the
   // immutable `initial` prop) so the Save button correctly disables
@@ -67,6 +69,7 @@ export function SettingsProfileClient({ initial }: Props) {
     e.preventDefault();
     setBusy(true);
     setMessage(null);
+    setError(null);
     try {
       const { user: updated } = await authApi.updateMe({
         display_name: displayName,
@@ -76,7 +79,7 @@ export function SettingsProfileClient({ initial }: Props) {
         notify_via_email: notifyEmail,
       });
       setUser(updated);
-      setMessage("Saved.");
+      setMessage("Saved");
       if (messageTimerRef.current !== null) {
         window.clearTimeout(messageTimerRef.current);
       }
@@ -95,9 +98,9 @@ export function SettingsProfileClient({ initial }: Props) {
           };
           if (parsed.error?.message) detail = parsed.error.message;
         } catch {}
-        setMessage(`Failed: ${detail}`);
+        setError(`Couldn't save: ${detail}`);
       } else {
-        setMessage("Failed: network error");
+        setError("Couldn't save. Network error.");
       }
     } finally {
       setBusy(false);
@@ -198,13 +201,7 @@ export function SettingsProfileClient({ initial }: Props) {
         >
           {busy ? "Saving…" : "Save changes"}
         </button>
-        <span
-          role="status"
-          aria-live="polite"
-          className="text-xs text-white/70"
-        >
-          {message ?? ""}
-        </span>
+        <SettingsFeedback message={message} error={error} />
       </div>
     </form>
   );

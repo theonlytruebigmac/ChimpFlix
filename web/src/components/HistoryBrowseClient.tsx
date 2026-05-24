@@ -8,6 +8,7 @@
 /// Matches the LibraryBrowseClient / GenreBrowseClient shape so the
 /// three discovery surfaces feel identical.
 
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useTransition } from "react";
 
@@ -65,9 +66,36 @@ export function HistoryBrowseClient({
   return (
     <div className="space-y-5">
       {items.length === 0 ? (
-        <p className="text-white/60">
-          Nothing watched yet. Play something and it&apos;ll show up here.
-        </p>
+        <div className="mx-auto max-w-md py-10 text-center">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/55">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <circle cx="12" cy="12" r="9" />
+              <polyline points="12 7 12 12 15 14" />
+            </svg>
+          </div>
+          <h2 className="text-base font-semibold text-white">
+            No watch history yet
+          </h2>
+          <p className="mt-1.5 text-sm text-white/60">
+            Press play on anything and it&apos;ll show up here.
+          </p>
+          <Link
+            href="/"
+            className="mt-5 inline-block text-sm text-white underline underline-offset-4 hover:text-(--color-accent)"
+          >
+            Browse titles
+          </Link>
+        </div>
       ) : (
         <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {items.map((it) => (

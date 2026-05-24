@@ -39,6 +39,8 @@ export function PortraitWithFallback({
     <img
       src={src}
       alt={name}
+      loading="lazy"
+      decoding="async"
       className={className}
       onError={() => setFailed(true)}
     />
