@@ -5,9 +5,9 @@ use std::net::IpAddr;
 use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::header::{SET_COOKIE, USER_AGENT};
+use axum::http::header::{self, SET_COOKIE, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use chimpflix_common::now_ms;
 use chimpflix_library::queries;
 use chimpflix_library::{
@@ -16,7 +16,7 @@ use chimpflix_library::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::error::ApiError;
 use crate::auth::{AuthUser, OwnerAuth, SESSION_MAX_AGE_S, cookie, password};
@@ -125,6 +125,21 @@ pub async fn setup(
     {
         return Err(ApiError::Forbidden);
     }
+    // BLOCK #5: setup-token gate. Closes the CSRF-bypass race window
+    // where, between server boot and the operator completing first-
+    // run setup, any reachable caller could claim the owner account.
+    //
+    // Behaviour:
+    //   * `CHIMPFLIX_SETUP_TOKEN` set → require `X-Setup-Token`
+    //     request header with exact match (constant-time compare).
+    //   * Token unset AND `APP_PUBLIC_ORIGIN` looks public (https://)
+    //     → refuse setup with an actionable error. Same pattern as
+    //     the plaintext-vault refusal in `load_vault`.
+    //   * Token unset AND origin is LAN-ish → allow (current
+    //     behaviour preserved for dev + LAN-only deployments).
+    //
+    // See docs/PUBLIC_RELEASE_HARDENING.md BLOCK #5.
+    enforce_setup_token(&headers)?;
     validate_username(&input.username)?;
     validate_password(&input.password)?;
     let email = input
@@ -438,6 +453,24 @@ pub async fn revoke_my_session(
     if session.user_id != user.id {
         return Err(ApiError::NotFound);
     }
+    // Sole-owner self-lockout guard (MONTH 1 in
+    // `docs/PUBLIC_RELEASE_HARDENING.md`). Without it, the only owner
+    // can revoke their own current session and the resulting "no
+    // owner with a live session" state is only recoverable by direct
+    // SQLite edits (or by running `owner-password-reset` from the CLI
+    // — see Tier 0.6).
+    if session_id == user.session_id && user.role == chimpflix_library::UserRole::Owner {
+        let owner_count = queries::count_owners(&state.pool)
+            .await
+            .map_err(ApiError::Internal)?;
+        if owner_count <= 1 {
+            return Err(ApiError::validation(
+                "cannot revoke your own current session as the sole owner — \
+                 promote another user to Owner first, or use /auth/logout \
+                 (which still requires you to log back in)",
+            ));
+        }
+    }
     queries::delete_session(&state.pool, session_id)
         .await
         .map_err(ApiError::Internal)?;
@@ -558,6 +591,18 @@ pub struct UpdateMeInput {
     pub email: Option<String>,
     pub default_audio_lang: Option<String>,
     pub default_subtitle_lang: Option<String>,
+    /// Subtitle styling. Strings empty-out to NULL via the same
+    /// `normalize` pass as the language fields. Numeric fields use
+    /// the sentinel `0` for "clear" — passing 0 is meaningless for
+    /// font-size (clamped >= 8 below) and bottom-inset (clamped >= 0
+    /// but a literal 0 is fine because that's the bottom edge). The
+    /// happy path passes a real value or omits the key entirely.
+    pub subtitle_font_size_px: Option<i64>,
+    pub subtitle_text_color: Option<String>,
+    pub subtitle_background_color: Option<String>,
+    pub subtitle_font_family: Option<String>,
+    pub subtitle_edge: Option<String>,
+    pub subtitle_bottom_inset_pct: Option<i64>,
     /// Single-Option: present → set the boolean. Omit to leave as-is.
     pub notify_via_email: Option<bool>,
 }
@@ -655,6 +700,222 @@ pub async fn change_password(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// GDPR-style self-service: export own data + delete own account.
+// MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`.
+// ---------------------------------------------------------------------------
+
+/// `GET /auth/me/export` — JSON dump of every row keyed on this user.
+/// Excludes credentials (password hash, TOTP secret, OAuth tokens,
+/// session cookies) and admin-side bookkeeping; this is the
+/// "portable, take-it-with-me" view, not a forensic clone.
+pub async fn export_me(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use sqlx::Row;
+
+    let profile = queries::find_user_by_id(&state.pool, user.id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    // Watch state per (item|episode|media_file). The play_state table
+    // is the source of truth for "what the user has watched."
+    let play_state: Vec<serde_json::Value> = sqlx::query(
+        "SELECT item_id, episode_id, media_file_id, position_ms, duration_ms,
+                watched, view_count, last_played_at
+         FROM play_state WHERE user_id = ?",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .iter()
+    .map(|r| {
+        serde_json::json!({
+            "item_id": r.try_get::<Option<i64>, _>("item_id").ok().flatten(),
+            "episode_id": r.try_get::<Option<i64>, _>("episode_id").ok().flatten(),
+            "media_file_id": r.try_get::<Option<i64>, _>("media_file_id").ok().flatten(),
+            "position_ms": r.try_get::<Option<i64>, _>("position_ms").ok().flatten(),
+            "duration_ms": r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+            "watched": r.try_get::<i64, _>("watched").unwrap_or(0) != 0,
+            "view_count": r.try_get::<i64, _>("view_count").unwrap_or(0),
+            "last_played_at": r.try_get::<Option<i64>, _>("last_played_at").ok().flatten(),
+        })
+    })
+    .collect();
+
+    let my_list: Vec<i64> = sqlx::query_scalar(
+        "SELECT item_id FROM user_my_list WHERE user_id = ? ORDER BY added_at",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let ratings: Vec<serde_json::Value> = sqlx::query(
+        "SELECT item_id, rating, rated_at FROM user_ratings WHERE user_id = ?",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "item_id": r.try_get::<i64, _>("item_id").unwrap_or(0),
+                    "rating": r.try_get::<i64, _>("rating").unwrap_or(0),
+                    "rated_at": r.try_get::<i64, _>("rated_at").unwrap_or(0),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let hidden_libraries: Vec<i64> = sqlx::query_scalar(
+        "SELECT library_id FROM user_hidden_libraries WHERE user_id = ?",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let audit_entries: Vec<serde_json::Value> = sqlx::query(
+        "SELECT action, target_kind, target_id, payload_json, ip,
+                user_agent, created_at
+         FROM audit_log WHERE actor_user_id = ?
+         ORDER BY created_at DESC LIMIT 500",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "action": r.try_get::<String, _>("action").unwrap_or_default(),
+                    "target_kind": r.try_get::<Option<String>, _>("target_kind").ok().flatten(),
+                    "target_id": r.try_get::<Option<String>, _>("target_id").ok().flatten(),
+                    "payload_json": r.try_get::<Option<String>, _>("payload_json").ok().flatten(),
+                    "ip": r.try_get::<Option<String>, _>("ip").ok().flatten(),
+                    "user_agent": r.try_get::<Option<String>, _>("user_agent").ok().flatten(),
+                    "created_at": r.try_get::<i64, _>("created_at").unwrap_or(0),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "exported_at_ms": now_ms(),
+        "schema_version": 1,
+        "profile": {
+            "id": profile.id,
+            "username": profile.username,
+            "display_name": profile.display_name,
+            "email": profile.email,
+            "role": profile.role,
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        },
+        "play_state": play_state,
+        "my_list": my_list,
+        "ratings": ratings,
+        "hidden_libraries": hidden_libraries,
+        "audit_log": audit_entries,
+        "_note": "Credentials (password hash, TOTP secret, OAuth tokens) and \
+                  active session cookies are intentionally excluded. Audit \
+                  log truncated to the most recent 500 entries.",
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteMeRequest {
+    pub current_password: String,
+}
+
+impl std::fmt::Debug for DeleteMeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteMeRequest")
+            .field("current_password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `DELETE /auth/me` — purge the requesting user's account.
+///
+/// Requires re-entering the current password (defense against CSRF +
+/// stolen-cookie deletion). Refuses for the sole owner. The cascade
+/// drops rows from play_state, my_list, ratings, hidden_libraries,
+/// user_totp, user_trakt_tokens, user_auth_providers, notifications,
+/// and sessions via FK ON DELETE CASCADE.
+pub async fn delete_me(
+    State(state): State<AppState>,
+    Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
+    user: AuthUser,
+    headers: HeaderMap,
+    Json(input): Json<DeleteMeRequest>,
+) -> Result<Response, ApiError> {
+    if input.current_password.is_empty() {
+        return Err(ApiError::validation("current password is required"));
+    }
+
+    let record = queries::find_user_with_secret_by_username(&state.pool, &user.username)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    if !password::verify(&input.current_password, &record.password_hash) {
+        audit_auth(
+            &state,
+            "auth.delete_me.failure",
+            Some(user.id),
+            Some(user.id),
+            None,
+            &headers,
+            Some(ip),
+        )
+        .await;
+        return Err(ApiError::Unauthorized);
+    }
+
+    // delete_user has the last-owner guard built in.
+    let removed = queries::delete_user(&state.pool, user.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    if !removed {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "delete_user reported no rows affected"
+        )));
+    }
+
+    audit_auth(
+        &state,
+        "auth.delete_me.success",
+        Some(user.id),
+        Some(user.id),
+        None,
+        &headers,
+        Some(ip),
+    )
+    .await;
+
+    // Clear the session cookie on the response so the now-deleted
+    // user's browser doesn't keep echoing a stale value.
+    let clear_session = cookie::clear_cookie_header(state.auth.cookie_secure);
+    let clear_csrf = cookie::clear_csrf_cookie_header(state.auth.cookie_secure);
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&clear_session).expect("ascii cookie"),
+    );
+    resp.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&clear_csrf).expect("ascii cookie"),
+    );
+    Ok(resp)
+}
+
 pub async fn update_me(
     State(state): State<AppState>,
     user: AuthUser,
@@ -704,12 +965,53 @@ pub async fn update_me(
     } else {
         None
     };
+    // Subtitle style: validate enums and numeric ranges before the
+    // values reach the DB. Out-of-range values become 400s rather than
+    // silently being clamped — the UI only sends values from a closed
+    // palette, so an out-of-range value is a client bug worth surfacing.
+    if let Some(px) = input.subtitle_font_size_px
+        && !(8..=128).contains(&px)
+    {
+        return Err(ApiError::validation(
+            "subtitle_font_size_px must be between 8 and 128",
+        ));
+    }
+    if let Some(pct) = input.subtitle_bottom_inset_pct
+        && !(0..=90).contains(&pct)
+    {
+        return Err(ApiError::validation(
+            "subtitle_bottom_inset_pct must be between 0 and 90",
+        ));
+    }
+    let font_family_normalized = normalize(input.subtitle_font_family);
+    if let Some(Some(ref f)) = font_family_normalized {
+        if !["default", "sans", "serif", "mono"].contains(&f.as_str()) {
+            return Err(ApiError::validation(
+                "subtitle_font_family must be one of: default, sans, serif, mono",
+            ));
+        }
+    }
+    let edge_normalized = normalize(input.subtitle_edge);
+    if let Some(Some(ref e)) = edge_normalized {
+        if !["none", "outline", "shadow"].contains(&e.as_str()) {
+            return Err(ApiError::validation(
+                "subtitle_edge must be one of: none, outline, shadow",
+            ));
+        }
+    }
+
     let patch = queries::UserSelfUpdate {
         display_name: normalize(input.display_name),
         avatar_url: avatar_normalized,
         email: email_patch,
         default_audio_lang: normalize(input.default_audio_lang),
         default_subtitle_lang: normalize(input.default_subtitle_lang),
+        subtitle_font_size_px: input.subtitle_font_size_px.map(Some),
+        subtitle_text_color: normalize(input.subtitle_text_color),
+        subtitle_background_color: normalize(input.subtitle_background_color),
+        subtitle_font_family: font_family_normalized,
+        subtitle_edge: edge_normalized,
+        subtitle_bottom_inset_pct: input.subtitle_bottom_inset_pct.map(Some),
         notify_via_email: input.notify_via_email,
     };
     let updated = queries::update_user_self(&state.pool, user.id, patch)
@@ -1371,6 +1673,30 @@ pub async fn request_password_reset(
     headers: HeaderMap,
     Json(input): Json<PasswordResetRequest>,
 ) -> Result<StatusCode, ApiError> {
+    // Server-config precheck (MONTH 1 in
+    // `docs/PUBLIC_RELEASE_HARDENING.md`). Without SMTP configured,
+    // we'd accept the request, generate a token, and silently fail
+    // to email it — the user keeps clicking "send" forever wondering
+    // why nothing arrives. Loudly surfacing the missing config gives
+    // them a useful answer ("ask your admin to set up SMTP").
+    // This check leaks whether SMTP is set up server-side; that's
+    // intentional global config state, not per-user data.
+    {
+        let settings_snap = state.settings.read().await.clone();
+        match Mailer::from_settings(&settings_snap, &state.pool, &state.vault).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(ApiError::validation(
+                    "Email isn't configured on this server. Ask the administrator \
+                     to set up SMTP under Admin -> Server -> Email, then try again.",
+                ));
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(e));
+            }
+        }
+    }
+
     let email = input.email.trim();
     // Silently no-op for malformed input — same response shape as the
     // happy path so a probe sees no difference.
@@ -1702,6 +2028,68 @@ pub async fn update_user(
 /// `Origin` header, falling back to the `Referer` (path stripped).
 /// Used to seed `public_url` so the CSRF middleware accepts the same
 /// browser on subsequent requests without manual config.
+/// Setup-token gate (BLOCK #5 in `docs/PUBLIC_RELEASE_HARDENING.md`).
+///
+/// Three branches, in order:
+///
+/// 1. `CHIMPFLIX_SETUP_TOKEN` set → require `X-Setup-Token` header
+///    with a constant-time-compared exact match. Wrong / missing
+///    header is 401.
+/// 2. Env unset AND `APP_PUBLIC_ORIGIN` starts with `https://` →
+///    refuse with 403. This refuses to permit an unauthenticated
+///    setup claim on an internet-facing instance, matching the
+///    plaintext-vault refusal in [`load_vault`](crate::load_vault).
+/// 3. Otherwise (LAN-ish or dev) → allow, preserving the current
+///    one-shot setup UX. The CSRF middleware's existing
+///    Origin/Referer check still applies.
+fn enforce_setup_token(headers: &HeaderMap) -> Result<(), ApiError> {
+    use std::env;
+    match env::var("CHIMPFLIX_SETUP_TOKEN").ok().filter(|v| !v.is_empty()) {
+        Some(expected) => {
+            let provided = headers
+                .get("x-setup-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                Ok(())
+            } else {
+                Err(ApiError::Unauthorized)
+            }
+        }
+        None => {
+            let is_public = env::var("APP_PUBLIC_ORIGIN")
+                .ok()
+                .is_some_and(|origin| origin.starts_with("https://"));
+            if is_public {
+                Err(ApiError::validation(
+                    "first-run setup is disabled on internet-facing deployments without \
+                     a setup token. Restart with CHIMPFLIX_SETUP_TOKEN=<random> and \
+                     resend POST /auth/setup with the matching X-Setup-Token header. \
+                     See docs/DEPLOYMENT.md for the recommended preflight order.",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Constant-time byte-slice equality. Length-leaking but value-stable:
+/// returns false immediately on length mismatch, then folds all bytes
+/// into a single accumulator on a match. Sufficient for our use — the
+/// token is a generated random value, not derived from anything the
+/// attacker can length-extend.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn setup_origin_from_headers(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers
         .get(axum::http::header::ORIGIN)
@@ -1931,12 +2319,56 @@ fn invalid_credentials() -> ApiError {
     ApiError::validation("invalid credentials")
 }
 
+/// Read the inbound session cookie (if any), parse it, and delete
+/// the matching `sessions` row. Failures are best-effort — a bad
+/// HMAC, expired session, or missing cookie all silently no-op so a
+/// fresh first-time login isn't blocked by an irrelevant cleanup.
+///
+/// Drives WEEK 1 #13 in `docs/PUBLIC_RELEASE_HARDENING.md`. Called
+/// on the success path of every login flow (`login`, `oauth_complete`,
+/// `accept_invite`, `confirm_password_reset`) so a fixated cookie
+/// can't survive the credential check that proves the legitimate
+/// user is at the keyboard.
+async fn invalidate_inbound_session_if_any(state: &AppState, headers: &HeaderMap) {
+    let raw = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let expected_name = crate::auth::cookie_name(state.auth.cookie_secure);
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix(expected_name).and_then(|s| s.strip_prefix('=')) {
+            if let Some((session_id, _nonce)) =
+                crate::auth::cookie::parse_value(value, &state.auth.session_secret)
+            {
+                if let Err(e) = queries::delete_session(&state.pool, session_id).await {
+                    debug!(error = %format!("{e:#}"), session_id, "fixation defense: delete_session failed");
+                }
+            }
+            return;
+        }
+    }
+}
+
 pub(crate) async fn issue_session(
     state: &AppState,
     user: &User,
     headers: &HeaderMap,
     ip: Option<IpAddr>,
 ) -> Result<(String, String), ApiError> {
+    // Session-fixation defense (WEEK 1 #13 in
+    // `docs/PUBLIC_RELEASE_HARDENING.md`). Invalidate any session
+    // bound to a pre-existing cookie on this request before
+    // minting a new one. Without it, an attacker who planted a
+    // known cookie on the victim's browser could reuse it after
+    // the victim successfully logs in. Centralised here so every
+    // login-success path (login, oauth_complete, accept_invite,
+    // confirm_password_reset, complete_setup) gets the defense
+    // without each handler having to remember.
+    invalidate_inbound_session_if_any(state, headers).await;
+
     let mut nonce = [0u8; 32];
     password::fill_random(&mut nonce).map_err(ApiError::Internal)?;
     let expires_at = now_ms() + SESSION_MAX_AGE_S * 1000;
@@ -2078,5 +2510,30 @@ mod tests {
     fn obviously_bad_helpers_dont_match_random_strings() {
         assert!(!is_obviously_bad_password("correct horse battery staple"));
         assert!(!is_obviously_bad_password("Tr0ub4dor&3xx"));
+    }
+
+    /// Smoke-test the session-fixation cookie parser: a fabricated
+    /// cookie value with a valid HMAC must round-trip via
+    /// `cookie::parse_value`; one with a tampered session id must not.
+    /// The handler integration uses this in
+    /// `invalidate_inbound_session_if_any`. Full HTTP-layer coverage
+    /// would require a live AppState + DB; this guards the crypto
+    /// contract that the fixation defense relies on.
+    #[test]
+    fn fixation_defense_relies_on_parse_value_round_trip() {
+        let secret = b"a-test-secret-32-bytes-or-larger!";
+        let nonce = [42u8; 32];
+        let value = crate::auth::cookie::build_value(7, &nonce, secret);
+        let parsed = crate::auth::cookie::parse_value(&value, secret);
+        assert_eq!(parsed, Some((7, nonce)));
+
+        // Tampered session id (the attacker-fabricated scenario): the
+        // payload's HMAC no longer matches, so parse_value returns
+        // None and invalidate_inbound_session_if_any silently skips
+        // (correct behaviour — we never want to delete a row keyed by
+        // a forged id).
+        let mut tampered = value.clone();
+        tampered.replace_range(0..1, "9");
+        assert!(crate::auth::cookie::parse_value(&tampered, secret).is_none());
     }
 }

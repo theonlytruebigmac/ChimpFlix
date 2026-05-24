@@ -42,11 +42,16 @@ pub type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, Default
 pub type StringLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 
 /// Build a per-IP limiter for auth-style routes: 10 requests / minute
-/// with a burst of 5. Tight enough to stop a brute-force, loose enough
-/// that a human typing wrong a few times doesn't get locked.
+/// with a burst of 2. Tightened from burst=5 by WEEK 1 item #6 in
+/// `docs/PUBLIC_RELEASE_HARDENING.md` — a 100-IP botnet got 500 free
+/// password guesses per minute under the old config; this knocks
+/// that down to 200, which combined with the lowered per-username
+/// activation threshold makes a real difference. A human typing
+/// their password wrong twice in a row still has 8 free attempts in
+/// the next minute (well above any legitimate use).
 pub fn auth_limiter() -> Arc<IpLimiter> {
     let quota =
-        Quota::per_minute(NonZeroU32::new(10).unwrap()).allow_burst(NonZeroU32::new(5).unwrap());
+        Quota::per_minute(NonZeroU32::new(10).unwrap()).allow_burst(NonZeroU32::new(2).unwrap());
     Arc::new(RateLimiter::keyed(quota))
 }
 
@@ -147,7 +152,13 @@ impl AttemptTracker {
     }
 
     /// Returns the duration the caller must wait, or None if it can proceed.
-    /// Lockout policy: 5 failures → 30s, 8 → 5min, 12 → 30min.
+    /// Lockout policy: 3 failures → 60min, 6 → 6h, 10 → 24h. Tightened
+    /// from the original 5/8/12 thresholds + 30s/5min/30min lockouts by
+    /// WEEK 1 item #6 in `docs/PUBLIC_RELEASE_HARDENING.md`. The 60-min
+    /// floor matches the "if you forgot your password, go fix it in
+    /// /forgot-password instead of guessing more" UX expectation; the
+    /// trailing 24h is a defense against persistent distributed
+    /// brute-forcers across an extended window.
     pub async fn check(&self, key: &str) -> Option<Duration> {
         let guard = self.inner.read().await;
         let entry = guard.get(key)?;
@@ -181,10 +192,10 @@ impl AttemptTracker {
 
 fn backoff_for(failures: u32) -> Duration {
     match failures {
-        0..=4 => Duration::from_secs(0),
-        5..=7 => Duration::from_secs(30),
-        8..=11 => Duration::from_secs(5 * 60),
-        _ => Duration::from_secs(30 * 60),
+        0..=2 => Duration::from_secs(0),
+        3..=5 => Duration::from_secs(60 * 60),
+        6..=9 => Duration::from_secs(6 * 60 * 60),
+        _ => Duration::from_secs(24 * 60 * 60),
     }
 }
 
@@ -195,14 +206,24 @@ mod tests {
     #[tokio::test]
     async fn lockout_progression() {
         let t = AttemptTracker::new();
-        for _ in 0..4 {
+        for _ in 0..2 {
             t.record_failure("alice").await;
         }
-        assert!(t.check("alice").await.is_none()); // under threshold
-        t.record_failure("alice").await; // 5th failure
+        assert!(t.check("alice").await.is_none()); // under threshold (≤ 2)
+        t.record_failure("alice").await; // 3rd failure → 60min lockout
         let wait = t.check("alice").await.unwrap();
-        assert!(wait.as_secs() <= 30 && wait.as_secs() > 0);
+        assert!(wait.as_secs() > 30 * 60 && wait.as_secs() <= 60 * 60);
         t.record_success("alice").await;
         assert!(t.check("alice").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn long_lockout_escalates() {
+        let t = AttemptTracker::new();
+        for _ in 0..10 {
+            t.record_failure("eve").await;
+        }
+        let wait = t.check("eve").await.unwrap();
+        assert!(wait.as_secs() > 6 * 60 * 60); // 10th failure → 24h
     }
 }

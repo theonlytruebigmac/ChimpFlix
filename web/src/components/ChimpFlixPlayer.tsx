@@ -22,13 +22,14 @@ import {
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
 import { detectClientCapabilities, isSafari } from "@/lib/client-caps";
+import { getPrefs, updatePrefs, usePrefs } from "@/lib/prefs";
 import {
-  cssFontFamilyForSubtitlePref,
-  getPrefs,
-  prefsToAssStyle,
-  updatePrefs,
-  usePrefs,
-} from "@/lib/prefs";
+  DEFAULT_SUBTITLE_STYLE,
+  cssFontFamilyForSubtitleStyle,
+  subtitleStyleToAss,
+  type SubtitleFontFamily,
+  type SubtitleStyle,
+} from "@/lib/subtitle-style";
 import { consumePrewarm } from "@/lib/prewarm";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 
@@ -73,39 +74,10 @@ const BITRATE_CAP_OPTIONS: BitrateCapChoice[] = [
   { label: "250 Kbps", bps: 250_000 },
 ];
 
-/// Subtitle appearance preferences. Applied via injected `<style>`
-/// using `::cue` selectors, so the same WebVTT sidecar renders
-/// differently per user / preference without re-extracting the
-/// file. Stored to localStorage so it persists across sessions and
-/// files.
-export interface SubtitleAppearance {
-  /// CSS font-size in pixels. 24 looks right at 1080p; we expose a
-  /// stepped list rather than a continuous slider because cue
-  /// rendering rounds anyway and steps are easier to dial in.
-  fontSizePx: number;
-  /// Foreground (text) color. Hex including the leading #.
-  textColor: string;
-  /// Background rgba, applied to the cue box. Includes alpha so
-  /// "fully transparent" (text-shadow only) is a valid pick.
-  backgroundColor: string;
-  /// Edge style for the glyphs. Outline is the safest pick over
-  /// busy backgrounds; shadow looks cleaner on dark cinema content;
-  /// none lets the cue box do all the contrast work.
-  edge: "none" | "outline" | "shadow";
-  /// Bottom inset as a percentage of the player height. 5-15 is
-  /// the typical range; higher pushes subs closer to the middle
-  /// of the frame (useful on phones held in portrait).
-  bottomInsetPct: number;
-}
-
-const DEFAULT_SUBTITLE_APPEARANCE: SubtitleAppearance = {
-  fontSizePx: 24,
-  textColor: "#ffffff",
-  backgroundColor: "rgba(0,0,0,0.55)",
-  edge: "outline",
-  bottomInsetPct: 8,
-};
-
+// Subtitle styling model + helpers live in @/lib/subtitle-style.ts as
+// the canonical single source of truth, server-synced per account via
+// users.subtitle_*. The presets below are UI-only — they don't change
+// the model, they're just the picker palette.
 const FONT_SIZE_PRESETS: { label: string; px: number }[] = [
   { label: "S", px: 18 },
   { label: "M", px: 24 },
@@ -126,7 +98,6 @@ const BG_PRESETS: { label: string; value: string }[] = [
 ];
 
 const OFFSET_STORAGE_PREFIX = "chimpflix:subtitle:offset:";
-const APPEARANCE_STORAGE_KEY = "chimpflix:subtitle:appearance";
 
 export interface VersionChoice {
   media_file_id: number;
@@ -242,6 +213,12 @@ interface Props {
   /// `earliest_of_both`. Drives the scrobble decision alongside
   /// `playedThresholdPct`. Default `threshold_pct` when omitted.
   completionBehaviour?: string;
+  /// Initial subtitle styling, server-sourced from the user record.
+  /// The player owns local state from here on and PATCHes /auth/me
+  /// when the viewer changes a value in the gear menu. Omitted →
+  /// fall back to `DEFAULT_SUBTITLE_STYLE` (e.g. preview surfaces
+  /// without an authenticated user).
+  initialSubtitleStyle?: SubtitleStyle;
 }
 
 /// iOS Safari (and standalone iPhone PWAs) doesn't implement
@@ -520,6 +497,7 @@ export function ChimpFlixPlayer({
   versions,
   playedThresholdPct,
   completionBehaviour,
+  initialSubtitleStyle = DEFAULT_SUBTITLE_STYLE,
 }: Props) {
   // Normalize the configured threshold to a fraction (0-1) once. Clamp
   // to a sane band to defend against the API returning garbage.
@@ -697,12 +675,30 @@ export function ChimpFlixPlayer({
   /// already in the per-file cache). No HLS.js cue-time fiddling
   /// needed.
   const [subtitleOffsetMs, setSubtitleOffsetMs] = useState<number>(0);
-  /// Subtitle appearance preferences applied via injected ::cue CSS.
-  /// Stored under `chimpflix:subtitle:appearance` so the same look
-  /// follows the user across files. Client-only — no session
-  /// restart on change, the player just re-renders the <style> tag.
-  const [subtitleAppearance, setSubtitleAppearance] =
-    useState<SubtitleAppearance>(DEFAULT_SUBTITLE_APPEARANCE);
+  /// Subtitle styling state. Seeded from the user record (server-side
+  /// source of truth, phase 89). The gear menu mutates this locally
+  /// for immediate visual feedback and fires a PATCH /auth/me so the
+  /// new value follows the user across devices. Optimistic — a 4xx
+  /// is logged but doesn't roll back the local state, which keeps the
+  /// in-session UX snappy.
+  const [subtitleStyle, setSubtitleStyleLocal] =
+    useState<SubtitleStyle>(initialSubtitleStyle);
+  const setSubtitleStyle = useCallback((next: SubtitleStyle) => {
+    setSubtitleStyleLocal(next);
+    authApi
+      .updateMe({
+        subtitle_font_size_px: next.fontSizePx,
+        subtitle_text_color: next.textColor,
+        subtitle_background_color: next.backgroundColor,
+        subtitle_font_family: next.fontFamily,
+        subtitle_edge: next.edge,
+        subtitle_bottom_inset_pct: next.bottomInsetPct,
+      })
+      .catch(() => {
+        // Best-effort persistence; viewer keeps the look in-session
+        // even if the write failed (e.g. transient offline).
+      });
+  }, []);
   // External-subtitle selection lives alongside subtitleSel. When set,
   // the embedded `subtitle_index` is forced off and the video gets a
   // sibling `<track>` element. Only one path can be active at a time.
@@ -719,13 +715,26 @@ export function ChimpFlixPlayer({
   );
   const externalSubUrl = externalSub?.url ?? null;
 
-  // Hydrate subtitle prefs from localStorage. Offset is per-file
-  // (each title has its own sync drift); appearance is global
-  // (users want consistent styling across the library). This is
-  // "sync to external state" (the localStorage is the source of truth
-  // across mounts) so the setState-in-effect is the right pattern —
-  // the alternative would be a useSyncExternalStore wrapper for
-  // negligible benefit. Block-level disable covers each call site.
+  // One-shot cleanup of the pre-phase-89 device-local appearance key.
+  // Subtitle styling is server-synced now; the orphan key would just
+  // confuse anyone inspecting DevTools. Safe to noop after the first
+  // mount that observes it — localStorage.removeItem on a missing
+  // key is a cheap no-op so we don't bother gating.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.removeItem("chimpflix:subtitle:appearance");
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Hydrate per-file subtitle offset from localStorage on file change.
+  // Offset stays device-local (each title has its own sync drift; what
+  // a viewer dialled in for one file shouldn't follow them to another).
+  // This is "sync to external state" so the setState-in-effect pattern
+  // is correct — the alternative would be a useSyncExternalStore
+  // wrapper for negligible benefit.
   useEffect(() => {
     if (typeof window === "undefined") return;
     /* eslint-disable react-hooks/set-state-in-effect */
@@ -741,11 +750,6 @@ export function ChimpFlixPlayer({
         // showing the previous file's offset after a version
         // switch.
         setSubtitleOffsetMs(0);
-      }
-      const appRaw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
-      if (appRaw) {
-        const parsed = JSON.parse(appRaw) as Partial<SubtitleAppearance>;
-        setSubtitleAppearance({ ...DEFAULT_SUBTITLE_APPEARANCE, ...parsed });
       }
     } catch {
       // Corrupt localStorage or quota issue; fall back to defaults.
@@ -764,18 +768,6 @@ export function ChimpFlixPlayer({
       // Quota exceeded or private-browsing mode; ignore.
     }
   }, [activeMediaFileId, subtitleOffsetMs]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      window.localStorage.setItem(
-        APPEARANCE_STORAGE_KEY,
-        JSON.stringify(subtitleAppearance),
-      );
-    } catch {
-      // ignore
-    }
-  }, [subtitleAppearance]);
 
   // Move WebVTT cues vertically so they (1) honor the user's
   // bottom-inset preference, (2) auto-shift up while the player
@@ -818,7 +810,7 @@ export function ChimpFlixPlayer({
         // + right bars), which doesn't affect vertical
         // positioning, so we leave letterboxBottomPct at 0.
       }
-      const baseBottomPct = Math.max(0, Math.min(60, subtitleAppearance.bottomInsetPct));
+      const baseBottomPct = Math.max(0, Math.min(60, subtitleStyle.bottomInsetPct));
       const controlsBumpPct = showControls ? 16 : 0;
       const effectiveBottomPct = Math.min(
         baseBottomPct + letterboxBottomPct + controlsBumpPct,
@@ -868,7 +860,7 @@ export function ChimpFlixPlayer({
       ro.disconnect();
       document.removeEventListener("fullscreenchange", fsHandler);
     };
-  }, [showControls, subtitleAppearance.bottomInsetPct]);
+  }, [showControls, subtitleStyle.bottomInsetPct]);
 
   // Inject a global `::cue` stylesheet so the user's appearance
   // prefs apply to BOTH the HLS.js-managed WebVTT sidecar and any
@@ -890,7 +882,7 @@ export function ChimpFlixPlayer({
       document.head.appendChild(el);
     }
     const edgeRule = (() => {
-      switch (subtitleAppearance.edge) {
+      switch (subtitleStyle.edge) {
         case "outline":
           // Multi-shadow trick to fake an outline that survives
           // browsers that don't support text-stroke on ::cue.
@@ -922,10 +914,10 @@ export function ChimpFlixPlayer({
     // console warnings per page load in Firefox.
     const font = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
     const cssBlock = `
-      background: ${subtitleAppearance.backgroundColor} !important;
-      background-color: ${subtitleAppearance.backgroundColor} !important;
-      color: ${subtitleAppearance.textColor} !important;
-      font-size: ${subtitleAppearance.fontSizePx}px !important;
+      background: ${subtitleStyle.backgroundColor} !important;
+      background-color: ${subtitleStyle.backgroundColor} !important;
+      color: ${subtitleStyle.textColor} !important;
+      font-size: ${subtitleStyle.fontSizePx}px !important;
       font-family: ${font} !important;
       line-height: 1.25 !important;
       ${edgeRule}
@@ -939,7 +931,7 @@ export function ChimpFlixPlayer({
       // re-entries should keep the style. The element is keyed by
       // id so re-creating is a no-op.
     };
-  }, [subtitleAppearance]);
+  }, [subtitleStyle]);
 
   // <track> elements default to `disabled` until JS flips their mode —
   // even with the `default` attribute, autoplay-policy quirks across
@@ -977,16 +969,27 @@ export function ChimpFlixPlayer({
       styleEl.id = id;
       document.head.appendChild(styleEl);
     }
-    const scale = Math.max(0.5, Math.min(3, prefs.subtitleFontScale));
-    const bg = prefs.subtitleBackground;
-    const color = prefs.subtitleColor;
-    const family = cssFontFamilyForSubtitlePref(prefs.subtitleFontFamily);
+    const fontSize = Math.max(8, Math.min(128, subtitleStyle.fontSizePx));
+    const bg = subtitleStyle.backgroundColor;
+    const color = subtitleStyle.textColor;
+    const family = cssFontFamilyForSubtitleStyle(subtitleStyle.fontFamily);
+    // Edge → CSS text-shadow. Outline = multi-direction tight shadow
+    // (poor man's stroke; CSS doesn't have a real text-stroke that
+    // composes well with native cue rendering). Shadow = single
+    // bottom-right drop. None = no shadow.
+    const edgeRule =
+      subtitleStyle.edge === "outline"
+        ? "text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000;"
+        : subtitleStyle.edge === "shadow"
+          ? "text-shadow: 2px 2px 3px rgba(0,0,0,0.85);"
+          : "text-shadow: none;";
     styleEl.textContent = `
       .${id}::cue {
-        font-size: ${scale * 100}%;
+        font-size: ${fontSize}px;
         color: ${color};
         background: ${bg};
         ${family ? `font-family: ${family};` : ""}
+        ${edgeRule}
       }
     `;
     return () => {
@@ -996,10 +999,11 @@ export function ChimpFlixPlayer({
     };
   }, [
     cueClass,
-    prefs.subtitleBackground,
-    prefs.subtitleColor,
-    prefs.subtitleFontScale,
-    prefs.subtitleFontFamily,
+    subtitleStyle.backgroundColor,
+    subtitleStyle.textColor,
+    subtitleStyle.fontSizePx,
+    subtitleStyle.fontFamily,
+    subtitleStyle.edge,
   ]);
   const [tracksOpen, setTracksOpen] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
@@ -1147,9 +1151,9 @@ export function ChimpFlixPlayer({
         // The transcoder uses it as the `force_style=` argument on
         // ffmpeg's `subtitles=` filter — for direct play or external
         // <track> rendering it does nothing.
-        const subtitleStyle =
+        const burnedSubtitleStyle =
           subtitleSel !== null && subtitleSel !== undefined
-            ? (prefsToAssStyle(getPrefs()) ?? undefined)
+            ? (subtitleStyleToAss(subtitleStyle) ?? undefined)
             : undefined;
         const livePrefs = getPrefs();
         // Detected per-browser support — widens direct-play to HEVC on
@@ -1179,7 +1183,7 @@ export function ChimpFlixPlayer({
             start_position_ms: resumeMs,
             audio_index: audioSel,
             subtitle_index: subtitleSel === null ? undefined : subtitleSel,
-            subtitle_style: subtitleStyle,
+            subtitle_style: burnedSubtitleStyle,
             quality_target:
               qualitySel.height !== null
                 ? { height: qualitySel.height }
@@ -3455,8 +3459,8 @@ export function ChimpFlixPlayer({
               <SubtitleSettingsControl
                 offsetMs={subtitleOffsetMs}
                 onOffsetChange={setSubtitleOffsetMs}
-                appearance={subtitleAppearance}
-                onAppearanceChange={setSubtitleAppearance}
+                style={subtitleStyle}
+                onStyleChange={setSubtitleStyle}
                 hasActiveSubtitle={
                   externalSubUrl !== null || typeof subtitleSel === "number"
                 }
@@ -3787,14 +3791,14 @@ function VersionColumn({
 function SubtitleSettingsControl({
   offsetMs,
   onOffsetChange,
-  appearance,
-  onAppearanceChange,
+  style,
+  onStyleChange,
   hasActiveSubtitle,
 }: {
   offsetMs: number;
   onOffsetChange: (ms: number) => void;
-  appearance: SubtitleAppearance;
-  onAppearanceChange: (a: SubtitleAppearance) => void;
+  style: SubtitleStyle;
+  onStyleChange: (a: SubtitleStyle) => void;
   /// Whether a subtitle is currently selected. Drives the offset
   /// stepper's enabled state — offset is a no-op without an
   /// active sub.
@@ -3882,7 +3886,7 @@ function SubtitleSettingsControl({
             <div className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/55">
               Appearance
             </div>
-            <SubtitleAppearancePanel value={appearance} onChange={onAppearanceChange} />
+            <SubtitleStylePanel value={style} onChange={onStyleChange} />
           </div>
           </div>
         </div>
@@ -3918,14 +3922,14 @@ function OffsetStep({
   );
 }
 
-function SubtitleAppearancePanel({
+export function SubtitleStylePanel({
   value,
   onChange,
 }: {
-  value: SubtitleAppearance;
-  onChange: (next: SubtitleAppearance) => void;
+  value: SubtitleStyle;
+  onChange: (next: SubtitleStyle) => void;
 }) {
-  const patch = (p: Partial<SubtitleAppearance>) => onChange({ ...value, ...p });
+  const patch = (p: Partial<SubtitleStyle>) => onChange({ ...value, ...p });
   return (
     <div className="mt-3 space-y-3 text-[0.7rem]">
       <div>
@@ -3988,6 +3992,26 @@ function SubtitleAppearancePanel({
         </div>
       </div>
       <div>
+        <div className="mb-1 text-white/55">Font</div>
+        <div className="flex gap-1">
+          {(
+            [
+              ["default", "Default"],
+              ["sans", "Sans"],
+              ["serif", "Serif"],
+              ["mono", "Mono"],
+            ] as const
+          ).map(([val, lbl]) => (
+            <ApprBtn
+              key={val}
+              label={lbl}
+              active={value.fontFamily === val}
+              onClick={() => patch({ fontFamily: val as SubtitleFontFamily })}
+            />
+          ))}
+        </div>
+      </div>
+      <div>
         <div className="mb-1 flex items-center justify-between text-white/55">
           <span>Position</span>
           <span className="tabular-nums text-white/80">
@@ -4018,7 +4042,7 @@ function SubtitleAppearancePanel({
       <div>
         <button
           type="button"
-          onClick={() => onChange(DEFAULT_SUBTITLE_APPEARANCE)}
+          onClick={() => onChange(DEFAULT_SUBTITLE_STYLE)}
           className="text-[0.65rem] uppercase tracking-wider text-white/50 hover:text-white/85"
         >
           Reset to defaults

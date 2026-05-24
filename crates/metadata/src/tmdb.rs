@@ -553,10 +553,17 @@ impl TmdbClient {
         // (on success) JSON parsing. `resp.json()` consumes the body
         // and gives no visibility into what TMDB actually sent when
         // parsing fails, which is exactly the case we need to debug.
-        let body = resp
-            .text()
-            .await
-            .with_context(|| format!("read TMDB body from {url}"))?;
+        //
+        // `bounded_text` caps the read at 4 MiB and bails mid-stream
+        // if exceeded — defends against a hostile or broken upstream
+        // (see WEEK 1 #11 in `docs/PUBLIC_RELEASE_HARDENING.md`).
+        let body = crate::http::bounded_text(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            &format!("TMDB GET {url}"),
+        )
+        .await
+        .with_context(|| format!("read TMDB body from {url}"))?;
 
         if !status.is_success() {
             let snippet: String = body.chars().take(200).collect();

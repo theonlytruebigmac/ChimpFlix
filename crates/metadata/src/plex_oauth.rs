@@ -111,9 +111,17 @@ impl PlexOAuthClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        resp.json::<PlexPin>()
-            .await
-            .context("parse Plex /pins response")
+        crate::http::bounded_json::<PlexPin>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Plex /pins response",
+
+        )
+
+        .await
     }
 
     /// Poll one PIN. Returns `Pending` while Plex hasn't seen the user
@@ -142,7 +150,7 @@ impl PlexOAuthClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        let pin: PlexPin = resp.json().await.context("parse Plex /pins/{id} response")?;
+        let pin: PlexPin = crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "parse Plex /pins/{id} response").await?;
         if let Some(token) = pin.auth_token {
             return Ok(PinPollResult::Ready(token));
         }
@@ -175,9 +183,17 @@ impl PlexOAuthClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        resp.json::<PlexUser>()
-            .await
-            .context("parse Plex /user response")
+        crate::http::bounded_json::<PlexUser>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Plex /user response",
+
+        )
+
+        .await
     }
 
     /// Build the URL we redirect the user to (or open in a popup) so

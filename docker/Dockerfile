@@ -107,8 +107,8 @@ ENV DATA_DIR=/data \
     BIND_ADDR=0.0.0.0:8080 \
     RUST_LOG=info,sqlx=warn
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health > /dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/api/v1/ready > /dev/null || exit 1
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/chimpflix-server"]
 
 # ---- Web runtime -----------------------------------------------------------

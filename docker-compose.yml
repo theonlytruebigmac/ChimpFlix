@@ -114,11 +114,16 @@ services:
     # group_add:
     #   - "video"   # operator host's `video` group GID, usually 44
     #   - "render"  # newer distros split out renderD* into a 'render' group, usually 109
+    # /api/v1/ready (BLOCK #2) probes the DB pool, ffmpeg binary, and
+    # vault decrypt before reporting healthy — so the proxy doesn't
+    # route real traffic at a partially-broken server. `/health` is
+    # the cheap "process is alive" probe; keep it for upstream load
+    # balancers that need a sub-millisecond response.
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/v1/ready"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 30s
       retries: 3
 
   web:

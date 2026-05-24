@@ -69,6 +69,24 @@ pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::R
     let db_path = data_dir.join("chimpflix.db");
     let url = format!("sqlite://{}", db_path.display());
 
+    // Pre-migration auto-backup (MONTH 1 in
+    // `docs/PUBLIC_RELEASE_HARDENING.md`). When the DB exists and has
+    // applied migrations whose max version is below what the embedded
+    // migrator is about to run, copy the file to
+    // `<data_dir>/backups/pre-migration/<unix_stamp>.db` first. A bad
+    // migration on upgrade is otherwise an unrecoverable wedge —
+    // SQLite ALTER TABLE is forward-only, no automatic rollback.
+    //
+    // First boot (no DB) or already-current (no pending migrations)
+    // both skip the snapshot — it's cheap-to-detect and there's
+    // nothing to lose.
+    if let Err(e) = pre_migration_snapshot(data_dir, &db_path).await {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "pre-migration auto-backup failed; continuing boot anyway",
+        );
+    }
+
     // ── Migration pool: single connection, FK off ───────────────────
     let migrate_opts = SqliteConnectOptions::from_str(&url)?
         .create_if_missing(true)
@@ -149,8 +167,16 @@ pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::R
         opts = opts.pragma("cache_size", format!("-{kib}"));
     }
 
+    // Pool sizing: 24 connections. Bumped from 8 by WEEK 1 #7 in
+    // `docs/PUBLIC_RELEASE_HARDENING.md`. With the previous 8-conn
+    // cap + 30s `busy_timeout`, ~50 concurrent mixed-read users
+    // could exhaust the pool and queue behind it for up to 30s
+    // before timing out. 24 is comfortable for a busy multi-user
+    // deployment; going higher than this without profiling tends
+    // to hurt SQLite write contention (the WAL serialises writes,
+    // so more readers waiting on a writer doesn't help throughput).
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        .max_connections(24)
         .connect_with(opts)
         .await
         .context("open library database")?;
@@ -252,6 +278,86 @@ fn anyhow_sqlite_code(e: &anyhow::Error) -> Option<String> {
         }
     }
     None
+}
+
+/// Compare the embedded migrator's max version against the DB's
+/// `_sqlx_migrations` max version. When the DB is behind, snapshot
+/// `chimpflix.db` to `<data_dir>/backups/pre-migration/<unix_stamp>.db`
+/// before letting the live migration run.
+///
+/// Skips cleanly when:
+///   * `chimpflix.db` doesn't exist (first boot, no schema to lose).
+///   * The file exists but is empty (interrupted prior boot).
+///   * The DB has no `_sqlx_migrations` table yet (also first boot).
+///   * Embedded max == DB max (no pending migrations).
+///
+/// Best-effort — any failure logs and returns Ok so a flaky snapshot
+/// doesn't block the boot.
+async fn pre_migration_snapshot(
+    data_dir: &Path,
+    db_path: &Path,
+) -> anyhow::Result<()> {
+    let meta = match tokio::fs::metadata(db_path).await {
+        Ok(m) if m.len() > 0 => m,
+        _ => return Ok(()),
+    };
+
+    let embedded_max = sqlx::migrate!("./migrations")
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(0);
+    if embedded_max == 0 {
+        return Ok(());
+    }
+
+    // Open a read-only probe pool — never touches the WAL, never
+    // creates the file. Returns None when `_sqlx_migrations` doesn't
+    // exist yet (fresh-ish DB about to receive its first migration
+    // run from this binary).
+    let url = format!("sqlite://{}?mode=ro", db_path.display());
+    let probe_opts = SqliteConnectOptions::from_str(&url)?;
+    let probe_pool = match SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(probe_opts)
+        .await
+    {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    let applied_max: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(version) FROM _sqlx_migrations",
+    )
+    .fetch_optional(&probe_pool)
+    .await
+    .ok()
+    .flatten();
+    probe_pool.close().await;
+
+    let applied = applied_max.unwrap_or(-1);
+    if applied >= embedded_max {
+        // Already current — nothing to back up against.
+        return Ok(());
+    }
+
+    let backup_dir = data_dir.join("backups").join("pre-migration");
+    tokio::fs::create_dir_all(&backup_dir).await?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = backup_dir.join(format!("chimpflix-pre-{stamp}-v{applied}-to-v{embedded_max}.db"));
+    tokio::fs::copy(db_path, &dest).await?;
+    info!(
+        from = %db_path.display(),
+        to = %dest.display(),
+        bytes = meta.len(),
+        applied_version = applied,
+        target_version = embedded_max,
+        "pre-migration snapshot written",
+    );
+    Ok(())
 }
 
 #[cfg(unix)]

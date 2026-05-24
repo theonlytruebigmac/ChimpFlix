@@ -120,9 +120,17 @@ impl TraktClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        resp.json::<DeviceCodeResponse>()
-            .await
-            .context("parse Trakt device-code response")
+        crate::http::bounded_json::<DeviceCodeResponse>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt device-code response",
+
+        )
+
+        .await
     }
 
     /// Poll the device-token endpoint. Trakt returns a real token once
@@ -190,9 +198,17 @@ impl TraktClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        resp.json::<TokenPair>()
-            .await
-            .context("parse Trakt refresh response")
+        crate::http::bounded_json::<TokenPair>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt refresh response",
+
+        )
+
+        .await
     }
 
     pub async fn push_history(&self, access_token: &str, entries: &[HistoryPush]) -> Result<()> {
@@ -388,9 +404,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /users/me/stats", resp).await);
         }
-        resp.json::<UserStats>()
-            .await
-            .context("parse Trakt user stats")
+        crate::http::bounded_json::<UserStats>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt user stats",
+
+        )
+
+        .await
     }
 
     /// Pull personalized recommendations for `kind` ("movies" or
@@ -417,9 +441,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error(&format!("GET {path}"), resp).await);
         }
-        resp.json::<Vec<RecommendationEntry>>()
-            .await
-            .context("parse Trakt recommendations")
+        crate::http::bounded_json::<Vec<RecommendationEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt recommendations",
+
+        )
+
+        .await
     }
 
     /// Pull the user's Trakt favorites — Trakt's "desert island"
@@ -441,9 +473,17 @@ impl TraktClient {
         // Response envelope is the same as personal-list items + the
         // watchlist GET — flat array of `{ type, movie?, show? }`.
         // Reusing TraktListItem keeps the parse layer DRY.
-        resp.json::<Vec<TraktListItem>>()
-            .await
-            .context("parse Trakt favorites")
+        crate::http::bounded_json::<Vec<TraktListItem>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt favorites",
+
+        )
+
+        .await
     }
 
     /// Pull the user's personal Trakt lists (the ones THEY created
@@ -462,9 +502,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /users/me/lists", resp).await);
         }
-        resp.json::<Vec<TraktList>>()
-            .await
-            .context("parse Trakt lists")
+        crate::http::bounded_json::<Vec<TraktList>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt lists",
+
+        )
+
+        .await
     }
 
     /// Fetch items in one of the user's personal lists. `list_id` is
@@ -491,9 +539,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /users/me/lists/{list_id}/items", resp).await);
         }
-        resp.json::<Vec<TraktListItem>>()
-            .await
-            .context("parse Trakt list items")
+        crate::http::bounded_json::<Vec<TraktListItem>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt list items",
+
+        )
+
+        .await
     }
 
     /// Fetch the user's hidden-from-recommendations list. Used to
@@ -518,9 +574,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /users/hidden/recommendations", resp).await);
         }
-        resp.json::<Vec<HiddenEntry>>()
-            .await
-            .context("parse Trakt hidden recommendations")
+        crate::http::bounded_json::<Vec<HiddenEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt hidden recommendations",
+
+        )
+
+        .await
     }
 
     /// Hide a Trakt recommendation so the algorithm stops returning it.
@@ -585,9 +649,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error(&format!("GET /calendars/my/shows{suffix}"), resp).await);
         }
-        resp.json::<Vec<CalendarEpisodeEntry>>()
-            .await
-            .context("parse Trakt calendar")
+        crate::http::bounded_json::<Vec<CalendarEpisodeEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt calendar",
+
+        )
+
+        .await
     }
 
     /// Movie release calendar — `/calendars/my/movies/{start}/{days}`.
@@ -611,9 +683,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /calendars/my/movies", resp).await);
         }
-        resp.json::<Vec<CalendarMovieEntry>>()
-            .await
-            .context("parse Trakt movie calendar")
+        crate::http::bounded_json::<Vec<CalendarMovieEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt movie calendar",
+
+        )
+
+        .await
     }
 
     /// Mirror of [`push_collection`] for removals — same body shape,
@@ -686,9 +766,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /sync/last_activities", resp).await);
         }
-        resp.json::<LastActivities>()
-            .await
-            .context("parse Trakt last_activities")
+        crate::http::bounded_json::<LastActivities>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt last_activities",
+
+        )
+
+        .await
     }
 
     /// Push a bulk "I own these files" update to Trakt's collection.
@@ -765,9 +853,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /sync/watchlist", resp).await);
         }
-        resp.json::<Vec<WatchlistEntry>>()
-            .await
-            .context("parse Trakt watchlist")
+        crate::http::bounded_json::<Vec<WatchlistEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt watchlist",
+
+        )
+
+        .await
     }
 
     pub async fn pull_history(
@@ -790,9 +886,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /sync/history", resp).await);
         }
-        resp.json::<Vec<HistoryEntry>>()
-            .await
-            .context("parse Trakt history")
+        crate::http::bounded_json::<Vec<HistoryEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt history",
+
+        )
+
+        .await
     }
 
     pub async fn pull_playback(&self, access_token: &str) -> Result<Vec<PlaybackEntry>> {
@@ -807,9 +911,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /sync/playback", resp).await);
         }
-        resp.json::<Vec<PlaybackEntry>>()
-            .await
-            .context("parse Trakt playback")
+        crate::http::bounded_json::<Vec<PlaybackEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt playback",
+
+        )
+
+        .await
     }
 
     pub async fn push_rating(&self, access_token: &str, entry: RatingPush) -> Result<()> {
@@ -895,9 +1007,17 @@ impl TraktClient {
         if !resp.status().is_success() {
             return Err(api_error("GET /sync/ratings", resp).await);
         }
-        resp.json::<Vec<RatingEntry>>()
-            .await
-            .context("parse Trakt ratings")
+        crate::http::bounded_json::<Vec<RatingEntry>>(
+
+            resp,
+
+            crate::http::DEFAULT_METADATA_BYTES,
+
+            "parse Trakt ratings",
+
+        )
+
+        .await
     }
 
     async fn user_post(

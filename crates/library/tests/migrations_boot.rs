@@ -263,3 +263,212 @@ async fn phase36_rebuild_preserves_item_collection_links() {
 
     pool.close().await;
 }
+
+/// Library-browse "Unwatched / In progress / Watched" status filters
+/// must agree with the Continue Watching rail about what those states
+/// mean for SHOWS. Before this regression test landed, the filter
+/// joined `play_state` directly on the show's item_id — but progress
+/// for a show always lives on its episode rows (the `play_state` CHECK
+/// constraint enforces exactly one of `item_id` / `episode_id`). The
+/// result was:
+///   * "In progress" returned zero shows even when CW had them.
+///   * "Watched" returned zero shows even when every episode was
+///     marked watched (the show-level Mark-watched toggle on the
+///     title page agreed it was finished).
+///   * "Unwatched" returned every show, including ones the user had
+///     fully finished — because the show's own `play_state` row never
+///     exists, the LEFT JOIN gives NULL, and `(NULL OR watched=0)` is
+///     true.
+///
+/// This test builds four shows in four distinct states and asserts
+/// each filter returns exactly the shows it should.
+#[tokio::test]
+async fn status_filters_aggregate_show_state_from_episodes() {
+    use chimpflix_library::{ItemFilter, ItemKind, queries};
+
+    let data_dir = fresh_data_dir();
+    let _cleanup = Cleanup(data_dir.clone());
+    let pool = db::open(&data_dir).await.expect("db::open succeeds");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    // One user. The status filters key on user_id, but a single user
+    // is enough — each show is its own state under that user.
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) \
+         VALUES (1, 'tester', '', 'owner', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind, created_at, updated_at) \
+         VALUES (1, 'Shows', 'tv', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert library");
+
+    // Four shows, each with two episodes and one file per episode.
+    // ids: show=100+N, season=200+N, episodes=300+N0/N1, files=400+N0/N1.
+    let shows = [
+        (101, "Untouched"),     // no play_state at all
+        (102, "MidEpisode"),    // ep0 has position > 0, watched = 0
+        (103, "PartialWatch"),  // ep0 watched=1, ep1 untouched
+        (104, "FullyWatched"),  // both episodes watched=1
+    ];
+    for (show_id, title) in shows {
+        sqlx::query(
+            "INSERT INTO items (id, library_id, kind, title, sort_title, added_at, updated_at) \
+             VALUES (?, 1, 'show', ?, ?, ?, ?)",
+        )
+        .bind(show_id)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert show");
+
+        let season_id = show_id + 100;
+        sqlx::query(
+            "INSERT INTO seasons (id, show_id, season_number) VALUES (?, ?, 1)",
+        )
+        .bind(season_id)
+        .bind(show_id)
+        .execute(&pool)
+        .await
+        .expect("insert season");
+
+        for ep_idx in 0..2_i64 {
+            let episode_id = show_id * 10 + ep_idx;
+            sqlx::query(
+                "INSERT INTO episodes (id, season_id, episode_number, title, added_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(episode_id)
+            .bind(season_id)
+            .bind(ep_idx + 1)
+            .bind(format!("E{}", ep_idx + 1))
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert episode");
+
+            sqlx::query(
+                "INSERT INTO media_files (episode_id, path, size_bytes, mtime_ms, scanned_at) \
+                 VALUES (?, ?, 1, ?, ?)",
+            )
+            .bind(episode_id)
+            .bind(format!("/tmp/show{show_id}/e{ep_idx}.mkv"))
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert media file");
+        }
+    }
+
+    // Now wire play_state per show, matching each state above.
+    // MidEpisode: ep0 has position_ms > 0, watched=0.
+    sqlx::query(
+        "INSERT INTO play_state \
+            (user_id, episode_id, position_ms, watched, last_played_at) \
+         VALUES (1, ?, 60000, 0, ?)",
+    )
+    .bind(102 * 10) // MidEpisode ep0
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert mid-episode play_state");
+
+    // PartialWatch: ep0 watched=1, ep1 untouched.
+    sqlx::query(
+        "INSERT INTO play_state \
+            (user_id, episode_id, position_ms, watched, last_played_at) \
+         VALUES (1, ?, 0, 1, ?)",
+    )
+    .bind(103 * 10)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert partial-watch ep0 play_state");
+
+    // FullyWatched: both episodes watched=1.
+    for ep_idx in 0..2_i64 {
+        sqlx::query(
+            "INSERT INTO play_state \
+                (user_id, episode_id, position_ms, watched, last_played_at) \
+             VALUES (1, ?, 0, 1, ?)",
+        )
+        .bind(104 * 10 + ep_idx)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert fully-watched play_state");
+    }
+
+    // Helper: run list_items with one status flag set, return matched
+    // show ids sorted for stable comparison.
+    async fn run_filter(
+        pool: &SqlitePool,
+        kind: ItemKind,
+        unwatched: bool,
+        in_progress: bool,
+        watched: bool,
+    ) -> Vec<i64> {
+        let filter = ItemFilter {
+            kind: Some(kind),
+            unwatched_only: if unwatched { Some(true) } else { None },
+            in_progress_only: if in_progress { Some(true) } else { None },
+            watched_only: if watched { Some(true) } else { None },
+            page_size: Some(200),
+            ..Default::default()
+        };
+        let page = queries::list_items(pool, filter, 1, None)
+            .await
+            .expect("list_items");
+        let mut ids: Vec<i64> = page.items.iter().map(|li| li.item.id).collect();
+        ids.sort();
+        ids
+    }
+
+    // Unwatched (shows): only "Untouched" — no episode has any
+    // play_state activity for any of the others.
+    let got = run_filter(&pool, ItemKind::Show, true, false, false).await;
+    assert_eq!(got, vec![101], "unwatched: only Untouched should match");
+
+    // In progress (shows): MidEpisode (one episode mid-position) AND
+    // PartialWatch (one watched, one still unwatched). FullyWatched
+    // must NOT show up (every active episode is watched). Untouched
+    // must NOT show up (no activity at all).
+    let got = run_filter(&pool, ItemKind::Show, false, true, false).await;
+    assert_eq!(
+        got,
+        vec![102, 103],
+        "in_progress: MidEpisode + PartialWatch should match; \
+         FullyWatched + Untouched should not",
+    );
+
+    // Watched (shows): only "FullyWatched" — every active episode is
+    // marked watched. The PartialWatch case has an unwatched episode
+    // left so it must NOT be Watched.
+    let got = run_filter(&pool, ItemKind::Show, false, false, true).await;
+    assert_eq!(got, vec![104], "watched: only FullyWatched should match");
+
+    // Sanity: with no status filter at all, all four shows should come
+    // back. Confirms the OR branches didn't accidentally suppress the
+    // baseline list-all path.
+    let all = run_filter(&pool, ItemKind::Show, false, false, false).await;
+    assert_eq!(all, vec![101, 102, 103, 104], "no-filter baseline");
+}

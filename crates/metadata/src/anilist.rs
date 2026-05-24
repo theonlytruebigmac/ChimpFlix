@@ -249,7 +249,13 @@ impl AniListClient {
             );
             anyhow::bail!("AniList POST returned {status}");
         }
-        let parsed: GraphQlResponse<T> = resp.json().await.context("parse AniList JSON")?;
+        let parsed: GraphQlResponse<T> = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            "AniList POST",
+        )
+        .await
+        .context("parse AniList JSON")?;
         if let Some(errs) = &parsed.errors {
             if !errs.is_empty() {
                 let msg = errs

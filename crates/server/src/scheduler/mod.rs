@@ -237,19 +237,31 @@ pub async fn compute_next_run_with_settings(
     )
 }
 
-/// Seed the default task set on first run. Idempotent — if any tasks
-/// exist (created by a previous boot or by the user) this does nothing.
+/// Seed the default task set. Additive by `kind`: any kind already
+/// present (whether from a prior boot, a manual operator add, or
+/// because it was in the seed list at the previous version) is
+/// skipped, and any kind missing from the table is inserted.
+///
+/// Why additive instead of all-or-nothing: the previous shape bailed
+/// out on the first existing row, which meant any task added to the
+/// seed list after first boot never reached existing installs. We
+/// were missing six analyzer-sweep rows in a year-old DB as a
+/// result. The trade-off is that operators who deliberately delete
+/// a default row will see it return on the next boot — disable it
+/// instead of deleting it if you want it gone.
 ///
 /// New tasks use the frequency model directly (no cron strings); the
 /// `cron_expr` field is set to a sensible placeholder so toggling to
 /// "Custom (advanced)" later starts from something reasonable.
 pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
-    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_tasks")
-        .fetch_one(pool)
-        .await?;
-    if existing > 0 {
-        return Ok(());
-    }
+    use sqlx::Row;
+    let existing_kinds: std::collections::HashSet<String> =
+        sqlx::query("SELECT DISTINCT kind FROM scheduled_tasks")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.try_get::<String, _>("kind").ok())
+            .collect();
     struct Seed {
         kind: &'static str,
         name: &'static str,
@@ -379,6 +391,80 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{}",
             cron_placeholder: "0 0 5 * * *",
         },
+        // ---- Analyzer safety-net sweeps ----
+        //
+        // Each of the following is a "find work the scan pipeline
+        // missed and enqueue it" task. Handlers are idempotent and
+        // dedup per file/item, so re-running while jobs are in flight
+        // is a no-op. Weekly + maintenance window keeps the initial
+        // backfill off the hot path; once a library is steady-state
+        // these mostly find nothing to do.
+        Seed {
+            kind: "analyze_loudness",
+            name: "Analyze loudness (EBU R 128)",
+            frequency: "weekly",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 0 5 * * 0",
+        },
+        Seed {
+            kind: "extract_subs_sweep",
+            name: "Extract embedded subtitles",
+            frequency: "weekly",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 30 5 * * 0",
+        },
+        Seed {
+            kind: "scan_extras",
+            name: "Scan for extras (trailers/featurettes)",
+            frequency: "weekly",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 0 6 * * 0",
+        },
+        // OMDb + TMDB logo sweeps are pure HTTP — cheap enough to skip
+        // the window. Provider-disabled installs (no OMDb key / TMDB
+        // disabled) no-op cheaply inside the handler.
+        Seed {
+            kind: "refresh_ratings",
+            name: "Refresh external ratings (OMDb)",
+            frequency: "weekly",
+            requires_window: false,
+            params_json: "{}",
+            cron_placeholder: "0 0 7 * * 1",
+        },
+        Seed {
+            kind: "refresh_logos",
+            name: "Refresh title logos",
+            frequency: "weekly",
+            requires_window: false,
+            params_json: "{}",
+            cron_placeholder: "0 30 7 * * 1",
+        },
+        // OpenSubtitles fetch needs operator-configured credentials;
+        // the task no-ops cleanly when none are set. Seeding it ahead
+        // of time means operators just enter creds and start getting
+        // subs on the next run, instead of also having to create the
+        // task.
+        Seed {
+            kind: "fetch_subtitles",
+            name: "Fetch external subtitles",
+            frequency: "weekly",
+            requires_window: true,
+            params_json: "{\"languages\":[\"en\"]}",
+            cron_placeholder: "0 0 8 * * 0",
+        },
+        // Verify backups weekly — catches snapshot corruption before
+        // restore time. Cheap (PRAGMA integrity_check on each .db).
+        Seed {
+            kind: "verify_backups",
+            name: "Verify backup integrity",
+            frequency: "weekly",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 30 8 * * 0",
+        },
     ];
     // Window snap requires the actual operator-configured window which
     // lives on the (yet-to-be-populated) settings cache. At seed time
@@ -386,7 +472,11 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
     // that's what the row was initialized with.
     let win_start = "02:00";
     let win_end = "09:00";
+    let mut inserted = 0usize;
     for s in defaults {
+        if existing_kinds.contains(s.kind) {
+            continue;
+        }
         let next = compute_next_run(
             s.frequency,
             s.cron_placeholder,
@@ -409,8 +499,11 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             next,
         )
         .await?;
+        inserted += 1;
     }
-    info!("seeded default scheduled tasks");
+    if inserted > 0 {
+        info!(inserted, "seeded default scheduled tasks");
+    }
     Ok(())
 }
 
@@ -680,6 +773,36 @@ async fn dispatch(
                 .execute(format!("VACUUM INTO '{target}'").as_str())
                 .await?;
             append_log(log, format!("wrote {}", path.display()));
+
+            // Retention prune (BLOCK #4). Reads the operator-tunable
+            // cap, lists existing snapshots, sorts newest-first, and
+            // deletes the tail past the cap. 0 disables pruning.
+            let retention = {
+                let snap = state.settings.read().await;
+                snap.backup_retention_count
+            };
+            if retention > 0 {
+                match prune_old_backups(&dir, retention as usize).await {
+                    Ok((kept, removed_paths)) => {
+                        if !removed_paths.is_empty() {
+                            for p in &removed_paths {
+                                append_log(log, format!("pruned {}", p.display()));
+                            }
+                            append_log(
+                                log,
+                                format!(
+                                    "retention: kept {kept} newest snapshot(s), removed {}",
+                                    removed_paths.len(),
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) => append_log(
+                        log,
+                        format!("retention prune failed (will retry next run): {e:#}"),
+                    ),
+                }
+            }
             Ok(())
         }
         "scan_library" => {
@@ -1188,6 +1311,42 @@ pub fn registry() -> Vec<TaskKindInfo> {
                           tmdb_id and no logo_path are touched.",
             params_schema: r#"{"batch_size": "number (optional; default 50)"}"#,
             default_frequency: "weekly",
+            default_requires_maintenance_window: false,
+        },
+        TaskKindInfo {
+            kind: "refresh_ratings",
+            display_name: "Refresh external ratings (OMDb)",
+            description: "Sweep items whose external ratings are stale \
+                          (>30 days) or missing and enqueue per-item \
+                          OMDb fetches. Requires an OMDb API key in \
+                          /admin/server/credentials; no-ops cleanly \
+                          otherwise.",
+            params_schema: r#"{"batch_size": "number (optional; default 100)"}"#,
+            default_frequency: "weekly",
+            default_requires_maintenance_window: false,
+        },
+        TaskKindInfo {
+            kind: "extract_subs_sweep",
+            display_name: "Extract embedded subtitles",
+            description: "Sweep media files whose container subtitle \
+                          tracks haven't been extracted to VTT cache \
+                          yet and enqueue per-file extracts. Heavy on \
+                          the first pass after a large import; cheap \
+                          once steady state.",
+            params_schema: r#"{"batch_size": "number (optional; default 500)"}"#,
+            default_frequency: "weekly",
+            default_requires_maintenance_window: true,
+        },
+        TaskKindInfo {
+            kind: "scan_extras",
+            display_name: "Scan for extras (trailers/featurettes)",
+            description: "Sweep items whose extras directory hasn't \
+                          been scanned or whose parent dir mtime has \
+                          advanced and enqueue per-item walks. The \
+                          per-item handler dedups on dir mtime so \
+                          re-running is cheap.",
+            params_schema: r#"{"batch_size": "number (optional; default 50)"}"#,
+            default_frequency: "weekly",
             default_requires_maintenance_window: true,
         },
         TaskKindInfo {
@@ -1274,6 +1433,51 @@ async fn analyze_loudness_task(
     Ok(())
 }
 
+/// Walk `dir`, keep only files matching the `chimpflix-*.db` naming
+/// convention, sort newest-first by mtime, and delete entries past
+/// `keep`. Returns `(kept_count, removed_paths)`. See BLOCK #4 in
+/// `docs/PUBLIC_RELEASE_HARDENING.md`.
+async fn prune_old_backups(
+    dir: &std::path::Path,
+    keep: usize,
+) -> anyhow::Result<(usize, Vec<std::path::PathBuf>)> {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(e) => return Err(e.into()),
+    };
+    let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    while let Some(ent) = rd.next_entry().await? {
+        let path = ent.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !(name.starts_with("chimpflix-") && name.ends_with(".db")) {
+            continue;
+        }
+        let meta = match ent.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((path, mtime));
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    let kept = entries.len().min(keep);
+    let to_remove: Vec<std::path::PathBuf> =
+        entries.into_iter().skip(keep).map(|(p, _)| p).collect();
+    for p in &to_remove {
+        if let Err(e) = tokio::fs::remove_file(p).await {
+            return Err(anyhow::anyhow!("delete {}: {e}", p.display()));
+        }
+    }
+    Ok((kept, to_remove))
+}
+
 async fn verify_backups_task(state: &AppState, log: &Arc<std::sync::Mutex<String>>) -> Result<()> {
     use sqlx::ConnectOptions;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -1308,6 +1512,11 @@ async fn verify_backups_task(state: &AppState, log: &Arc<std::sync::Mutex<String
 
     let mut ok = 0usize;
     let mut bad: Vec<String> = Vec::new();
+    // Vault-key mismatches are reported but do NOT fail the task.
+    // The operator may have legitimately rotated the vault key, in
+    // which case older backups won't decrypt with the current value
+    // — that's known and recoverable, not a corruption signal.
+    let mut vault_mismatches: Vec<String> = Vec::new();
     for path in files {
         let name = path
             .file_name()
@@ -1355,10 +1564,50 @@ async fn verify_backups_task(state: &AppState, log: &Arc<std::sync::Mutex<String
             .await;
         match integrity {
             Ok(s) if s == "ok" => ok += 1,
-            Ok(s) => bad.push(format!("{name}: integrity_check returned `{s}`")),
-            Err(e) => bad.push(format!("{name}: integrity_check failed: {e}")),
+            Ok(s) => {
+                bad.push(format!("{name}: integrity_check returned `{s}`"));
+                pool.close().await;
+                continue;
+            }
+            Err(e) => {
+                bad.push(format!("{name}: integrity_check failed: {e}"));
+                pool.close().await;
+                continue;
+            }
+        }
+        // Vault-key sanity check against this backup's own encrypted
+        // rows. A mismatch means restoring this snapshot today would
+        // brick every encrypted credential — flag the file so the
+        // operator notices BEFORE they're mid-incident.
+        match chimpflix_library::queries::vault_self_test(&pool, &state.vault).await {
+            Ok(chimpflix_library::queries::VaultSelfTest::Ok { .. })
+            | Ok(chimpflix_library::queries::VaultSelfTest::NoEncryptedRows) => {}
+            Ok(chimpflix_library::queries::VaultSelfTest::Mismatch { sampled, error }) => {
+                vault_mismatches
+                    .push(format!("{name}: vault key mismatch on {sampled} ({error})"));
+            }
+            Err(e) => {
+                vault_mismatches
+                    .push(format!("{name}: vault self-test query failed: {e:#}"));
+            }
         }
         pool.close().await;
+    }
+
+    for warn in &vault_mismatches {
+        append_log(log, warn);
+    }
+    if !vault_mismatches.is_empty() {
+        append_log(
+            log,
+            format!(
+                "{} backup(s) cannot be decrypted with the current CHIMPFLIX_SECRET_KEY — \
+                 restoring them would brick stored credentials. Keep the source key around \
+                 or run `chimpflix-server vault-rotate` against the source key before relying \
+                 on these snapshots.",
+                vault_mismatches.len(),
+            ),
+        );
     }
 
     if bad.is_empty() {
@@ -1989,20 +2238,51 @@ async fn fetch_subtitles_task(
     // only ones the provider can look up. The handler does its own
     // existing-subtitle check per (target, language) so we don't need
     // to filter on that here.
+    //
+    // MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`: cap per-run
+    // enqueue at PER_RUN_CAP items, with the next run picking up
+    // where this one stopped. Without the cap, the first run on a
+    // 10k-item library created 10k jobs in a single transaction
+    // (slow + locks the jobs table) and re-running before the queue
+    // drains piled on more. ORDER BY id ASC + LIMIT/OFFSET threaded
+    // through `last_subtitle_fetch_cursor_<library>` in `secrets`
+    // table keeps the sweep moving without missing items.
+    const PER_RUN_CAP: i64 = 500;
+    let cursor_slot = match library_id {
+        Some(lid) => format!("subtitle_fetch_cursor_library_{lid}"),
+        None => "subtitle_fetch_cursor_all".to_string(),
+    };
+    let cursor_start: i64 = match queries::vault_get(&state.pool, &state.vault, &cursor_slot)
+        .await
+    {
+        Ok(Some(v)) => v.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    };
+
     let item_ids: Vec<i64> = if let Some(lid) = library_id {
         sqlx::query_scalar(
             "SELECT id FROM items
              WHERE library_id = ?
-               AND (tmdb_id IS NOT NULL OR imdb_id IS NOT NULL)",
+               AND id > ?
+               AND (tmdb_id IS NOT NULL OR imdb_id IS NOT NULL)
+             ORDER BY id ASC
+             LIMIT ?",
         )
         .bind(lid)
+        .bind(cursor_start)
+        .bind(PER_RUN_CAP)
         .fetch_all(&state.pool)
         .await?
     } else {
         sqlx::query_scalar(
             "SELECT id FROM items
-             WHERE tmdb_id IS NOT NULL OR imdb_id IS NOT NULL",
+             WHERE id > ?
+               AND (tmdb_id IS NOT NULL OR imdb_id IS NOT NULL)
+             ORDER BY id ASC
+             LIMIT ?",
         )
+        .bind(cursor_start)
+        .bind(PER_RUN_CAP)
         .fetch_all(&state.pool)
         .await?
     };
@@ -2013,11 +2293,34 @@ async fn fetch_subtitles_task(
         &languages,
     )
     .await?;
+
+    // Advance / wrap the cursor. When this run found fewer than
+    // PER_RUN_CAP items, we've reached the end of the table: reset
+    // to 0 so the next run starts fresh. Otherwise persist the
+    // highest id seen.
+    let new_cursor = if (item_ids.len() as i64) < PER_RUN_CAP {
+        0
+    } else {
+        item_ids.last().copied().unwrap_or(cursor_start)
+    };
+    if let Err(e) = queries::vault_set(
+        &state.pool,
+        &state.vault,
+        &cursor_slot,
+        &new_cursor.to_string(),
+        None,
+    )
+    .await
+    {
+        append_log(log, format!("cursor persist failed: {e:#}"));
+    }
+
     append_log(
         log,
         format!(
-            "enqueued {enqueued} fetch_subtitles_item jobs across {} items",
-            item_ids.len()
+            "enqueued {enqueued} fetch_subtitles_item jobs across {} items \
+             (cursor advanced {cursor_start} -> {new_cursor}, cap {PER_RUN_CAP})",
+            item_ids.len(),
         ),
     );
     Ok(())

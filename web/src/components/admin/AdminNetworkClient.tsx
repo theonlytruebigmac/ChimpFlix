@@ -131,11 +131,36 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
     }
   }
 
+  const diag = initial.proxy_diagnostic;
+
   return (
     <div>
       {error && (
         <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
+        </div>
+      )}
+
+      {diag.looks_misconfigured && (
+        <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">
+          <div className="font-semibold">Trusted-proxy config looks broken</div>
+          <p className="mt-1 text-xs text-amber-200/80">
+            This request reached the server from{" "}
+            <code className="font-mono">{diag.peer_ip}</code> — a private
+            range, which means a reverse proxy or Docker bridge is in front.{" "}
+            {diag.trusted_proxies.length === 0
+              ? "TRUSTED_PROXIES is empty, so every request looks like it's coming from the proxy. Per-IP rate limits collapse to one bucket, and audit logs attribute every action to that one IP."
+              : `TRUSTED_PROXIES is set to ${diag.trusted_proxies.join(", ")} — it doesn't cover ${diag.peer_ip}, so the proxy headers are ignored. Set TRUSTED_PROXIES to the CIDR your proxy lives in.`}
+            {" "}
+            See <a
+              href="https://github.com/soybigmac/ChimpFlix/blob/main/docs/DEPLOYMENT.md#trusted-proxy-anti-patterns"
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-amber-100"
+            >
+              the deployment runbook
+            </a> for the exact line to add.
+          </p>
         </div>
       )}
 

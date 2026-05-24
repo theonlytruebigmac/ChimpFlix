@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod cli;
 mod client_ip;
 mod events;
 mod file_watcher;
@@ -46,6 +47,16 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Operator self-rescue subcommands (`owner-password-reset`,
+    // `owner-2fa-reset`, `vault-rotate`). When argv[1] matches a known
+    // subcommand, dispatch runs the handler and returns Some(result)
+    // — we exit before any of the server's normal boot side effects.
+    // When argv has no subcommand, returns None and we fall through to
+    // the server boot below.
+    if let Some(result) = cli::maybe_dispatch().await {
+        return result;
+    }
+
     let log_buffer = log_buffer::LogBuffer::new();
     init_tracing(log_buffer.clone());
 
@@ -94,6 +105,57 @@ async fn main() -> anyhow::Result<()> {
         probe_pool
     };
     queries::ensure_default_user(&pool).await?;
+
+    // Vault decoupling check (BLOCK #1 in
+    // docs/PUBLIC_RELEASE_HARDENING.md). Sample one encrypted secret
+    // and try to decrypt with the current key. When the sample fails
+    // AND there's a `chimpflix.db.pre-restore-*` sibling — meaning
+    // this boot is the first one after a restore — exit loudly: the
+    // operator restored a DB encrypted under a different vault key
+    // and every secret-dependent flow would silently break. On a
+    // non-restore boot the same failure means the key was rotated
+    // without running `vault-rotate`; we log a loud warning but
+    // continue, matching the existing graceful-degradation policy in
+    // `vault_get_or_warn`.
+    match queries::vault_self_test(&pool, &vault).await {
+        Ok(queries::VaultSelfTest::NoEncryptedRows) => {
+            info!("vault check: no encrypted rows yet — fresh install or pre-creds boot");
+        }
+        Ok(queries::VaultSelfTest::Ok { sampled }) => {
+            info!(sampled = %sampled, "vault check: sample row decrypted ok");
+        }
+        Ok(queries::VaultSelfTest::Mismatch { sampled, error }) => {
+            if has_pre_restore_sibling(&data_dir).await {
+                eprintln!(
+                    "FATAL: encrypted secrets in chimpflix.db cannot be decrypted with the \n\
+                     current {key_env} value.\n\n\
+                     A `chimpflix.db.pre-restore-*` sibling is present in {data}, which means \n\
+                     this boot is the first one after a backup restore. Backups are encrypted \n\
+                     with the vault key of the source server — restoring against a different \n\
+                     key bricks every SMTP password, Trakt token, TOTP secret, and session \n\
+                     HMAC in the file.\n\n\
+                     Recover with one of:\n  \
+                     1. Set {key_env} to the source server's key and restart.\n  \
+                     2. Roll back: rename the `pre-restore-*.db` sibling back to chimpflix.db.\n\n\
+                     (Sample row that failed: {sampled} — {error})",
+                    key_env = chimpflix_common::MASTER_KEY_ENV,
+                    data = data_dir.display(),
+                );
+                std::process::exit(78); // EX_CONFIG
+            }
+            warn!(
+                sampled = %sampled,
+                error = %error,
+                "vault check: sample row failed to decrypt. Secret-dependent integrations \
+                 (SMTP, Trakt, OpenSubtitles, 2FA) will be disabled until the operator \
+                 re-enters them under Admin -> Server -> Credentials or runs \
+                 `chimpflix-server vault-rotate`.",
+            );
+        }
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "vault check failed; continuing boot");
+        }
+    }
 
     // One-shot heal pass for episode titles that look filename-derived.
     // Catches rows that were upserted before the parser sanitizer +
@@ -392,6 +454,10 @@ async fn main() -> anyhow::Result<()> {
         library_scans_in_progress: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashSet::new(),
         )),
+        ws_connections_per_user: Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
+        http_metrics: crate::api::http_metrics::HttpMetricsRegistry::new(),
         trakt_refresh_locks: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         task_metrics: crate::tasks::metrics::LiveMetrics::new(),
         worker_pool: Arc::new(tokio::sync::RwLock::new(None)),
@@ -474,6 +540,10 @@ async fn main() -> anyhow::Result<()> {
     // flipping the switch back on resumes immediately.
     file_watcher::spawn(state.clone());
 
+    // Keep a clone for the graceful-shutdown drain (so we can poll
+    // `list_sessions` until live transcodes finish). `state` itself
+    // moves into the router below.
+    let state_for_drain = state.clone();
     let app = api::router(state);
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -484,11 +554,12 @@ async fn main() -> anyhow::Result<()> {
     // to handlers/middleware via ConnectInfo — required by the
     // per-IP rate limiter on auth routes. The limiter still honors
     // X-Forwarded-For / X-Real-IP if set by a trusted proxy upstream.
+    let transcoder_for_drain = state_for_drain.transcoder.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(transcoder_for_drain))
     .await?;
 
     Ok(())
@@ -531,6 +602,28 @@ fn init_tracing(buffer: log_buffer::LogBuffer) {
         )
         .with(log_buffer::LogBufferLayer::new(buffer).with_filter(buffer_filter))
         .init();
+}
+
+/// True iff `data_dir` contains a `chimpflix.db.pre-restore-*.db`
+/// sibling — the artifact `apply_pending_restore_if_present` drops in
+/// place when it adopts a staged restore. We use the presence of this
+/// file as a "this boot is the first one after a restore" signal in
+/// the vault-decoupling check (BLOCK #1).
+async fn has_pre_restore_sibling(data_dir: &std::path::Path) -> bool {
+    let mut entries = match tokio::fs::read_dir(data_dir).await {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    while let Ok(Some(ent)) = entries.next_entry().await {
+        if ent
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("chimpflix.db.pre-restore-") && n.ends_with(".db"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Load the credential vault from `CHIMPFLIX_SECRET_KEY`. If the env var
@@ -730,7 +823,7 @@ async fn build_omdb_from_vault(
     Ok(Some(OmdbClient::new(key)?))
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(transcoder: chimpflix_transcoder::TranscodeManager) {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
     };
@@ -750,6 +843,38 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received");
+
+    // Drain in-flight transcodes before letting axum tear down
+    // (MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`). Without this,
+    // a rolling restart kills every active player mid-segment.
+    // 30s is a balance: long enough for the player to finish the
+    // current segment + transition cleanly, short enough that a stuck
+    // session doesn't hold the restart hostage. After the deadline
+    // we proceed anyway; ffmpeg subprocesses get cleaned up on
+    // process exit.
+    const DRAIN_DEADLINE_S: u64 = 30;
+    let started = std::time::Instant::now();
+    let mut last_count: Option<usize> = None;
+    loop {
+        let active = transcoder.list_sessions().len();
+        if active == 0 {
+            info!("transcode drain complete");
+            break;
+        }
+        if started.elapsed().as_secs() >= DRAIN_DEADLINE_S {
+            tracing::warn!(
+                active,
+                deadline_s = DRAIN_DEADLINE_S,
+                "transcode drain deadline reached; proceeding with shutdown",
+            );
+            break;
+        }
+        if Some(active) != last_count {
+            info!(active, "waiting for transcode sessions to finish");
+            last_count = Some(active);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Emit a `stop` event with the closing session's cumulative

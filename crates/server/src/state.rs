@@ -180,6 +180,18 @@ pub struct AppState {
     /// transcode segments — the dominant cause of "smooth at 7pm, skips
     /// during the 2am maintenance window" reports.
     pub library_scans_in_progress: Arc<RwLock<HashSet<i64>>>,
+    /// Per-user open WebSocket count. Used by the WS upgrade handler
+    /// to enforce the per-user connection cap (MONTH 1 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`). A misbehaving or
+    /// compromised client can otherwise open hundreds of WS
+    /// connections; each one fans out events from the same broadcast
+    /// channel. Reads are O(1) under the lock; the lock is held only
+    /// briefly during upgrade/teardown.
+    pub ws_connections_per_user: Arc<RwLock<HashMap<i64, u32>>>,
+    /// Per-route HTTP request counters surfaced via `/metrics`.
+    /// Recorded by `crate::api::http_metrics::track` (an outer
+    /// router middleware) and read by the Prometheus exporter.
+    pub http_metrics: crate::api::http_metrics::HttpMetricsRegistry,
     /// Per-user Trakt token-refresh serialization. Each entry is a
     /// dedicated `Mutex<()>` held for the lifetime of one user's
     /// refresh-and-upsert sequence so concurrent server tasks
@@ -360,6 +372,37 @@ impl AppState {
     pub async fn try_acquire_library_scan(&self, library_id: i64) -> bool {
         let mut guard = self.library_scans_in_progress.write().await;
         guard.insert(library_id)
+    }
+
+    /// Try to claim a WebSocket connection slot for `user_id`. Returns
+    /// `true` when under the per-user cap and the slot was claimed;
+    /// `false` when the user already has `cap` connections open. The
+    /// caller MUST pair a successful `true` return with a later call
+    /// to [`release_ws_connection`] (RAII guard recommended) or the
+    /// per-user count leaks. See MONTH 1 #1 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub async fn try_acquire_ws_connection(&self, user_id: i64, cap: u32) -> bool {
+        let mut guard = self.ws_connections_per_user.write().await;
+        let entry = guard.entry(user_id).or_insert(0);
+        if *entry >= cap {
+            return false;
+        }
+        *entry += 1;
+        true
+    }
+
+    /// Release a previously acquired WebSocket slot. Idempotent — a
+    /// release without a matching acquire (e.g. after a panic that
+    /// bypassed the RAII guard) decrements toward zero rather than
+    /// underflowing.
+    pub async fn release_ws_connection(&self, user_id: i64) {
+        let mut guard = self.ws_connections_per_user.write().await;
+        if let Some(n) = guard.get_mut(&user_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                guard.remove(&user_id);
+            }
+        }
     }
 
     /// Release the scan lock previously taken by

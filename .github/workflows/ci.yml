@@ -110,10 +110,116 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,scope=${{ matrix.target }},mode=max
 
+  # Boots the freshly built server image and verifies it answers
+  # `/health` before declaring the build releasable. Catches:
+  #   * Migration errors against a fresh data dir.
+  #   * Missing env defaults (the image won't boot without them).
+  #   * ffmpeg binary missing from the image.
+  # See `docs/PUBLIC_RELEASE_HARDENING.md` Tier 0 item 0.8 + Tier 1
+  # item #2 (the `/ready` endpoint, which this job should switch to
+  # once it lands).
+  smoke:
+    name: Smoke (server image)
+    runs-on: ubuntu-latest
+    needs: [image]
+    # Only run when image was actually pushed (push events) so we can
+    # pull by tag. On PRs the image is built but not pushed.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "ref=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Boot server image against fresh data dir
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/server:${{ steps.tag.outputs.ref }}
+        run: |
+          mkdir -p ./smoke-data
+          docker pull "$IMAGE"
+          docker run -d --rm \
+            --name chimpflix-smoke \
+            -p 18080:8080 \
+            -e DATA_DIR=/data \
+            -e CHIMPFLIX_ALLOW_PLAINTEXT_VAULT=1 \
+            -v "$PWD/smoke-data:/data" \
+            "$IMAGE"
+          # Wait up to 60s for /health.
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/api/v1/ready >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          docker logs chimpflix-smoke | tail -200
+          docker stop chimpflix-smoke || true
+          test "$ok" = "1" || { echo "::error::server did not answer /health within 60s"; exit 1; }
+          # Migration smoke: the data dir should now contain a non-empty
+          # chimpflix.db, signalling at least one migration applied.
+          test -s ./smoke-data/chimpflix.db || { echo "::error::chimpflix.db missing or empty after boot"; exit 1; }
+
+      # Migration matrix: for tagged releases only, boot the *previous*
+      # release's image first to seed an older schema, then boot the new
+      # image against the same data dir to prove the upgrade migrations
+      # apply cleanly. Skipped on the very first release (no prior tag).
+      - name: Migration matrix (previous release → this release)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NEW_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/server:${{ steps.tag.outputs.ref }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "No prior v* tag found — first release, skipping migration matrix."
+            exit 0
+          fi
+          PREV_VER="${PREV_TAG#v}"
+          PREV_IMAGE="${REGISTRY}/${IMAGE_BASE}/server:${PREV_VER}"
+          echo "Replaying $PREV_IMAGE → $NEW_IMAGE"
+          mkdir -p ./migrate-data
+          docker pull "$PREV_IMAGE"
+          docker run -d --rm \
+            --name chimpflix-migrate-old \
+            -e DATA_DIR=/data \
+            -e CHIMPFLIX_ALLOW_PLAINTEXT_VAULT=1 \
+            -v "$PWD/migrate-data:/data" \
+            "$PREV_IMAGE"
+          # Give the old image time to apply its full migration set.
+          sleep 20
+          docker logs chimpflix-migrate-old | tail -50
+          docker stop chimpflix-migrate-old || true
+          # Now boot the new image against the same data dir.
+          docker run -d --rm \
+            --name chimpflix-migrate-new \
+            -p 18081:8080 \
+            -e DATA_DIR=/data \
+            -e CHIMPFLIX_ALLOW_PLAINTEXT_VAULT=1 \
+            -v "$PWD/migrate-data:/data" \
+            "$NEW_IMAGE"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18081/api/v1/ready >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          docker logs chimpflix-migrate-new | tail -200
+          docker stop chimpflix-migrate-new || true
+          test "$ok" = "1" || {
+            echo "::error::upgrade from $PREV_TAG failed — migrations did not apply cleanly";
+            exit 1;
+          }
+
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [image]
+    needs: [image, smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

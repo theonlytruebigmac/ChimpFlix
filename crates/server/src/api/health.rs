@@ -5,8 +5,11 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use chimpflix_library::queries;
 use serde::Serialize;
+use sqlx::Executor;
 
 use crate::api::error::ApiError;
 use crate::state::AppState;
@@ -27,11 +30,119 @@ pub struct HealthResponse {
 /// this. Intentionally minimal: no `version` (would aid CVE targeting),
 /// no build details, no DB metrics. The authenticated `/server-info`
 /// endpoint surfaces the version field for the admin UI.
+///
+/// **This is a "process is alive" probe.** For "process is actually
+/// serving real traffic," use `/ready` instead. The docker-compose
+/// healthcheck points at `/ready`; upstream load balancers that
+/// expect a sub-millisecond response can stay on `/health`.
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         uptime_s: started_at().elapsed().as_secs(),
     })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadyResponse {
+    pub status: &'static str,
+    pub uptime_s: u64,
+    pub checks: ReadyChecks,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadyChecks {
+    pub database: CheckStatus,
+    pub ffmpeg: CheckStatus,
+    pub vault: CheckStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Ok,
+    /// Component is present but in a degraded mode — for example, the
+    /// vault has no encrypted rows yet, or ffmpeg is intentionally
+    /// not configured. Counts as ready (degraded != failing).
+    Degraded { detail: String },
+    Failed { detail: String },
+}
+
+impl CheckStatus {
+    fn is_failed(&self) -> bool {
+        matches!(self, CheckStatus::Failed { .. })
+    }
+}
+
+/// Deep readiness probe — the response code reflects whether this
+/// process can actually serve traffic right now. Returns 200 when all
+/// checks are Ok/Degraded; 503 when any check is Failed. Pointed at
+/// from the docker-compose healthcheck and the BLOCK #2 smoke job in
+/// CI (see `docs/PUBLIC_RELEASE_HARDENING.md`).
+pub async fn ready(State(state): State<AppState>) -> Response {
+    let database = check_database(&state).await;
+    let ffmpeg = check_ffmpeg(&state).await;
+    let vault = check_vault(&state).await;
+
+    let any_failed = database.is_failed() || ffmpeg.is_failed() || vault.is_failed();
+    let body = ReadyResponse {
+        status: if any_failed { "failed" } else { "ok" },
+        uptime_s: started_at().elapsed().as_secs(),
+        checks: ReadyChecks {
+            database,
+            ffmpeg,
+            vault,
+        },
+    };
+    let status = if any_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(body)).into_response()
+}
+
+async fn check_database(state: &AppState) -> CheckStatus {
+    match state.pool.execute("SELECT 1").await {
+        Ok(_) => CheckStatus::Ok,
+        Err(e) => CheckStatus::Failed {
+            detail: format!("SELECT 1 against pool failed: {e}"),
+        },
+    }
+}
+
+async fn check_ffmpeg(state: &AppState) -> CheckStatus {
+    let bin = state.ffmpeg.ffmpeg.clone();
+    let result = tokio::process::Command::new(&bin)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    match result {
+        Ok(out) if out.status.success() => CheckStatus::Ok,
+        Ok(out) => CheckStatus::Failed {
+            detail: format!("`{bin} -version` exited with {:?}", out.status.code()),
+        },
+        Err(e) => CheckStatus::Failed {
+            detail: format!("could not spawn `{bin} -version`: {e}"),
+        },
+    }
+}
+
+async fn check_vault(state: &AppState) -> CheckStatus {
+    match queries::vault_self_test(&state.pool, &state.vault).await {
+        Ok(queries::VaultSelfTest::Ok { .. }) => CheckStatus::Ok,
+        Ok(queries::VaultSelfTest::NoEncryptedRows) => CheckStatus::Degraded {
+            detail: "no encrypted rows yet (fresh install or pre-credentials boot)".to_string(),
+        },
+        Ok(queries::VaultSelfTest::Mismatch { sampled, error }) => CheckStatus::Failed {
+            detail: format!("sample row {sampled} did not decrypt: {error}"),
+        },
+        Err(e) => CheckStatus::Failed {
+            detail: format!("vault self-test query failed: {e:#}"),
+        },
+    }
 }
 
 #[derive(Debug, Serialize)]

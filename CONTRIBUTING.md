@@ -7,7 +7,7 @@ contribution so we can align on direction.
 
 ## Code of conduct
 
-This project follows the [Contributor Covenant](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
+This project follows the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md).
 Be excellent to each other.
 
 ## Repo layout

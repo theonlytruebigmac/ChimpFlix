@@ -191,6 +191,21 @@ export function SettingsIntegrationsClient() {
           </p>
         )}
 
+        {status?.linked && status.expired && (
+          <p className="mt-2 text-xs text-red-300">
+            Your Trakt access token has expired. The next sync will try
+            to refresh it; if that fails (the refresh token is also
+            expired after ~60 days of no use), unlink and re-link below.
+          </p>
+        )}
+
+        {status?.linked && !status.expired && status.expiring_soon && (
+          <p className="mt-2 text-xs text-amber-300">
+            Your Trakt access token expires soon. Run a sync to refresh
+            it, or it will silently stop working in the next few days.
+          </p>
+        )}
+
         {status && status.app_configured && !status.linked && !pending && (
           <button
             onClick={startLink}

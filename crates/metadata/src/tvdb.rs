@@ -229,10 +229,13 @@ impl TvdbClient {
                 );
                 bail!("TVDB {url} returned {status}");
             }
-            return resp
-                .json::<T>()
-                .await
-                .with_context(|| format!("parse TVDB JSON from {url}"));
+            return crate::http::bounded_json::<T>(
+                resp,
+                crate::http::DEFAULT_METADATA_BYTES,
+                &format!("TVDB GET {url}"),
+            )
+            .await
+            .with_context(|| format!("parse TVDB JSON from {url}"));
         }
         bail!("TVDB {url} kept returning 401 after token refresh")
     }
@@ -280,7 +283,13 @@ impl TvdbClient {
                 body.chars().take(200).collect::<String>()
             );
         }
-        let env: Envelope<LoginData> = resp.json().await.context("parse TVDB login response")?;
+        let env: Envelope<LoginData> = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            "TVDB POST /login",
+        )
+        .await
+        .context("parse TVDB login response")?;
         Ok(env.data.token)
     }
 }

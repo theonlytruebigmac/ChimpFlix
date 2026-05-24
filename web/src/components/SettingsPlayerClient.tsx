@@ -1,19 +1,49 @@
 "use client";
 
-import { usePrefs } from "@/lib/prefs";
+import { useCallback, useState } from "react";
 
-// Device-local player prefs. These live in localStorage rather than on the
-// user record because they're per-browser ergonomics — what feels right on
-// a TV-connected laptop differs from what feels right on a phone.
-export function SettingsPlayerClient() {
+import { SubtitleStylePanel } from "@/components/ChimpFlixPlayer";
+import { auth as authApi } from "@/lib/chimpflix-api";
+import { usePrefs } from "@/lib/prefs";
+import {
+  type SubtitleStyle,
+} from "@/lib/subtitle-style";
+
+// Player prefs split: device-local (volume / autoplay / trailer-mute /
+// loudness / auto-skip) lives in localStorage via usePrefs; subtitle
+// styling is server-synced per account via /api/v1/auth/me (phase 89).
+// The split mirrors what users actually want — "what does my account
+// look like" follows the account, "what does this device do" follows
+// the device.
+export function SettingsPlayerClient({
+  initialSubtitleStyle,
+}: {
+  initialSubtitleStyle: SubtitleStyle;
+}) {
   const [prefs, updatePrefs] = usePrefs();
+  const [subtitleStyle, setSubtitleStyleLocal] =
+    useState<SubtitleStyle>(initialSubtitleStyle);
+  const setSubtitleStyle = useCallback((next: SubtitleStyle) => {
+    setSubtitleStyleLocal(next);
+    authApi
+      .updateMe({
+        subtitle_font_size_px: next.fontSizePx,
+        subtitle_text_color: next.textColor,
+        subtitle_background_color: next.backgroundColor,
+        subtitle_font_family: next.fontFamily,
+        subtitle_edge: next.edge,
+        subtitle_bottom_inset_pct: next.bottomInsetPct,
+      })
+      .catch(() => {
+        // Best-effort persistence — keep the local pick so the
+        // preview reflects what the viewer just chose. A persistent
+        // failure surfaces on the next refresh (the server returns
+        // the un-updated values).
+      });
+  }, []);
 
   return (
     <div className="space-y-6">
-      <p className="text-xs text-white/55">
-        Saved on this device only. Switch browsers and these reset to defaults.
-      </p>
-
       <Group>
         <ToggleRow
           label="Autoplay next episode"
@@ -40,72 +70,21 @@ export function SettingsPlayerClient() {
           onChange={(v) => updatePrefs({ autoSkipIntro: v })}
         />
       </Group>
+      <p className="text-xs text-white/45">
+        Toggles above are saved on this device only. Switch browsers and
+        they reset to defaults.
+      </p>
 
       <div>
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wider text-white/45">
           Subtitle styling
         </h3>
         <p className="mb-3 text-xs text-white/45">
-          Applies to external subtitles. Burned-in subtitles use these styles
-          when transcoding text tracks.
+          Saved to your account — follows you across devices. Applies to
+          both browser-rendered subtitles and burned-in subtitles when
+          transcoding text tracks.
         </p>
-        <Group>
-          <SliderRow
-            label="Font size"
-            value={prefs.subtitleFontScale}
-            min={0.6}
-            max={2.4}
-            step={0.1}
-            unit="×"
-            onChange={(v) => updatePrefs({ subtitleFontScale: v })}
-          />
-          <ColorRow
-            label="Text color"
-            value={hexFromCss(prefs.subtitleColor) ?? "#ffffff"}
-            onChange={(v) => updatePrefs({ subtitleColor: v })}
-          />
-          <SliderRow
-            label="Background opacity"
-            value={alphaFromRgba(prefs.subtitleBackground)}
-            min={0}
-            max={1}
-            step={0.05}
-            unit=""
-            onChange={(v) =>
-              updatePrefs({ subtitleBackground: `rgba(0, 0, 0, ${v})` })
-            }
-          />
-          <SelectRow
-            label="Position"
-            value={prefs.subtitlePosition}
-            options={[
-              { value: "bottom", label: "Bottom (default)" },
-              { value: "top", label: "Top" },
-            ]}
-            onChange={(v) =>
-              updatePrefs({ subtitlePosition: v as "top" | "bottom" })
-            }
-          />
-          <SelectRow
-            label="Font family"
-            value={prefs.subtitleFontFamily}
-            options={[
-              { value: "default", label: "Default" },
-              { value: "sans", label: "Sans-serif" },
-              { value: "serif", label: "Serif" },
-              { value: "mono", label: "Monospace" },
-            ]}
-            onChange={(v) =>
-              updatePrefs({
-                subtitleFontFamily: v as
-                  | "default"
-                  | "sans"
-                  | "serif"
-                  | "mono",
-              })
-            }
-          />
-        </Group>
+        <SubtitleStylePanel value={subtitleStyle} onChange={setSubtitleStyle} />
       </div>
     </div>
   );
@@ -156,111 +135,4 @@ function ToggleRow({
       </span>
     </label>
   );
-}
-
-function SliderRow({
-  label,
-  value,
-  min,
-  max,
-  step,
-  unit,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  unit: string;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <label className="grid grid-cols-[1fr_auto] items-center gap-3 py-3 text-sm">
-      <span className="text-white/70">{label}</span>
-      <span className="flex items-center gap-3">
-        <input
-          type="range"
-          min={min}
-          max={max}
-          step={step}
-          value={value}
-          onChange={(e) => onChange(parseFloat(e.target.value))}
-          className="w-40 accent-(--color-accent)"
-        />
-        <span className="w-12 text-right font-mono text-xs tabular-nums text-white/65">
-          {value.toFixed(step < 1 ? 2 : 0)}
-          {unit}
-        </span>
-      </span>
-    </label>
-  );
-}
-
-function ColorRow({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="flex items-center justify-between gap-3 py-3 text-sm">
-      <span className="text-white/70">{label}</span>
-      <input
-        type="color"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="h-7 w-12 cursor-pointer rounded border border-white/10 bg-transparent"
-      />
-    </label>
-  );
-}
-
-function SelectRow({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  options: Array<{ value: string; label: string }>;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="flex items-center justify-between gap-3 py-3 text-sm">
-      <span className="text-white/70">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded bg-white/10 px-3 py-1.5 text-xs outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-/// Convert the most common stored color forms back to `#RRGGBB` so the
-/// native color picker renders correctly. Returns null for shapes we
-/// can't normalise (the input then falls back to white as the default).
-function hexFromCss(css: string): string | null {
-  const trimmed = css.trim();
-  if (/^#[0-9a-fA-F]{6}$/.test(trimmed)) return trimmed.toLowerCase();
-  return null;
-}
-
-/// Pull the alpha component out of an `rgba(...)` string; defaults to
-/// 0.6 if the input doesn't parse so the slider always has a value.
-function alphaFromRgba(css: string): number {
-  const m = css.match(/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([\d.]+)\s*\)/);
-  if (!m) return 0.6;
-  return parseFloat(m[1]);
 }

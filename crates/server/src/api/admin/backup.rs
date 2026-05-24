@@ -68,6 +68,16 @@ pub async fn backup(
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
+    // Disk-full pre-check (MONTH 1 in
+    // `docs/PUBLIC_RELEASE_HARDENING.md`). Require 1.2x current DB
+    // size free on the data partition before letting VACUUM INTO
+    // start — without it, an out-of-space VACUUM truncates the
+    // target and can leave behind a corrupt half-snapshot the
+    // operator might later restore from.
+    if let Err(reason) = preflight_disk_space(&state.data_dir).await {
+        return Err(ApiError::InsufficientStorage(reason));
+    }
+
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -161,6 +171,21 @@ pub struct ListBackupsResponse {
     /// Convenience for the UI: total bytes occupied by all
     /// listed snapshots. Operators use this to decide what to prune.
     pub total_bytes: u64,
+    /// True when this server has at least one row encrypted at rest
+    /// (any of `secrets`, `webhooks.secret_enc`, `user_totp`). When
+    /// true, the UI shows a banner reminding the operator that
+    /// backups are useless without the matching CHIMPFLIX_SECRET_KEY
+    /// — keep the key alongside the snapshots. Drives the
+    /// vault-decoupling messaging required by BLOCK #1 of
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub vault_key_required: bool,
+    /// Cap on retained auto-snapshots from
+    /// `server_settings.backup_retention_count`. The UI surfaces
+    /// `backups.len()` / `retention_count` so operators notice
+    /// retention pressure before the daily prune kicks in. 0 means
+    /// pruning is disabled. See BLOCK #4 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub retention_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,11 +255,22 @@ pub async fn list(
     let pending_restore = fs::metadata(state.data_dir.join(STAGED_RESTORE_FILENAME))
         .await
         .is_ok();
+    let vault_key_required = matches!(
+        chimpflix_library::queries::vault_self_test(&state.pool, &state.vault).await,
+        Ok(chimpflix_library::queries::VaultSelfTest::Ok { .. })
+            | Ok(chimpflix_library::queries::VaultSelfTest::Mismatch { .. })
+    );
+    let retention_count = {
+        let snap = state.settings.read().await;
+        snap.backup_retention_count
+    };
 
     Ok(Json(ListBackupsResponse {
         backups: entries,
         pending_restore,
         total_bytes,
+        vault_key_required,
+        retention_count,
     }))
 }
 
@@ -505,6 +541,50 @@ fn resolve_backup_path(data_dir: &Path, filename: &str) -> Result<PathBuf, ApiEr
         )));
     }
     Ok(data_dir.join(AUTO_BACKUP_SUBDIR).join(filename))
+}
+
+/// Probe the data partition's free space and ensure there's at least
+/// 1.2× the current `chimpflix.db` size available. Returns `Err(reason)`
+/// when the partition is too full to safely write a snapshot. No-op on
+/// non-Unix (statvfs unavailable; rely on VACUUM INTO surfacing an OS
+/// error). See MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`.
+#[cfg(unix)]
+async fn preflight_disk_space(data_dir: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let db_path = data_dir.join("chimpflix.db");
+    let db_size = match fs::metadata(&db_path).await {
+        Ok(m) => m.len(),
+        Err(_) => return Ok(()),
+    };
+
+    let path_bytes = data_dir.as_os_str().as_bytes();
+    let mut c_path = Vec::with_capacity(path_bytes.len() + 1);
+    c_path.extend_from_slice(path_bytes);
+    c_path.push(0);
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr() as *const _, &mut stat) };
+    if rc != 0 {
+        // Don't block backup on a stat failure — surface the actual
+        // VACUUM error if any.
+        return Ok(());
+    }
+    let free_bytes = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+    let required = db_size.saturating_mul(12) / 10;
+    if free_bytes < required {
+        return Err(format!(
+            "data partition has only {free_bytes} bytes free, need ~{required} bytes \
+             (1.2× of chimpflix.db = {db_size}) to safely snapshot. Free space and \
+             retry."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn preflight_disk_space(_data_dir: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// At startup: check for a `chimpflix.db.pending-restore` file in

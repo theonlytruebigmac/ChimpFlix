@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/soybigmac/ChimpFlix/security/advisories/new
+    about: |
+      Do not file security issues here. Use GitHub Private Security
+      Advisories. See SECURITY.md for details.
+  - name: Question or discussion
+    url: https://github.com/soybigmac/ChimpFlix/discussions
+    about: |
+      Open-ended questions, deployment help, or design discussions
+      belong in Discussions, not Issues.

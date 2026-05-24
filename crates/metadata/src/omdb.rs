@@ -179,7 +179,13 @@ impl OmdbClient {
         if !resp.status().is_success() {
             anyhow::bail!("omdb http {}", resp.status());
         }
-        let raw: RawResponse = resp.json().await.context("omdb body decode")?;
+        let raw: RawResponse = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            "OMDb GET",
+        )
+        .await
+        .context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             return Ok(None);
         }
@@ -218,7 +224,13 @@ impl OmdbClient {
         if !resp.status().is_success() {
             anyhow::bail!("omdb http {}", resp.status());
         }
-        let raw: RawResponse = resp.json().await.context("omdb body decode")?;
+        let raw: RawResponse = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            "OMDb GET",
+        )
+        .await
+        .context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             // Title not in OMDb — treat as a clean miss so the chain
             // moves to the next agent.
@@ -257,7 +269,13 @@ impl OmdbClient {
                 resp.text().await.unwrap_or_default()
             );
         }
-        let raw: RawResponse = resp.json().await.context("omdb body decode")?;
+        let raw: RawResponse = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            "OMDb GET",
+        )
+        .await
+        .context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             // OMDb returns these two error strings for both unknown
             // IMDb ids and unindexed-yet-released titles. Treat as a

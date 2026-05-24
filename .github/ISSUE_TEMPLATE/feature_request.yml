@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a new feature or change to an existing one.
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest something. ChimpFlix has
+        a focused scope — please check
+        [README.md](https://github.com/soybigmac/ChimpFlix/blob/main/README.md#what-chimpflix-is-and-is-not)
+        before filing. Out-of-scope requests (music libraries, photos,
+        Live TV, mobile apps, plugin system) will be closed politely.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Describe the user-facing problem, not the implementation. "I
+        want X" is weaker than "I'm trying to do Y and Z blocks me."
+      placeholder: |
+        When I scroll my watchlist on iPad, the rail snaps back on
+        every gesture, so I can't get past the first 6 items.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        Optional. If you have a specific change in mind, sketch it. If
+        you don't, leave this blank — the maintainers will propose one.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Existing features or workarounds you've already tried, and
+        why they fall short.
+  - type: input
+    id: scope_check
+    attributes:
+      label: In-scope justification
+      description: |
+        One sentence on why this belongs in ChimpFlix specifically vs.
+        an upstream service, a plugin (we don't have plugins), or a
+        separate tool.
+    validations:
+      required: true

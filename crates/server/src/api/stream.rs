@@ -643,10 +643,16 @@ async fn create_session_impl(
             ))
         }
         PlayMode::Transcode => {
-            // Enforce the operator's concurrent-transcode cap. The setting
-            // is hot-reloaded, so we re-read it each time rather than
-            // capturing it at startup. Race window between len() and
-            // start() is acceptable — worst case we let in one extra.
+            // Enforce the operator's concurrent-transcode cap. WEEK 1 #9
+            // in `docs/PUBLIC_RELEASE_HARDENING.md` flagged the prior
+            // shape as a TOCTOU race — two requests both saw
+            // `current < max` and both started, putting `current` at
+            // `max + 1`. The `start_gate` mutex serialises the check +
+            // session-spawn path so the cap is enforced atomically
+            // against itself. The lock is held only across the
+            // start-session call site below; cancel/keepalive/etc do
+            // not contend on it.
+            let _start_gate = state.transcoder.lock_start_gate().await;
             let max_concurrent = state.settings.read().await.transcoder_max_concurrent;
             let current = state.transcoder.list_sessions().len() as i64;
             if current >= max_concurrent {

@@ -14,6 +14,7 @@ pub mod agent;
 pub mod agents;
 pub mod anilist;
 pub mod anilist_cache;
+pub mod http;
 pub mod omdb;
 pub mod opensubtitles;
 pub mod plex_oauth;

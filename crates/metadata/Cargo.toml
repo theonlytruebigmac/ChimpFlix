@@ -12,6 +12,11 @@ authors.workspace = true
 chimpflix-common = { path = "../common" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# bytes::Bytes for assembling streamed-and-capped HTTP responses (see
+# opensubtitles.rs subtitle download). reqwest already pulls bytes
+# transitively but listing it explicitly is friendlier when grepping.
+bytes = "1"
+futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

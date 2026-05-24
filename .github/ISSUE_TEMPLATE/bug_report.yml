@@ -1,0 +1,90 @@
+name: Bug report
+description: Something isn't working the way you expected.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Filling out the fields below saves
+        a triage round-trip and gets you a useful answer faster.
+
+        **Security issues do not belong here** — use
+        [Private Security Advisories](https://github.com/soybigmac/ChimpFlix/security/advisories/new)
+        instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One paragraph. What did you expect to happen, what actually happened.
+      placeholder: |
+        I expected X. Instead Y happened.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered list. Pretend the reader has never used ChimpFlix.
+      placeholder: |
+        1. Open /library/123
+        2. Click "Scan now"
+        3. Wait 30 seconds
+        4. See error toast in bottom-right
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ChimpFlix version
+      description: |
+        For tagged releases, the version (e.g. `v0.1.0`). For `main`,
+        the short commit SHA (`git rev-parse --short HEAD`).
+      placeholder: v0.1.0 or 1a2b3c4
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose (default)
+        - Docker (custom)
+        - Bare metal (cargo run)
+        - Other (describe in summary)
+    validations:
+      required: true
+  - type: input
+    id: proxy
+    attributes:
+      label: Reverse proxy in front
+      description: |
+        Caddy / nginx / Traefik / Cloudflare Tunnel / none. If yes,
+        is `TRUSTED_PROXIES` configured? (See docs/DEPLOYMENT.md.)
+      placeholder: Caddy + TRUSTED_PROXIES set
+  - type: input
+    id: browser
+    attributes:
+      label: Browser (for UI / playback bugs)
+      description: Chromium / Firefox / Safari + version + OS.
+      placeholder: Safari 17.4 on iOS 17.4
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        From `docker compose logs chimpflix-server` or wherever your
+        logs go. Strip anything sensitive (tokens, IPs you don't want
+        public) before pasting.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I'm on a supported version (latest 0.x or `main`).
+          required: true
+        - label: This is not a security issue (those go through
+            Private Security Advisories).
+          required: true

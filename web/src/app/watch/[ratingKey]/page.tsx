@@ -26,6 +26,7 @@ import {
 import { PrerollGate } from "@/components/PrerollGate";
 import { plexImage } from "@/lib/image";
 import { requireUser } from "@/lib/chimpflix-server";
+import { subtitleStyleFromUser } from "@/lib/subtitle-style";
 
 // `ratingKey` is the same identifier the home page produces via
 // chimpflix-adapt:
@@ -567,6 +568,7 @@ export default async function WatchPage({
       versions={resolved.versions}
       playedThresholdPct={playedThresholdPct}
       completionBehaviour={completionBehaviour}
+      initialSubtitleStyle={subtitleStyleFromUser(user)}
     />
   );
 

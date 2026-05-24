@@ -101,11 +101,12 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
                 .context("items ratings_updated_at update (omdb miss)")?;
         }
         Err(e) => {
-            // Surface as a retryable error so the worker pool's
-            // backoff curve handles transient OMDb failures (429,
-            // 5xx, network blips). Permanent 4xx (e.g. invalid key)
-            // gets the same retry treatment until Phase 5 lands the
-            // error-class machinery.
+            // Bubble up — the worker pool's `error_class::classify`
+            // sorts the failure into the right retry curve. 429 →
+            // ExternalRateLimit (long backoff), 401/403 → ExternalAuth
+            // (dead-letter), timeouts → Timeout (short backoff), OMDb
+            // "negative response: ..." → Permanent (dead-letter, no
+            // retries).
             warn!(
                 item_id,
                 imdb_id = %imdb_id,

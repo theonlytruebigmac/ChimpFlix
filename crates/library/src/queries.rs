@@ -613,6 +613,81 @@ fn has_active_files_clause() -> &'static str {
     )"
 }
 
+/// Watch-status filters for SHOW rows need to aggregate from
+/// episode-level `play_state` rows — there's never a `play_state` with
+/// `item_id = <show id>` (the CHECK constraint on play_state enforces
+/// exactly one of `item_id` / `episode_id` is set, and progress writes
+/// always target the episode for TV/anime). The library-browse
+/// "Unwatched / In progress / Watched" chips therefore can't rely on
+/// the top-level `LEFT JOIN play_state ps ON ps.item_id = i.id` for
+/// shows — that join is uniformly NULL for every show row, which used
+/// to send the in_progress filter to "no results" and the unwatched
+/// filter to "every show including ones the user has fully watched."
+///
+/// Each helper returns a self-contained predicate suitable for the
+/// `show` branch of an `OR` against the (correct) movie branch that
+/// reads from `ps.*` directly. Every helper has exactly one `?` bind
+/// for `user_id`, except `in_progress` which has two — keep the bind
+/// sequence in `list_items` in sync.
+///
+/// Semantics chosen to match the Continue Watching rail
+/// ([`on_deck`]) and the title-page `show_watch_stats` rollup, so all
+/// three surfaces agree on what "watched" / "in progress" mean for a
+/// show:
+///   * Watched (show) = at least one active episode exists AND every
+///     active episode has `watched = 1` (mirrors what makes the
+///     show-level "Mark watched" toggle flip on the title page).
+///   * In progress (show) = at least one episode has play activity
+///     (mid-episode position or a watched episode) AND at least one
+///     active episode is still unwatched.
+///   * Unwatched (show) = no episode has any play_state activity at
+///     all (matches what the user expects when filtering for "haven't
+///     touched this yet").
+fn show_unwatched_clause() -> &'static str {
+    "NOT EXISTS ( \
+        SELECT 1 FROM play_state psx \
+        JOIN episodes ex ON ex.id = psx.episode_id \
+        JOIN seasons sx ON sx.id = ex.season_id \
+        WHERE sx.show_id = i.id AND psx.user_id = ? \
+          AND (psx.watched = 1 OR psx.position_ms > 0) \
+    )"
+}
+
+fn show_in_progress_clause() -> &'static str {
+    "EXISTS ( \
+        SELECT 1 FROM play_state psx \
+        JOIN episodes ex ON ex.id = psx.episode_id \
+        JOIN seasons sx ON sx.id = ex.season_id \
+        WHERE sx.show_id = i.id AND psx.user_id = ? \
+          AND (psx.watched = 1 OR psx.position_ms > 0) \
+     ) \
+     AND EXISTS ( \
+        SELECT 1 FROM episodes ey \
+        JOIN seasons sy ON sy.id = ey.season_id \
+        JOIN media_files mfy ON mfy.episode_id = ey.id AND mfy.removed_at IS NULL \
+        LEFT JOIN play_state psy ON psy.episode_id = ey.id AND psy.user_id = ? \
+        WHERE sy.show_id = i.id \
+          AND (psy.watched IS NULL OR psy.watched = 0) \
+     )"
+}
+
+fn show_watched_clause() -> &'static str {
+    "EXISTS ( \
+        SELECT 1 FROM episodes ex \
+        JOIN seasons sx ON sx.id = ex.season_id \
+        JOIN media_files mfx ON mfx.episode_id = ex.id AND mfx.removed_at IS NULL \
+        WHERE sx.show_id = i.id \
+     ) \
+     AND NOT EXISTS ( \
+        SELECT 1 FROM episodes ey \
+        JOIN seasons sy ON sy.id = ey.season_id \
+        JOIN media_files mfy ON mfy.episode_id = ey.id AND mfy.removed_at IS NULL \
+        LEFT JOIN play_state psy ON psy.episode_id = ey.id AND psy.user_id = ? \
+        WHERE sy.show_id = i.id \
+          AND (psy.watched IS NULL OR psy.watched = 0) \
+     )"
+}
+
 /// Wrap a per-file WHERE fragment in an EXISTS subquery that resolves
 /// the right item for both movies (`mf.item_id`) and TV/anime episodes
 /// (`mf.episode_id` → seasons → show item). `removed_at IS NULL` keeps
@@ -789,18 +864,34 @@ pub async fn list_items(
     }
     // Per-user watch-status filters. play_state is LEFT JOINed in ITEM_SELECT,
     // but the COUNT query has to JOIN itself — see count_sql below.
+    //
+    // Movie branch reads `ps.*` from the top-level LEFT JOIN. Show
+    // branch can't (play_state is never keyed on a show item_id) — it
+    // aggregates from episode-level rows via the helpers above. Each
+    // show-side EXISTS introduces its own `?` for user_id; the bind
+    // sequence in count_q / list_q below has matching `.bind(user_id)`
+    // calls in the same conditional order.
     if filter.unwatched_only.unwrap_or(false) {
-        where_clauses.push(
-            "(ps.watched IS NULL OR ps.watched = 0) \
-             AND COALESCE(ps.position_ms, 0) = 0"
-                .into(),
-        );
+        where_clauses.push(format!(
+            "((i.kind = 'movie' AND (ps.watched IS NULL OR ps.watched = 0) \
+                                AND COALESCE(ps.position_ms, 0) = 0) \
+              OR (i.kind = 'show' AND {}))",
+            show_unwatched_clause()
+        ));
     }
     if filter.in_progress_only.unwrap_or(false) {
-        where_clauses.push("ps.watched = 0 AND ps.position_ms > 0".into());
+        where_clauses.push(format!(
+            "((i.kind = 'movie' AND ps.watched = 0 AND ps.position_ms > 0) \
+              OR (i.kind = 'show' AND {}))",
+            show_in_progress_clause()
+        ));
     }
     if filter.watched_only.unwrap_or(false) {
-        where_clauses.push("ps.watched = 1".into());
+        where_clauses.push(format!(
+            "((i.kind = 'movie' AND ps.watched = 1) \
+              OR (i.kind = 'show' AND {}))",
+            show_watched_clause()
+        ));
     }
     if filter.year_min.is_some() {
         where_clauses.push("i.year IS NOT NULL AND i.year >= ?".into());
@@ -866,10 +957,16 @@ pub async fn list_items(
     // the same join whenever watch-status filters OR the LastPlayed sort
     // reference `ps.*`. Cheap to always include the join — the user_id
     // bind is added below.
+    //
+    // MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`: cap the COUNT(*)
+    // at 10_000 rows. FTS5 with bm25 ranking over a huge library will
+    // happily walk every match for the count; the UI only ever needs
+    // "N or 10000+" for pagination, so the saturating cap is a free
+    // bound on the worst case.
     let count_sql = format!(
-        "SELECT COUNT(*) AS n FROM items i{fts_join} \
+        "SELECT COUNT(*) AS n FROM (SELECT 1 FROM items i{fts_join} \
          LEFT JOIN play_state ps ON ps.item_id = i.id AND ps.user_id = ? \
-         {where_sql}"
+         {where_sql} LIMIT 10000)"
     );
     let list_sql = if filter.q.is_some() {
         // SELECT mirrors ITEM_SELECT but with the items_fts JOIN so
@@ -936,6 +1033,18 @@ pub async fn list_items(
     if let Some(ref fts) = fts_query {
         count_q = count_q.bind(fts);
     }
+    // Watch-status user_id binds — one per `?` in the show-side EXISTS
+    // helpers, pushed in the same conditional order the WHERE clauses
+    // were added above so positional binding stays aligned.
+    if filter.unwatched_only.unwrap_or(false) {
+        count_q = count_q.bind(user_id);
+    }
+    if filter.in_progress_only.unwrap_or(false) {
+        count_q = count_q.bind(user_id).bind(user_id);
+    }
+    if filter.watched_only.unwrap_or(false) {
+        count_q = count_q.bind(user_id);
+    }
     if let Some(ymin) = filter.year_min {
         count_q = count_q.bind(ymin);
     }
@@ -956,6 +1065,15 @@ pub async fn list_items(
     }
     if let Some(ref fts) = fts_query {
         list_q = list_q.bind(fts);
+    }
+    if filter.unwatched_only.unwrap_or(false) {
+        list_q = list_q.bind(user_id);
+    }
+    if filter.in_progress_only.unwrap_or(false) {
+        list_q = list_q.bind(user_id).bind(user_id);
+    }
+    if filter.watched_only.unwrap_or(false) {
+        list_q = list_q.bind(user_id);
     }
     if let Some(ymin) = filter.year_min {
         list_q = list_q.bind(ymin);
@@ -1766,11 +1884,18 @@ pub async fn list_items_for_person(
     person_id: i64,
     user_id: i64,
     accessible: Option<&[i64]>,
+    limit: i64,
+    offset: i64,
 ) -> Result<Vec<ListedItem>> {
     let lib_filter = library_filter_sql("i.library_id", accessible);
     let active_files = has_active_files_clause();
     // Most-recent first by year; sort_title alphabetic tiebreaker so
     // multi-year overlaps (re-releases, restorations) don't jitter.
+    // LIMIT / OFFSET added MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`
+    // — a prolific actor (500+ credits) used to serialize the full
+    // set on every request.
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
     let sql = format!(
         "{ITEM_SELECT} \
          WHERE EXISTS (SELECT 1 FROM item_credits ic \
@@ -1778,11 +1903,14 @@ pub async fn list_items_for_person(
            AND {active_files} \
            AND {lib_filter} \
          ORDER BY i.year IS NULL, i.year DESC, \
-                  i.sort_title COLLATE NOCASE ASC, i.id ASC"
+                  i.sort_title COLLATE NOCASE ASC, i.id ASC \
+         LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&sql)
         .bind(user_id)
         .bind(person_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?;
     rows.iter()
@@ -1797,6 +1925,27 @@ pub async fn list_items_for_person(
             })
         })
         .collect::<Result<Vec<_>>>()
+}
+
+/// Count of items credited to `person_id` and visible to `user_id`.
+/// Used by the filmography page to render "showing N of M" + the
+/// pagination footer.
+pub async fn count_items_for_person(
+    pool: &SqlitePool,
+    person_id: i64,
+    accessible: Option<&[i64]>,
+) -> Result<i64> {
+    let lib_filter = library_filter_sql("i.library_id", accessible);
+    let active_files = has_active_files_clause();
+    let sql = format!(
+        "SELECT COUNT(*) AS n FROM items i \
+         WHERE EXISTS (SELECT 1 FROM item_credits ic \
+                       WHERE ic.item_id = i.id AND ic.person_id = ?) \
+           AND {active_files} \
+           AND {lib_filter}"
+    );
+    let row = sqlx::query(&sql).bind(person_id).fetch_one(pool).await?;
+    Ok(row.try_get("n").unwrap_or(0))
 }
 
 /// Fetch full [`ListedItem`]s for a known list of item ids, preserving
@@ -2624,6 +2773,12 @@ pub struct UserSelfUpdate {
     pub email: Option<Option<String>>,
     pub default_audio_lang: Option<Option<String>>,
     pub default_subtitle_lang: Option<Option<String>>,
+    pub subtitle_font_size_px: Option<Option<i64>>,
+    pub subtitle_text_color: Option<Option<String>>,
+    pub subtitle_background_color: Option<Option<String>>,
+    pub subtitle_font_family: Option<Option<String>>,
+    pub subtitle_edge: Option<Option<String>>,
+    pub subtitle_bottom_inset_pct: Option<Option<i64>>,
     pub notify_via_email: Option<bool>,
 }
 
@@ -2651,6 +2806,24 @@ pub async fn update_user_self(
     if patch.default_subtitle_lang.is_some() {
         sets.push("default_subtitle_lang = ?");
     }
+    if patch.subtitle_font_size_px.is_some() {
+        sets.push("subtitle_font_size_px = ?");
+    }
+    if patch.subtitle_text_color.is_some() {
+        sets.push("subtitle_text_color = ?");
+    }
+    if patch.subtitle_background_color.is_some() {
+        sets.push("subtitle_background_color = ?");
+    }
+    if patch.subtitle_font_family.is_some() {
+        sets.push("subtitle_font_family = ?");
+    }
+    if patch.subtitle_edge.is_some() {
+        sets.push("subtitle_edge = ?");
+    }
+    if patch.subtitle_bottom_inset_pct.is_some() {
+        sets.push("subtitle_bottom_inset_pct = ?");
+    }
     if patch.notify_via_email.is_some() {
         sets.push("notify_via_email = ?");
     }
@@ -2676,6 +2849,24 @@ pub async fn update_user_self(
         q = q.bind(v);
     }
     if let Some(v) = patch.default_subtitle_lang {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.subtitle_font_size_px {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.subtitle_text_color {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.subtitle_background_color {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.subtitle_font_family {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.subtitle_edge {
+        q = q.bind(v);
+    }
+    if let Some(v) = patch.subtitle_bottom_inset_pct {
         q = q.bind(v);
     }
     if let Some(v) = patch.notify_via_email {
@@ -9764,6 +9955,17 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.backup_retention_count {
+        // Clamp to a sane range — operators occasionally fat-finger
+        // 0 or a wild number. 0 disables pruning (documented in the
+        // setting); cap at 365 (≈ a year of dailies) so nobody hides
+        // a leak behind a giant retention window.
+        let clamped = v.clamp(0, 365);
+        sqlx::query("UPDATE server_settings SET backup_retention_count = ? WHERE id = 1")
+            .bind(clamped)
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.extras_json {
         sqlx::query("UPDATE server_settings SET extras_json = ? WHERE id = 1")
             .bind(v)
@@ -10373,6 +10575,13 @@ pub async fn create_scheduled_task(
     input: NewScheduledTask,
     next_run_at: i64,
 ) -> Result<ScheduledTask> {
+    // INSERT + the follow-up SELECT have to use the same connection,
+    // otherwise the SELECT can land on a pool connection that still
+    // holds a pre-INSERT WAL snapshot and the row appears to have
+    // "disappeared". Hit this in production during seeding — the
+    // INSERT committed (next AUTOINCREMENT id confirmed it) but a
+    // sibling pool connection couldn't see it yet.
+    let mut conn = pool.acquire().await?;
     let now = now_ms();
     let id: i64 = sqlx::query(
         "INSERT INTO scheduled_tasks
@@ -10391,11 +10600,16 @@ pub async fn create_scheduled_task(
     .bind(next_run_at)
     .bind(now)
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?
     .try_get("id")?;
-    get_scheduled_task(pool, id)
-        .await?
+    let row = sqlx::query("SELECT * FROM scheduled_tasks WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    row.as_ref()
+        .map(ScheduledTask::from_row)
+        .transpose()?
         .context("inserted task disappeared")
 }
 
@@ -12162,6 +12376,126 @@ pub async fn vault_set(
     Ok(())
 }
 
+/// Result of a vault self-test: pick one encrypted row and attempt to
+/// decrypt it with the supplied vault. Three outcomes:
+///
+/// - `NoEncryptedRows` — neither `secrets` nor `webhooks` nor
+///   `user_totp` has any encrypted (nonce IS NOT NULL) row. A vault
+///   key change here is safe: there's nothing to lose.
+/// - `Ok { sampled }` — at least one encrypted row exists, and the
+///   sample decrypted successfully. The current key matches the data.
+/// - `Mismatch { sampled, error }` — encrypted rows exist but the
+///   sample failed to decrypt. Either the key was rotated without
+///   running `vault-rotate`, or the DB was restored from a backup
+///   that was encrypted under a different key.
+#[derive(Debug, Clone)]
+pub enum VaultSelfTest {
+    NoEncryptedRows,
+    Ok {
+        sampled: String,
+    },
+    Mismatch {
+        sampled: String,
+        error: String,
+    },
+}
+
+/// Decrypt-check helper used by:
+///
+/// - The server boot path (refuses to start when a restore + key
+///   mismatch are both detected).
+/// - The `/admin/backups` list endpoint (surfaces a UI banner when
+///   encrypted data exists, so operators know the backup is only
+///   useful with the matching vault key).
+/// - The `verify_backups` scheduled task (flags individual backup
+///   files where decryption with the current key fails).
+///
+/// We scan `secrets` first because it's the most likely to have data;
+/// fall back to `webhooks`, then `user_totp`, before declaring no
+/// encrypted rows exist.
+pub async fn vault_self_test(
+    pool: &SqlitePool,
+    vault: &chimpflix_common::Vault,
+) -> Result<VaultSelfTest> {
+    if let Some((label, blob)) = sample_encrypted_blob(pool).await? {
+        match vault.decrypt(&blob) {
+            Ok(_) => Ok(VaultSelfTest::Ok { sampled: label }),
+            Err(e) => Ok(VaultSelfTest::Mismatch {
+                sampled: label,
+                error: format!("{e:#}"),
+            }),
+        }
+    } else {
+        Ok(VaultSelfTest::NoEncryptedRows)
+    }
+}
+
+/// Return the first encrypted (nonce IS NOT NULL) row from any
+/// vault-protected table, paired with a human-readable label for the
+/// source. Returns None when nothing is encrypted at rest.
+async fn sample_encrypted_blob(
+    pool: &SqlitePool,
+) -> Result<Option<(String, chimpflix_common::EncryptedBlob)>> {
+    if let Some(row) = sqlx::query(
+        "SELECT name, value_enc, nonce FROM secrets
+         WHERE nonce IS NOT NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("sample secrets for vault self-test")?
+    {
+        let name: String = row.try_get("name")?;
+        let value_enc: Vec<u8> = row.try_get("value_enc")?;
+        let nonce: Option<Vec<u8>> = row.try_get("nonce").ok().flatten();
+        return Ok(Some((
+            format!("secrets.{name}"),
+            chimpflix_common::EncryptedBlob {
+                value: value_enc,
+                nonce,
+            },
+        )));
+    }
+    if let Some(row) = sqlx::query(
+        "SELECT id, secret_enc, secret_nonce FROM webhooks
+         WHERE secret_enc IS NOT NULL AND secret_nonce IS NOT NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("sample webhooks for vault self-test")?
+    {
+        let id: i64 = row.try_get("id")?;
+        let value_enc: Vec<u8> = row.try_get("secret_enc")?;
+        let nonce: Option<Vec<u8>> = row.try_get("secret_nonce").ok().flatten();
+        return Ok(Some((
+            format!("webhooks.id={id}"),
+            chimpflix_common::EncryptedBlob {
+                value: value_enc,
+                nonce,
+            },
+        )));
+    }
+    if let Some(row) = sqlx::query(
+        "SELECT user_id, secret_enc, secret_nonce FROM user_totp
+         WHERE secret_nonce IS NOT NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("sample user_totp for vault self-test")?
+    {
+        let user_id: i64 = row.try_get("user_id")?;
+        let value_enc: Vec<u8> = row.try_get("secret_enc")?;
+        let nonce: Option<Vec<u8>> = row.try_get("secret_nonce").ok().flatten();
+        return Ok(Some((
+            format!("user_totp.user_id={user_id}"),
+            chimpflix_common::EncryptedBlob {
+                value: value_enc,
+                nonce,
+            },
+        )));
+    }
+    Ok(None)
+}
+
 pub async fn vault_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
     let result = sqlx::query("DELETE FROM secrets WHERE name = ?")
         .bind(name)
@@ -13405,5 +13739,90 @@ mod tests {
         assert_eq!(parse_air_date_to_ms("1970-01-01"), Some(0));
         // 2024-01-19 = 1705622400000 (UTC midnight)
         assert_eq!(parse_air_date_to_ms("2024-01-19"), Some(1_705_622_400_000));
+    }
+
+    /// In-memory DB with just the tables `vault_self_test` looks at.
+    /// Hand-rolled (rather than running migrations) so the test is
+    /// fast and self-contained.
+    async fn vault_test_pool() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE secrets (
+                name TEXT PRIMARY KEY,
+                value_enc BLOB NOT NULL,
+                nonce BLOB,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                updated_by INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE webhooks (
+                id INTEGER PRIMARY KEY,
+                secret_enc BLOB,
+                secret_nonce BLOB
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE user_totp (
+                user_id INTEGER PRIMARY KEY,
+                secret_enc BLOB NOT NULL,
+                secret_nonce BLOB
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn vault_self_test_reports_no_encrypted_rows_when_empty() {
+        let pool = vault_test_pool().await;
+        let vault = chimpflix_common::Vault::with_key(&[0u8; 32]).unwrap();
+        let result = vault_self_test(&pool, &vault).await.unwrap();
+        assert!(
+            matches!(result, VaultSelfTest::NoEncryptedRows),
+            "expected NoEncryptedRows, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_self_test_ok_when_keys_match() {
+        let pool = vault_test_pool().await;
+        let vault = chimpflix_common::Vault::with_key(&[1u8; 32]).unwrap();
+        vault_set(&pool, &vault, "tmdb", "secret-value", None)
+            .await
+            .unwrap();
+        let result = vault_self_test(&pool, &vault).await.unwrap();
+        assert!(
+            matches!(result, VaultSelfTest::Ok { .. }),
+            "expected Ok, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_self_test_mismatch_when_key_rotated() {
+        let pool = vault_test_pool().await;
+        let original = chimpflix_common::Vault::with_key(&[1u8; 32]).unwrap();
+        vault_set(&pool, &original, "tmdb", "secret-value", None)
+            .await
+            .unwrap();
+        let rotated = chimpflix_common::Vault::with_key(&[2u8; 32]).unwrap();
+        let result = vault_self_test(&pool, &rotated).await.unwrap();
+        assert!(
+            matches!(result, VaultSelfTest::Mismatch { .. }),
+            "expected Mismatch, got {result:?}",
+        );
     }
 }

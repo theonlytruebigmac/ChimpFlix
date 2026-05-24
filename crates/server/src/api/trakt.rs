@@ -170,6 +170,17 @@ pub struct StatusResponse {
     pub last_synced_at: Option<i64>,
     pub scope: Option<String>,
     pub app_configured: bool,
+    /// True when the access token is within ~10 days of its
+    /// `expires_at` AND no sync has refreshed it recently. Trakt
+    /// refresh tokens are valid 60 days from last use; after 50
+    /// days of no sync, the link is about to silently expire.
+    /// MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub expiring_soon: bool,
+    /// True when the access token's `expires_at` is already in the
+    /// past. The next sync will attempt a refresh; if the refresh
+    /// token has also expired (60+ days since last use) the link
+    /// is dead and the user has to re-link.
+    pub expired: bool,
 }
 
 pub async fn status(
@@ -181,19 +192,30 @@ pub async fn status(
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(match tokens {
-        Some(t) => StatusResponse {
-            linked: true,
-            linked_at: Some(t.linked_at),
-            last_synced_at: t.last_synced_at,
-            scope: t.scope,
-            app_configured,
-        },
+        Some(t) => {
+            let now = chimpflix_common::now_ms();
+            // 10 days in milliseconds.
+            const WARN_WINDOW_MS: i64 = 10 * 24 * 60 * 60 * 1000;
+            let expired = t.expires_at < now;
+            let expiring_soon = !expired && (t.expires_at - now) < WARN_WINDOW_MS;
+            StatusResponse {
+                linked: true,
+                linked_at: Some(t.linked_at),
+                last_synced_at: t.last_synced_at,
+                scope: t.scope,
+                app_configured,
+                expiring_soon,
+                expired,
+            }
+        }
         None => StatusResponse {
             linked: false,
             linked_at: None,
             last_synced_at: None,
             scope: None,
             app_configured,
+            expiring_soon: false,
+            expired: false,
         },
     }))
 }

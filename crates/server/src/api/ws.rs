@@ -25,6 +25,26 @@ use crate::auth::AuthUser;
 use crate::events::{Event, SessionsEvent};
 use crate::state::AppState;
 
+// Per-frame and per-message caps for the live event WebSocket. Inbound
+// messages from this socket are limited to ping/pong + the occasional
+// future client-to-server control message — none of which need to be
+// large. WEEK 1 #12 in `docs/PUBLIC_RELEASE_HARDENING.md`: prevent a
+// client (compromised or malicious) from queuing multi-MB frames that
+// the server has to buffer.
+//
+// 64 KiB / 16 KiB matches what tungstenite uses by default but axum
+// 0.8 sets higher ceilings (16 MiB / 16 MiB). Pinning them down here
+// is cheap.
+const WS_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const WS_MAX_FRAME_BYTES: usize = 16 * 1024;
+
+/// Maximum simultaneous WebSocket connections per authenticated user.
+/// A real browser opens one to two (main app tab + the rare second
+/// tab). 5 is comfortably above legitimate use and well below the
+/// point where a misbehaving / malicious client can fan out events
+/// at us. MONTH 1 in `docs/PUBLIC_RELEASE_HARDENING.md`.
+const WS_MAX_CONNECTIONS_PER_USER: u32 = 5;
+
 pub async fn handler(
     State(state): State<AppState>,
     user: AuthUser,
@@ -35,12 +55,52 @@ pub async fn handler(
         warn!(user_id = user.id, "ws upgrade rejected: foreign Origin");
         return (StatusCode::FORBIDDEN, "origin not permitted").into_response();
     }
-    ws.on_upgrade(move |socket| run(state, user, socket))
+    // Per-user connection cap. Claim a slot BEFORE accepting the
+    // upgrade so we never half-open a socket that the run() loop
+    // would then have to close.
+    if !state
+        .try_acquire_ws_connection(user.id, WS_MAX_CONNECTIONS_PER_USER)
+        .await
+    {
+        warn!(
+            user_id = user.id,
+            cap = WS_MAX_CONNECTIONS_PER_USER,
+            "ws upgrade rejected: per-user connection cap reached",
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many WebSocket connections for this user",
+        )
+            .into_response();
+    }
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(WS_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| run(state, user, socket))
         .into_response()
 }
 
 async fn run(state: AppState, user: AuthUser, mut socket: WebSocket) {
     debug!(user_id = user.id, role = ?user.role, "ws connection opened");
+    // RAII guard for the per-user connection cap claimed in `handler`.
+    // Releases the slot on every exit path including a panic inside
+    // the select loop below. Without it the per-user count leaks and
+    // legitimate reconnects would be rejected after the cap is hit.
+    struct ConnCountGuard {
+        state: AppState,
+        user_id: i64,
+    }
+    impl Drop for ConnCountGuard {
+        fn drop(&mut self) {
+            let state = self.state.clone();
+            let user_id = self.user_id;
+            tokio::spawn(async move { state.release_ws_connection(user_id).await });
+        }
+    }
+    let _conn_guard = ConnCountGuard {
+        state: state.clone(),
+        user_id: user.id,
+    };
+
     let mut rx = state.hub.subscribe();
 
     // Push the current active-sessions list immediately so freshly-

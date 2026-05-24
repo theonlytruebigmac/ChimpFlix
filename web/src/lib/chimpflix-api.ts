@@ -32,6 +32,15 @@ export interface User {
   email: string | null;
   default_audio_lang: string | null;
   default_subtitle_lang: string | null;
+  /** Per-user subtitle styling. null = use the client-default. Drives
+   * both browser `::cue` rendering and ASS burn-in. See
+   * `web/src/lib/subtitle-style.ts` for the canonical model + helpers. */
+  subtitle_font_size_px: number | null;
+  subtitle_text_color: string | null;
+  subtitle_background_color: string | null;
+  subtitle_font_family: string | null;
+  subtitle_edge: string | null;
+  subtitle_bottom_inset_pct: number | null;
   /** Whether the user opted into email mirroring of in-app notifications. */
   notify_via_email: boolean;
   /** Most-recent successful login. null on first login. */
@@ -52,6 +61,16 @@ export interface UpdateMeInput {
   email?: string;
   default_audio_lang?: string;
   default_subtitle_lang?: string;
+  // Subtitle styling. Strings: empty string clears, omit to leave
+  // unchanged. Numerics: present sets, omit to leave unchanged
+  // (clearing back to null isn't exposed — the UI always picks a
+  // concrete value from a closed palette).
+  subtitle_font_size_px?: number;
+  subtitle_text_color?: string;
+  subtitle_background_color?: string;
+  subtitle_font_family?: string;
+  subtitle_edge?: string;
+  subtitle_bottom_inset_pct?: number;
   notify_via_email?: boolean;
 }
 
@@ -529,6 +548,24 @@ export interface NetworkSettings {
    *  values like `192.168.1.50:8080` pin the listener to a specific
    *  NIC. Restart required for changes to take effect. */
   bind_interface: string;
+  /** Diagnostic of what the server *actually* trusts and sees as the
+   *  request peer. Drives the "your proxy config is broken" banner
+   *  on the admin home (see PUBLIC_RELEASE_HARDENING.md WEEK 1 #8). */
+  proxy_diagnostic: ProxyDiagnostic;
+}
+
+export interface ProxyDiagnostic {
+  /** TRUSTED_PROXIES parsed at boot, as CIDR strings. Empty = no
+   *  proxy headers are honoured at all. */
+  trusted_proxies: string[];
+  /** Immediate TCP peer for the request that loaded this page. */
+  peer_ip: string | null;
+  /** True when peer is in an RFC1918 / RFC4193 / loopback / link-local
+   *  range — almost always a reverse proxy or Docker bridge. */
+  peer_is_private: boolean;
+  /** True when the peer looks private AND TRUSTED_PROXIES doesn't
+   *  cover it. The UI banner fires off this flag. */
+  looks_misconfigured: boolean;
 }
 
 export interface NetworkUpdateInput {
@@ -1504,6 +1541,10 @@ export interface ServerSettingsUpdate {
   database_cache_size_mb?: number;
   metadata_language?: string;
   recently_added_days?: number;
+  /** Cap on auto-backup snapshots kept under
+   *  `<data_dir>/backups/auto/`. Default 14, clamped 0..=365 (0
+   *  disables pruning). See PUBLIC_RELEASE_HARDENING.md BLOCK #4. */
+  backup_retention_count?: number;
   extras_json?: string;
 }
 
@@ -1712,6 +1753,14 @@ export interface TraktStatus {
   last_synced_at: number | null;
   scope: string | null;
   app_configured: boolean;
+  /** True when the access token is within ~10 days of expiring AND
+   *  no sync has refreshed it lately. Drives the "your Trakt link
+   *  is about to silently expire" warning in Settings. See
+   *  PUBLIC_RELEASE_HARDENING.md MONTH 1. */
+  expiring_soon: boolean;
+  /** True when the access token has already expired. The next sync
+   *  attempts a refresh; if that fails, the user must re-link. */
+  expired: boolean;
 }
 
 export interface TraktSyncNowResult {
@@ -3566,6 +3615,16 @@ export interface ListBackupsResponse {
    *  next server restart to apply. */
   pending_restore: boolean;
   total_bytes: number;
+  /** True when this server has at least one row encrypted at rest.
+   *  Drives the "back up your vault key alongside the snapshot" banner
+   *  on the admin backups page (see PUBLIC_RELEASE_HARDENING.md
+   *  BLOCK #1). */
+  vault_key_required: boolean;
+  /** Cap on retained auto-snapshots from `backup_retention_count`.
+   *  The UI uses this to surface "N of M retained" and warn before
+   *  the daily prune kicks in. 0 means pruning is disabled (see
+   *  PUBLIC_RELEASE_HARDENING.md BLOCK #4). */
+  retention_count: number;
 }
 
 export interface StageRestoreResponse {

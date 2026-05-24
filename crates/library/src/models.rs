@@ -960,15 +960,23 @@ pub struct ItemFilter {
     /// couldn't fingerprint the filename. Omit for "all items
     /// regardless of match status."
     pub auto_matched: Option<bool>,
-    /// True → only items the current user has never started (no
-    /// play_state row, or watched=0 with no recorded position).
-    /// Mutually exclusive with [`in_progress_only`] / [`watched_only`]
-    /// at the UI layer; passing two of them simply intersects.
+    /// True → only items the current user has never started.
+    /// Movies: no play_state row (or watched=0 with no recorded
+    /// position). Shows: no episode has any play_state activity at
+    /// all. Mutually exclusive with [`in_progress_only`] /
+    /// [`watched_only`] at the UI layer; passing two of them simply
+    /// intersects.
     pub unwatched_only: Option<bool>,
-    /// True → only items the current user has started but not finished
-    /// (play_state row with position > 0 and watched=0).
+    /// True → only items the current user has started but not
+    /// finished. Movies: play_state row with position > 0 and
+    /// watched=0. Shows: at least one episode has play activity
+    /// (mid-position or watched) AND at least one active episode is
+    /// still unwatched.
     pub in_progress_only: Option<bool>,
-    /// True → only items the current user has finished (watched=1).
+    /// True → only items the current user has finished. Movies:
+    /// watched=1. Shows: at least one active episode exists AND every
+    /// active episode is marked watched (matches what flips the
+    /// show-level Mark-watched toggle on the title page).
     pub watched_only: Option<bool>,
     /// Inclusive lower bound on `items.year`. Items with NULL year are
     /// excluded when either bound is set. Decade chips on the browse UI
@@ -1501,6 +1509,15 @@ pub struct User {
     pub email: Option<String>,
     pub default_audio_lang: Option<String>,
     pub default_subtitle_lang: Option<String>,
+    /// Subtitle styling. NULL = use the client's compiled-in defaults
+    /// (see `web/src/lib/subtitle-style.ts::DEFAULT_SUBTITLE_STYLE`).
+    /// Drives both browser ::cue rendering and ASS burn-in.
+    pub subtitle_font_size_px: Option<i64>,
+    pub subtitle_text_color: Option<String>,
+    pub subtitle_background_color: Option<String>,
+    pub subtitle_font_family: Option<String>,
+    pub subtitle_edge: Option<String>,
+    pub subtitle_bottom_inset_pct: Option<i64>,
     /// Per-user toggle for email-mirroring of in-app notifications.
     /// Defaults to false so misconfigured SMTP can't surprise users
     /// with mail they didn't expect.
@@ -1538,6 +1555,30 @@ impl User {
                 .flatten(),
             default_subtitle_lang: row
                 .try_get::<Option<String>, _>("default_subtitle_lang")
+                .ok()
+                .flatten(),
+            subtitle_font_size_px: row
+                .try_get::<Option<i64>, _>("subtitle_font_size_px")
+                .ok()
+                .flatten(),
+            subtitle_text_color: row
+                .try_get::<Option<String>, _>("subtitle_text_color")
+                .ok()
+                .flatten(),
+            subtitle_background_color: row
+                .try_get::<Option<String>, _>("subtitle_background_color")
+                .ok()
+                .flatten(),
+            subtitle_font_family: row
+                .try_get::<Option<String>, _>("subtitle_font_family")
+                .ok()
+                .flatten(),
+            subtitle_edge: row
+                .try_get::<Option<String>, _>("subtitle_edge")
+                .ok()
+                .flatten(),
+            subtitle_bottom_inset_pct: row
+                .try_get::<Option<i64>, _>("subtitle_bottom_inset_pct")
                 .ok()
                 .flatten(),
             notify_via_email: row.try_get::<i64, _>("notify_via_email").ok().unwrap_or(0) != 0,
@@ -2040,6 +2081,14 @@ pub struct ServerSettings {
     /// stored in the credential vault. Rate-limited externally; the
     /// per-item handler backs off on 429.
     pub external_ratings_enabled: bool,
+    /// Cap on auto-backup snapshots kept under `<data_dir>/backups/auto/`.
+    /// The post-backup prune step deletes the oldest entries when the
+    /// on-disk count exceeds this value. Default 14 ≈ two weeks of
+    /// daily snapshots, matching typical home Plex retention. Set to
+    /// 0 to disable pruning (NOT recommended — the directory will
+    /// fill the partition over time). See BLOCK #4 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub backup_retention_count: i64,
     /// JSON-encoded escape-hatch storage for fields added by later phases
     /// without their own migration.
     pub extras_json: String,
@@ -2287,6 +2336,11 @@ impl ServerSettings {
                 .flatten()
                 .unwrap_or(0)
                 != 0,
+            backup_retention_count: row
+                .try_get::<Option<i64>, _>("backup_retention_count")
+                .ok()
+                .flatten()
+                .unwrap_or(14),
             extras_json: row.try_get("extras_json")?,
             updated_at: row.try_get("updated_at")?,
             updated_by: row.try_get::<Option<i64>, _>("updated_by").ok().flatten(),
@@ -2441,6 +2495,8 @@ pub struct ServerSettingsUpdate {
     pub embedded_subs_extract_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ratings_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_retention_count: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras_json: Option<String>,
 }

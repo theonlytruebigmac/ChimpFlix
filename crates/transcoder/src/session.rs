@@ -668,6 +668,14 @@ struct Inner {
     /// just use the GPU for the encode side.
     capabilities: Arc<crate::TranscoderCapabilities>,
     sessions: RwLock<HashMap<String, Arc<Session>>>,
+    /// Serialises the "check the operator's concurrent-session cap
+    /// then start a new session" path so two requests racing under
+    /// the cap can't both win. Without it, the cap is enforced as
+    /// `current < max`-then-`start` (two non-atomic steps); under
+    /// burst load the check passes twice and `current` ends up at
+    /// `max + 1`. See WEEK 1 #9 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    start_gate: tokio::sync::Mutex<()>,
 }
 
 impl TranscodeManager {
@@ -684,8 +692,19 @@ impl TranscodeManager {
                 ffmpeg,
                 capabilities,
                 sessions: RwLock::new(HashMap::new()),
+                start_gate: tokio::sync::Mutex::new(()),
             }),
         })
+    }
+
+    /// Acquire the start-gate mutex. Callers hold the returned guard
+    /// across "read current session count" and "call `start`" so the
+    /// pair is atomic against other concurrent starts. The lock is
+    /// internal to `TranscodeManager` because the gate is only
+    /// meaningful relative to the manager's own session registry.
+    /// See WEEK 1 #9 in `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub async fn lock_start_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.start_gate.lock().await
     }
 
     /// Read accessor for the capability probe — callers (the session
@@ -1928,6 +1947,13 @@ async fn spawn_ffmpeg(
         tonemap = needs_tonemap,
         "spawning ffmpeg"
     );
+
+    // Apply per-session virtual-memory cap (BLOCK #3 in
+    // docs/PUBLIC_RELEASE_HARDENING.md). Defends against pathological
+    // media files triggering an unbounded ffmpeg allocation that OOMs
+    // the host. Operators tune via CHIMPFLIX_TRANSCODER_MEMORY_MB
+    // (default 2048).
+    crate::rlimit::apply_session_limits(&mut cmd, cfg.session_memory_mb);
 
     let mut child = cmd
         .spawn()

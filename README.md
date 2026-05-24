@@ -119,13 +119,67 @@ cargo clippy --workspace --all-targets -- -D warnings
 CI runs `fmt`, `clippy`, `cargo test`, the Next.js build, and both Docker
 image builds on every PR. See [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
+## Privacy
+
+The server makes outbound HTTP calls **only** to services the operator
+explicitly configures (TMDB, AniList, Trakt, OpenSubtitles, and SMTP).
+No analytics. No phone-home. No auto-update check. No third-party
+JavaScript in the web bundle (no Google Fonts, no CDN scripts, no
+tracking). Everything stays on the box the operator runs.
+
+See [SECURITY.md](SECURITY.md) for the full no-telemetry commitment
+and how to report a vulnerability.
+
+## Supported browsers
+
+ChimpFlix targets the current and one previous major version of:
+
+- **Chromium-based** (Chrome, Edge, Brave, Arc) 120+
+- **Firefox** 120+
+- **Safari** 17+ on macOS and iOS (HLS playback is best-effort on
+  Safari ≤16)
+
+The web frontend uses Media Source Extensions (MSE) where supported
+and falls back to native HLS on Safari. Older browsers will load the
+UI but may hit playback edge cases that the maintainers won't
+prioritise.
+
+## Operator self-rescue
+
+If you lose access to the owner account, the server binary has
+subcommands that recover without poking at SQLite directly. Stop the
+live server first, then:
+
+```bash
+# Reset the owner's password (prompts for new value without echo).
+chimpflix-server owner-password-reset --email owner@example.com
+
+# Clear a lost 2FA enrollment so the next login skips TOTP.
+chimpflix-server owner-2fa-reset --email owner@example.com
+
+# Re-encrypt every vault row with a new master key (keys read from env vars).
+OLD=$(cat .old-key) NEW=$(openssl rand -hex 32) \
+  chimpflix-server vault-rotate --old-key-env OLD --new-key-env NEW
+```
+
+Run `chimpflix-server --help` for the full subcommand reference, and
+see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the pre-flight
+checklist before exposing the server publicly.
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system shape, crate
   boundaries, process model, request lifecycles.
 - [docs/SCHEMA.md](docs/SCHEMA.md) — SQLite schema for v0.1.
 - [docs/API.md](docs/API.md) — REST endpoints and WebSocket event catalog.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — reverse-proxy recipes,
+  trusted-proxy config, TLS, public-exposure preflight.
+- [docs/PUBLIC_RELEASE_HARDENING.md](docs/PUBLIC_RELEASE_HARDENING.md)
+  — running hardening plan and confirmed-fine invariants.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to build, style, PR process.
+- [SECURITY.md](SECURITY.md) — vulnerability disclosure and the
+  no-telemetry commitment.
+- [CHANGELOG.md](CHANGELOG.md) — what shipped, release by release.
 
 ## License
 

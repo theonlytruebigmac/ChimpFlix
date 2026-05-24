@@ -27,6 +27,11 @@ pub enum ApiError {
     /// of a generic 500 banner.
     #[error("bad upstream: {0}")]
     BadGateway(String),
+    /// 507 Insufficient Storage — used by the backup endpoint when
+    /// the partition can't fit a snapshot. See MONTH 1 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    #[error("insufficient storage: {0}")]
+    InsufficientStorage(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -55,6 +60,11 @@ impl IntoResponse for ApiError {
                 m.clone(),
             ),
             ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, "bad_upstream", m.clone()),
+            ApiError::InsufficientStorage(m) => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "insufficient_storage",
+                m.clone(),
+            ),
             ApiError::Internal(e) => {
                 error!(error = %format!("{e:#}"), "internal error");
                 (

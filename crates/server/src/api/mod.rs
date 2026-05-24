@@ -11,7 +11,9 @@ mod episodes;
 pub mod error;
 mod health;
 mod items;
+pub mod http_metrics;
 mod libraries;
+mod metrics;
 pub(crate) mod markers;
 mod my_list;
 mod notifications;
@@ -104,6 +106,7 @@ pub fn router(state: AppState) -> Router {
 
     let v1 = Router::new()
         .route("/health", get(health::health))
+        .route("/ready", get(health::ready))
         .route("/server-info", get(health::server_info))
         // Auth (non-rate-limited surface: status read, logout, identity)
         .route("/auth/status", get(auth::status))
@@ -117,7 +120,11 @@ pub fn router(state: AppState) -> Router {
             "/auth/me/sessions/revoke-others",
             post(auth::revoke_other_sessions),
         )
-        .route("/auth/me", get(auth::me).patch(auth::update_me))
+        .route(
+            "/auth/me",
+            get(auth::me).patch(auth::update_me).delete(auth::delete_me),
+        )
+        .route("/auth/me/export", get(auth::export_me))
         .route("/auth/me/password", post(auth::change_password))
         .route(
             "/auth/me/email/request-change",
@@ -621,9 +628,23 @@ pub fn router(state: AppState) -> Router {
         // WebSocket
         .route("/ws", get(ws::handler));
 
+    let metrics_registry = state.http_metrics.clone();
     Router::new()
         .route("/health", get(health::health))
+        .route("/ready", get(health::ready))
+        // Prometheus exposition. Unauth by design; operators are
+        // expected to gate it at the reverse proxy. See WEEK 1 #10
+        // in `docs/PUBLIC_RELEASE_HARDENING.md`.
+        .route("/metrics", get(metrics::metrics))
         .nest("/api/v1", v1.merge(limited_auth))
+        // Per-route HTTP request count + latency tracking. Outer
+        // layer so every route (health / ready / metrics / API)
+        // contributes; the metrics endpoint itself shows up as
+        // `/metrics` in the registry. See WEEK 1 #10.
+        .layer(middleware::from_fn_with_state(
+            metrics_registry,
+            http_metrics::track,
+        ))
         // Cap JSON body size for safety; multipart routes set their own
         // per-handler limits via Multipart's `max_length`.
         .layer(RequestBodyLimitLayer::new(DEFAULT_BODY_LIMIT_BYTES))

@@ -209,21 +209,35 @@ impl OpenSubtitlesClient {
         // signed by them, but a DNS hijack or compromised mirror
         // could return arbitrary payload. Cap at 10 MB; a real
         // subtitle (even verbose ASS for a full film) is well under
-        // 2 MB. Anything bigger is suspicious and we'd otherwise
-        // buffer the whole thing into Vec<u8> before noticing.
+        // 2 MB. Anything bigger is suspicious.
+        //
+        // WEEK 1 #11 in `docs/PUBLIC_RELEASE_HARDENING.md` upgraded
+        // this from a buffer-then-check (which still let the whole
+        // body land in memory before deciding) to a streaming read
+        // that bails as soon as the accumulator exceeds the cap. A
+        // hostile upstream cranking out gigabytes at line rate is
+        // now bounded by the cap, not by RAM.
         const MAX_SUBTITLE_BYTES: u64 = 10 * 1024 * 1024;
         if let Some(len) = dl.content_length() {
             if len > MAX_SUBTITLE_BYTES {
                 bail!("OpenSubtitles download oversized: {len} bytes > {MAX_SUBTITLE_BYTES} max");
             }
         }
-        let bytes = dl.bytes().await.context("read subtitle body")?;
-        if bytes.len() as u64 > MAX_SUBTITLE_BYTES {
-            bail!(
-                "OpenSubtitles download oversized after read: {} bytes",
-                bytes.len()
-            );
+        use futures::StreamExt as _;
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut stream = dl.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read subtitle chunk")?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() as u64 > MAX_SUBTITLE_BYTES {
+                bail!(
+                    "OpenSubtitles download exceeded cap mid-stream ({} bytes > {} max)",
+                    buf.len(),
+                    MAX_SUBTITLE_BYTES,
+                );
+            }
         }
+        let bytes = bytes::Bytes::from(buf);
         // Sniff the first few bytes against the formats we accept.
         // Picture-based / unknown payloads are rejected here rather
         // than getting stored and then surprising the player.

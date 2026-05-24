@@ -38,6 +38,35 @@ pub struct NetworkResponse {
     /// undefined" when adjusting the CORS allowlist, because the
     /// page-load fetch didn't include this key.)
     pub bind_interface: String,
+    /// Diagnostic block (WEEK 1 #8 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`). Surfaces what the server
+    /// actually trusts and what it sees as the request peer, so the
+    /// operator notices a misconfigured proxy before it silently
+    /// collapses per-IP rate limits.
+    pub proxy_diagnostic: ProxyDiagnostic,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProxyDiagnostic {
+    /// `TRUSTED_PROXIES` parsed at boot, formatted as CIDR strings.
+    /// Empty array = no proxy headers are honoured at all.
+    pub trusted_proxies: Vec<String>,
+    /// Immediate TCP peer IP for the request that loaded this page.
+    /// `None` when the extractor couldn't resolve a peer (shouldn't
+    /// happen on a normal axum boot).
+    pub peer_ip: Option<String>,
+    /// True when the peer IP belongs to an RFC1918 / RFC4193 /
+    /// loopback range — almost certainly a Docker bridge or a
+    /// reverse proxy. Combined with the trusted-proxies list, the
+    /// UI uses this to render an actionable warning:
+    /// "your proxy sits at 172.18.0.x, but TRUSTED_PROXIES doesn't
+    /// include that — every request looks like it's coming from
+    /// the same IP, so per-IP rate limits collapse to one bucket."
+    pub peer_is_private: bool,
+    /// True when `peer_is_private` is true AND `trusted_proxies` is
+    /// either empty or does not contain `peer_ip`. The UI banner
+    /// fires off this flag.
+    pub looks_misconfigured: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -63,7 +92,10 @@ pub struct NetworkUpdate {
     pub bind_interface: Option<String>,
 }
 
-fn response_from(s: chimpflix_library::ServerSettings) -> NetworkResponse {
+fn response_from(
+    s: chimpflix_library::ServerSettings,
+    proxy_diagnostic: ProxyDiagnostic,
+) -> NetworkResponse {
     let cors_origins: Vec<String> = serde_json::from_str(&s.cors_origins).unwrap_or_default();
     NetworkResponse {
         public_url: s.public_url,
@@ -74,20 +106,59 @@ fn response_from(s: chimpflix_library::ServerSettings) -> NetworkResponse {
         lan_networks: s.lan_networks,
         auth_bypass_cidrs: s.auth_bypass_cidrs,
         bind_interface: s.bind_interface,
+        proxy_diagnostic,
+    }
+}
+
+/// True for RFC1918 / RFC4193 / loopback / link-local. These are the
+/// ranges a reverse proxy or Docker bridge will sit in; if the
+/// immediate peer is in one of them, the operator almost certainly
+/// has a proxy in front and the rate-limiter / audit log will give
+/// useless attribution unless `TRUSTED_PROXIES` covers it.
+fn is_private_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
+fn build_proxy_diagnostic(state: &AppState, peer: std::net::IpAddr) -> ProxyDiagnostic {
+    let trusted: Vec<String> = state
+        .trusted_proxies
+        .iter()
+        .map(|net| net.to_string())
+        .collect();
+    let peer_is_private = is_private_peer(peer);
+    let peer_in_trusted = state.trusted_proxies.iter().any(|net| net.contains(&peer));
+    ProxyDiagnostic {
+        trusted_proxies: trusted,
+        peer_ip: Some(peer.to_string()),
+        peer_is_private,
+        looks_misconfigured: peer_is_private && !peer_in_trusted,
     }
 }
 
 pub async fn get(
     State(state): State<AppState>,
     _owner: OwnerAuth,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Result<Json<NetworkResponse>, ApiError> {
     let s = state.settings.read().await.clone();
-    Ok(Json(response_from(s)))
+    let diag = build_proxy_diagnostic(&state, peer.ip());
+    Ok(Json(response_from(s, diag)))
 }
 
 pub async fn patch(
     State(state): State<AppState>,
     OwnerAuth(actor): OwnerAuth,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(input): Json<NetworkUpdate>,
 ) -> Result<Json<NetworkResponse>, ApiError> {
@@ -120,6 +191,7 @@ pub async fn patch(
         let mut guard = state.settings.write().await;
         *guard = updated.clone();
     }
+    let diag = build_proxy_diagnostic(&state, peer.ip());
 
     let user_agent = headers
         .get(USER_AGENT)
@@ -139,7 +211,7 @@ pub async fn patch(
     )
     .await;
 
-    Ok(Json(response_from(updated)))
+    Ok(Json(response_from(updated, diag)))
 }
 
 #[derive(Debug, Serialize)]

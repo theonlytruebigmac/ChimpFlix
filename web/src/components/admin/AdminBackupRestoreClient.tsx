@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  admin as adminApi,
   backups as backupsApi,
   type BackupEntry,
   type ListBackupsResponse,
@@ -23,6 +24,8 @@ export function AdminBackupRestoreClient() {
   const [askDelete, setAskDelete] = useState<BackupEntry | null>(null);
   const [askCancelRestore, setAskCancelRestore] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [retentionDraft, setRetentionDraft] = useState<number | null>(null);
+  const [retentionSaving, setRetentionSaving] = useState(false);
   // Captured once at mount so render is a pure function of state.
   // Refreshed on every backup list reload so the "Xh ago" labels
   // stay roughly accurate as the page sits open.
@@ -170,6 +173,83 @@ export function AdminBackupRestoreClient() {
         </div>
       )}
 
+      {data?.vault_key_required && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">
+          <div className="font-semibold">Back up your vault key alongside these snapshots</div>
+          <p className="mt-1 text-xs text-amber-200/80">
+            This server has encrypted credentials at rest (SMTP password,
+            Trakt tokens, TOTP secrets, session HMAC). Backups are useless
+            without the matching{" "}
+            <code className="font-mono">CHIMPFLIX_SECRET_KEY</code>. Store the
+            current key off-box in a password manager — restoring a snapshot
+            against a different key bricks every encrypted credential.
+            {" "}
+            See <a
+              href="https://github.com/soybigmac/ChimpFlix/blob/main/docs/PUBLIC_RELEASE_HARDENING.md#1-backupvault-decoupling-silently-bricks-restores"
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-amber-100"
+            >
+              the hardening doc
+            </a> for the recovery procedure.
+          </p>
+        </div>
+      )}
+
+      {data && (
+        <section className="rounded-lg border border-white/10 bg-white/2 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold">Retention</h3>
+              <p className="mt-0.5 text-xs text-white/50">
+                Daily snapshots past this count get pruned after each
+                <code className="ml-1 font-mono text-white/65">backup_db</code> run.
+                Set to 0 to disable pruning entirely. Range 0&ndash;365.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={365}
+                value={retentionDraft ?? data.retention_count}
+                onChange={(e) =>
+                  setRetentionDraft(Number.parseInt(e.target.value, 10) || 0)
+                }
+                className="w-20 rounded-md border border-white/15 bg-black/30 px-2 py-1 text-right text-sm tabular-nums outline-none focus:border-(--color-accent)"
+              />
+              <button
+                type="button"
+                disabled={
+                  retentionSaving ||
+                  retentionDraft == null ||
+                  retentionDraft === data.retention_count
+                }
+                onClick={async () => {
+                  if (retentionDraft == null) return;
+                  setRetentionSaving(true);
+                  try {
+                    await adminApi.settings.patch({
+                      backup_retention_count: retentionDraft,
+                    });
+                    await refresh();
+                    setToast(`Retention updated to ${retentionDraft}.`);
+                    setRetentionDraft(null);
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setRetentionSaving(false);
+                  }
+                }}
+                className="rounded bg-(--color-accent) px-3 py-1 text-xs font-semibold text-white disabled:opacity-50"
+              >
+                {retentionSaving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
       <section className="rounded-lg border border-white/10 bg-white/2">
         <div className="flex items-baseline justify-between border-b border-white/10 px-4 py-3">
           <div>
@@ -180,11 +260,36 @@ export function AdminBackupRestoreClient() {
             </p>
           </div>
           {data && data.backups.length > 0 && (
-            <div className="text-xs tabular-nums text-white/55">
-              {data.backups.length} file{data.backups.length === 1 ? "" : "s"}
-              {" · "}
-              {formatBytes(data.total_bytes)}
-            </div>
+            (() => {
+              const pressure =
+                data.retention_count > 0
+                  ? data.backups.length / data.retention_count
+                  : 0;
+              const colour =
+                pressure >= 1
+                  ? "text-amber-300"
+                  : pressure >= 0.85
+                    ? "text-amber-200/80"
+                    : "text-white/55";
+              return (
+                <div className={`text-xs tabular-nums ${colour}`}>
+                  {data.retention_count > 0 ? (
+                    <>
+                      {data.backups.length} of {data.retention_count} retained
+                      {pressure >= 0.85 && (
+                        <span className="ml-1">(next run will prune)</span>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {data.backups.length} file{data.backups.length === 1 ? "" : "s"} (retention disabled)
+                    </>
+                  )}
+                  {" · "}
+                  {formatBytes(data.total_bytes)}
+                </div>
+              );
+            })()
           )}
         </div>
 

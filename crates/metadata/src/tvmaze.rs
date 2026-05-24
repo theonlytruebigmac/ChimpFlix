@@ -74,10 +74,13 @@ impl TvMazeClient {
             warn!(%status, %url, body = %body.chars().take(200).collect::<String>(), "TVMaze error");
             anyhow::bail!("TVMaze {url} returned {status}");
         }
-        let raw: RawShow = resp
-            .json()
-            .await
-            .with_context(|| format!("parse TVMaze JSON from {url}"))?;
+        let raw: RawShow = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            &format!("TVMaze GET {url}"),
+        )
+        .await
+        .with_context(|| format!("parse TVMaze JSON from {url}"))?;
         Ok(Some(raw.into()))
     }
 
@@ -102,10 +105,13 @@ impl TvMazeClient {
             warn!(%status, %url, body = %body.chars().take(200).collect::<String>(), "TVMaze episode fetch error");
             anyhow::bail!("TVMaze {url} returned {status}");
         }
-        let raws: Vec<RawEpisode> = resp
-            .json()
-            .await
-            .with_context(|| format!("parse TVMaze episodes from {url}"))?;
+        let raws: Vec<RawEpisode> = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            &format!("TVMaze GET {url}"),
+        )
+        .await
+        .with_context(|| format!("parse TVMaze episodes from {url}"))?;
         Ok(raws.into_iter().map(TvMazeEpisode::from).collect())
     }
 }

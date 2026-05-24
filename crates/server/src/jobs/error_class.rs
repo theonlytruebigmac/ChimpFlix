@@ -114,12 +114,20 @@ pub fn classify(err: &anyhow::Error) -> ErrorClass {
     }
 
     // Permanent indicators: file gone, corrupt source the codec
-    // refuses to play, sqlx not-found.
+    // refuses to play, sqlx not-found, or an external API explicitly
+    // saying "I can't serve this" in a way that won't change on
+    // retry. "negative response" is the OMDb client's bail message
+    // for anything OMDb returned `{"Response":"False",...}` for that
+    // wasn't a known not-found shape — by the time it reaches the
+    // classifier, retrying just burns the request budget against an
+    // upstream that's told us no. Operators who suspect OMDb has
+    // recovered can re-enqueue manually from the dead-letter view.
     if chain.contains("no such file")
         || chain.contains("file not found")
         || chain.contains("invalid data")
         || chain.contains("unrecognised codec")
         || chain.contains("unsupported format")
+        || chain.contains("negative response")
     {
         return ErrorClass::Permanent;
     }
@@ -283,6 +291,19 @@ mod tests {
             classify(&make("invalid data: garbled mkv header")),
             ErrorClass::Permanent
         );
+    }
+
+    #[test]
+    fn omdb_negative_response_is_permanent_not_transient() {
+        // OMDb returns `{"Response":"False","Error":"Error getting data."}`
+        // for various IMDb ids the metadata team hasn't indexed.
+        // Retrying just burns the daily request budget. Pre-fix this
+        // fell into Transient and ate 3 backoff attempts before
+        // dying — confirmed via production log 2026-05-24.
+        let err = make(
+            "omdb fetch failed for item 60: omdb negative response: Error getting data.",
+        );
+        assert_eq!(classify(&err), ErrorClass::Permanent);
     }
 
     #[test]

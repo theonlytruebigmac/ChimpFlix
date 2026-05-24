@@ -3,6 +3,7 @@
 pub mod capabilities;
 pub mod hwaccel;
 pub mod probe;
+mod rlimit;
 pub mod session;
 
 /// Format a filesystem path for use as an `ffmpeg -i <input>` argument
@@ -29,6 +30,7 @@ pub use probe::{
     Chapter, GopProbe, ProbeResult, ProbeStream, StreamKind, probe, probe_chapters, probe_gop,
     probe_subtitle_codec,
 };
+pub use rlimit::apply_session_limits;
 pub use session::{
     AudioTreatment, ContainerFormat, HLS_SEGMENT_DURATION_S, LoudnessTarget, Session,
     SessionSnapshot, SubExtractionStatus, TonemapConfig, TranscodeManager, VideoTreatment,
@@ -45,6 +47,19 @@ pub struct FfmpegConfig {
     /// transcode sessions and the rest of the system.
     /// `None` = run at default priority.
     pub background_nice_level: Option<i32>,
+    /// Per-session virtual-memory cap in megabytes. Applied via
+    /// `setrlimit(RLIMIT_AS, ...)` in the pre_exec hook so the kernel
+    /// kills a runaway ffmpeg subprocess instead of letting it OOM
+    /// the host. **Default 0 (disabled)** — `RLIMIT_AS` caps the
+    /// process's total virtual address space, and CUDA's `cuInit()`
+    /// mmaps tens of GiB of unified-memory address range *before*
+    /// any actual allocation, so any non-zero cap below ~64 GiB
+    /// reliably kills GPU-accelerated sessions with a misleading
+    /// `CUDA_ERROR_OUT_OF_MEMORY`. Operators on CPU-only hosts can
+    /// opt in by setting `CHIMPFLIX_TRANSCODER_MEMORY_MB` to e.g.
+    /// 2048; GPU hosts should leave it unset. See BLOCK #3 in
+    /// `docs/PUBLIC_RELEASE_HARDENING.md`.
+    pub session_memory_mb: u64,
 }
 
 impl Default for FfmpegConfig {
@@ -53,9 +68,25 @@ impl Default for FfmpegConfig {
             ffmpeg: "ffmpeg".to_string(),
             ffprobe: "ffprobe".to_string(),
             background_nice_level: None,
+            session_memory_mb: DEFAULT_SESSION_MEMORY_MB,
         }
     }
 }
+
+/// Default `RLIMIT_AS` cap applied to each transcode session
+/// subprocess. **0 = disabled**, which is the correct default for any
+/// host with a GPU: `cuInit()` mmaps an enormous virtual address
+/// range (tens of GiB on a 16 GiB card) for the unified-memory
+/// reservation before allocating anything; an `RLIMIT_AS` lower than
+/// that range makes every CUDA session fail with the misleading
+/// `CUDA_ERROR_OUT_OF_MEMORY` error.
+///
+/// Operators on CPU-only hosts (no NVENC/NVDEC/VAAPI hwaccel) can
+/// set `CHIMPFLIX_TRANSCODER_MEMORY_MB` to 2048 (covers 4K H.264 sw
+/// encode with overhead) for a real DoS bound. GPU operators
+/// should leave it unset and rely on the container's cgroup memory
+/// limit (Docker `mem_limit:`) for the same defense.
+pub const DEFAULT_SESSION_MEMORY_MB: u64 = 0;
 
 impl FfmpegConfig {
     pub fn from_env() -> Self {
@@ -63,6 +94,10 @@ impl FfmpegConfig {
             ffmpeg: std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string()),
             ffprobe: std::env::var("FFPROBE_BIN").unwrap_or_else(|_| "ffprobe".to_string()),
             background_nice_level: None,
+            session_memory_mb: std::env::var("CHIMPFLIX_TRANSCODER_MEMORY_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_SESSION_MEMORY_MB),
         }
     }
 
