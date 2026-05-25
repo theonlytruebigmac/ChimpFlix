@@ -49,6 +49,7 @@ export function AdminCredentialsClient({
   const [slots, setSlots] = useState(initial.slots);
   const [encryptedAtRest] = useState(initial.encrypted_at_rest);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   function replaceSlot(next: SecretSlotView) {
     setSlots((current) =>
@@ -74,10 +75,34 @@ export function AdminCredentialsClient({
       )}
 
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
       )}
+      {notice && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
+        >
+          {notice}
+        </div>
+      )}
+
+      <PlexIdentitySection
+        onError={setError}
+        onNotice={(m) => {
+          setNotice(m);
+          // Auto-clear after 6s — long enough to read, short enough
+          // that a stale "rotated" line doesn't sit on the page
+          // through the operator's next visit.
+          window.setTimeout(() => setNotice(null), 6000);
+        }}
+      />
 
       <div className="space-y-3">
         {slots.map((slot) => (
@@ -90,6 +115,85 @@ export function AdminCredentialsClient({
         ))}
       </div>
     </div>
+  );
+}
+
+/// Plex client identity — not a vault secret, but adjacent enough
+/// that putting it here keeps every "long-lived per-server credential"
+/// in one place. The identifier itself isn't displayed (it's a UUID
+/// without operational meaning); only the rotate action lives here.
+function PlexIdentitySection({
+  onError,
+  onNotice,
+}: {
+  onError: (msg: string | null) => void;
+  onNotice: (msg: string) => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function rotate() {
+    setBusy(true);
+    onError(null);
+    try {
+      await adminApi.plex.rotateIdentifier();
+      onNotice(
+        "Plex client identifier rotated. The next sign-in flow will mint a fresh identity. Existing per-user Plex links are unaffected.",
+      );
+      setConfirming(false);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-white/10 bg-white/2 p-5">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Plex client identity</h3>
+          <p className="mt-1 text-xs leading-relaxed text-white/55">
+            Every install has a unique client identifier that ChimpFlix sends
+            to Plex during PIN-based sign-in. It&apos;s generated on first
+            use and reused across restarts so in-flight authorizations
+            survive a redeploy. Rotate it if you suspect the identifier has
+            leaked, or if you&apos;re handing the install to a new operator
+            who wants a clean Plex client identity.
+          </p>
+          <p className="mt-2 text-xs text-white/45">
+            Rotating <strong>does not</strong> sign out existing Plex-linked
+            users — their per-user tokens live separately. It only affects
+            future sign-in flows.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setConfirming(true)}
+          disabled={busy}
+          className="shrink-0 rounded-md border border-white/15 px-3 py-1.5 text-xs text-white/80 hover:border-white/30 hover:text-white disabled:opacity-50"
+        >
+          Rotate identifier
+        </button>
+      </div>
+      {confirming && (
+        <ConfirmDialog
+          title="Rotate the Plex client identifier?"
+          body={
+            <>
+              The next <code>/auth/plex/start</code> call will mint a fresh
+              UUID and use it for all future PIN flows. Existing per-user
+              Plex links are unaffected. This action is logged to the
+              audit trail.
+            </>
+          }
+          confirmLabel="Rotate"
+          busy={busy}
+          onConfirm={() => void rotate()}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </section>
   );
 }
 

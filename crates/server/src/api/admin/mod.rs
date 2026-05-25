@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod maintenance;
 pub mod network;
 pub mod optimized;
+pub mod plex;
 pub mod preroll;
 pub mod secrets;
 pub mod settings;

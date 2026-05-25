@@ -11840,6 +11840,19 @@ pub async fn allocate_username_from_external(
 // Plex client identifier (lazy-persisted in server_settings)
 // ---------------------------------------------------------------------------
 
+/// Clear the stored Plex client identifier so the next call to
+/// `ensure_plex_client_identifier` mints a fresh UUID. Operator
+/// surface for the admin "rotate Plex identity" action; the caller
+/// is also responsible for clearing the cached `PlexOAuthHandle` so
+/// the new identifier is picked up immediately rather than after a
+/// process restart.
+pub async fn clear_plex_client_identifier(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("UPDATE server_settings SET plex_client_identifier = NULL")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Return the stored Plex client identifier or generate-and-persist a
 /// fresh UUID on first read. Stable across restarts so re-launching
 /// the server doesn't break in-flight authorizations.

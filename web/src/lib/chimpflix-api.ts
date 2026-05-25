@@ -3375,6 +3375,16 @@ export const admin = {
         { method: "POST", body: value ? { value } : {} },
       ),
   },
+  plex: {
+    /// Rotate the per-install Plex client identifier so future PIN
+    /// flows announce a fresh identity to Plex. Does NOT invalidate
+    /// existing per-user Plex links — those are stored separately
+    /// under each user's auth-provider row.
+    rotateIdentifier: () =>
+      apiFetch<{ rotated: boolean }>("/admin/plex/rotate-identifier", {
+        method: "POST",
+      }),
+  },
   libraryHealth: () =>
     apiFetch<LibraryHealthResponse>("/admin/library-health"),
   /// Drill-in for a single Library Health counter — returns the

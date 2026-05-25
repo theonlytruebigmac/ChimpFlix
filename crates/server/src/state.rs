@@ -56,8 +56,9 @@ pub type OmdbHandle = Arc<RwLock<Option<OmdbClient>>>;
 /// Hot-swappable Plex OAuth client. Built lazily from the per-install
 /// client identifier stored on `server_settings`; the `/auth/plex/start`
 /// endpoint ensures one is constructed on first use. Cleared by the
-/// admin "rotate identifier" action (not yet implemented) so future
-/// PINs use a fresh identity.
+/// admin "rotate identifier" action
+/// (`POST /admin/plex/rotate-identifier`) so future PINs are issued
+/// against a freshly-minted client identity.
 pub type PlexOAuthHandle = Arc<RwLock<Option<PlexOAuthClient>>>;
 
 /// In-memory pending-PIN store. Plex returns a numeric PIN id we have

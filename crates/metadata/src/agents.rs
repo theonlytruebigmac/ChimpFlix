@@ -1040,7 +1040,7 @@ fn pick_anilist_title(meta: &crate::anilist::AniListShow, language: &str) -> Opt
 }
 
 // ---------------------------------------------------------------------------
-// OMDb (placeholder — fully implemented in Slice 7)
+// OMDb
 // ---------------------------------------------------------------------------
 
 /// OMDb agent — primarily an IMDb-id-driven ratings supplement, also

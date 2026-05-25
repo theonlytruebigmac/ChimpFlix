@@ -471,6 +471,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/library-health", get(admin::health::get))
         .route("/admin/library-health/items", get(admin::health::items))
         .route("/admin/agents", get(admin::agents::list_available))
+        .route(
+            "/admin/plex/rotate-identifier",
+            post(admin::plex::rotate_identifier),
+        )
         .route("/admin/secrets", get(admin::secrets::list))
         .route(
             "/admin/secrets/{name}",
