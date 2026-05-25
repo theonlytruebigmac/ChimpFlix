@@ -8,6 +8,7 @@ import {
   type SecretTestResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { formatDateTime } from "@/lib/format";
 
 /// Slots whose vault value is a JSON object on the wire. The UI renders
 /// one labeled input per field and serializes to JSON on save, so the
@@ -208,8 +209,7 @@ function SlotCard({
                 <span className="font-mono">••••{last4}</span>
                 {slot.stored && (
                   <span className="ml-2">
-                    · updated{" "}
-                    {new Date(slot.stored.updated_at).toLocaleString()}
+                    · updated {formatDateTime(slot.stored.updated_at)}
                   </span>
                 )}
               </>

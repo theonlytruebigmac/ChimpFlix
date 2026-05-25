@@ -144,7 +144,7 @@ export function Card({
                 in poster variant to avoid double-titling.
               */}
               {!isPoster && (
-                <div className="pointer-events-none absolute inset-x-0 top-0 bg-linear-to-b from-black/85 via-black/40 to-transparent pb-10 transition-opacity duration-150 delay-200 group-hover:opacity-0">
+                <div className="pointer-events-none absolute inset-x-0 top-0 bg-linear-to-b from-black/85 via-black/40 to-transparent pb-10 transition-opacity duration-200 delay-200 group-hover:opacity-0">
                   <div className="line-clamp-2 px-3 pt-2.5 text-sm font-semibold leading-tight drop-shadow-lg">
                     {label}
                   </div>

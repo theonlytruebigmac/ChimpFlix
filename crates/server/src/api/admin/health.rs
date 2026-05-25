@@ -241,7 +241,7 @@ pub struct HealthItemsQuery {
 pub struct HealthItemsResponse {
     pub category: String,
     pub total: i64,
-    pub rows: Vec<HealthItemRow>,
+    pub items: Vec<HealthItemRow>,
 }
 
 /// Drill-in for the Library Health counters. `category` is one of:
@@ -537,6 +537,6 @@ pub async fn items(
     Ok(Json(HealthItemsResponse {
         category: category.to_string(),
         total,
-        rows,
+        items: rows,
     }))
 }

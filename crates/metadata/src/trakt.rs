@@ -1046,6 +1046,16 @@ async fn api_error(label: &str, resp: reqwest::Response) -> anyhow::Error {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     warn!(%status, label, body = %text.chars().take(200).collect::<String>(), "Trakt API error");
+    // 401 deserves a more actionable message than the generic body — the
+    // proactive refresh window in trakt_sync covers expiry, so a 401
+    // here usually means the user revoked our authorization on the Trakt
+    // side or the refresh token rotated unexpectedly. Tell the operator
+    // what to do instead of dumping the raw HTML response.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return anyhow::anyhow!(
+            "Trakt {label} returned 401 — the user's link may have been revoked on the Trakt side. Unlink and relink Trakt under Settings → Integrations."
+        );
+    }
     anyhow::anyhow!(
         "Trakt {label} returned {status}: {}",
         text.chars().take(200).collect::<String>()

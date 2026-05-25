@@ -13,6 +13,7 @@
 //! readable.
 
 use tokio::process::Command;
+use tracing::warn;
 
 use crate::TranscoderCapabilities;
 
@@ -79,11 +80,29 @@ impl HwAccel {
             "qsv" | "quicksync" | "intel" => Self::Qsv,
             "videotoolbox" | "vt" | "apple" => Self::Videotoolbox,
             "amf" | "amd" => Self::Amf,
-            _ => return Self::None,
+            other => {
+                // Operator typo'd the setting (or pasted a stale value)
+                // — warn loudly so the silent libx264 fallback isn't
+                // mistaken for the configured encoder being honored.
+                warn!(
+                    setting = %other,
+                    "unknown transcoder hwaccel setting; falling back to software libx264"
+                );
+                return Self::None;
+            }
         };
         if want.is_available(caps) {
             want
         } else {
+            // Configured encoder isn't available on this host (driver
+            // missing, kernel module not loaded, GPU passthrough not
+            // wired up). The operator deliberately set this, so a silent
+            // drop to libx264 leaves them wondering why their nvenc
+            // sessions show "software" in the dashboard.
+            warn!(
+                requested = ?want,
+                "configured transcoder hwaccel is not available on this host (driver missing, ffmpeg lacks codec, or capability probe failed); falling back to software libx264"
+            );
             Self::None
         }
     }

@@ -181,6 +181,10 @@ export function FixMatchDialog({
                         src={`${TMDB_IMAGE}${c.poster_path}`}
                         alt=""
                         loading="lazy"
+                        onError={(e) => {
+                          (e.currentTarget as HTMLImageElement).style.display =
+                            "none";
+                        }}
                         className="h-full w-full object-cover"
                       />
                     ) : (

@@ -283,7 +283,9 @@ pub async fn download(
     AxumPath(filename): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     let path = resolve_backup_path(&state.data_dir, &filename)?;
-    let meta = fs::metadata(&path).await.map_err(|_| ApiError::NotFound)?;
+    let meta = fs::metadata(&path)
+        .await
+        .map_err(|_| ApiError::NotFoundResource("backup"))?;
     let size = meta.len();
     let file = fs::File::open(&path)
         .await
@@ -316,7 +318,7 @@ pub async fn delete(
 ) -> Result<StatusCode, ApiError> {
     let path = resolve_backup_path(&state.data_dir, &filename)?;
     if !path.exists() {
-        return Err(ApiError::NotFound);
+        return Err(ApiError::NotFoundResource("backup"));
     }
     fs::remove_file(&path)
         .await
@@ -356,7 +358,7 @@ pub async fn stage_restore(
 ) -> Result<Json<StageRestoreResponse>, ApiError> {
     let src = resolve_backup_path(&state.data_dir, &filename)?;
     if !src.exists() {
-        return Err(ApiError::NotFound);
+        return Err(ApiError::NotFoundResource("backup"));
     }
 
     // Sanity check: file is a SQLite DB by header bytes, AND it has
@@ -365,11 +367,15 @@ pub async fn stage_restore(
     // 16-byte-headered SQLite file in the auto-backup dir would be
     // staged and applied on next boot — giving anyone with write
     // access to that directory persistent control over server state.
-    let header_bytes = fs::read(&src).await.map_err(|e| {
+    //
+    // Read just the first 16 bytes for the header check rather than
+    // `fs::read` the whole file (a multi-GB backup would otherwise
+    // allocate multi-GB just to look at its first row of bytes).
+    let mut file = fs::File::open(&src).await.map_err(|e| {
         // TOCTOU: the source file may have been deleted between the
-        // `exists()` check above and this `fs::read`. Map the IO
-        // `NotFound` to a useful validation message so the operator
-        // gets a clear "file disappeared" instead of an opaque 500.
+        // `exists()` check above and this open. Map the IO `NotFound`
+        // to a useful validation message so the operator gets a clear
+        // "file disappeared" instead of an opaque 500.
         if e.kind() == std::io::ErrorKind::NotFound {
             ApiError::validation(format!(
                 "`{filename}` was removed before the stage could complete; re-list backups and try again"
@@ -378,7 +384,21 @@ pub async fn stage_restore(
             ApiError::Internal(e.into())
         }
     })?;
-    if header_bytes.len() < 16 || !header_bytes.starts_with(b"SQLite format 3\0") {
+    let mut header_bytes = [0u8; 16];
+    use tokio::io::AsyncReadExt;
+    file.read_exact(&mut header_bytes).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof
+            || e.kind() == std::io::ErrorKind::NotFound
+        {
+            ApiError::validation(format!(
+                "`{filename}` does not look like a SQLite database file"
+            ))
+        } else {
+            ApiError::Internal(e.into())
+        }
+    })?;
+    drop(file);
+    if !header_bytes.starts_with(b"SQLite format 3\0") {
         return Err(ApiError::validation(format!(
             "`{filename}` does not look like a SQLite database file"
         )));
@@ -482,7 +502,7 @@ pub async fn cancel_restore(
 ) -> Result<StatusCode, ApiError> {
     let staged = state.data_dir.join(STAGED_RESTORE_FILENAME);
     if !staged.exists() {
-        return Err(ApiError::NotFound);
+        return Err(ApiError::NotFoundResource("backup"));
     }
     fs::remove_file(&staged)
         .await

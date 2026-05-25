@@ -123,6 +123,18 @@ pub struct SessionSnapshot {
     /// admin Now Playing tile and flushed to the playback_events
     /// table on session close.
     pub bytes_served: i64,
+    /// State of the ffmpeg child. `Healthy` for live sessions;
+    /// `Exited{...}` when the heartbeat probe or the stderr-drain
+    /// waitpid path has observed the process gone. The admin
+    /// dashboard renders a warning pill on Exited rows so a silently-
+    /// dead session is visible without grepping logs.
+    pub transcode_health: TranscodeHealth,
+    /// Subtitle sidecar extraction state when the session has a
+    /// WebVTT sidecar. `None` for sessions without one (burn-in path
+    /// or no subtitle selected). Lets the admin dashboard show
+    /// "sub extraction failed" when the operator's "captions don't
+    /// load" report can be tied back to a specific session.
+    pub subtitle_health: Option<SubtitleHealth>,
 }
 
 const SESSION_ID_BYTES: usize = 16;
@@ -264,6 +276,89 @@ pub struct WebVttSidecar {
     pub progress: Arc<tokio::sync::watch::Receiver<SubExtractionStatus>>,
 }
 
+/// Health-of-the-ffmpeg-child state, shared between the spawned
+/// monitor tasks (writers) and `SessionSnapshot` construction
+/// (reader). Starts `Healthy`; flips to `Exited` once either the
+/// heartbeat probe or the stderr-drain waitpid path sees the
+/// process gone. Never flips back — a session can only exit once.
+///
+/// Operators see this surface in the admin transcoder dashboard
+/// (a red "exited" pill on the row) so a silently-dead session is
+/// distinguishable from one that's just slow. The detail string is
+/// the human-readable cause: "killed signal=11" / "exited code=1" /
+/// "no longer alive (heartbeat probe)".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscodeHealth {
+    Healthy,
+    Exited { detail: String, at_ms: i64 },
+}
+
+impl TranscodeHealth {
+    pub fn is_exited(&self) -> bool {
+        matches!(self, TranscodeHealth::Exited { .. })
+    }
+}
+
+/// Snapshot of background subtitle extraction status. Mirrors
+/// [`SubExtractionStatus`] but is a stable, serializable surface
+/// for the admin API + dashboard. None means the session has no
+/// sidecar (regular burn-in path or no subtitle selected).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubtitleHealth {
+    Pending,
+    Ready,
+    Failed { reason: String },
+}
+
+/// Shared, mutable health state attached to a `Session`. Created in
+/// `TranscodeManager::start` before spawning ffmpeg, then cloned
+/// into the monitor tasks so they can flip `transcode` when the
+/// child dies. Read by `SessionSnapshot` construction.
+#[derive(Debug)]
+pub struct SessionHealth {
+    transcode: std::sync::RwLock<TranscodeHealth>,
+}
+
+impl SessionHealth {
+    pub fn new() -> Self {
+        Self {
+            transcode: std::sync::RwLock::new(TranscodeHealth::Healthy),
+        }
+    }
+
+    pub fn current(&self) -> TranscodeHealth {
+        self.transcode
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or(TranscodeHealth::Healthy)
+    }
+
+    /// Mark the session as exited. Idempotent: the first caller
+    /// wins, so a heartbeat-probe transition isn't clobbered by a
+    /// later stderr-drain waitpid that would otherwise overwrite
+    /// the "no longer alive" detail with a more specific "exited
+    /// code=N" — both are correct, but the first observation gets
+    /// the timestamp closest to the actual death.
+    pub fn mark_exited(&self, detail: impl Into<String>, at_ms: i64) {
+        if let Ok(mut guard) = self.transcode.write() {
+            if matches!(*guard, TranscodeHealth::Healthy) {
+                *guard = TranscodeHealth::Exited {
+                    detail: detail.into(),
+                    at_ms,
+                };
+            }
+        }
+    }
+}
+
+impl Default for SessionHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared progress signal for the background WebVTT extraction.
 /// Cloned across the `Session` (read-only) and the spawned task
 /// (write-only via [`tokio::sync::watch::Sender`]).
@@ -371,6 +466,11 @@ pub struct Session {
     /// of the session. Incremented on each pause→resume transition.
     total_paused_ms: AtomicI64,
     _child: Mutex<Child>,
+    /// Shared health state. Cloned into the heartbeat-probe and
+    /// stderr-drain tasks spawned by `spawn_ffmpeg` so they can flip
+    /// the state when ffmpeg dies. Read at snapshot time to surface
+    /// the "exited" pill on the admin dashboard.
+    pub(crate) health: Arc<SessionHealth>,
 }
 
 impl Drop for Session {
@@ -422,6 +522,29 @@ impl Session {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Read the current subtitle-sidecar extraction status as a
+    /// stable, serializable `SubtitleHealth`. Returns None when this
+    /// session has no sidecar (regular burn-in path, no subtitle, or
+    /// picture-format subs). Reads the latest watched value without
+    /// blocking — `borrow` on a `watch::Receiver` is a fast lock-free
+    /// read of the most recent published state.
+    pub fn subtitle_health(&self) -> Option<SubtitleHealth> {
+        let sidecar = self.webvtt_sidecar.as_ref()?;
+        let status = sidecar.progress.borrow().clone();
+        Some(match status {
+            SubExtractionStatus::Pending => SubtitleHealth::Pending,
+            SubExtractionStatus::Ready => SubtitleHealth::Ready,
+            SubExtractionStatus::Failed(reason) => SubtitleHealth::Failed { reason },
+        })
+    }
+
+    /// Read the ffmpeg-child health state. Set to `Healthy` at start
+    /// and flipped to `Exited` by the heartbeat probe or stderr-drain
+    /// task when the child dies.
+    pub fn transcode_health(&self) -> TranscodeHealth {
+        self.health.current()
     }
 
     /// Total wall-clock time the encoder has been paused, including
@@ -966,6 +1089,12 @@ impl TranscodeManager {
             None
         };
 
+        // Pre-create the shared health state so the monitor tasks
+        // spawned inside spawn_ffmpeg can update it when ffmpeg dies,
+        // and the Session we construct below holds the same Arc so
+        // snapshot readers see the same state.
+        let health = Arc::new(SessionHealth::new());
+
         let child = spawn_ffmpeg(
             &self.inner.ffmpeg,
             media_file_path,
@@ -994,6 +1123,7 @@ impl TranscodeManager {
             &tonemap,
             gpu_device,
             loudness_target.as_ref(),
+            Arc::clone(&health),
         )
         .await?;
 
@@ -1027,6 +1157,7 @@ impl TranscodeManager {
             pause_started_at: AtomicI64::new(0),
             total_paused_ms: AtomicI64::new(0),
             _child: Mutex::new(child),
+            health,
         });
 
         self.inner
@@ -1170,6 +1301,8 @@ impl TranscodeManager {
             encoder_preset: session.encoder_preset.label().to_string(),
             paused: session.is_paused(),
             bytes_served: session.bytes_served(),
+            transcode_health: session.transcode_health(),
+            subtitle_health: session.subtitle_health(),
         };
         let path = session.output_dir.clone();
         drop(session); // Dropping kills the ffmpeg child via kill_on_drop.
@@ -1201,6 +1334,8 @@ impl TranscodeManager {
                 encoder_preset: s.encoder_preset.label().to_string(),
                 paused: s.is_paused(),
                 bytes_served: s.bytes_served(),
+                transcode_health: s.transcode_health(),
+                subtitle_health: s.subtitle_health(),
             })
             .collect()
     }
@@ -1396,6 +1531,7 @@ async fn spawn_ffmpeg(
     tonemap: &TonemapConfig,
     gpu_device: &str,
     loudness_target: Option<&LoudnessTarget>,
+    health: Arc<SessionHealth>,
 ) -> Result<Child> {
     // fMP4 segments live under .m4s; TS segments under .ts. Init
     // segment (init.mp4) only exists for fMP4 — ffmpeg writes it
@@ -1985,6 +2121,7 @@ async fn spawn_ffmpeg(
         let session_id_str = session_id.to_string();
         let session_dir_str = session_dir.to_path_buf();
         let started_at = std::time::Instant::now();
+        let heartbeat_health = Arc::clone(&health);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.tick().await; // skip immediate
@@ -2005,6 +2142,13 @@ async fn spawn_ffmpeg(
                         elapsed_s = started_at.elapsed().as_secs(),
                         "session monitor: ffmpeg pid no longer alive — stopping monitor",
                     );
+                    // Flip the shared health state so the admin
+                    // dashboard's session row turns into an "exited"
+                    // pill. mark_exited is idempotent — if the
+                    // stderr-drain task got here first with a more
+                    // detailed exit code, its detail wins.
+                    heartbeat_health
+                        .mark_exited("no longer alive (heartbeat probe)", now_ms());
                     break;
                 }
                 // Count segment files across all variant dirs.
@@ -2049,6 +2193,7 @@ async fn spawn_ffmpeg(
         let session_id_str = session_id.to_string();
         let pid = child.id();
         let session_dir_for_finalize = session_dir.to_path_buf();
+        let stderr_health = Arc::clone(&health);
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             const RING_CAP: usize = 8;
@@ -2172,6 +2317,15 @@ async fn spawn_ffmpeg(
                     stderr_tail = %tail,
                     "ffmpeg stderr drained — liveness now tracked solely by the heartbeat monitor",
                 );
+                // Flip the shared health state so the admin dashboard
+                // surfaces the dead session. Only when waitpid actually
+                // reaped the child — "still running (stderr closed
+                // without exit?)" means the encoder is alive and we
+                // leave the health untouched; heartbeat will catch a
+                // real exit if/when one arrives.
+                if !exit_detail.starts_with("still running") {
+                    stderr_health.mark_exited(&exit_detail, now_ms());
+                }
             }
             // Make sure each variant playlist carries `#EXT-X-ENDLIST`.
             // When ffmpeg exits cleanly it adds this itself; when it

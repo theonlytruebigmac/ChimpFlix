@@ -89,6 +89,7 @@ export interface Notification {
 export interface NotificationsListResponse {
   notifications: Notification[];
   unread: number;
+  total: number;
 }
 
 export interface SessionSummary {
@@ -2036,7 +2037,7 @@ export interface LibraryHealthItemRow {
 export interface LibraryHealthItemsResponse {
   category: LibraryHealthCategory;
   total: number;
-  rows: LibraryHealthItemRow[];
+  items: LibraryHealthItemRow[];
 }
 
 // ─── Admin: credential vault ───────────────────────────────────────────────
@@ -2119,7 +2120,26 @@ export interface DashboardSession {
   /// encoder's own preset vocabulary (libx264 ultrafast/veryfast/
   /// medium, NVENC p1/p4/p6, etc.).
   encoder_preset: string;
+  /// State of the ffmpeg child for this session. `healthy` is the
+  /// normal case; `exited` means the heartbeat probe or the stderr-
+  /// drain task saw the process gone — the row should render a
+  /// warning pill in the admin dashboard.
+  transcode_health?: TranscodeHealth;
+  /// Subtitle sidecar extraction state, when the session has a
+  /// sidecar. Absent on burn-in / no-subtitle sessions.
+  subtitle_health?: SubtitleHealth | null;
 }
+
+/// Mirrors `chimpflix_transcoder::TranscodeHealth`.
+export type TranscodeHealth =
+  | { kind: "healthy" }
+  | { kind: "exited"; detail: string; at_ms: number };
+
+/// Mirrors `chimpflix_transcoder::SubtitleHealth`.
+export type SubtitleHealth =
+  | { kind: "pending" }
+  | { kind: "ready" }
+  | { kind: "failed"; reason: string };
 
 export interface DashboardScanJob {
   id: number;
@@ -3097,6 +3117,8 @@ export interface NowPlayingSession {
   /// Cumulative bytes served over HTTP since session start (segment +
   /// playlist GETs). Flushed to `playback_events.bytes_sent` on close.
   bytes_served: number;
+  transcode_health?: TranscodeHealth;
+  subtitle_health?: SubtitleHealth | null;
 }
 
 export interface StatsLibraryBucket {
@@ -3439,11 +3461,15 @@ export const admin = {
       apiFetch<void>(`/admin/webhooks/${id}`, { method: "DELETE" }),
     test: (id: number) =>
       apiFetch<void>(`/admin/webhooks/${id}/test`, { method: "POST" }),
-    listDeliveries: (id: number, limit?: number) =>
-      apiFetch<{ deliveries: WebhookDelivery[] }>(
+    listDeliveries: (id: number, limit?: number, offset?: number) => {
+      const query: Record<string, string | number | boolean> = {};
+      if (limit !== undefined) query.limit = limit;
+      if (offset !== undefined) query.offset = offset;
+      return apiFetch<{ deliveries: WebhookDelivery[]; total: number }>(
         `/admin/webhooks/${id}/deliveries`,
-        { query: limit ? { limit } : undefined },
-      ),
+        { query: Object.keys(query).length > 0 ? query : undefined },
+      );
+    },
   },
   network: {
     get: () => apiFetch<NetworkSettings>("/admin/network"),

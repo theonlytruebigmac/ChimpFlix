@@ -6,6 +6,7 @@ import { SettingsPasswordClient } from "@/components/SettingsPasswordClient";
 import { SettingsProfileClient } from "@/components/SettingsProfileClient";
 import { SettingsSessionsClient } from "@/components/SettingsSessionsClient";
 import { SettingsTwoFactorClient } from "@/components/SettingsTwoFactorClient";
+import { formatDate, formatDateTime } from "@/lib/format";
 
 /// Account tab. Holds the per-user identity surface plus the
 /// server-info summary that used to sit at the top of the old settings
@@ -24,11 +25,11 @@ export default async function AccountSettingsPage() {
       <Section title="Membership">
         <Row label="Username" value={`@${user.username}`} />
         <Row label="Role" value={user.role === "owner" ? "Owner" : "User"} />
-        <Row label="Joined" value={new Date(user.created_at).toLocaleDateString()} />
+        <Row label="Joined" value={formatDate(user.created_at)} />
         {user.previous_login_at != null && (
           <Row
             label="Previous sign-in"
-            value={`${new Date(user.previous_login_at).toLocaleString()}${
+            value={`${formatDateTime(user.previous_login_at)}${
               user.previous_login_ip ? ` from ${user.previous_login_ip}` : ""
             }`}
           />

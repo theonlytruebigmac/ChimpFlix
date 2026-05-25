@@ -162,7 +162,7 @@ export function CollectionBrowseClient({
         </ul>
       )}
 
-      {total > DEFAULT_PAGE_SIZE && (
+      {total > pageSize && (
         <Pagination
           page={page}
           pageSize={pageSize}

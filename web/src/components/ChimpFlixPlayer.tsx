@@ -591,6 +591,22 @@ export function ChimpFlixPlayer({
   } | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+  // Transient, non-fatal notices ("Subtitle failed to load") that
+  // surface above the player chrome and auto-dismiss. Distinct from
+  // `error`, which takes over the screen for fatal playback failures.
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showNotice = useCallback((msg: string) => {
+    setNotice(msg);
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => setNotice(null), 4500);
+  }, []);
+  useEffect(
+    () => () => {
+      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    },
+    [],
+  );
   const [loading, setLoading] = useState(true);
   /// Set true when HLS.js is mid-recovery from a fatal error
   /// (network blip, MSE decode hiccup). A subtle overlay communicates
@@ -912,13 +928,16 @@ export function ChimpFlixPlayer({
     // already cascades into the child elements (<c>, <v>, <i>,
     // <b>) so dropping them costs nothing and silences four
     // console warnings per page load in Firefox.
-    const font = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    // Honor the user's font-family preference. The helper returns null
+    // for the "default" choice, meaning "let the browser pick its caption
+    // default" — emit no rule in that case so we don't override the UA.
+    const family = cssFontFamilyForSubtitleStyle(subtitleStyle.fontFamily);
     const cssBlock = `
       background: ${subtitleStyle.backgroundColor} !important;
       background-color: ${subtitleStyle.backgroundColor} !important;
       color: ${subtitleStyle.textColor} !important;
       font-size: ${subtitleStyle.fontSizePx}px !important;
-      font-family: ${font} !important;
+      ${family ? `font-family: ${family} !important;` : ""}
       line-height: 1.25 !important;
       ${edgeRule}
     `;
@@ -3174,12 +3193,13 @@ export function ChimpFlixPlayer({
               // External subtitle 404 / network blip would otherwise
               // leave the picker showing the row as "active" while no
               // cues render — a silent failure. Clear the selection
-              // so the UI reflects the real state and the user can
-              // pick another row.
+              // so the UI reflects the real state, surface a transient
+              // notice to the user, and log for diagnostics.
               console.warn(
                 "[player] external subtitle failed to load",
                 externalSub.url,
               );
+              showNotice("Subtitle track failed to load");
               selectSubtitle(null);
             }}
           />
@@ -3190,6 +3210,15 @@ export function ChimpFlixPlayer({
       {loading && !error && !autoplayBlocked && <LoadingSpinner />}
       {autoplayBlocked && !error && <BigPlayButton onClick={attemptPlay} />}
       {reconnecting && !error && <ReconnectingOverlay />}
+      {notice && !error && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="zf-fade-in pointer-events-none absolute left-1/2 top-6 z-30 -translate-x-1/2 rounded-md bg-black/75 px-4 py-2 text-sm text-white/95 shadow-lg ring-1 ring-white/10"
+        >
+          {notice}
+        </div>
+      )}
 
       {statsOpen && (
         <StatsOverlay
@@ -3930,8 +3959,37 @@ export function SubtitleStylePanel({
   onChange: (next: SubtitleStyle) => void;
 }) {
   const patch = (p: Partial<SubtitleStyle>) => onChange({ ...value, ...p });
+  const previewFamily = cssFontFamilyForSubtitleStyle(value.fontFamily);
+  const previewEdge =
+    value.edge === "outline"
+      ? "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000"
+      : value.edge === "shadow"
+        ? "2px 2px 3px rgba(0,0,0,0.85)"
+        : "none";
   return (
     <div className="mt-3 space-y-3 text-[0.7rem]">
+      <div
+        className="relative flex h-16 items-end justify-center overflow-hidden rounded"
+        style={{
+          backgroundImage:
+            "linear-gradient(135deg,#1a2238 0%,#3b1f2c 60%,#0d1525 100%)",
+        }}
+        aria-hidden="true"
+      >
+        <span
+          className="mb-2 inline-block max-w-[90%] truncate rounded px-1.5"
+          style={{
+            backgroundColor: value.backgroundColor,
+            color: value.textColor,
+            fontSize: `${Math.min(18, Math.max(11, value.fontSizePx * 0.55))}px`,
+            fontFamily: previewFamily ?? undefined,
+            textShadow: previewEdge,
+            lineHeight: 1.25,
+          }}
+        >
+          The quick brown fox jumps over the lazy dog
+        </span>
+      </div>
       <div>
         <div className="mb-1 text-white/55">Size</div>
         <div className="flex gap-1">

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
 import { SettingsFeedback } from "./ui/SettingsFeedback";
+import { formatDate, formatDateTime } from "@/lib/format";
 import {
   admin as adminApi,
   auth as authApi,
@@ -338,11 +339,11 @@ export function SettingsInvitesClient() {
                   </div>
                   <div className="text-xs text-white/50">
                     {inv.expires_at
-                      ? `Expires ${new Date(inv.expires_at).toLocaleString()}`
+                      ? `Expires ${formatDateTime(inv.expires_at)}`
                       : "Never expires"}
                     {" · "}
                     {inv.sent_at
-                      ? `Emailed ${new Date(inv.sent_at).toLocaleDateString()}`
+                      ? `Emailed ${formatDate(inv.sent_at)}`
                       : inv.email
                         ? "Email pending / failed"
                         : "Link only"}
@@ -400,9 +401,7 @@ export function SettingsInvitesClient() {
                   </div>
                   <div className="text-xs text-white/45">
                     Used{" "}
-                    {inv.consumed_at
-                      ? new Date(inv.consumed_at).toLocaleString()
-                      : ""}
+                    {inv.consumed_at ? formatDateTime(inv.consumed_at) : ""}
                   </div>
                 </div>
               </li>

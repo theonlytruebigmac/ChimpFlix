@@ -15,6 +15,8 @@ import {
   type StatsTopItemRow,
   type StatsTopUserRow,
 } from "@/lib/chimpflix-api";
+import { formatDate } from "@/lib/format";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 // Frontend-only concurrent-streams sparkline — keeps the last
 // CONCURRENT_HISTORY samples from the now-playing poll and draws
@@ -730,9 +732,7 @@ function UserDrillIn({
             <div className="px-6 py-3 text-xs text-red-300">{error}</div>
           )}
           {events == null ? (
-            <div className="px-6 py-8 text-center text-sm text-white/55">
-              Loading…
-            </div>
+            <LoadingPlaceholder />
           ) : events.length === 0 ? (
             <div className="px-6 py-8 text-center text-sm text-white/55">
               No events recorded for this user yet.
@@ -935,5 +935,5 @@ function formatRelative(epochMs: number): string {
   if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24);
   if (d < 30) return `${d}d ago`;
-  return new Date(epochMs).toLocaleDateString();
+  return formatDate(epochMs);
 }

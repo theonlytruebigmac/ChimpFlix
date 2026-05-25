@@ -308,7 +308,15 @@ function ActionButton({
 }
 
 function StatGrid({ children }: { children: React.ReactNode }) {
-  return <div className="grid grid-cols-2 gap-2 md:grid-cols-4">{children}</div>;
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="grid grid-cols-2 gap-2 md:grid-cols-4"
+    >
+      {children}
+    </div>
+  );
 }
 
 function Stat({

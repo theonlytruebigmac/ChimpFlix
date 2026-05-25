@@ -89,7 +89,12 @@ export function useItemLike(ratingKey: string): {
           setRating(final);
           notifyRatingChanged(itemId, final);
         }
-      } catch {
+      } catch (e) {
+        // Revert the optimistic toggle. We don't have a global toast
+        // system to surface this — log to console so dev tools shows
+        // the network failure, since the silent flip-back used to leave
+        // users confused ("why did my like un-like itself?").
+        console.error("[likes] rating PUT/DELETE failed:", e);
         setRating(wasLiked ? rating : null);
       } finally {
         setBusy(false);

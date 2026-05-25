@@ -74,12 +74,16 @@ body {
   animation: zfFadeIn 220ms ease-out both;
 }
 
+/* Modal backdrop + content animate over the same window so the
+   overlay feels like one cohesive transition. The backdrop uses a
+   plain ease-out while the content uses a spring-like cubic-bezier
+   to add a slight "settle" — same duration keeps them in sync. */
 .zf-modal-backdrop {
-  animation: zfFadeIn 180ms ease-out both;
+  animation: zfFadeIn 240ms ease-out both;
 }
 
 .zf-modal-in {
-  animation: zfModalIn 280ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: zfModalIn 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .zf-rise-in {

@@ -23,8 +23,10 @@ export function SettingsPlayerClient({
   const [prefs, updatePrefs] = usePrefs();
   const [subtitleStyle, setSubtitleStyleLocal] =
     useState<SubtitleStyle>(initialSubtitleStyle);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const setSubtitleStyle = useCallback((next: SubtitleStyle) => {
     setSubtitleStyleLocal(next);
+    setSaveError(null);
     authApi
       .updateMe({
         subtitle_font_size_px: next.fontSizePx,
@@ -34,11 +36,11 @@ export function SettingsPlayerClient({
         subtitle_edge: next.edge,
         subtitle_bottom_inset_pct: next.bottomInsetPct,
       })
-      .catch(() => {
-        // Best-effort persistence — keep the local pick so the
-        // preview reflects what the viewer just chose. A persistent
-        // failure surfaces on the next refresh (the server returns
-        // the un-updated values).
+      .catch((e: unknown) => {
+        // Preview keeps the local pick so the viewer can see what they
+        // chose, but flag that it won't survive a refresh — silent
+        // swallow leaves users confused when settings revert.
+        setSaveError(e instanceof Error ? e.message : String(e));
       });
   }, []);
 
@@ -85,6 +87,16 @@ export function SettingsPlayerClient({
           transcoding text tracks.
         </p>
         <SubtitleStylePanel value={subtitleStyle} onChange={setSubtitleStyle} />
+        {saveError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+          >
+            Couldn&apos;t save subtitle style: {saveError}. Changes will
+            revert on next refresh.
+          </div>
+        )}
       </div>
     </div>
   );

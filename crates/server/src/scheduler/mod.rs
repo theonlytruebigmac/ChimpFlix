@@ -24,7 +24,9 @@ use chimpflix_library::scanner;
 use chimpflix_library::{NewScheduledTask, ScheduledTask};
 use chrono::{Local, NaiveTime, TimeZone, Utc};
 use cron::Schedule;
+use futures::FutureExt;
 use sqlx::SqlitePool;
+use std::panic::AssertUnwindSafe;
 use tracing::{debug, error, info, warn};
 
 use crate::state::AppState;
@@ -103,6 +105,26 @@ fn parse_hhmm(s: &str, fallback_h: u32, fallback_m: u32) -> NaiveTime {
         }
     }
     NaiveTime::from_hms_opt(fallback_h, fallback_m, 0).expect("valid fallback")
+}
+
+/// Parse a scheduled task's `params_json` into a `serde_json::Value`,
+/// falling back to `{}` (empty object) when the stored JSON is invalid.
+/// Logs a WARN with the task kind so a misconfigured admin edit isn't
+/// silently absorbed — without the log, callers downstream just see
+/// their defaults applied and never learn they typed broken JSON.
+fn parse_task_params(task_kind: &str, params_json: &str) -> serde_json::Value {
+    match serde_json::from_str(params_json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                task_kind,
+                error = %e,
+                params = %params_json.chars().take(200).collect::<String>(),
+                "scheduled task params_json failed to parse; using empty object"
+            );
+            serde_json::Value::Object(Default::default())
+        }
+    }
 }
 
 /// Snap `t_ms` forward to the next moment that falls within the
@@ -540,11 +562,39 @@ async fn run_once(state: &AppState) -> Result<()> {
     let due = queries::claim_due_tasks(&state.pool, now).await?;
     for task in due {
         let st = state.clone();
-        tokio::spawn(async move {
-            execute(st, task).await;
-        });
+        spawn_execute_caught(st, task);
     }
     Ok(())
+}
+
+/// Spawn `execute(state, task)` with panic logging. A panic inside
+/// `execute` would otherwise be swallowed by tokio's default handling
+/// (the runtime prints to stderr but the panic doesn't reach our
+/// tracing pipeline), so the operator has no warning that one of
+/// their scheduled tasks crashed the worker. `AssertUnwindSafe` is
+/// sound here because we don't reuse the future after the panic — we
+/// only log the message and discard.
+fn spawn_execute_caught(state: AppState, task: ScheduledTask) {
+    let task_id = task.id;
+    let task_name = task.name.clone();
+    let task_kind = task.kind.clone();
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(execute(state, task)).catch_unwind().await;
+        if let Err(panic) = outcome {
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "(non-string panic payload)".to_string());
+            error!(
+                task_id,
+                task = %task_name,
+                kind = %task_kind,
+                panic = %msg,
+                "scheduled task panicked — worker survives, but the task's status was not updated"
+            );
+        }
+    });
 }
 
 /// Public for the `POST /admin/tasks/{id}/run` route — fires the handler
@@ -561,7 +611,7 @@ pub async fn run_now(state: AppState, task_id: i64) -> Result<()> {
     if task.last_status.as_deref() == Some("running") {
         bail!("task {} is already running", task.name);
     }
-    tokio::spawn(async move { execute(state, task).await });
+    spawn_execute_caught(state, task);
     Ok(())
 }
 
@@ -700,8 +750,7 @@ async fn dispatch(
             // Trim succeeded + dead rows from the `jobs` table.
             // params.succeeded_retention_days / dead_retention_days
             // override the defaults (7 / 30).
-            let params: serde_json::Value =
-                serde_json::from_str(&task.params_json).unwrap_or_default();
+            let params = parse_task_params(&task.kind, &task.params_json);
             let succ_days = params
                 .get("succeeded_retention_days")
                 .and_then(|v| v.as_i64())
@@ -730,8 +779,7 @@ async fn dispatch(
             // (default 90). The audit log is append-only and grows
             // unbounded otherwise; 90 days is enough to investigate
             // most incidents while keeping the table size sane.
-            let params: serde_json::Value =
-                serde_json::from_str(&task.params_json).unwrap_or_else(|_| serde_json::json!({}));
+            let params = parse_task_params(&task.kind, &task.params_json);
             let retention_days = params
                 .get("retention_days")
                 .and_then(|v| v.as_i64())
@@ -900,8 +948,7 @@ async fn dispatch(
             // Refresh every item in the library (or the whole DB if no
             // params.library_id is given). Best-effort; per-item failures
             // do not fail the task.
-            let params: serde_json::Value = serde_json::from_str(&task.params_json)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let params = parse_task_params(&task.kind, &task.params_json);
             let library_id = params.get("library_id").and_then(|v| v.as_i64());
             // Refresh is chain-aware now — runs whichever agents are
             // enabled per-library. Missing TMDB is not a blocker.
@@ -958,8 +1005,7 @@ async fn dispatch(
             // 10k-file library piling up everything in one tick.
             // Subsequent ticks drain whatever the queue worker
             // hasn't picked up yet.
-            let params: serde_json::Value =
-                serde_json::from_str(&task.params_json).unwrap_or_default();
+            let params = parse_task_params(&task.kind, &task.params_json);
             let scoped_library_id = params.get("library_id").and_then(|v| v.as_i64());
             let per_library_cap = params
                 .get("batch_size")

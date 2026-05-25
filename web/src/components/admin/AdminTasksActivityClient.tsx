@@ -490,19 +490,21 @@ function RecentRunsCard({
               nowMs={nowMs}
             />
           ))}
-          <div className="border-t border-white/8 px-4 py-2">
-            <Pagination
-              page={effectivePage}
-              pageSize={pageSize}
-              total={runs.length}
-              onPageChange={setPage}
-              onPageSizeChange={(s) => {
-                setPageSize(s);
-                setPage(1);
-              }}
-              noun="runs"
-            />
-          </div>
+          {runs.length > pageSize && (
+            <div className="border-t border-white/8 px-4 py-2">
+              <Pagination
+                page={effectivePage}
+                pageSize={pageSize}
+                total={runs.length}
+                onPageChange={setPage}
+                onPageSizeChange={(s) => {
+                  setPageSize(s);
+                  setPage(1);
+                }}
+                noun="runs"
+              />
+            </div>
+          )}
         </>
       )}
     </div>

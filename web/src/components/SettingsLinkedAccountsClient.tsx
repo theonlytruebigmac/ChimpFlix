@@ -5,6 +5,7 @@ import { plex, type PlexLinkSummary } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PlexSignInButton } from "./PlexSignInButton";
 import { SettingsFeedback } from "./ui/SettingsFeedback";
+import { formatDate } from "@/lib/format";
 
 /// Per-user "Linked accounts" card. Today this is Plex-only; when we
 /// add Google OAuth the same surface will list both providers.
@@ -70,8 +71,7 @@ export function SettingsLinkedAccountsClient() {
                     ({plexLink.external_email})
                   </span>
                 )}
-                {" · "}since{" "}
-                {new Date(plexLink.linked_at).toLocaleDateString()}
+                {" · "}since {formatDate(plexLink.linked_at)}
               </div>
             ) : (
               <div className="mt-0.5 text-xs text-white/55">

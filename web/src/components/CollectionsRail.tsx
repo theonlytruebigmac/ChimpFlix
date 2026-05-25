@@ -1,3 +1,6 @@
+"use client";
+
+import { useState } from "react";
 import Link from "next/link";
 import type { Collection } from "@/lib/chimpflix-api";
 import { plexImage, plexSrcSet } from "@/lib/image";
@@ -39,6 +42,10 @@ function CollectionCard({ collection }: { collection: Collection }) {
   const artPath = collection.backdrop_path ?? collection.poster_path;
   const img = plexImage(artPath ?? undefined, 480, 270);
   const srcSet = plexSrcSet(artPath ?? undefined, 480, 270);
+  // Flip to the name-only fallback when the art URL is present but
+  // 404s at runtime (e.g. an admin renamed the poster on disk).
+  const [imgFailed, setImgFailed] = useState(false);
+  const showImg = img && !imgFailed;
 
   return (
     <div className="group relative w-44 flex-none sm:w-56 md:w-72 hover:z-50">
@@ -50,7 +57,7 @@ function CollectionCard({ collection }: { collection: Collection }) {
             className="block text-left"
           >
             <div className="relative aspect-video bg-gradient-to-br from-neutral-800 via-neutral-900 to-black">
-              {img ? (
+              {showImg ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
                   src={img}
@@ -58,6 +65,7 @@ function CollectionCard({ collection }: { collection: Collection }) {
                   alt=""
                   loading="lazy"
                   decoding="async"
+                  onError={() => setImgFailed(true)}
                   className="h-full w-full object-cover"
                 />
               ) : (
@@ -73,7 +81,7 @@ function CollectionCard({ collection }: { collection: Collection }) {
               {/* Title overlay over art. Mirrors Card's treatment so the
                   rail reads consistently when art is present. Skipped
                   on the fallback because the name already dominates. */}
-              {img && (
+              {showImg && (
                 <div className="pointer-events-none absolute inset-x-0 top-0 bg-linear-to-b from-black/85 via-black/40 to-transparent pb-10">
                   <div className="line-clamp-2 px-3 pt-2.5 text-sm font-semibold leading-tight drop-shadow-lg">
                     {collection.name}

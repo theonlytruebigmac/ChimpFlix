@@ -19,6 +19,7 @@ import {
 } from "@/lib/modal-cache";
 import { useMyListItem } from "@/lib/my-list";
 import { notifyRatingChanged } from "@/lib/likes";
+import { formatDate } from "@/lib/format";
 import Link from "next/link";
 import {
   auth as authApi,
@@ -274,6 +275,10 @@ function TitleModalView({
   // owner checks via authApi.me — we need a parallel one here because
   // SeasonEpisodes lives in this scope, not theirs.
   const [isOwnerView, setIsOwnerView] = useState(false);
+  // Logo image failure → fall back to the H1 title. TMDB occasionally
+  // returns 404 for a logo URL its API claimed exists; without this
+  // the modal shows a broken-image icon next to the brand chrome.
+  const [logoFailed, setLogoFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
     authApi
@@ -367,6 +372,12 @@ function TitleModalView({
           <img
             src={backdrop}
             alt=""
+            onError={(e) => {
+              // Plex thumbnail / TMDB CDN miss — hide the broken-icon
+              // flash; the surrounding gradient + brand chrome covers
+              // for the missing art.
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
             className={`zf-fade-in absolute inset-0 h-full w-full object-cover transition-opacity duration-500 ${
               trailerVideoId ? "opacity-0" : "opacity-100"
             }`}
@@ -392,11 +403,12 @@ function TitleModalView({
             <span className="text-white/85">{isShow ? "Series" : "Film"}</span>
           </div>
           <div className="mb-5">
-            {item.logo ? (
+            {item.logo && !logoFailed ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={item.logo}
                 alt={title}
+                onError={() => setLogoFailed(true)}
                 className="zf-fade-in max-h-44 max-w-md drop-shadow-2xl sm:max-h-56 sm:max-w-lg"
                 style={{ objectFit: "contain", objectPosition: "left bottom" }}
               />
@@ -643,13 +655,16 @@ function SimilarCard({ item }: { item: MediaItem }) {
       onFocus={() => prefetchModalData(item.ratingKey)}
       className="group block w-full cursor-pointer overflow-hidden rounded-md bg-black text-left transition-colors hover:bg-white/5"
     >
-      <div className="relative aspect-video">
+      <div className="relative aspect-video bg-black">
         {img ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={img}
             alt={label}
             loading="lazy"
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
             className="h-full w-full object-cover"
           />
         ) : (
@@ -1049,6 +1064,9 @@ function CollectionMemberTile({ item }: { item: ListedItem }) {
             src={poster}
             alt={item.title}
             loading="lazy"
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
             className="h-full w-full object-cover"
           />
         ) : (
@@ -2337,6 +2355,9 @@ function ExtraTile({ extra }: { extra: Extra }) {
             src={extra.thumb_url}
             alt=""
             loading="lazy"
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
             className="h-full w-full object-cover"
           />
         )}
@@ -2452,6 +2473,10 @@ function ReviewsSection({
                       src={r.avatar_url}
                       alt=""
                       loading="lazy"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).style.display =
+                          "none";
+                      }}
                       className="h-full w-full object-cover"
                     />
                   ) : (
@@ -2470,7 +2495,7 @@ function ReviewsSection({
                     )}
                   </div>
                   <div className="text-xs text-white/45">
-                    {new Date(r.created_at).toLocaleDateString()}
+                    {formatDate(r.created_at)}
                     {r.source === "tmdb" && (
                       <span className="ml-2 text-white/30">via TMDB</span>
                     )}

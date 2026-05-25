@@ -3561,18 +3561,28 @@ pub async fn list_notifications(
     pool: &SqlitePool,
     user_id: i64,
     limit: i64,
+    offset: i64,
 ) -> Result<Vec<Notification>> {
     let rows = sqlx::query(
         "SELECT * FROM notifications
           WHERE user_id = ?
           ORDER BY created_at DESC
-          LIMIT ?",
+          LIMIT ? OFFSET ?",
     )
     .bind(user_id)
     .bind(limit.clamp(1, 200))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?;
     rows.iter().map(Notification::from_row).collect()
+}
+
+pub async fn count_notifications(pool: &SqlitePool, user_id: i64) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("n")?)
 }
 
 pub async fn count_unread_notifications(pool: &SqlitePool, user_id: i64) -> Result<i64> {
@@ -5043,10 +5053,21 @@ pub async fn purge_removed_media_files(
     .await?;
     report.purged_paths = path_rows;
 
+    // Wrap the four cascading DELETEs in a single transaction so a
+    // failure mid-cascade can't leave parents pointing at vanished
+    // children (or vice versa). Without this, a writer panic between
+    // the media_files DELETE and the orphan-sweep would leave
+    // dangling rows that the next purge tick would handle anyway —
+    // but a *reader* hitting the window would see an inconsistent
+    // tree (an item with zero seasons, or a season with zero
+    // episodes). One BEGIN/COMMIT keeps the entire cascade atomic
+    // from the reader's perspective.
+    let mut tx = pool.begin().await?;
+
     // Hard-delete the soft-deleted files past the grace window.
     let r = sqlx::query("DELETE FROM media_files WHERE removed_at IS NOT NULL AND removed_at < ?")
         .bind(older_than_ms)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     report.files_purged = r.rows_affected();
 
@@ -5060,7 +5081,7 @@ pub async fn purge_removed_media_files(
         "DELETE FROM episodes
          WHERE NOT EXISTS (SELECT 1 FROM media_files WHERE episode_id = episodes.id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     report.episodes_purged = r.rows_affected();
 
@@ -5068,7 +5089,7 @@ pub async fn purge_removed_media_files(
         "DELETE FROM seasons
          WHERE NOT EXISTS (SELECT 1 FROM episodes WHERE season_id = seasons.id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     report.seasons_purged = r.rows_affected();
 
@@ -5079,9 +5100,11 @@ pub async fn purge_removed_media_files(
          WHERE (kind = 'movie' AND NOT EXISTS (SELECT 1 FROM media_files WHERE item_id = items.id))
             OR (kind = 'show'  AND NOT EXISTS (SELECT 1 FROM seasons WHERE show_id = items.id))",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     report.items_purged = r.rows_affected();
+
+    tx.commit().await?;
 
     Ok(report)
 }
@@ -5118,12 +5141,18 @@ pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Re
         report.purged_paths.push(path);
     }
 
+    // Wrap the file DELETE + cascade in a single transaction. Same
+    // atomicity reasoning as `purge_removed_media_files`: a reader
+    // hitting the window between the media_files DELETE and the
+    // orphan-sweep would otherwise see a half-pruned tree.
+    let mut tx = pool.begin().await?;
+
     let delete_sql = format!("DELETE FROM media_files WHERE id IN ({placeholders})");
     let mut q = sqlx::query(&delete_sql);
     for id in file_ids {
         q = q.bind(*id);
     }
-    let r = q.execute(pool).await?;
+    let r = q.execute(&mut *tx).await?;
     report.files_purged = r.rows_affected();
 
     // Cascade orphan sweep — same order + logic as `purge_removed_media_files`.
@@ -5134,7 +5163,7 @@ pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Re
         "DELETE FROM episodes
          WHERE NOT EXISTS (SELECT 1 FROM media_files WHERE episode_id = episodes.id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     report.episodes_purged = r.rows_affected();
 
@@ -5142,7 +5171,7 @@ pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Re
         "DELETE FROM seasons
          WHERE NOT EXISTS (SELECT 1 FROM episodes WHERE season_id = seasons.id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     report.seasons_purged = r.rows_affected();
 
@@ -5151,9 +5180,11 @@ pub async fn delete_media_files_force(pool: &SqlitePool, file_ids: &[i64]) -> Re
          WHERE (kind = 'movie' AND NOT EXISTS (SELECT 1 FROM media_files WHERE item_id = items.id))
             OR (kind = 'show'  AND NOT EXISTS (SELECT 1 FROM seasons WHERE show_id = items.id))",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     report.items_purged = r.rows_affected();
+
+    tx.commit().await?;
 
     Ok(report)
 }
@@ -10441,16 +10472,31 @@ pub async fn list_webhook_deliveries(
     pool: &SqlitePool,
     webhook_id: i64,
     limit: i64,
+    offset: i64,
 ) -> Result<Vec<WebhookDelivery>> {
     let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
     let rows = sqlx::query(
-        "SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT * FROM webhook_deliveries
+         WHERE webhook_id = ?
+         ORDER BY created_at DESC
+         LIMIT ? OFFSET ?",
     )
     .bind(webhook_id)
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     rows.iter().map(WebhookDelivery::from_row).collect()
+}
+
+pub async fn count_webhook_deliveries(pool: &SqlitePool, webhook_id: i64) -> Result<i64> {
+    let total: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = ?")
+            .bind(webhook_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(total.0)
 }
 
 // ---------------------------------------------------------------------------

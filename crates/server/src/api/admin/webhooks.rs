@@ -184,11 +184,13 @@ pub async fn test_fire(
 #[derive(Debug, Deserialize)]
 pub struct DeliveriesParams {
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DeliveriesResponse {
     pub deliveries: Vec<WebhookDelivery>,
+    pub total: i64,
 }
 
 pub async fn list_deliveries(
@@ -197,10 +199,15 @@ pub async fn list_deliveries(
     Path(id): Path<i64>,
     Query(params): Query<DeliveriesParams>,
 ) -> Result<Json<DeliveriesResponse>, ApiError> {
-    let deliveries = queries::list_webhook_deliveries(&state.pool, id, params.limit.unwrap_or(50))
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+    let deliveries = queries::list_webhook_deliveries(&state.pool, id, limit, offset)
         .await
         .map_err(ApiError::Internal)?;
-    Ok(Json(DeliveriesResponse { deliveries }))
+    let total = queries::count_webhook_deliveries(&state.pool, id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(DeliveriesResponse { deliveries, total }))
 }
 
 async fn validate_new(input: &NewWebhook) -> Result<(), ApiError> {

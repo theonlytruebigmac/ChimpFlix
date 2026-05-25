@@ -220,14 +220,22 @@ pub async fn status(
     }))
 }
 
+#[derive(Debug, Serialize)]
+pub struct UnlinkResponse {
+    /// True when an existing link was deleted; false when there was
+    /// nothing to delete (idempotent). Matches the `MarkedResponse`
+    /// / `RevokeResponse` shape used by sibling endpoints.
+    pub removed: bool,
+}
+
 pub async fn unlink(
     State(state): State<AppState>,
     user: AuthUser,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<UnlinkResponse>, ApiError> {
     let removed = queries::delete_trakt_tokens(&state.pool, user.id)
         .await
         .map_err(ApiError::Internal)?;
-    Ok(Json(serde_json::json!({ "removed": removed })))
+    Ok(Json(UnlinkResponse { removed }))
 }
 
 #[derive(Debug, Serialize)]

@@ -106,7 +106,7 @@ export function HistoryBrowseClient({
         </ul>
       )}
 
-      {initialTotal > 0 && (
+      {initialTotal > pageSize && (
         <Pagination
           page={initialPage}
           pageSize={pageSize}

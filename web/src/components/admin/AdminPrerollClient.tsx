@@ -7,6 +7,7 @@ import {
   type PrerollStatus,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { SettingsCard, SettingsRow } from "./ui/SettingsCard";
 
 interface Props {
   initialStatus: PrerollStatus;
@@ -120,34 +121,71 @@ export function AdminPrerollClient({
   return (
     <div className="space-y-6">
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
       )}
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6 space-y-4">
-        <h2 className="text-base font-semibold">Current pre-roll</h2>
-        {status.configured ? (
-          <div className="space-y-3">
-            <div className="text-sm text-white/75">
-              File configured ({formatBytes(status.size_bytes ?? 0)}).{" "}
-              {enabled ? (
-                <span className="text-green-300">Active — plays before each session.</span>
-              ) : (
-                <span className="text-amber-300">Disabled — toggle to enable.</span>
+      <SettingsCard title="Current pre-roll">
+        <div className="space-y-4 px-5 py-4">
+          {status.configured ? (
+            <>
+              <div className="text-sm text-white/75">
+                File configured ({formatBytes(status.size_bytes ?? 0)}).{" "}
+                {enabled ? (
+                  <span className="text-green-300">
+                    Active — plays before each session.
+                  </span>
+                ) : (
+                  <span className="text-amber-300">
+                    Disabled — toggle to enable.
+                  </span>
+                )}
+              </div>
+              {status.url && (
+                <video
+                  ref={previewRef}
+                  src={status.url}
+                  controls
+                  preload="metadata"
+                  className="max-h-72 w-full rounded border border-white/10 bg-black"
+                />
               )}
-            </div>
-            {status.url && (
-              <video
-                ref={previewRef}
-                src={status.url}
-                controls
-                preload="metadata"
-                className="max-h-72 w-full rounded border border-white/10 bg-black"
-              />
-            )}
-            <div className="flex flex-wrap gap-2">
-              <label className="rounded-md border border-white/15 px-3 py-1.5 text-sm cursor-pointer hover:bg-white/5">
+              <div className="flex flex-wrap gap-2">
+                <label className="rounded-md border border-white/15 px-3 py-1.5 text-sm cursor-pointer hover:bg-white/5">
+                  <input
+                    type="file"
+                    accept="video/mp4,video/webm,video/x-matroska,.mkv"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      e.target.value = "";
+                      if (f) upload(f);
+                    }}
+                    disabled={busy === "upload"}
+                  />
+                  {busy === "upload" ? "Uploading…" : "Replace…"}
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setAskClear(true)}
+                  disabled={busy === "clear"}
+                  className="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+                >
+                  {busy === "clear" ? "Removing…" : "Remove"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <div>
+              <div className="mb-3 rounded border border-dashed border-white/15 bg-white/2 px-4 py-6 text-center text-sm text-white/55">
+                No pre-roll uploaded.
+              </div>
+              <label className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 cursor-pointer">
                 <input
                   type="file"
                   accept="video/mp4,video/webm,video/x-matroska,.mkv"
@@ -159,76 +197,45 @@ export function AdminPrerollClient({
                   }}
                   disabled={busy === "upload"}
                 />
-                {busy === "upload" ? "Uploading…" : "Replace…"}
+                {busy === "upload" ? "Uploading…" : "Upload pre-roll…"}
               </label>
-              <button
-                type="button"
-                onClick={() => setAskClear(true)}
-                disabled={busy === "clear"}
-                className="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-50"
-              >
-                {busy === "clear" ? "Removing…" : "Remove"}
-              </button>
+              <p className="mt-2 text-xs text-white/45">
+                MP4 / WebM / MKV, up to 200 MiB. Aim for &lt; 30s — every
+                viewer sits through this on every session.
+              </p>
             </div>
-          </div>
-        ) : (
-          <div>
-            <div className="mb-3 rounded border border-dashed border-white/15 bg-white/2 px-4 py-6 text-center text-sm text-white/55">
-              No pre-roll uploaded.
-            </div>
-            <label className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 cursor-pointer">
-              <input
-                type="file"
-                accept="video/mp4,video/webm,video/x-matroska,.mkv"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  e.target.value = "";
-                  if (f) upload(f);
-                }}
-                disabled={busy === "upload"}
-              />
-              {busy === "upload" ? "Uploading…" : "Upload pre-roll…"}
-            </label>
-            <p className="mt-2 text-xs text-white/45">
-              MP4 / WebM / MKV, up to 200 MiB. Aim for &lt; 30s — every viewer
-              sits through this on every session.
-            </p>
-          </div>
-        )}
-      </section>
+          )}
+        </div>
+      </SettingsCard>
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-6 space-y-4">
-        <h2 className="text-base font-semibold">Playback</h2>
-        <label className="flex items-start gap-3 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => toggle(e.target.checked)}
-            disabled={!status.configured || busy === "toggle"}
-            className="mt-1"
-          />
-          <div>
-            <div className="font-medium">Play pre-roll before each session</div>
-            <p className="mt-1 text-xs text-white/55">
-              When on, the player runs the pre-roll then transitions to the
-              main content. The viewer can skip after the first frame.
-              Disabled automatically when no pre-roll is uploaded. Skipped
-              when the viewer is resuming a partially-watched item.
-            </p>
-          </div>
-        </label>
-
-        <div className="border-t border-white/10 pt-4">
-          <div className="flex items-baseline justify-between">
-            <div className="text-sm font-medium">Volume</div>
-            <div className="text-xs tabular-nums text-white/55">{volume}%</div>
-          </div>
-          <p className="mt-1 text-xs text-white/55">
-            Output level applied to the pre-roll when the player runs it.
-            Useful for taming stings mastered at theatre levels so they
-            don&apos;t blow out speakers before the show starts.
-          </p>
+      <SettingsCard title="Playback">
+        <SettingsRow
+          label="Play pre-roll before each session"
+          help="When on, the player runs the pre-roll then transitions to the main content. The viewer can skip after the first frame. Disabled automatically when no pre-roll is uploaded. Skipped when the viewer is resuming a partially-watched item."
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => toggle(e.target.checked)}
+              disabled={!status.configured || busy === "toggle"}
+            />
+            <span className="text-white/75">
+              {enabled ? "Enabled" : "Disabled"}
+            </span>
+          </label>
+        </SettingsRow>
+        <SettingsRow
+          label={
+            <span className="flex items-baseline justify-between gap-2">
+              <span>Volume</span>
+              <span className="text-xs tabular-nums text-white/55">
+                {volume}%
+              </span>
+            </span>
+          }
+          help="Output level applied to the pre-roll when the player runs it. Useful for taming stings mastered at theatre levels so they don't blow out speakers before the show starts."
+        >
           <input
             type="range"
             min={0}
@@ -236,19 +243,24 @@ export function AdminPrerollClient({
             step={1}
             value={volume}
             onChange={(e) => setVolumeAndPersist(Number(e.target.value))}
-            className="mt-3 w-full"
+            className="w-full"
             aria-label="Pre-roll volume"
           />
           <div className="mt-1 flex justify-between text-[10px] uppercase tracking-wide text-white/40">
             <span>Mute</span>
             <span>Source level</span>
           </div>
-        </div>
-
-        {savedAt && (
-          <div className="text-xs text-white/50">Saved.</div>
-        )}
-      </section>
+          {savedAt && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="mt-2 text-xs text-emerald-300"
+            >
+              Saved.
+            </div>
+          )}
+        </SettingsRow>
+      </SettingsCard>
       {askClear && (
         <ConfirmDialog
           title="Remove the current pre-roll?"

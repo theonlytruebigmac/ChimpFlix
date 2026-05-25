@@ -1,5 +1,6 @@
 import { admin as adminApi } from "@/lib/chimpflix-api";
 import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
+import { formatDateTime } from "@/lib/format";
 
 export default async function AdminAlertsPage() {
   const data = await adminApi.alerts({ limit: 50 });
@@ -34,7 +35,7 @@ export default async function AdminAlertsPage() {
                 {data.log_alerts.map((l, i) => (
                   <tr key={i} className="border-t border-white/5">
                     <td className="whitespace-nowrap px-3 py-1.5 text-white/60">
-                      {new Date(l.timestamp_ms).toLocaleString()}
+                      {formatDateTime(l.timestamp_ms)}
                     </td>
                     <td
                       className={`whitespace-nowrap px-3 py-1.5 font-mono ${l.level === "ERROR" ? "text-red-400" : "text-amber-300"}`}
@@ -76,7 +77,7 @@ export default async function AdminAlertsPage() {
                 {data.audit.map((e) => (
                   <tr key={e.id} className="border-t border-white/5">
                     <td className="whitespace-nowrap px-3 py-1.5 text-white/60">
-                      {new Date(e.created_at).toLocaleString()}
+                      {formatDateTime(e.created_at)}
                     </td>
                     <td className="whitespace-nowrap px-3 py-1.5 font-mono text-white/70">
                       {e.action}

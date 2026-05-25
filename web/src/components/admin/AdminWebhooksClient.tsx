@@ -10,6 +10,7 @@ import {
 import { Pill } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
+import { formatDateTime } from "@/lib/format";
 
 export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse }) {
   const [webhooks, setWebhooks] = useState(initial.webhooks);
@@ -29,7 +30,11 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
   return (
     <div className="space-y-6">
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
       )}
@@ -336,7 +341,7 @@ function WebhookRow({
                       return (
                         <tr key={d.id} className="border-t border-white/5">
                           <td className="px-3 py-1.5 text-white/60">
-                            {new Date(d.created_at).toLocaleString()}
+                            {formatDateTime(d.created_at)}
                           </td>
                           <td className="px-3 py-1.5 font-mono text-white/70">
                             {d.event}

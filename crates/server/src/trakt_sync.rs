@@ -87,8 +87,68 @@ where
             }
         }
     }
-    let client = Arc::new(client);
-    Ok(Some(f(client, tokens.access_token).await?))
+    let client_arc = Arc::new(client);
+    let access_token_for_call = tokens.access_token.clone();
+    let outcome = f(Arc::clone(&client_arc), access_token_for_call).await;
+    // Reactive 401 recovery. The proactive expires_at window above
+    // catches the common "token aged out" case, but Trakt can also
+    // rotate / invalidate a refresh token server-side (security
+    // event, account-level revocation). In that case our local
+    // `expires_at` still looks fresh but every call comes back 401.
+    // Trigger a refresh here so the *next* call uses a freshly-
+    // minted token; we don't transparently retry the current call
+    // because the closure has already been consumed (FnOnce). The
+    // original error still propagates so the user sees an
+    // actionable message this time. Subsequent retries succeed
+    // without operator intervention.
+    if let Err(err) = &outcome {
+        if is_unauthorized_error(err) {
+            let lock = state.trakt_refresh_lock(user_id).await;
+            let _guard = lock.lock().await;
+            // Re-read tokens — a concurrent caller may have already
+            // refreshed in response to its own 401.
+            if let Ok(Some(latest)) =
+                queries::get_trakt_tokens(&state.pool, &state.vault, user_id).await
+            {
+                if latest.access_token == tokens.access_token {
+                    match client_arc.refresh_token(&latest.refresh_token).await {
+                        Ok(pair) => {
+                            let expires_at = now_ms() + pair.expires_in * 1000;
+                            if let Err(e) = queries::upsert_trakt_tokens(
+                                &state.pool,
+                                &state.vault,
+                                user_id,
+                                &pair.access_token,
+                                &pair.refresh_token,
+                                pair.scope.as_deref(),
+                                expires_at,
+                            )
+                            .await
+                            {
+                                warn!(user_id, error = %format!("{e:#}"), "Trakt 401-triggered refresh succeeded but token upsert failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                user_id,
+                                error = %format!("{e:#}"),
+                                "Trakt 401 received and refresh attempt also failed; user may need to unlink and relink"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(outcome?))
+}
+
+/// Detect a Trakt 401 in an error chain. The metadata client's
+/// `api_error` returns a custom 401 message; `is_unauthorized_error`
+/// matches that and any chained context above it.
+fn is_unauthorized_error(err: &anyhow::Error) -> bool {
+    let chain = format!("{err:#}");
+    chain.contains("401") || chain.contains("returned 401")
 }
 
 /// Push a single watched event to Trakt for every linked user (used by

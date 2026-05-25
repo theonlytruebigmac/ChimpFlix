@@ -7,6 +7,7 @@ import {
   type AuditLogEntry,
 } from "@/lib/chimpflix-api";
 import { DEFAULT_PAGE_SIZE, Pagination } from "./ui";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 interface Props {
   initial: AuditListResponse;
@@ -112,11 +113,7 @@ export function AdminAuditClient({ initial }: Props) {
             setPage(1);
           }}
           noun="entries"
-          leading={
-            loading ? (
-              <span className="text-[12px] text-white/45">Loading…</span>
-            ) : undefined
-          }
+          leading={loading ? <LoadingPlaceholder variant="inline" /> : undefined}
         />
       </div>
     </div>

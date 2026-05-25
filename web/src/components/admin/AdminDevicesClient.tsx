@@ -6,11 +6,14 @@ import {
   type AdminSessionSummary,
 } from "@/lib/chimpflix-api";
 import { Pill } from "./ui";
+import { ConfirmDialog } from "../ConfirmDialog";
+import { formatDateTime } from "@/lib/format";
 
 export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[] }) {
   const [sessions, setSessions] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [askRevoke, setAskRevoke] = useState<AdminSessionSummary | null>(null);
   // Wall-clock at the time of the most recent fetch. Captured
   // alongside the session list so the "expiring soon" pill can be
   // computed during render without calling Date.now() there (which
@@ -22,11 +25,6 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
     try {
       const r = await adminApi.sessions.list();
       setSessions(r.sessions);
-      // Date.now() inside an async handler is fine but
-      // react-hooks/purity is conservative when the function is
-      // defined at component-scope — disable here, this only runs
-      // after the user clicks Revoke.
-      // eslint-disable-next-line react-hooks/purity
       setNowMs(Date.now());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -57,7 +55,11 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
   return (
     <div className="space-y-4">
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
       )}
@@ -111,29 +113,21 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
                       {s.ip ?? "—"}
                     </td>
                     <td className="whitespace-nowrap px-4 py-2 text-white/60">
-                      {new Date(s.last_seen_at).toLocaleString()}
+                      {formatDateTime(s.last_seen_at)}
                     </td>
                     <td className="whitespace-nowrap px-4 py-2">
                       {expiring ? (
-                        <Pill tone="warn">
-                          {new Date(s.expires_at).toLocaleString(undefined, {
-                            dateStyle: "medium",
-                            timeStyle: "short",
-                          })}
-                        </Pill>
+                        <Pill tone="warn">{formatDateTime(s.expires_at)}</Pill>
                       ) : (
                         <span className="text-xs text-white/60">
-                          {new Date(s.expires_at).toLocaleString(undefined, {
-                            dateStyle: "medium",
-                            timeStyle: "short",
-                          })}
+                          {formatDateTime(s.expires_at)}
                         </span>
                       )}
                     </td>
                     <td className="whitespace-nowrap px-4 py-2 text-right">
                       <button
                         disabled={busy}
-                        onClick={() => revoke(s.id)}
+                        onClick={() => setAskRevoke(s)}
                         className="rounded border border-white/15 px-2 py-1 text-xs text-white/70 hover:border-red-500/50 hover:text-red-300"
                       >
                         Revoke
@@ -145,6 +139,28 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
             </tbody>
           </table>
         </div>
+      )}
+      {askRevoke && (
+        <ConfirmDialog
+          title={`Revoke session for @${askRevoke.username}?`}
+          body={
+            <>
+              The session on{" "}
+              <strong>{summarizeUserAgent(askRevoke.user_agent)}</strong> will
+              be signed out immediately. The user will need to sign in again
+              from that device.
+            </>
+          }
+          confirmLabel="Revoke session"
+          destructive
+          busy={busy}
+          onConfirm={async () => {
+            const target = askRevoke;
+            await revoke(target.id);
+            setAskRevoke(null);
+          }}
+          onCancel={() => setAskRevoke(null)}
+        />
       )}
     </div>
   );

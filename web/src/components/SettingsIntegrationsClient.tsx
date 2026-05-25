@@ -9,6 +9,7 @@ import {
   type TraktUserStats,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { formatDateTime } from "@/lib/format";
 
 /// Per-user integrations card. Right now the only integration here is
 /// Trakt — when more land (Trakt+anything-else), wrap each in its own
@@ -242,13 +243,10 @@ export function SettingsIntegrationsClient() {
           <div className="mt-3 space-y-2">
             <div className="text-xs text-white/60">
               Linked since{" "}
-              {status.linked_at
-                ? new Date(status.linked_at).toLocaleString()
-                : "—"}
+              {status.linked_at ? formatDateTime(status.linked_at) : "—"}
               {status.last_synced_at && (
                 <>
-                  {" · "}last sync{" "}
-                  {new Date(status.last_synced_at).toLocaleString()}
+                  {" · "}last sync {formatDateTime(status.last_synced_at)}
                 </>
               )}
             </div>

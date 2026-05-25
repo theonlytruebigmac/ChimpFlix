@@ -29,6 +29,7 @@ import {
   type PillTone,
 } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 interface Props {
   initialLibraries: Library[];
@@ -790,7 +791,7 @@ function LibraryDrawer({
               overwriting earlier results.
             </p>
             {agents == null ? (
-              <div className="text-sm text-white/50">Loading…</div>
+              <LoadingPlaceholder variant="inline" />
             ) : (
               <AgentPriorityEditor
                 libraryId={lib.id}

@@ -40,20 +40,35 @@ interface ApiItem {
 
 async function fetchMyList(): Promise<MediaItem[]> {
   const res = await fetch("/api/v1/my-list", { cache: "no-store" });
-  if (!res.ok) return [];
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as { items: ApiItem[] };
   return data.items.map(adaptItem);
 }
 
 export function MyListClient() {
   const [items, setItems] = useState<MediaItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
-      const result = await fetchMyList();
-      if (!cancelled) setItems(result);
+      try {
+        const result = await fetchMyList();
+        if (!cancelled) {
+          setItems(result);
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          // Distinguish a real fetch failure from an empty list. The
+          // old fall-through-to-[] path was indistinguishable from the
+          // empty state and left users wondering why their saved list
+          // disappeared after a network blip.
+          setError(e instanceof Error ? e.message : String(e));
+          setItems([]);
+        }
+      }
     }
 
     load();
@@ -69,6 +84,16 @@ export function MyListClient() {
   return (
     <div className="px-4 sm:px-8 md:px-12 pb-24 pt-24 sm:pt-28">
       <h1 className="mb-10 text-4xl font-bold tracking-tight">My List</h1>
+
+      {error && (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="mb-6 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300"
+        >
+          Couldn&apos;t load your list: {error}. Try refreshing.
+        </div>
+      )}
 
       {items === null ? (
         // Skeleton grid mirroring the loaded layout — every other browse

@@ -4,22 +4,17 @@ import { PortraitWithFallback } from "@/components/PortraitWithFallback";
 import { ModalRoot } from "@/components/ModalRoot";
 import { ChimpFlixApiError, people as peopleApi } from "@/lib/chimpflix-api";
 import { requireUser } from "@/lib/chimpflix-server";
+import { formatDate } from "@/lib/format";
 
 function formatLifespan(birthMs: number | null, deathMs: number | null): string | null {
   if (birthMs == null && deathMs == null) return null;
-  const fmt = (ms: number) =>
-    new Date(ms).toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-    });
   if (birthMs != null && deathMs != null) {
     const ageMs = deathMs - birthMs;
     const years = Math.floor(ageMs / (365.25 * 24 * 3600 * 1000));
-    return `${fmt(birthMs)} – ${fmt(deathMs)} (age ${years})`;
+    return `${formatDate(birthMs)} – ${formatDate(deathMs)} (age ${years})`;
   }
-  if (birthMs != null) return `Born ${fmt(birthMs)}`;
-  return `Died ${fmt(deathMs as number)}`;
+  if (birthMs != null) return `Born ${formatDate(birthMs)}`;
+  return `Died ${formatDate(deathMs as number)}`;
 }
 
 export default async function PersonPage({

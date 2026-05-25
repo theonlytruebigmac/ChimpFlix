@@ -9,6 +9,7 @@ import {
   type LibraryHealthItemRow,
   type LibraryHealthResponse,
 } from "@/lib/chimpflix-api";
+import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 interface CounterTile {
   category: LibraryHealthCategory;
@@ -208,7 +209,7 @@ function HealthDrillIn({
       .libraryHealthItems(tile.category, { limit: pageSize, offset })
       .then((r) => {
         if (cancelled) return;
-        setRows((prev) => (offset === 0 ? r.rows : [...(prev ?? []), ...r.rows]));
+        setRows((prev) => (offset === 0 ? r.items : [...(prev ?? []), ...r.items]));
         setTotal(r.total);
         setError(null);
       })
@@ -255,9 +256,11 @@ function HealthDrillIn({
           <div>
             <h2 className="text-lg font-semibold">{tile.label}</h2>
             <p className="mt-0.5 text-xs text-white/55">
-              {total == null
-                ? "Loading…"
-                : `${total.toLocaleString()} ${total === 1 ? "item" : "items"} affected`}
+              {total == null ? (
+                <LoadingPlaceholder variant="inline" />
+              ) : (
+                `${total.toLocaleString()} ${total === 1 ? "item" : "items"} affected`
+              )}
             </p>
           </div>
           <button
@@ -277,9 +280,7 @@ function HealthDrillIn({
             <div className="px-6 py-3 text-xs text-red-300">{error}</div>
           )}
           {rows == null && !error ? (
-            <div className="px-6 py-8 text-center text-sm text-white/55">
-              Loading…
-            </div>
+            <LoadingPlaceholder />
           ) : rows && rows.length === 0 ? (
             <div className="px-6 py-8 text-center text-sm text-white/55">
               Nothing to show — all clear.

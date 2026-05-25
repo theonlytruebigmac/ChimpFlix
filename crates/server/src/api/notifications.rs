@@ -19,6 +19,10 @@ use crate::state::AppState;
 pub struct NotificationsListResponse {
     pub notifications: Vec<Notification>,
     pub unread: i64,
+    /// Total rows for the user — drives the bell-page paginator and
+    /// lets the UI surface "showing N of M" instead of silently
+    /// truncating at the previous fixed `limit=200` ceiling.
+    pub total: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +31,9 @@ pub struct ListQuery {
     /// default leaves room for "load more" without a follow-up call.
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Row offset for paging. 0-based.
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 pub async fn list(
@@ -35,15 +42,20 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<NotificationsListResponse>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let notifications = queries::list_notifications(&state.pool, user.id, limit)
+    let offset = q.offset.unwrap_or(0).max(0);
+    let notifications = queries::list_notifications(&state.pool, user.id, limit, offset)
         .await
         .map_err(ApiError::Internal)?;
     let unread = queries::count_unread_notifications(&state.pool, user.id)
         .await
         .map_err(ApiError::Internal)?;
+    let total = queries::count_notifications(&state.pool, user.id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(NotificationsListResponse {
         notifications,
         unread,
+        total,
     }))
 }
 

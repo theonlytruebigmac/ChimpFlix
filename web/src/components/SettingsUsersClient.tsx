@@ -10,6 +10,7 @@ import {
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
+import { formatDate } from "@/lib/format";
 
 interface Props {
   currentUserId: number;
@@ -202,7 +203,7 @@ export function SettingsUsersClient({
                 )}
               </div>
               <div className="mt-0.5 text-xs text-white/40">
-                Joined {new Date(u.created_at).toLocaleDateString()}
+                Joined {formatDate(u.created_at)}
               </div>
             </div>
             {u.id !== currentUserId && tier(currentUserRole) >= tier(u.role) && (

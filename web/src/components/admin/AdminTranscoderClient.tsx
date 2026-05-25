@@ -6,7 +6,9 @@ import {
   type DashboardSession,
   type HevcMode,
   type ServerSettings,
+  type SubtitleHealth,
   type TonemapAlgorithm,
+  type TranscodeHealth,
   type TranscoderBackgroundPreset,
   type TranscoderCapabilities,
   type TranscoderEncoderPreset,
@@ -175,7 +177,13 @@ export function AdminTranscoderClient({
         setActive(d.active_transcodes);
         setNowMs(d.server.now_ms);
       })
-      .catch(() => {});
+      .catch((e: unknown) => {
+        // Initial snapshot fetch failed — the WS will (re)populate
+        // active_transcodes once it connects, but surface the failure
+        // so a misconfigured admin auth or down server isn't silent.
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+      });
 
     if (typeof window === "undefined") return () => {};
     let socket: WebSocket | null = null;
@@ -736,6 +744,7 @@ export function AdminTranscoderClient({
                   <th className="px-4 py-2">Session</th>
                   <th className="px-4 py-2">User</th>
                   <th className="px-4 py-2">File</th>
+                  <th className="px-4 py-2">Health</th>
                   <th className="px-4 py-2">Started</th>
                   <th className="px-4 py-2">Last seen</th>
                   <th className="px-4 py-2" />
@@ -752,6 +761,12 @@ export function AdminTranscoderClient({
                     </td>
                     <td className="whitespace-nowrap px-4 py-2 text-white/70">
                       file #{s.media_file_id}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2">
+                      <SessionHealthPills
+                        transcode={s.transcode_health}
+                        subtitle={s.subtitle_health ?? undefined}
+                      />
                     </td>
                     <td className="whitespace-nowrap px-4 py-2 text-white/60">
                       {formatRelative(nowMs - s.created_at)}
@@ -995,6 +1010,39 @@ function PresetField({
     <div>
       <label className="mb-1 block text-sm font-medium">{label}</label>
       {children}
+    </div>
+  );
+}
+
+/// Renders one or two pills on the active-transcodes row representing
+/// the ffmpeg-child health and the subtitle-extraction state. Healthy
+/// + Ready (or absent subtitle) renders the neutral "Live" pill so the
+/// column never looks empty for a normal row.
+function SessionHealthPills({
+  transcode,
+  subtitle,
+}: {
+  transcode: TranscodeHealth | undefined;
+  subtitle: SubtitleHealth | undefined;
+}) {
+  const t = transcode ?? { kind: "healthy" as const };
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {t.kind === "exited" ? (
+        <span title={t.detail}>
+          <Pill tone="bad">ffmpeg exited</Pill>
+        </span>
+      ) : (
+        <Pill tone="ok">live</Pill>
+      )}
+      {subtitle && subtitle.kind === "pending" && (
+        <Pill tone="info">subs pending</Pill>
+      )}
+      {subtitle && subtitle.kind === "failed" && (
+        <span title={subtitle.reason}>
+          <Pill tone="warn">subs failed</Pill>
+        </span>
+      )}
     </div>
   );
 }

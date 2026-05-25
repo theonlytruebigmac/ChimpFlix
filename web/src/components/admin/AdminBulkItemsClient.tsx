@@ -9,6 +9,8 @@ import {
   type Library,
   type ListedItem,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { LoadingPlaceholder } from "@/components/ui/LoadingPlaceholder";
 
 interface Props {
   libraries: Library[];
@@ -34,6 +36,7 @@ export function AdminBulkItemsClient({ libraries }: Props) {
   );
   const [busy, setBusy] = useState<string | null>(null);
   const [tagInput, setTagInput] = useState("");
+  const [confirmRemoveTag, setConfirmRemoveTag] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -110,12 +113,20 @@ export function AdminBulkItemsClient({ libraries }: Props) {
   return (
     <div className="space-y-4">
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+        >
           {error}
         </div>
       )}
       {report && (
-        <div className="rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white/80">
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white/80"
+        >
           <div className="font-semibold">{report.kind}</div>
           <div>
             {report.r.ok} ok · {report.r.failed} failed
@@ -225,16 +236,34 @@ export function AdminBulkItemsClient({ libraries }: Props) {
           <button
             type="button"
             disabled={busy !== null || !tagInput.trim()}
-            onClick={() =>
-              runOp(`Remove tag '${tagInput.trim()}'`, () =>
-                bulkApi.removeTag(ids, tagInput.trim()),
-              )
-            }
+            onClick={() => setConfirmRemoveTag(true)}
             className="rounded border border-red-500/40 px-3 py-1 text-xs text-red-300 hover:bg-red-500/10 disabled:opacity-50"
           >
             Remove tag
           </button>
         </div>
+      )}
+      {confirmRemoveTag && (
+        <ConfirmDialog
+          title="Remove tag from selected items?"
+          body={
+            <>
+              Remove the tag <strong>{tagInput.trim()}</strong> from{" "}
+              <strong>{selected.size}</strong>{" "}
+              {selected.size === 1 ? "item" : "items"}. This can be undone by
+              re-adding the tag.
+            </>
+          }
+          confirmLabel="Remove tag"
+          destructive
+          busy={busy !== null}
+          onConfirm={async () => {
+            const label = `Remove tag '${tagInput.trim()}'`;
+            await runOp(label, () => bulkApi.removeTag(ids, tagInput.trim()));
+            setConfirmRemoveTag(false);
+          }}
+          onCancel={() => setConfirmRemoveTag(false)}
+        />
       )}
 
       <div className="overflow-hidden rounded-lg border border-white/10">
@@ -257,8 +286,8 @@ export function AdminBulkItemsClient({ libraries }: Props) {
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={5} className="px-3 py-6 text-center text-white/50">
-                  Loading…
+                <td colSpan={5} className="px-3 py-6">
+                  <LoadingPlaceholder />
                 </td>
               </tr>
             ) : items.length === 0 ? (

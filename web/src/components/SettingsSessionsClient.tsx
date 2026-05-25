@@ -7,6 +7,7 @@ import {
   type MySessionEntry,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { formatDate } from "@/lib/format";
 
 export function SettingsSessionsClient() {
   const [sessions, setSessions] = useState<MySessionEntry[] | null>(null);
@@ -114,8 +115,8 @@ export function SettingsSessionsClient() {
                 {s.ip ?? "unknown IP"} · last seen {formatAge(s.last_seen_at)}
               </div>
               <div className="text-[10px] uppercase tracking-wider text-white/35">
-                Created {new Date(s.created_at).toLocaleDateString()} · expires{" "}
-                {new Date(s.expires_at).toLocaleDateString()}
+                Created {formatDate(s.created_at)} · expires{" "}
+                {formatDate(s.expires_at)}
               </div>
             </div>
             <button

@@ -10,6 +10,7 @@ import {
 } from "@/lib/chimpflix-api";
 import { DEFAULT_PAGE_SIZE, FilterChip, Pagination, Pill } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { formatTime } from "@/lib/format";
 
 /// Owner-only queue dashboard. Three sections:
 ///
@@ -520,7 +521,7 @@ export function AdminJobsClient({
                   <td className="px-3 py-3 text-[12px] text-white/55">
                     {nowMs > 0
                       ? relativeSince(j.created_at, nowMs)
-                      : new Date(j.created_at).toLocaleTimeString()}
+                      : formatTime(j.created_at)}
                   </td>
                   <td className="px-3 py-3 text-right">
                     {(j.status === "dead" || j.status === "failed") && (
@@ -541,17 +542,19 @@ export function AdminJobsClient({
         </div>
       )}
 
-      <Pagination
-        page={page}
-        pageSize={pageSize}
-        total={state.total}
-        onPageChange={setPage}
-        onPageSizeChange={(s) => {
-          setPageSize(s);
-          setPage(1);
-        }}
-        noun="jobs"
-      />
+      {state.total > pageSize && (
+        <Pagination
+          page={page}
+          pageSize={pageSize}
+          total={state.total}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => {
+            setPageSize(s);
+            setPage(1);
+          }}
+          noun="jobs"
+        />
+      )}
 
       <p className="text-xs text-white/45">
         Refreshes every {POLL_MS / 1000}s while the tab is visible. Failed

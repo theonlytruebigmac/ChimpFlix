@@ -8,6 +8,7 @@ import {
   type MediaFileMarkersResponse,
 } from "@/lib/chimpflix-api";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { LoadingPlaceholder } from "@/components/ui/LoadingPlaceholder";
 
 interface Props {
   mediaFileId: number;
@@ -195,7 +196,7 @@ export function MarkerEditor({
             </div>
           )}
           {loaded == null && !error ? (
-            <p className="text-sm text-white/55">Loading…</p>
+            <LoadingPlaceholder />
           ) : (
             <>
               {autoRows.length > 0 && (
@@ -325,7 +326,11 @@ export function MarkerEditor({
         </div>
 
         <footer className="flex items-center justify-between gap-3 border-t border-white/10 px-5 py-3">
-          <span className="text-xs text-white/50">
+          <span
+            role="status"
+            aria-live="polite"
+            className="text-xs text-white/50"
+          >
             {savedAt && !dirty
               ? "Saved."
               : dirty

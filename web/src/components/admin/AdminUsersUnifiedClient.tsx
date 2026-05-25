@@ -25,6 +25,7 @@ import {
 } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
+import { formatDate, formatDateTime } from "@/lib/format";
 
 interface Props {
   currentUserId: number;
@@ -326,7 +327,7 @@ function UserRow({
     : user.last_login_at && nowMs > 0
       ? formatRelative(nowMs - user.last_login_at)
       : user.last_login_at
-        ? new Date(user.last_login_at).toLocaleDateString()
+        ? formatDate(user.last_login_at)
         : "never";
   const subtitleBits: string[] = [];
   if (user.email) subtitleBits.push(user.email);
@@ -686,10 +687,10 @@ function ProfileTab({
   onDelete: () => void;
 }) {
   const lastLogin = user.last_login_at
-    ? `${new Date(user.last_login_at).toLocaleString()}${user.last_login_ip ? ` · ${user.last_login_ip}` : ""}`
+    ? `${formatDateTime(user.last_login_at)}${user.last_login_ip ? ` · ${user.last_login_ip}` : ""}`
     : "never";
   const previousLogin = user.previous_login_at
-    ? `${new Date(user.previous_login_at).toLocaleString()}${user.previous_login_ip ? ` · ${user.previous_login_ip}` : ""}`
+    ? `${formatDateTime(user.previous_login_at)}${user.previous_login_ip ? ` · ${user.previous_login_ip}` : ""}`
     : "—";
 
   return (
@@ -700,7 +701,7 @@ function ProfileTab({
           { label: "Email", value: user.email ?? "—" },
           {
             label: "Joined",
-            value: new Date(user.created_at).toLocaleDateString(),
+            value: formatDate(user.created_at),
           },
           { label: "Last login", value: lastLogin },
           { label: "Previous login", value: previousLogin },
@@ -864,11 +865,10 @@ function DevicesTab({
                 {summarizeUserAgent(s.user_agent)}
               </div>
               <div className="mt-0.5 text-[11px] text-white/45">
-                {s.ip ?? "—"} · last seen{" "}
-                {new Date(s.last_seen_at).toLocaleString()}
+                {s.ip ?? "—"} · last seen {formatDateTime(s.last_seen_at)}
               </div>
               <div className="text-[11px] text-white/40">
-                expires {new Date(s.expires_at).toLocaleDateString()}
+                expires {formatDate(s.expires_at)}
               </div>
             </div>
             <button

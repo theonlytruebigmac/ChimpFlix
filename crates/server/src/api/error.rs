@@ -1,7 +1,7 @@
 //! Unified API error type with JSON `IntoResponse`.
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use thiserror::Error;
@@ -11,6 +11,12 @@ use tracing::error;
 pub enum ApiError {
     #[error("not found")]
     NotFound,
+    /// Like NotFound but with a short resource label (e.g. "backup",
+    /// "library", "item") so operators reading logs / API responses
+    /// can tell what wasn't found instead of seeing a bare "not found".
+    /// New code should prefer this over `NotFound`.
+    #[error("{0} not found")]
+    NotFoundResource(&'static str),
     #[error("{0}")]
     Validation(String),
     #[error("unauthenticated")]
@@ -44,8 +50,24 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Pull a Retry-After hint out of TooManyRequests messages of the
+        // form "...try again in {N}s". Lets login lockouts (handed to us
+        // as ApiError::TooManyRequests by the per-identity attempt
+        // tracker) emit the same Retry-After header the IP-rate-limit
+        // middleware sets, so clients and ops tooling get a consistent
+        // contract regardless of which path triggered the 429.
+        let retry_after_s = if let ApiError::TooManyRequests(m) = &self {
+            extract_retry_after_secs(m)
+        } else {
+            None
+        };
         let (status, code, message): (StatusCode, &'static str, String) = match &self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found".to_string()),
+            ApiError::NotFoundResource(label) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("{label} not found"),
+            ),
             ApiError::Validation(m) => (StatusCode::BAD_REQUEST, "validation_failed", m.clone()),
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -77,6 +99,21 @@ impl IntoResponse for ApiError {
         let body = Json(json!({
             "error": { "code": code, "message": message }
         }));
-        (status, body).into_response()
+        let mut resp = (status, body).into_response();
+        if let Some(secs) = retry_after_s {
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+        }
+        resp
     }
+}
+
+/// Parse "...try again in {N}s" suffix out of a TooManyRequests message
+/// so the IntoResponse impl can echo it as a Retry-After header. Returns
+/// None for any other shape; the header is then omitted.
+fn extract_retry_after_secs(message: &str) -> Option<u64> {
+    let tail = message.rsplit_once("try again in ").map(|(_, t)| t)?;
+    let num = tail.split('s').next()?.trim();
+    num.parse::<u64>().ok()
 }

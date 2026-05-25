@@ -11,6 +11,7 @@ import {
 import { LibraryAccessClient } from "./LibraryAccessClient";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
+import { formatDateTime } from "@/lib/format";
 
 interface Props {
   initial: Library[];
@@ -207,7 +208,7 @@ export function SettingsLibrariesClient({ initial }: Props) {
                   </div>
                   {lib.last_scan_at && (
                     <div className="mt-0.5 text-xs text-white/40">
-                      Last scan {new Date(lib.last_scan_at).toLocaleString()}
+                      Last scan {formatDateTime(lib.last_scan_at)}
                     </div>
                   )}
                 </div>
@@ -380,8 +381,8 @@ function ScanHistoryView({
                 </span>
                 <span className="text-white/70">
                   {s.started_at
-                    ? new Date(s.started_at).toLocaleString()
-                    : new Date(s.created_at).toLocaleString()}
+                    ? formatDateTime(s.started_at)
+                    : formatDateTime(s.created_at)}
                 </span>
                 {s.error_message && (
                   <div className="mt-1 text-red-300">{s.error_message}</div>

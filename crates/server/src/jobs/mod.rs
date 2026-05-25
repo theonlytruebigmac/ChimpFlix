@@ -159,6 +159,18 @@ impl KindLimiter {
     }
 }
 
+/// RAII wrapper that aborts the underlying tokio `JoinHandle` when
+/// the binding goes out of scope. Used to tie the lifetime of helper
+/// tasks (heartbeats, watchdogs) to a parent scope so a panic inside
+/// the parent can't leave the helper running indefinitely.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Backoff applied to the next retry after a handler returns Err.
 /// Exponential up to a cap, computed from the existing `attempts`
 /// counter (which `claim_next_job` already incremented).
@@ -456,7 +468,12 @@ async fn worker_loop(
                 // Cheap (one UPDATE per 5 min).
                 let heartbeat_state = state.clone();
                 let heartbeat_id = job.id;
-                let heartbeat = tokio::spawn(async move {
+                // RAII abort: if the surrounding handler future panics
+                // or the worker loop unwinds for any reason, the guard
+                // drops and aborts the heartbeat — without this the
+                // heartbeat keeps touching the lease forever, blocking
+                // orphan-reclaim from picking the job up after a panic.
+                let _heartbeat = AbortOnDrop(tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(HEARTBEAT_INTERVAL).await;
                         if let Err(e) = touch_job_lease(&heartbeat_state.pool, heartbeat_id).await {
@@ -467,7 +484,7 @@ async fn worker_loop(
                             );
                         }
                     }
-                });
+                }));
 
                 // Per-job progress tracking. The worker installs a
                 // `JobContext` in a tokio task-local before calling
@@ -491,7 +508,8 @@ async fn worker_loop(
                 })
                 .await;
                 state.job_progress.finish(job.id);
-                heartbeat.abort();
+                // Heartbeat is aborted by `_heartbeat`'s Drop on scope exit
+                // (covers both normal flow and handler panic).
                 let finished_at = chimpflix_common::now_ms();
                 let duration_ms = finished_at.saturating_sub(started_at);
                 match result {
