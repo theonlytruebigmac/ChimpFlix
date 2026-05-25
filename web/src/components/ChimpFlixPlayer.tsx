@@ -3446,6 +3446,12 @@ export function ChimpFlixPlayer({
                 </div>
               )}
             </div>
+            <div className="ml-auto flex shrink-0 items-center">
+              <CastButton
+                videoRef={videoRef}
+                resolveMedia={resolveCastMedia}
+              />
+            </div>
           </div>
         </div>
 
@@ -3584,10 +3590,6 @@ export function ChimpFlixPlayer({
                 onToggle={() => setSpeedOpen((o) => !o)}
                 onClose={() => setSpeedOpen(false)}
                 onSelect={setSpeed}
-              />
-              <CastButton
-                videoRef={videoRef}
-                resolveMedia={resolveCastMedia}
               />
               <IconButton
                 onClick={togglePip}

@@ -27,7 +27,16 @@ function csp(): string {
     // Function() in some paths. Round-3 tried to drop it and broke
     // client hydration in dev (Suspense fallbacks never resolved).
     // Re-evaluate when we move to nonce-based CSP.
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+    //
+    // `https://www.gstatic.com` hosts the Google Cast Web Sender SDK
+    // (`cast_sender.js` + the chained `cast_framework.js`). Without it
+    // here the SDK never loads on Android Chrome / installed PWAs — CSP
+    // blocks the script tag and the cast button stays hidden because
+    // `__onGCastApiAvailable` never fires. Desktop Chrome sometimes
+    // worked anyway because the Cast bridge can be wired through a
+    // CSP-exempt browser extension on that platform, but the PWA path
+    // is strictly CSP-gated.
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com",
     "style-src 'self' 'unsafe-inline'",
     // Posters / backdrops served from same origin; trailer thumbnails
     // come from i.ytimg.com. The metadata enrichment pipeline can also

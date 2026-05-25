@@ -101,11 +101,16 @@ export function loadCastSdk(): Promise<boolean> {
 }
 
 /// Cast session state surfaced to the React tree. `available` flips
-/// true when the SDK has loaded AND at least one Cast receiver is
-/// discovered on the local network. `connected` is true while a cast
-/// session is live (media may not have started yet — see `mediaInfo`).
+/// true once the Cast SDK has loaded — the toolbar button should
+/// appear from that point so the affordance is discoverable even
+/// before a receiver wakes up on the LAN. `hasDevices` narrows that
+/// to "a receiver is actually on the network right now" so the
+/// tooltip can read "Cast to device" vs "No cast devices found".
+/// `connected` is true while a cast session is live (media may not
+/// have started yet — see `mediaInfo`).
 export interface CastState {
   available: boolean;
+  hasDevices: boolean;
   connected: boolean;
   deviceName: string | null;
 }
@@ -115,6 +120,7 @@ export interface CastState {
 export function useCastState(): CastState {
   const [state, setState] = useState<CastState>({
     available: false,
+    hasDevices: false,
     connected: false,
     deviceName: null,
   });
@@ -136,12 +142,14 @@ export function useCastState(): CastState {
         const castState = ctx.getCastState();
         if (cancelled) return;
         setState({
+          // SDK loaded successfully — surface the button so the user
+          // can discover the affordance even before a receiver wakes
+          // up. Picker handles the empty case with "No devices found".
+          available: true,
           // `castState` strings: NO_DEVICES_AVAILABLE / NOT_CONNECTED /
-          // CONNECTING / CONNECTED. We treat anything other than the
-          // "no devices" state as "user has a cast device they can
-          // pick" so the button shows up; the click handler then
-          // routes through the SDK picker.
-          available: castState !== framework.CastState.NO_DEVICES_AVAILABLE,
+          // CONNECTING / CONNECTED. Anything other than the "no devices"
+          // state means a receiver is actually reachable right now.
+          hasDevices: castState !== framework.CastState.NO_DEVICES_AVAILABLE,
           connected: castState === framework.CastState.CONNECTED,
           deviceName: session?.getCastDevice?.()?.friendlyName ?? null,
         });

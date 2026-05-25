@@ -78,7 +78,9 @@ export function CastButton({
   const label = cast.connected
     ? `Stop casting${cast.deviceName ? ` to ${cast.deviceName}` : ""}`
     : cast.available
-      ? "Cast to device"
+      ? cast.hasDevices
+        ? "Cast to device"
+        : "No cast devices found"
       : "AirPlay";
 
   return (
