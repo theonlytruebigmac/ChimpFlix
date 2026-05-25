@@ -15,7 +15,7 @@ import {
   type OverviewKindCard,
   type TasksOverviewResponse,
 } from "@/lib/chimpflix-api";
-import { Pill } from "./ui";
+import { ErrorBanner, Pill } from "./ui";
 
 interface Props {
   initial: TasksOverviewResponse;
@@ -52,11 +52,7 @@ export function AdminTaskFlowClient({ initial }: Props) {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
 
       <div className="flex items-center justify-end gap-2 text-xs text-white/60">
         <Link

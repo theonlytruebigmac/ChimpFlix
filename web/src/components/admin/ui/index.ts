@@ -18,6 +18,7 @@ export {
 export { HeroCard } from "./HeroCard";
 export { FilterChip } from "./FilterChip";
 export { AdminTabBar, type AdminTab } from "./TabBar";
+export { ErrorBanner } from "./ErrorBanner";
 // Pagination lives in the shared ui/ folder so user-facing grids
 // (/library/[id]/browse, /genre, /collection, /history) can reuse it
 // without dipping into the admin namespace. Re-exported here so

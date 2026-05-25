@@ -21,6 +21,7 @@ import {
   type ScanJob,
   type ServerSettings,
 } from "@/lib/chimpflix-api";
+import { devWarn } from "@/lib/dev-log";
 
 interface Props {
   initialSettings: ServerSettings;
@@ -328,7 +329,7 @@ function LibraryStep({
         // will reflect whatever's actually happening (in particular
         // it'll show "another scan already running" via the
         // listScans poll).
-        console.warn("triggerScan failed during onboarding:", scanErr);
+        devWarn("triggerScan failed during onboarding:", scanErr);
       }
       onCreated({ id: library.id, name: library.name });
     } catch (e) {

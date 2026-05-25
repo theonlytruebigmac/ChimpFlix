@@ -29,6 +29,7 @@ import {
   type ClientCapabilities,
   type SessionInfo,
 } from "@/lib/chimpflix-api";
+import { devWarn } from "@/lib/dev-log";
 
 const TTL_MS = 60_000;
 /// Resume position tolerance when matching a cached prewarm against
@@ -99,7 +100,7 @@ export function prewarmFor(
       // poison subsequent hovers. We just log and forget — the
       // player's own createSession path is the source of truth.
       if (!(e instanceof ChimpFlixApiError)) {
-        console.warn("[prewarm] failed:", e);
+        devWarn("[prewarm] failed:", e);
       }
       current = null;
     } finally {

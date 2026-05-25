@@ -431,6 +431,22 @@ async fn worker_loop(
                     // terminal `dead`.
                     let _ =
                         mark_job_dead(&state.pool, job.id, "no handler registered for kind").await;
+                    let display = crate::tasks::registry::find_kind(&job.kind)
+                        .map(|k| k.display_name)
+                        .unwrap_or(job.kind.as_str());
+                    crate::notifier::notify_job_failed(
+                        &state,
+                        crate::notifier::JobFailedPayload {
+                            job_id: job.id,
+                            kind: &job.kind,
+                            display_name: display,
+                            error_class: Some("permanent"),
+                            last_error: "no handler registered for kind",
+                            attempts: job.attempts,
+                            max_attempts: 0,
+                        },
+                    )
+                    .await;
                     continue;
                 };
                 let payload: Value = serde_json::from_str(&job.payload).unwrap_or(Value::Null);
@@ -577,7 +593,7 @@ async fn worker_loop(
                             error = %msg,
                             "job handler returned error",
                         );
-                        if let Err(e) = mark_job_failed_with_class(
+                        match mark_job_failed_with_class(
                             &state.pool,
                             job.id,
                             &msg,
@@ -586,12 +602,38 @@ async fn worker_loop(
                         )
                         .await
                         {
-                            error!(
-                                worker = worker_id,
-                                job_id = job.id,
-                                error = %format!("{e:#}"),
-                                "mark_job_failed write failed",
-                            );
+                            Ok(true) => {
+                                // Edge-triggered: only notify on the
+                                // transition into terminal `dead`.
+                                // Retries-still-pending fail through
+                                // here returning `Ok(false)` and are
+                                // expected to be transient.
+                                let display = crate::tasks::registry::find_kind(&kind)
+                                    .map(|k| k.display_name)
+                                    .unwrap_or(kind.as_str());
+                                crate::notifier::notify_job_failed(
+                                    &state,
+                                    crate::notifier::JobFailedPayload {
+                                        job_id: job.id,
+                                        kind: &kind,
+                                        display_name: display,
+                                        error_class: Some(class.as_str()),
+                                        last_error: &msg,
+                                        attempts: job.attempts,
+                                        max_attempts: job.max_attempts,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                error!(
+                                    worker = worker_id,
+                                    job_id = job.id,
+                                    error = %format!("{e:#}"),
+                                    "mark_job_failed write failed",
+                                );
+                            }
                         }
                     }
                 }

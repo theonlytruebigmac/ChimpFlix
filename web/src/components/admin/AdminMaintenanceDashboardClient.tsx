@@ -8,6 +8,7 @@ import {
   type VacuumResult,
   type VerifyAllResult,
 } from "@/lib/chimpflix-api";
+import { ErrorBanner } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 
 /// Instance-wide maintenance dashboard. Each card maps 1:1 to a
@@ -277,11 +278,7 @@ function Card({
       <h2 className="mb-1 text-base font-semibold">{title}</h2>
       <p className="mb-4 text-xs text-white/55">{description}</p>
       <div className="mb-3">{action}</div>
-      {error && (
-        <div className="mb-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} className="mb-3" />
       {children}
     </section>
   );

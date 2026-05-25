@@ -7,7 +7,7 @@ import {
   type WebhookDelivery,
   type WebhooksListResponse,
 } from "@/lib/chimpflix-api";
-import { Pill } from "./ui";
+import { ErrorBanner, Pill } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 import { formatDateTime } from "@/lib/format";
@@ -29,15 +29,7 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div
-          role="alert"
-          aria-live="assertive"
-          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
-        >
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
 
       <div className="flex items-center justify-between">
         <span className="text-sm text-white/60">

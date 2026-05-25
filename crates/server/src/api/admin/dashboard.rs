@@ -127,7 +127,7 @@ pub async fn get(
 // are intentional cross-platform widening — clippy reads them as
 // redundant on the CI host arch.
 #[allow(clippy::unnecessary_cast)]
-fn statvfs_usage(path: &str) -> Option<(u64, u64)> {
+pub fn statvfs_usage(path: &str) -> Option<(u64, u64)> {
     if !StdPath::new(path).exists() {
         return None;
     }

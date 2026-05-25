@@ -4,6 +4,7 @@ pub(crate) mod access;
 pub(crate) mod admin;
 mod auth;
 mod auth_plex;
+mod cast;
 mod collections;
 mod cors;
 mod csrf;
@@ -300,6 +301,7 @@ pub fn router(state: AppState) -> Router {
             "/stream/sessions/{id}/{variant}/{name}",
             get(stream::variant_file),
         )
+        .route("/cast/sign", post(cast::sign))
         // Play state
         .route("/play-state", post(play_state::update))
         .route("/play-state/config", get(play_state::config))

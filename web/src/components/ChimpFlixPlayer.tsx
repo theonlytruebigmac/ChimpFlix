@@ -15,12 +15,17 @@ import type Hls from "hls.js";
 import {
   ChimpFlixApiError,
   auth as authApi,
+  cast as castApi,
   stream as streamApi,
   playState as playStateApi,
   seasons as seasonsApi,
   readCsrfToken,
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
+import { buildCastUrl, useCastState, type CastMediaPayload } from "@/lib/cast";
+import { CastButton } from "./CastButton";
+import { TOAST_DISMISS_LONG_MS, TOAST_DISMISS_PLAYER_MS } from "@/lib/toast";
+import { devError, devWarn } from "@/lib/dev-log";
 import { detectClientCapabilities, isSafari } from "@/lib/client-caps";
 import { getPrefs, updatePrefs, usePrefs } from "@/lib/prefs";
 import {
@@ -543,6 +548,26 @@ export function ChimpFlixPlayer({
   /// pre-warm hooks read it. `null` for a direct-play session (no
   /// transcoder session to pause/resume).
   const activeSessionIdRef = useRef<string | null>(null);
+  /// Source URL the current playback is bound to, in a shape ready
+  /// to hand to a Cast receiver after token-signing. Populated by
+  /// the session-creation effect; null until the first session is
+  /// up. Carries duration so the cast receiver can paint a full
+  /// progress bar without waiting on its own probe.
+  const castSourceRef = useRef<{
+    url: string;
+    contentType: string;
+    durationS?: number;
+  } | null>(null);
+  /// Live Cast state, observed at the player level (the CastButton
+  /// also observes it for its own icon swap). Drives the "Casting to
+  /// …" overlay so the user knows the local screen has gone idle on
+  /// purpose. Sourced from the SDK rather than a local boolean so
+  /// receiver-side disconnects (Chromecast unplugged, Google Home
+  /// "Stop", network drop) automatically clear the overlay without
+  /// us having to invent a synthetic onEnd callback for every path
+  /// that can break a session.
+  const castState = useCastState();
+  const isCasting = castState.connected;
   // Captured the resume position so a track switch mid-playback comes back
   // to roughly where the user was, not the original startPositionMs.
   // Always source-time (file timeline), not HLS media-time.
@@ -599,7 +624,7 @@ export function ChimpFlixPlayer({
   const showNotice = useCallback((msg: string) => {
     setNotice(msg);
     if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
-    noticeTimerRef.current = setTimeout(() => setNotice(null), 4500);
+    noticeTimerRef.current = setTimeout(() => setNotice(null), TOAST_DISMISS_PLAYER_MS);
   }, []);
   useEffect(
     () => () => {
@@ -1241,7 +1266,7 @@ export function ChimpFlixPlayer({
             lastGood.quality.height !== qualitySel.height ||
             lastGood.bitrateCap.bps !== bitrateCapSel.bps)
         ) {
-          console.warn(
+          devWarn(
             "[player] track/quality switch failed; reverting to last working selection",
           );
           setAudioSel(lastGood.audio);
@@ -1261,6 +1286,30 @@ export function ChimpFlixPlayer({
       // Trakt scrobble Stop (no session snapshot to resolve from).
       directMediaFileId =
         resp.session.id === "direct" ? activeMediaFileId : null;
+      // Snapshot the URL shape for the Cast button. The button reads
+      // this at click time so it always reflects the currently-mounted
+      // session (a mid-playback version/quality switch tears the
+      // session down and rebuilds, re-running this effect; the cast
+      // URL stays in sync because we're updating the ref each time).
+      if (sessionId) {
+        castSourceRef.current = {
+          url: `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/master.m3u8`,
+          contentType: "application/x-mpegurl",
+          durationS: durationMs ? durationMs / 1000 : undefined,
+        };
+      } else if (directMediaFileId !== null) {
+        castSourceRef.current = {
+          url: `/api/v1/stream/${directMediaFileId}/direct`,
+          // The receiver sniffs content from extension/MIME headers,
+          // but explicit `video/mp4` is the common default for direct-
+          // play; the actual response Content-Type is set per file by
+          // `crate::api::stream::direct`'s sniffer.
+          contentType: "video/mp4",
+          durationS: durationMs ? durationMs / 1000 : undefined,
+        };
+      } else {
+        castSourceRef.current = null;
+      }
 
       // If the user navigated away or switched versions/tracks during
       // the round-trip, fire DELETE inline so the orphan transcoder
@@ -1520,49 +1569,47 @@ export function ChimpFlixPlayer({
                 hls.subtitleTrack = 0;
                 hls.subtitleDisplay = true;
               }
-              // Pre-roll warmup: wait until the player has 15s of
-              // forward buffer (~2.5 segments) before calling .play().
+              // Pre-roll warmup: wait until the player has 30s of
+              // forward buffer (~5 segments) before calling .play().
               //
-              // The earlier 6s threshold was meant to cover one
-              // segment of headroom, but in practice produced a
-              // visible mid-second-1 stutter on fresh sessions. Root
-              // cause is the ffmpeg manifest cadence: the playlist is
-              // EVENT-type / `hls_list_size 0`, so it grows as new
-              // segments arrive — but HLS.js only re-polls the manifest
-              // every `targetduration` (= 6s) seconds. The sequence we
-              // were hitting:
+              // History: started at 6s (single-segment headroom),
+              // bumped to 15s (2.5 segments) after users reported a
+              // mid-second-1 stutter from the manifest re-poll cadence.
+              // The 15s target still left a visible blip a few seconds
+              // into the intro on cold starts when the realtime
+              // encoder briefly fell behind — the buffer drained
+              // faster than ffmpeg could refill it, and the gap landed
+              // somewhere in the first 30s of playback.
               //
-              //   wall=0  load playlist v0; lists [seg0]
-              //   wall=1  seg0 download done → warmup gate fires
-              //   wall=1  .play() called; playback consumes seg0
-              //   wall=6  playlist re-polled, learns about seg1
-              //   wall=6+ seg1 download starts
-              //   wall=7  playback reaches end of seg0; seg1 not yet
-              //           in MSE buffer → STALL → browser shows the
-              //           native loading spinner
+              // Root cause is structural: the encoder runs at ~realtime,
+              // so once playback starts consuming the buffer, any
+              // encoder hiccup (disk seek, codec startup, hwaccel
+              // priming) directly translates to underrun. The fix is
+              // to start with enough headroom that the encoder can
+              // stall for several seconds without playback noticing.
               //
-              // Bumping the warmup to 15s ensures that by the time
-              // .play() fires, the manifest has been polled at least
-              // once or twice and segments 0+1 (and often 2) are
-              // already in the MSE buffer. The encoder + manifest
-              // pipeline then keeps pace with real-time playback for
-              // the rest of the session.
+              // The 30s target spans well past the typical intro
+              // length and gives the encoder pipeline ~30s to settle
+              // into steady-state before playback touches its tail.
+              // Safety timeout is 45s (1.5×) so a genuinely slow
+              // encoder still falls through to .play() rather than
+              // spinning forever — but the operator-facing "loading"
+              // screen now feels more like a Netflix-style cold start
+              // than a 1-second flash.
               //
-              // User preference (2026-05-21): "I'd rather show the
-              // loading screen / circle longer if it hid whatever
-              // causes that stutter." Bias toward longer warmup over
-              // visible buffer underruns.
-              //
-              // Safety timeout bumped in lockstep so a genuinely
-              // slow encoder still falls through to .play() within a
-              // reasonable window rather than spinning forever.
+              // User preference (2026-05-21, reconfirmed 2026-05-25):
+              // "I'd rather the initial file take a bit longer to
+              // load to avoid blipping in the middle of the intro."
+              // Bias toward longer warmup over any visible
+              // mid-playback stutter. Don't lower without measuring
+              // first-segment buffer growth on a cold encoder.
               //
               // We also gate on `video.readyState >= HAVE_FUTURE_DATA`
               // — the browser's own "ready to play through" signal —
               // because `buffered.end` can lag the decoder for a few
               // hundred ms after `FRAG_BUFFERED` fires.
-              const WARMUP_TARGET_SEC = 15;
-              const WARMUP_TIMEOUT_MS = 15000;
+              const WARMUP_TARGET_SEC = 30;
+              const WARMUP_TIMEOUT_MS = 45000;
               let started = false;
               const start = () => {
                 if (started) return;
@@ -1684,7 +1731,7 @@ export function ChimpFlixPlayer({
                   !(e instanceof DOMException) ||
                   e.name !== "InvalidStateError"
                 ) {
-                  console.warn(
+                  devWarn(
                     "ChimpFlixPlayer: unexpected error during MSE cleanup",
                     e,
                   );
@@ -1943,7 +1990,7 @@ export function ChimpFlixPlayer({
             return `unknown <video> error (code=${code})`;
         }
       })();
-      console.error("[chimpflix] <video> error", {
+      devError("[chimpflix] <video> error", {
         code,
         message,
         networkState: video.networkState,
@@ -2510,12 +2557,15 @@ export function ChimpFlixPlayer({
     };
   }, []);
 
-  // Auto-hide the resume pill after 6 seconds. Long enough for the user
-  // to register the message and act on it, short enough to clear the
-  // chrome before the opening scene matters.
+  // Auto-hide the resume pill after the long-form dismiss window.
+  // Long enough for the user to register the message and act on it,
+  // short enough to clear the chrome before the opening scene matters.
   useEffect(() => {
     if (!resumePillVisible) return;
-    const t = window.setTimeout(() => setResumePillVisible(false), 6000);
+    const t = window.setTimeout(
+      () => setResumePillVisible(false),
+      TOAST_DISMISS_LONG_MS,
+    );
     return () => window.clearTimeout(t);
   }, [resumePillVisible]);
 
@@ -2888,6 +2938,59 @@ export function ChimpFlixPlayer({
     tryWebkitVideoFullscreen(videoRef.current);
   }, []);
 
+  /// Build the cast media payload at click time so the receiver
+  /// loads whatever the user is watching *right now* — not a stale
+  /// snapshot from when the button mounted. Returns null if there's
+  /// no active session to cast yet (button shouldn't be clickable in
+  /// that state, but guard anyway).
+  const resolveCastMedia = useCallback(async (): Promise<
+    CastMediaPayload | null
+  > => {
+    const source = castSourceRef.current;
+    if (!source) return null;
+    let token: string;
+    try {
+      const resp = await castApi.sign();
+      token = resp.token;
+    } catch (e) {
+      devWarn("[cast] sign request failed", e);
+      return null;
+    }
+    const url = buildCastUrl(source.url, token);
+    // Hand the receiver wall-clock source-time, not HLS media-time
+    // — for a transcode session the latter starts at 0 even when we
+    // joined mid-file, and we want the receiver to land where the
+    // user was watching on screen.
+    const liveS = (videoRef.current?.currentTime ?? 0) +
+      sessionStartMsRef.current / 1000;
+    return {
+      url,
+      contentType: source.contentType,
+      title,
+      subtitle,
+      startTimeS: Number.isFinite(liveS) ? liveS : undefined,
+      durationS: source.durationS,
+    };
+  }, [title, subtitle]);
+
+  // Pause local playback the moment a cast session goes live. We
+  // do *not* auto-resume on disconnect — a user who ended their
+  // cast because they walked away from the TV would be surprised by
+  // the laptop suddenly playing audio. The "Casting" overlay clears
+  // automatically because it's keyed off `isCasting` (derived from
+  // `castState.connected`), so receiver-side disconnects also tear
+  // the UI down without a dedicated callback.
+  const wasCastingRef = useRef(false);
+  useEffect(() => {
+    if (isCasting && !wasCastingRef.current) {
+      wasCastingRef.current = true;
+      const v = videoRef.current;
+      if (v && !v.paused) v.pause();
+    } else if (!isCasting && wasCastingRef.current) {
+      wasCastingRef.current = false;
+    }
+  }, [isCasting]);
+
   const togglePip = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -2907,24 +3010,24 @@ export function ChimpFlixPlayer({
       document
         .exitPictureInPicture()
         .catch((err) =>
-          console.warn("[player] exit picture-in-picture failed", err),
+          devWarn("[player] exit picture-in-picture failed", err),
         );
       return;
     }
     if (!document.pictureInPictureEnabled) {
-      console.warn(
+      devWarn(
         "[player] picture-in-picture not supported in this browser",
       );
       return;
     }
     if (typeof v.requestPictureInPicture !== "function") {
-      console.warn(
+      devWarn(
         "[player] video element has no requestPictureInPicture",
       );
       return;
     }
     v.requestPictureInPicture().catch((err) => {
-      console.warn("[player] picture-in-picture request failed", err);
+      devWarn("[player] picture-in-picture request failed", err);
     });
   }, []);
 
@@ -3181,6 +3284,11 @@ export function ChimpFlixPlayer({
         autoPlay
         onClick={onVideoClick}
         crossOrigin="anonymous"
+        // Opt-in to native iOS AirPlay routing. Without this attribute
+        // Safari hides the AirPlay button from the system playback
+        // chrome and `webkitShowPlaybackTargetPicker()` is a no-op.
+        // Free, no SDK — Apple ships AirPlay-for-HLS in WebKit itself.
+        x-webkit-airplay="allow"
         className={`h-full w-full bg-black ${cueClass}`}
       >
         {externalSub && (
@@ -3195,7 +3303,7 @@ export function ChimpFlixPlayer({
               // cues render — a silent failure. Clear the selection
               // so the UI reflects the real state, surface a transient
               // notice to the user, and log for diagnostics.
-              console.warn(
+              devWarn(
                 "[player] external subtitle failed to load",
                 externalSub.url,
               );
@@ -3210,6 +3318,7 @@ export function ChimpFlixPlayer({
       {loading && !error && !autoplayBlocked && <LoadingSpinner />}
       {autoplayBlocked && !error && <BigPlayButton onClick={attemptPlay} />}
       {reconnecting && !error && <ReconnectingOverlay />}
+      {isCasting && !error && <CastingOverlay title={title} />}
       {notice && !error && (
         <div
           role="status"
@@ -3475,6 +3584,10 @@ export function ChimpFlixPlayer({
                 onToggle={() => setSpeedOpen((o) => !o)}
                 onClose={() => setSpeedOpen(false)}
                 onSelect={setSpeed}
+              />
+              <CastButton
+                videoRef={videoRef}
+                resolveMedia={resolveCastMedia}
               />
               <IconButton
                 onClick={togglePip}
@@ -4932,6 +5045,44 @@ function ReconnectingOverlay() {
       <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/75 px-3 py-1.5 text-xs font-medium text-white/85 shadow-lg backdrop-blur-sm">
         <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-(--color-accent)" />
         Reconnecting…
+      </div>
+    </div>
+  );
+}
+
+/// Shown over the local frame while a Cast session is active. The
+/// receiver paints the video on the TV; locally we go dark so the
+/// laptop screen doesn't double-render and waste battery. The "Stop
+/// casting" button on the toolbar (`CastButton` in connected state)
+/// is how the user comes back.
+function CastingOverlay({ title }: { title: string }) {
+  return (
+    <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/85 text-center text-white">
+      <svg
+        width="64"
+        height="64"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="text-(--color-accent)"
+        aria-hidden
+      >
+        <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
+        <path d="M2 12a8 8 0 0 1 8 8" />
+        <path d="M2 16a4 4 0 0 1 4 4" />
+        <circle cx="3" cy="20" r="1.2" fill="currentColor" stroke="none" />
+      </svg>
+      <div className="mt-6 text-sm tracking-wide text-white/55 uppercase">
+        Casting
+      </div>
+      <div className="mt-1 max-w-md truncate text-2xl font-semibold">
+        {title}
+      </div>
+      <div className="mt-4 text-xs text-white/40">
+        Use the toolbar button to stop casting.
       </div>
     </div>
   );

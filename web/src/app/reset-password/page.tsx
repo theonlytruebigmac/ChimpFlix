@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { brandNameUpper } from "@/lib/env";
 import { auth, ChimpFlixApiError } from "@/lib/chimpflix-api";
+import { PasswordStrengthHint } from "@/components/PasswordStrengthHint";
 
 export default function ResetPasswordPage() {
   return (
@@ -122,9 +123,7 @@ function ResetContent() {
                 }}
                 className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
               />
-              <span className="mt-1 block text-xs text-white/40">
-                At least 8 characters.
-              </span>
+              <PasswordStrengthHint value={password} />
             </label>
 
             <label className="block">

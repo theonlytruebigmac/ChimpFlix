@@ -8,7 +8,9 @@ import {
   type SecretTestResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { ErrorBanner } from "./ui";
 import { formatDateTime } from "@/lib/format";
+import { TOAST_DISMISS_LONG_MS } from "@/lib/toast";
 
 /// Slots whose vault value is a JSON object on the wire. The UI renders
 /// one labeled input per field and serializes to JSON on save, so the
@@ -74,15 +76,7 @@ export function AdminCredentialsClient({
         </div>
       )}
 
-      {error && (
-        <div
-          role="alert"
-          aria-live="assertive"
-          className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
-        >
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
       {notice && (
         <div
           role="status"
@@ -97,10 +91,10 @@ export function AdminCredentialsClient({
         onError={setError}
         onNotice={(m) => {
           setNotice(m);
-          // Auto-clear after 6s — long enough to read, short enough
+          // Long-form dismiss — long enough to read, short enough
           // that a stale "rotated" line doesn't sit on the page
           // through the operator's next visit.
-          window.setTimeout(() => setNotice(null), 6000);
+          window.setTimeout(() => setNotice(null), TOAST_DISMISS_LONG_MS);
         }}
       />
 

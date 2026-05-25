@@ -6,6 +6,7 @@ import {
   type OptimizedVersion,
   type TranscoderPreset,
 } from "@/lib/chimpflix-api";
+import { ErrorBanner } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
@@ -49,11 +50,7 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
 
       <div className="flex items-center justify-between">
         <span className="text-sm text-white/60">

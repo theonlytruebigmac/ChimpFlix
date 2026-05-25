@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { brandNameUpper } from "@/lib/env";
 import { auth, ChimpFlixApiError, safeLocalPath } from "@/lib/chimpflix-api";
+import { PasswordStrengthHint } from "@/components/PasswordStrengthHint";
 import { PlexSignInButton } from "@/components/PlexSignInButton";
 
 type Mode = "login" | "setup" | "register" | "forgot" | "two_factor";
@@ -162,9 +163,25 @@ function LoginContent() {
   }
 
   if (mode === null) {
+    // Skeleton mirrors the live form's silhouette (heading + ~4 input
+    // strips + button) so the visual jump when the server responds is
+    // a fade-in rather than a layout shift. Plain "Loading…" text used
+    // to look like a half-broken page during cold first-byte on slow
+    // links.
     return (
-      <main className="flex min-h-dvh items-center justify-center bg-background text-white">
-        <div className="text-white/50">Loading…</div>
+      <main className="flex min-h-dvh items-center justify-center bg-background px-4 text-white">
+        <div className="w-full max-w-sm animate-pulse">
+          <div className="mb-2 h-9 w-32 rounded bg-white/10" />
+          <div className="mb-6 h-5 w-48 rounded bg-white/5" />
+          <div className="space-y-3">
+            <div className="h-11 rounded bg-white/5" />
+            <div className="h-11 rounded bg-white/5" />
+            <div className="h-12 rounded bg-white/10" />
+          </div>
+        </div>
+        <span className="sr-only" role="status" aria-live="polite">
+          Loading sign-in form
+        </span>
       </main>
     );
   }
@@ -307,6 +324,9 @@ function LoginContent() {
                   onChange={(e) => setPassword(e.target.value)}
                   className="w-full rounded bg-white/10 px-3 py-2.5 text-base outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
                 />
+                {(mode === "setup" || mode === "register") && (
+                  <PasswordStrengthHint value={password} />
+                )}
               </label>
             </>
           )}

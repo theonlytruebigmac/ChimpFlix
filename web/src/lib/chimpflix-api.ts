@@ -2878,6 +2878,24 @@ export const stream = {
     `/api/v1/stream/sessions/${encodeURIComponent(sessionId)}/master.m3u8`,
 };
 
+export interface CastSignResponse {
+  /// Opaque HMAC token. Append as `?ct=<token>` to manifest +
+  /// segment URLs the Cast receiver fetches; the server's
+  /// `StreamAuthUser` extractor accepts it in lieu of the cookie.
+  token: string;
+  /// Absolute expiry (epoch ms). The player refreshes the token if
+  /// it's within ~5 minutes of expiring while a cast session is
+  /// still active.
+  expires_at_ms: number;
+}
+
+/// Cast / AirPlay support. AirPlay needs no server-side handshake
+/// (Safari reuses the local video element's cookies when bridging to
+/// the AirPlay target), so this module only carries the Cast side.
+export const cast = {
+  sign: () => apiFetch<CastSignResponse>("/cast/sign", { method: "POST" }),
+};
+
 export interface PlayStateConfig {
   /** Threshold (1–99) at which the player auto-scrobbles a session. */
   played_threshold_pct: number;

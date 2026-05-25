@@ -22,6 +22,7 @@ use crate::state::AppState;
 pub const KIND_USER_REGISTERED: &str = "user.registered";
 pub const KIND_USER_TWO_FACTOR_DISABLED: &str = "user.2fa.disabled";
 pub const KIND_USER_TWO_FACTOR_RESET: &str = "user.2fa.reset";
+pub const KIND_JOB_FAILED: &str = "job.failed";
 
 #[derive(Debug, Serialize)]
 pub struct UserRegisteredPayload<'a> {
@@ -359,4 +360,92 @@ pub async fn notify_two_factor_reset(state: &AppState, actor: &User, target_user
         &html,
     )
     .await;
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobFailedPayload<'a> {
+    pub job_id: i64,
+    pub kind: &'a str,
+    pub display_name: &'a str,
+    pub error_class: Option<&'a str>,
+    pub last_error: &'a str,
+    pub attempts: i64,
+    pub max_attempts: i64,
+}
+
+/// Fan-out when a job lands in terminal `dead` state. Only fires on
+/// the dead-transition edge (retries don't notify) so a long-running
+/// backfill with transient errors doesn't spam owner inboxes. Sender
+/// is the worker loop; this function is best-effort and never fails
+/// the surrounding handler.
+pub async fn notify_job_failed(state: &AppState, payload: JobFailedPayload<'_>) {
+    let server_name = state.settings.read().await.server_name.clone();
+    let class_label = payload.error_class.unwrap_or("unknown");
+    let subject = format!(
+        "{kind} job failed ({class})",
+        kind = payload.display_name,
+        class = class_label,
+    );
+    let attempts_text = if payload.max_attempts > 0 {
+        format!("{} of {} attempts", payload.attempts, payload.max_attempts)
+    } else {
+        format!("{} attempt(s)", payload.attempts)
+    };
+    let text_body = format!(
+        "A {kind} job (id {id}) gave up after {attempts}.\n\
+         Class: {class}\n\
+         Last error: {err}\n\n\
+         The job will not retry automatically. Re-queue from the admin tasks page \
+         once the underlying issue is fixed.",
+        kind = payload.display_name,
+        id = payload.job_id,
+        attempts = attempts_text,
+        class = class_label,
+        err = payload.last_error,
+    );
+    let text = mail_template::render_email_text(mail_template::EmailTextOpts {
+        server_name: &server_name,
+        headline: &format!("{} job failed", payload.display_name),
+        body: &text_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner. Job-failure alerts \
+                      can be muted from Settings → Account → Notifications.",
+    });
+
+    let mut html_body = String::new();
+    let display_safe = mail_template::html_escape(payload.display_name);
+    let err_safe = mail_template::html_escape(payload.last_error);
+    html_body.push_str(&mail_template::section_paragraph(&format!(
+        "A <strong>{display_safe}</strong> job (id <code>{id}</code>) gave up after {attempts}.",
+        id = payload.job_id,
+        attempts = mail_template::html_escape(&attempts_text),
+    )));
+    let attempts_str = attempts_text.clone();
+    let job_id_str = payload.job_id.to_string();
+    html_body.push_str(&mail_template::section_kv(&[
+        ("Job kind", payload.kind),
+        ("Job id", &job_id_str),
+        ("Error class", class_label),
+        ("Attempts", &attempts_str),
+    ]));
+    html_body.push_str(&mail_template::section_callout(
+        CalloutKind::Warn,
+        &format!("<strong>Last error:</strong> {err_safe}"),
+    ));
+    html_body.push_str(&mail_template::section_cta_minimal(
+        "Review failed jobs",
+        "/settings/admin/library/scheduled-tasks/activity",
+    ));
+    let eyebrow = format!(
+        "Admin · Job failure &nbsp;{}",
+        mail_template::section_pip(PipKind::Warn, class_label),
+    );
+    let html = mail_template::render_email(mail_template::EmailOpts {
+        server_name: &server_name,
+        eyebrow_html: &eyebrow,
+        headline: &format!("{} job failed.", payload.display_name),
+        body_html: &html_body,
+        footer_note: "You're receiving this as a ChimpFlix server owner. Job-failure alerts \
+                      can be muted from Settings → Account → Notifications.",
+    });
+    notify_admins(state, KIND_JOB_FAILED, &payload, &subject, &text, &html).await;
 }

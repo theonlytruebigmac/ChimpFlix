@@ -10,6 +10,7 @@ import {
   type CollectionDetail,
   type ListedItem,
 } from "@/lib/chimpflix-api";
+import { ErrorBanner } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
@@ -46,11 +47,7 @@ export function AdminCollectionsClient({ initial }: Props) {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
 
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-sm text-white/55">

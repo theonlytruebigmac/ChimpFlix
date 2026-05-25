@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { ratings as ratingsApi } from "@/lib/chimpflix-api";
+import { devError } from "@/lib/dev-log";
 
 /// "Like" on the Card hover panel reuses the per-user rating endpoints.
 /// A like maps to a rating of 8 — Plex's thumbs-up convention — so the
@@ -94,7 +95,7 @@ export function useItemLike(ratingKey: string): {
         // system to surface this — log to console so dev tools shows
         // the network failure, since the silent flip-back used to leave
         // users confused ("why did my like un-like itself?").
-        console.error("[likes] rating PUT/DELETE failed:", e);
+        devError("[likes] rating PUT/DELETE failed:", e);
         setRating(wasLiked ? rating : null);
       } finally {
         setBusy(false);

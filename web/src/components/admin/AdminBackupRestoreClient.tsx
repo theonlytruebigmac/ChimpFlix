@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   admin as adminApi,
   backups as backupsApi,
@@ -8,6 +8,7 @@ import {
   type ListBackupsResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { ErrorBanner } from "./ui";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 /// Admin surface for the persisted auto-backup snapshots
@@ -117,6 +118,72 @@ export function AdminBackupRestoreClient() {
     }
   }
 
+  // Watch the server-restart progress whenever a restore is staged.
+  // The actual restore happens on next boot, so the operator clicks
+  // "Stage" then has to wait through a manual restart cycle. The
+  // amber banner above tells them what's happening; this effect adds
+  // observability — once a stage is queued, we poll `/api/v1/health`
+  // every 5s and show the operator whether the server is up, down, or
+  // freshly restarted (uptime reset back to near-zero).
+  //
+  // `pollingStatus` only carries the in-flight signal; the idle case
+  // is derived at render time from `data?.pending_restore` so we
+  // don't have to call `setState` synchronously from inside the
+  // effect just to "reset" it.
+  const restoredOnce = useRef(false);
+  const initialUptimeRef = useRef<number | null>(null);
+  const [pollingStatus, setPollingStatus] = useState<
+    "polling" | "down" | "back"
+  >("polling");
+  useEffect(() => {
+    if (!data?.pending_restore) {
+      restoredOnce.current = false;
+      initialUptimeRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/v1/health", { cache: "no-store" });
+        if (!r.ok) {
+          if (!cancelled) setPollingStatus("down");
+          return;
+        }
+        const body = (await r.json()) as { uptime_s?: number };
+        const uptime = body.uptime_s ?? 0;
+        if (initialUptimeRef.current === null) {
+          initialUptimeRef.current = uptime;
+        } else if (
+          uptime < initialUptimeRef.current &&
+          !restoredOnce.current
+        ) {
+          // Server restarted (new uptime is less than what we
+          // recorded before). Refresh the list to see if the
+          // pending_restore flag has cleared.
+          restoredOnce.current = true;
+          if (!cancelled) {
+            setPollingStatus("back");
+            setToast("Server restarted — restore applied.");
+            await refresh();
+          }
+        } else if (!cancelled) {
+          setPollingStatus("polling");
+        }
+      } catch {
+        if (!cancelled) setPollingStatus("down");
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [data?.pending_restore]);
+  const restartStatus: "idle" | "polling" | "down" | "back" = data?.pending_restore
+    ? pollingStatus
+    : "idle";
+
   function cancelRestore() {
     setAskCancelRestore(true);
   }
@@ -138,11 +205,7 @@ export function AdminBackupRestoreClient() {
 
   return (
     <div className="space-y-4">
-      {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
       {toast && (
         <div className="rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white/80">
           {toast}
@@ -159,6 +222,17 @@ export function AdminBackupRestoreClient() {
                 server to apply it. Your current database will be preserved
                 as <code className="font-mono">chimpflix.db.pre-restore-&lt;timestamp&gt;.db</code> in
                 the data directory.
+              </p>
+              <p
+                className="mt-2 text-xs text-amber-200/80"
+                role="status"
+                aria-live="polite"
+              >
+                {restartStatus === "down"
+                  ? "Server is offline — waiting for it to come back…"
+                  : restartStatus === "back"
+                    ? "Server is back online. Reload this page to confirm."
+                    : "Watching server uptime — we'll let you know the moment it restarts."}
               </p>
             </div>
             <button

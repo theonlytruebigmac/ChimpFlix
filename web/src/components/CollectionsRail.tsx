@@ -63,6 +63,8 @@ function CollectionCard({ collection }: { collection: Collection }) {
                   src={img}
                   srcSet={srcSet}
                   alt=""
+                  width={320}
+                  height={180}
                   loading="lazy"
                   decoding="async"
                   onError={() => setImgFailed(true)}

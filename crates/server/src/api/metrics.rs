@@ -99,9 +99,18 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         "chimpflix_backups{{stat=\"oldest_age_seconds\"}} {backup_oldest_age_s}",
     );
 
-    // ── SQLite WAL size ──
+    // ── SQLite WAL + main DB file sizes ──
+    // Both surface here so a Prometheus alert can fire when WAL bloat
+    // (long-running readers blocking checkpoint) or sheer DB growth
+    // crosses a threshold. The two are emitted as one gauge with a
+    // `file` label so we keep the metric surface compact.
     let wal_path = state.data_dir.join("chimpflix.db-wal");
+    let db_path = state.data_dir.join("chimpflix.db");
     let wal_bytes: u64 = tokio::fs::metadata(&wal_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let db_bytes: u64 = tokio::fs::metadata(&db_path)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
@@ -111,6 +120,31 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     );
     let _ = writeln!(out, "# TYPE chimpflix_sqlite_wal_bytes gauge");
     let _ = writeln!(out, "chimpflix_sqlite_wal_bytes {wal_bytes}");
+    let _ = writeln!(
+        out,
+        "# HELP chimpflix_sqlite_db_bytes SQLite main database file size in bytes."
+    );
+    let _ = writeln!(out, "# TYPE chimpflix_sqlite_db_bytes gauge");
+    let _ = writeln!(out, "chimpflix_sqlite_db_bytes {db_bytes}");
+
+    // ── Disk free space on the data dir ──
+    // `chimpflix_disk_free_bytes` lets operators alert before disk
+    // fill cascades into corrupted snapshots / failed transcodes.
+    // Reads via the shared `statvfs_usage` helper from the dashboard
+    // handler so the metric matches the operator-facing UI exactly.
+    if let Some(data_dir_str) = state.data_dir.to_str() {
+        if let Some((total, used)) = crate::api::admin::dashboard::statvfs_usage(data_dir_str) {
+            let free = total.saturating_sub(used);
+            let _ = writeln!(
+                out,
+                "# HELP chimpflix_disk_bytes Bytes on the filesystem hosting the data dir."
+            );
+            let _ = writeln!(out, "# TYPE chimpflix_disk_bytes gauge");
+            let _ = writeln!(out, "chimpflix_disk_bytes{{state=\"total\"}} {total}");
+            let _ = writeln!(out, "chimpflix_disk_bytes{{state=\"used\"}} {used}");
+            let _ = writeln!(out, "chimpflix_disk_bytes{{state=\"free\"}} {free}");
+        }
+    }
 
     // ── HTTP request counters + cumulative latency ──
     let http = state.http_metrics.snapshot().await;

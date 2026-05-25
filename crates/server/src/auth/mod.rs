@@ -1,12 +1,13 @@
 //! Authentication: passwords, signed session cookies, request extractor.
 
+pub mod cast_token;
 pub mod cookie;
 pub mod password;
 pub mod secret;
 
 mod extractor;
 
-pub use extractor::{AdminAuth, AuthUser, MaybeAuthUser, OwnerAuth};
+pub use extractor::{AdminAuth, AuthUser, MaybeAuthUser, OwnerAuth, StreamAuthUser};
 
 use chimpflix_library::UserRole;
 use std::sync::Arc;

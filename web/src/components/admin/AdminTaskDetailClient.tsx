@@ -22,7 +22,8 @@ import {
   formatRelativeAgo,
   formatRelativeFuture,
 } from "@/lib/relative-time";
-import { Pill } from "./ui";
+import { TOAST_DISMISS_SHORT_MS } from "@/lib/toast";
+import { ErrorBanner, Pill } from "./ui";
 
 /// Frequency dropdown options — superset of what `prettyFrequency()`
 /// can label. `custom` is intentionally omitted: editing raw cron
@@ -126,11 +127,7 @@ export function AdminTaskDetailClient({ initial, initialNowMs }: Props) {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
       {savedNotice && (
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
           {savedNotice}
@@ -204,7 +201,7 @@ export function AdminTaskDetailClient({ initial, initialNowMs }: Props) {
             setNowMs(Date.now());
             setSavedNotice("Schedule saved.");
             setError(null);
-            window.setTimeout(() => setSavedNotice(null), 2500);
+            window.setTimeout(() => setSavedNotice(null), TOAST_DISMISS_SHORT_MS);
           }}
           onError={(msg) => {
             setError(msg);

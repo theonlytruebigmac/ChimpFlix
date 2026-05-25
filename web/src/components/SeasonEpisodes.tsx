@@ -8,6 +8,7 @@ import {
 } from "@/lib/chimpflix-api";
 import { formatRuntime, type MediaItem } from "@/lib/chimpflix-types";
 import { plexImage } from "@/lib/image";
+import { TOAST_DISMISS_MS } from "@/lib/toast";
 import { usePlayedThresholdPct } from "@/lib/server-config";
 import { MarkerEditor } from "./MarkerEditor";
 
@@ -244,7 +245,7 @@ export function SeasonEpisodes({
   const [confirmation, setConfirmation] = useState<string | null>(null);
   useEffect(() => {
     if (!confirmation) return;
-    const t = window.setTimeout(() => setConfirmation(null), 3000);
+    const t = window.setTimeout(() => setConfirmation(null), TOAST_DISMISS_MS);
     return () => window.clearTimeout(t);
   }, [confirmation]);
   async function bulkToggleSeason() {

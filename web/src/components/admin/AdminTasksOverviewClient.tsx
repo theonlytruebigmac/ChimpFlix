@@ -25,7 +25,7 @@ import {
   formatRelativeAgo,
   formatRelativeFuture,
 } from "@/lib/relative-time";
-import { HeroCard, Pill, type PillTone } from "./ui";
+import { ErrorBanner, HeroCard, Pill, type PillTone } from "./ui";
 
 interface Props {
   initialOverview: TasksOverviewResponse;
@@ -105,11 +105,7 @@ export function AdminTasksOverviewClient({
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} />
 
       <HeroStrip summary={summary} nowMs={nowMs} />
 

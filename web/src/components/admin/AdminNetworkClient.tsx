@@ -7,7 +7,7 @@ import {
   type ReachabilityResult,
   type SecureConnectionsMode,
 } from "@/lib/chimpflix-api";
-import { Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
+import { ErrorBanner, Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
 
 const INPUT_CLASS =
   "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30";
@@ -135,11 +135,7 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
 
   return (
     <div>
-      {error && (
-        <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
+      <ErrorBanner error={error} className="mb-4" />
 
       {diag.looks_misconfigured && (
         <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">

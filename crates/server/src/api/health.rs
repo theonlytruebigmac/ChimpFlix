@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chimpflix_library::queries;
 use serde::Serialize;
-use sqlx::Executor;
+use sqlx::{Executor, Row};
 
 use crate::api::error::ApiError;
 use crate::state::AppState;
@@ -54,6 +54,7 @@ pub struct ReadyChecks {
     pub database: CheckStatus,
     pub ffmpeg: CheckStatus,
     pub vault: CheckStatus,
+    pub library_paths: CheckStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,8 +83,10 @@ pub async fn ready(State(state): State<AppState>) -> Response {
     let database = check_database(&state).await;
     let ffmpeg = check_ffmpeg(&state).await;
     let vault = check_vault(&state).await;
+    let library_paths = check_library_paths(&state).await;
 
-    let any_failed = database.is_failed() || ffmpeg.is_failed() || vault.is_failed();
+    let any_failed =
+        database.is_failed() || ffmpeg.is_failed() || vault.is_failed() || library_paths.is_failed();
     let body = ReadyResponse {
         status: if any_failed { "failed" } else { "ok" },
         uptime_s: started_at().elapsed().as_secs(),
@@ -91,6 +94,7 @@ pub async fn ready(State(state): State<AppState>) -> Response {
             database,
             ffmpeg,
             vault,
+            library_paths,
         },
     };
     let status = if any_failed {
@@ -127,6 +131,59 @@ async fn check_ffmpeg(state: &AppState) -> CheckStatus {
         Err(e) => CheckStatus::Failed {
             detail: format!("could not spawn `{bin} -version`: {e}"),
         },
+    }
+}
+
+/// Stat every configured library path. If any one is missing or
+/// unreadable (volume unmounted, NFS share dropped), mark the whole
+/// check Failed so an upstream load balancer drains this node — a
+/// server that can't see its media has no business serving requests.
+/// A library with zero configured paths is Degraded, not Failed:
+/// fresh installs sit in that state until the operator points at
+/// disk during onboarding.
+async fn check_library_paths(state: &AppState) -> CheckStatus {
+    let rows = match sqlx::query("SELECT path FROM library_paths")
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return CheckStatus::Failed {
+                detail: format!("could not list library_paths: {e}"),
+            };
+        }
+    };
+    if rows.is_empty() {
+        return CheckStatus::Degraded {
+            detail: "no library paths configured yet".to_string(),
+        };
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for row in &rows {
+        let path: String = match row.try_get("path") {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // `tokio::fs::metadata` follows symlinks (the operator may
+        // have mounted under `/mnt` and symlinked into `/data`). A
+        // missing or unreadable target counts as failed; the error
+        // message goes back to the operator so they can fix it.
+        match tokio::fs::metadata(&path).await {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => missing.push(format!("{path} (not a directory)")),
+            Err(e) => missing.push(format!("{path} ({e})")),
+        }
+    }
+    if missing.is_empty() {
+        CheckStatus::Ok
+    } else {
+        CheckStatus::Failed {
+            detail: format!(
+                "{} library path(s) unreachable: {}",
+                missing.len(),
+                missing.join("; "),
+            ),
+        }
     }
 }
 

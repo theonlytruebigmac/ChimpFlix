@@ -10,6 +10,7 @@ import {
   type MediaItem,
 } from "@/lib/chimpflix-types";
 import { plexImage } from "@/lib/image";
+import { TOAST_DISMISS_MS } from "@/lib/toast";
 import { openModal } from "@/lib/modal";
 import {
   getOrFetchModalData,
@@ -931,7 +932,7 @@ function WatchedToggle({
   // re-visiting the toggle doesn't hear stale state announced.
   useEffect(() => {
     if (!confirmation) return;
-    const t = window.setTimeout(() => setConfirmation(null), 3000);
+    const t = window.setTimeout(() => setConfirmation(null), TOAST_DISMISS_MS);
     return () => window.clearTimeout(t);
   }, [confirmation]);
 

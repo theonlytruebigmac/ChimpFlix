@@ -25,7 +25,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::api::error::ApiError;
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, StreamAuthUser};
 use crate::client_ip::EffectiveClientIp;
 use crate::net;
 use crate::state::AppState;
@@ -58,7 +58,7 @@ use crate::api::access::ensure_file_accessible;
 
 pub async fn direct(
     State(state): State<AppState>,
-    user: AuthUser,
+    StreamAuthUser(user): StreamAuthUser,
     Path(file_id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -1321,7 +1321,7 @@ pub async fn resume_session(
 
 pub async fn master_playlist(
     State(state): State<AppState>,
-    user: AuthUser,
+    StreamAuthUser(user): StreamAuthUser,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let session = ensure_session_accessible(&state, &user, &id)?;
@@ -1338,7 +1338,7 @@ pub async fn master_playlist(
 
 pub async fn variant_file(
     State(state): State<AppState>,
-    user: AuthUser,
+    StreamAuthUser(user): StreamAuthUser,
     Path((id, variant, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let session = ensure_session_accessible(&state, &user, &id)?;

@@ -76,7 +76,11 @@ pub enum PipKind {
     /// Amber pill, black text — used for non-critical security pips
     /// like "2FA".
     Warn,
-    /// Brand-red pill, white text — used for severity-tagged events.
+    /// Brand-red pill, white text — reserved for critical security
+    /// alerts (account compromise, repeated auth failures, vault
+    /// integrity events). No callers yet; the variant exists so the
+    /// future security-event mail templates have a colour-token they
+    /// can dispatch on without us having to invent it under deadline.
     #[allow(dead_code)]
     Danger,
 }

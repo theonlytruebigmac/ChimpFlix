@@ -8388,12 +8388,16 @@ pub async fn record_job_stage_timings(
 /// bump `run_after = now + backoff_ms` and set status back to
 /// `failed` (eligible for re-claim later); otherwise transition to
 /// `dead` (terminal — admin must re-queue manually).
+///
+/// Returns `true` when the row transitioned to terminal `dead`, so
+/// callers can fan out a one-time notification on that edge instead
+/// of querying the row again afterward.
 pub async fn mark_job_failed(
     pool: &SqlitePool,
     job_id: i64,
     error: &str,
     backoff_ms: i64,
-) -> Result<()> {
+) -> Result<bool> {
     mark_job_failed_with_class(pool, job_id, error, backoff_ms, None).await
 }
 
@@ -8405,13 +8409,18 @@ pub async fn mark_job_failed(
 /// and immediately moves the row to `dead`. Used for terminal
 /// failure classes (auth failure, permanent file errors) so the
 /// retry budget isn't wasted on errors that won't recover.
+///
+/// Returns `true` iff the row was moved to terminal `dead`. Callers
+/// that need to notify on terminal failure (operator alerts, audit
+/// fan-out) gate on the bool so a retryable hiccup doesn't spam
+/// notifications.
 pub async fn mark_job_failed_with_class(
     pool: &SqlitePool,
     job_id: i64,
     error: &str,
     backoff_ms: i64,
     error_class: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     crate::db::with_busy_retry(|| async {
         let now = now_ms();
         let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
@@ -8421,7 +8430,8 @@ pub async fn mark_job_failed_with_class(
         let attempts: i64 = row.try_get("attempts")?;
         let max_attempts: i64 = row.try_get("max_attempts")?;
         let force_terminal = matches!(error_class, Some("external_auth") | Some("permanent"));
-        if force_terminal || attempts >= max_attempts {
+        let went_terminal = force_terminal || attempts >= max_attempts;
+        if went_terminal {
             sqlx::query(
                 "UPDATE jobs
                  SET status      = 'dead',
@@ -8454,7 +8464,7 @@ pub async fn mark_job_failed_with_class(
             .execute(pool)
             .await?;
         }
-        Ok(())
+        Ok(went_terminal)
     })
     .await
 }

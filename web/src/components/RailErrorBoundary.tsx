@@ -1,6 +1,7 @@
 "use client";
 
 import { Component, type ReactNode } from "react";
+import { devError } from "@/lib/dev-log";
 
 interface Props {
   /// Where the failure happened — surfaces in the console log so an
@@ -34,7 +35,7 @@ export class RailErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: unknown): void {
-    console.error(`[RailErrorBoundary] ${this.props.label}:`, error);
+    devError(`[RailErrorBoundary] ${this.props.label}:`, error);
   }
 
   render(): ReactNode {

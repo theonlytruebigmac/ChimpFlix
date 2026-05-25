@@ -59,13 +59,20 @@ pub async fn patch(
         }
     }
     if let Some(raw) = input.job_kind_concurrency.as_deref() {
-        // Already validated as well-formed JSON of the right shape;
-        // unwrap is fine, but fall back gracefully if anything sneaks
-        // past so a malformed payload can't crash the request.
-        if let Ok(overrides) = serde_json::from_str::<std::collections::HashMap<String, usize>>(raw)
-        {
-            if let Some(handle) = state.worker_pool.read().await.clone() {
-                handle.apply_kind_concurrency(&overrides).await;
+        // Already validated as well-formed JSON of the right shape
+        // above. Re-parse defensively: a future caller could route
+        // through this fn without `validate(&input)?` at the top.
+        match serde_json::from_str::<std::collections::HashMap<String, usize>>(raw) {
+            Ok(overrides) => {
+                if let Some(handle) = state.worker_pool.read().await.clone() {
+                    handle.apply_kind_concurrency(&overrides).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "job_kind_concurrency parsed at validate-time but failed at hot-apply; skipping live resize",
+                );
             }
         }
     }

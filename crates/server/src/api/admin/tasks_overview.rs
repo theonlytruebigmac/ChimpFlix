@@ -582,8 +582,7 @@ pub async fn kind_detail(
         .await
         .map_err(ApiError::Internal)?;
 
-    let meta = registry::find_kind(&name);
-    if meta.is_none() {
+    let Some(meta) = registry::find_kind(&name) else {
         // Fall back to a legacy scheduled_tasks row lookup. If the
         // name doesn't match any row either, the kind genuinely
         // doesn't exist → 404.
@@ -592,8 +591,7 @@ pub async fn kind_detail(
             .find(|r| r.kind == name)
             .ok_or(ApiError::NotFound)?;
         return Ok(Json(legacy_kind_detail(&state, row).await?));
-    }
-    let meta = meta.unwrap();
+    };
 
     // Gate + schedule + live: same logic as the overview card builder.
     let gate_state = crate::tasks::gates::is_kind_allowed(&state, meta.job_kind).await;
@@ -932,13 +930,24 @@ pub async fn activity(
 
     // Concurrency override map for the ETA computation — reading
     // settings once outside the loop. JSON is `{ "kind": cap }`;
-    // anything malformed silently falls back to registry defaults
-    // (already validated at PATCH time).
+    // already validated at PATCH time, but a hand-edited DB or a
+    // migration mishap could leave malformed JSON in the row. Surface
+    // that instead of silently degrading to registry defaults.
     let settings = queries::get_server_settings(&state.pool)
         .await
         .map_err(ApiError::Internal)?;
     let concurrency_overrides: std::collections::HashMap<String, u32> =
-        serde_json::from_str(&settings.job_kind_concurrency).unwrap_or_default();
+        match serde_json::from_str(&settings.job_kind_concurrency) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    raw = %settings.job_kind_concurrency,
+                    "malformed job_kind_concurrency JSON in server_settings; falling back to registry defaults",
+                );
+                std::collections::HashMap::new()
+            }
+        };
 
     let mut per_kind: Vec<KindHealth> = Vec::new();
     let mut all_recent: Vec<RecentRun> = Vec::new();

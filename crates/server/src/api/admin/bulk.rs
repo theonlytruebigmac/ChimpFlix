@@ -11,6 +11,7 @@ use axum::http::header::USER_AGENT;
 use axum::http::{HeaderMap, StatusCode};
 use chimpflix_library::{NewAuditEntry, queries, scanner};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
@@ -76,7 +77,7 @@ pub async fn refresh_metadata(
         actor.id,
         &headers,
         "items.bulk.refresh_metadata",
-        &req,
+        &with_counts(&req, req.item_ids.len(), ok, failed),
     )
     .await;
     Ok(Json(BulkReport { ok, failed, errors }))
@@ -111,7 +112,14 @@ pub async fn add_tag(
         }
     }
     let failed = errors.len();
-    audit_with(&state, actor.id, &headers, "items.bulk.add_tag", &req).await;
+    audit_with(
+        &state,
+        actor.id,
+        &headers,
+        "items.bulk.add_tag",
+        &with_counts(&req, req.item_ids.len(), ok, failed),
+    )
+    .await;
     Ok(Json(BulkReport { ok, failed, errors }))
 }
 
@@ -138,7 +146,14 @@ pub async fn remove_tag(
         }
     }
     let failed = errors.len();
-    audit_with(&state, actor.id, &headers, "items.bulk.remove_tag", &req).await;
+    audit_with(
+        &state,
+        actor.id,
+        &headers,
+        "items.bulk.remove_tag",
+        &with_counts(&req, req.item_ids.len(), ok, failed),
+    )
+    .await;
     Ok(Json(BulkReport { ok, failed, errors }))
 }
 
@@ -220,13 +235,33 @@ pub async fn detect_markers(
         actor.id,
         &headers,
         "items.bulk.detect_markers",
-        &req,
+        &with_counts(&req, req.item_ids.len(), ok, failed),
     )
     .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(BulkReport { ok, failed, errors }),
     ))
+}
+
+/// Wrap a request payload with the post-execution outcome so the
+/// audit row shows "operator ran X against 50 items, 47 succeeded, 3
+/// failed" instead of just "operator ran X against [some ids]".
+/// Forensics for bulk operations need the counts; the bare request
+/// body buries them in `item_ids.len()` and reveals nothing about
+/// what actually happened.
+fn with_counts<T: Serialize>(
+    req: &T,
+    affected_item_count: usize,
+    ok: usize,
+    failed: usize,
+) -> serde_json::Value {
+    json!({
+        "request": req,
+        "affected_item_count": affected_item_count,
+        "ok": ok,
+        "failed": failed,
+    })
 }
 
 fn cap_check(n: usize) -> Result<(), ApiError> {

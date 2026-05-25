@@ -214,6 +214,75 @@ impl FromRequestParts<AppState> for AdminAuth {
     }
 }
 
+/// Stream-endpoint extractor: accepts either the normal session cookie
+/// or a short-lived `?ct=<token>` query parameter minted via
+/// [`crate::auth::cast_token`]. Used on the manifest + segment routes
+/// that a Chromecast receiver fetches directly (no cookie jar).
+///
+/// Token verification short-circuits the cookie path entirely; it
+/// returns a synthetic `AuthUser` with `session_id = 0` (never a real
+/// row id) so consumers that key off `session_id` can opt out of cast
+/// requests if they care. Library access still flows through
+/// `ensure_*_accessible`, so the token only ever grants what the user
+/// could already see in their own browser.
+#[derive(Debug, Clone)]
+pub struct StreamAuthUser(pub AuthUser);
+
+impl FromRequestParts<AppState> for StreamAuthUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        // Cast-token path first — if a `?ct=` query param is present
+        // and verifies, skip the cookie machinery entirely. The token
+        // is a transparent stand-in for the cookie; it grants the same
+        // library access and nothing more.
+        if let Some(query) = parts.uri.query() {
+            if let Some(token) = extract_cast_token_param(query) {
+                if let Some((user_id, _exp)) =
+                    crate::auth::cast_token::verify(&token, &state.auth.session_secret)
+                {
+                    let user = queries::find_user_by_id(&state.pool, user_id)
+                        .await
+                        .map_err(ApiError::Internal)?
+                        .ok_or(ApiError::Unauthorized)?;
+                    return Ok(StreamAuthUser(AuthUser {
+                        id: user.id,
+                        username: user.username,
+                        role: user.role,
+                        // Sentinel: 0 ≠ any real session row id. Lets
+                        // session-scoped operations notice "this isn't
+                        // a real session" if they care, while keeping
+                        // the field typed as `i64`.
+                        session_id: 0,
+                    }));
+                }
+                // Token present but invalid — fall through to cookie
+                // auth. A stale token shouldn't lock the user out if
+                // their browser tab still has a working cookie.
+            }
+        }
+        let inner = AuthUser::from_request_parts(parts, state).await?;
+        Ok(StreamAuthUser(inner))
+    }
+}
+
+/// Extract the value of the first `ct=...` parameter from a query
+/// string. We hand-parse instead of pulling in a query-string crate
+/// for one lookup — the only caller is the StreamAuthUser extractor
+/// and the format is fixed.
+fn extract_cast_token_param(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("ct=") {
+            // URL-decode in case the receiver added padding/escapes.
+            // We only really expect base64url charset (already URL-safe)
+            // but the Cast SDK has been known to escape `=` defensively
+            // on older receiver versions.
+            return Some(value.replace("%3D", "=").replace("%2F", "/"));
+        }
+    }
+    None
+}
+
 /// "Optional auth" wrapper for handlers that behave differently for
 /// signed-in vs anonymous callers — instead of failing the whole
 /// request with 401 when no session is present, missing/invalid
