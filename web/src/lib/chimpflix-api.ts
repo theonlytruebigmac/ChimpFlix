@@ -1431,6 +1431,13 @@ export interface ServerSettings {
    *  on file change. Read once at startup; toggling requires a
    *  server restart to take effect. */
   scan_automatically: boolean;
+  /** Swap the inotify backend for `notify::PollWatcher`. Required for
+   *  NFS/SMB mounts and bind-mounted-into-container setups where
+   *  inotify events don't propagate. Off by default. Restart required. */
+  file_watcher_use_polling: boolean;
+  /** Seconds between polling-watcher rescans. Only consulted when
+   *  `file_watcher_use_polling` is true. Default 30. */
+  file_watcher_poll_interval_secs: number;
   /** Server-wide default for ffmpeg loudnorm. When ON, every transcode
    *  session gets the filter applied (uses stored per-file
    *  measurements when available, else generic targets). Per-session
@@ -1529,6 +1536,8 @@ export interface ServerSettingsUpdate {
   maintenance_window_start?: string;
   maintenance_window_end?: string;
   scan_automatically?: boolean;
+  file_watcher_use_polling?: boolean;
+  file_watcher_poll_interval_secs?: number;
   audio_normalize_enabled?: boolean;
   subtitle_default_offset_ms?: number;
   scanner_nice_level?: number;
@@ -1943,7 +1952,16 @@ export interface RatingResponse {
   rating: number | null;
 }
 
+export interface AllRatingsResponse {
+  items: Record<string, number>;
+  episodes: Record<string, number>;
+}
+
 export const ratings = {
+  /// Bulk fetch — every rating the current user has set, in one call.
+  /// Used by `lib/likes.ts` so the home page renders Like state on
+  /// every card without firing N parallel `/items/:id/rating` GETs.
+  listMine: () => apiFetch<AllRatingsResponse>("/ratings"),
   getItem: (itemId: number) =>
     apiFetch<RatingResponse>(`/items/${itemId}/rating`),
   putItem: (itemId: number, rating: number) =>

@@ -247,6 +247,16 @@ function TitleModalView({
   initialEpisodeKey?: string;
 }) {
   const [detail, setDetail] = useState<ItemDetail>(data.detail);
+  // Bump-counter that tells SeasonEpisodes to refetch the currently
+  // selected season after a show-level bulk watched toggle. Per-
+  // episode toggles update SeasonEpisodes' local `episodes` array
+  // optimistically and don't need this; only the show-level path
+  // flips every episode server-side without touching that array,
+  // leaving the "Up Next" chip pointing at a stale episode.
+  const [bulkWatchVersion, setBulkWatchVersion] = useState(0);
+  const handleBulkWatchChange = useCallback(() => {
+    setBulkWatchVersion((v) => v + 1);
+  }, []);
   // Single landing pad for "the underlying item changed, mirror it
   // into local state and drop the modal cache so the next open
   // doesn't show stale state". Used by WatchedToggle / AdminActions
@@ -506,7 +516,11 @@ function TitleModalView({
                 </svg>
               )}
             </button>
-            <WatchedToggle detail={detail} onUpdated={handleDetailUpdated} />
+            <WatchedToggle
+              detail={detail}
+              onUpdated={handleDetailUpdated}
+              onBulkWatchChange={handleBulkWatchChange}
+            />
             {traktLinked && <TraktSyncBadge />}
             <AdminActions detail={detail} onUpdated={handleDetailUpdated} />
           </div>
@@ -595,6 +609,7 @@ function TitleModalView({
           isOwner={isOwnerView}
           targetEpisodeKey={initialEpisodeKey}
           onWatchStatsChange={refreshDetail}
+          bulkWatchVersion={bulkWatchVersion}
         />
       )}
 
@@ -869,9 +884,16 @@ function TraktSyncBadge() {
 function WatchedToggle({
   detail,
   onUpdated,
+  onBulkWatchChange,
 }: {
   detail: ItemDetail;
   onUpdated: (next: ItemDetail) => void;
+  /// Fired after a successful show-level bulk toggle so the parent
+  /// can tell SeasonEpisodes to refetch its current season — without
+  /// this the "Up Next" chip keeps pointing at the pre-toggle next
+  /// episode, since the bulk endpoint doesn't go through the per-
+  /// episode optimistic-flip path.
+  onBulkWatchChange?: () => void;
 }) {
   const isShow = detail.kind === "show";
   const [busy, setBusy] = useState(false);
@@ -912,6 +934,7 @@ function WatchedToggle({
       // are in sync without us having to mirror the server's logic.
       const next = await itemsApi.get(detail.id);
       onUpdated(next);
+      if (isShow) onBulkWatchChange?.();
       setConfirmation(
         isShow
           ? willBeWatched

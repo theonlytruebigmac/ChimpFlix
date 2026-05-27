@@ -19,10 +19,48 @@ interface RatingChangePayload {
   rating: number | null;
 }
 
+/// Module-level cache of every item rating the current user has set.
+/// Populated lazily on first `useItemLike` mount and kept in sync via
+/// the `RATINGS_EVENT` broadcasts emitted by the modal RatingBar and
+/// the Card Like button. One `GET /ratings` per session beats N
+/// parallel `GET /items/:id/rating` per home-page card load — the
+/// per-card fan-out was tripping the global rate limiter (HTTP 429
+/// cascade) once the home rails grew past ~20 visible items.
+let cache: Map<number, number> | null = null;
+let inflight: Promise<void> | null = null;
+
+async function ensureLoaded(): Promise<void> {
+  if (cache) return;
+  if (inflight) return inflight;
+  inflight = (async () => {
+    try {
+      const all = await ratingsApi.listMine();
+      const next = new Map<number, number>();
+      for (const [k, v] of Object.entries(all.items)) {
+        const id = Number.parseInt(k, 10);
+        if (Number.isFinite(id) && id > 0) next.set(id, v);
+      }
+      cache = next;
+    } catch {
+      // Network / auth failure — fall back to an empty cache so the UI
+      // renders unrated rather than spinning forever. Subsequent
+      // mutations will still hit the per-id endpoints and repopulate.
+      cache = new Map();
+    }
+  })();
+  return inflight;
+}
+
 /// Broadcast a rating change so Card likes + the modal RatingBar stay
 /// aligned within the tab. Call after the API write succeeds.
 export function notifyRatingChanged(itemId: number, rating: number | null) {
   if (typeof window === "undefined") return;
+  // Keep the module-level cache hot so any Card that mounts after the
+  // change reflects it without a refetch.
+  if (cache) {
+    if (rating === null) cache.delete(itemId);
+    else cache.set(itemId, rating);
+  }
   window.dispatchEvent(
     new CustomEvent<RatingChangePayload>(RATINGS_EVENT, {
       detail: { itemId, rating },
@@ -49,17 +87,11 @@ export function useItemLike(ratingKey: string): {
   useEffect(() => {
     if (!valid) return;
     let cancelled = false;
-    ratingsApi
-      .getItem(itemId)
-      .then((r) => {
-        if (!cancelled) {
-          setRating(r.rating);
-          setLoading(false);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setLoading(false);
-      });
+    void ensureLoaded().then(() => {
+      if (cancelled) return;
+      setRating(cache?.get(itemId) ?? null);
+      setLoading(false);
+    });
 
     function onChange(e: Event) {
       const detail = (e as CustomEvent<RatingChangePayload>).detail;

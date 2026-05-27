@@ -19,6 +19,7 @@ export function SeasonEpisodes({
   isOwner = false,
   targetEpisodeKey,
   onWatchStatsChange,
+  bulkWatchVersion = 0,
 }: {
   seasons: MediaItem[];
   initialEpisodes: MediaItem[];
@@ -38,6 +39,12 @@ export function SeasonEpisodes({
   /// all as watched" toggle stays in its pre-toggle state until the
   /// modal is closed and reopened.
   onWatchStatsChange?: () => void;
+  /// Monotonically bumped by the parent after a show-level bulk
+  /// watched toggle. Triggers a refetch of the currently selected
+  /// season so the "Up Next" chip (computed from local `episodes`
+  /// state) reflects the post-bulk watched flags instead of the
+  /// stale pre-bulk array.
+  bulkWatchVersion?: number;
 }) {
   const [selectedKey, setSelectedKey] = useState(initialSeasonKey);
   const [episodes, setEpisodes] = useState(initialEpisodes);
@@ -124,6 +131,16 @@ export function SeasonEpisodes({
       }
     }
   }, []);
+
+  // Refetch the currently selected season after a show-level bulk
+  // watched toggle (Mark all as watched / unwatched). Skips the
+  // initial mount so we don't double-fetch on first render.
+  const lastSeenBulkVersionRef = useRef(bulkWatchVersion);
+  useEffect(() => {
+    if (lastSeenBulkVersionRef.current === bulkWatchVersion) return;
+    lastSeenBulkVersionRef.current = bulkWatchVersion;
+    void changeSeason(selectedKey);
+  }, [bulkWatchVersion, selectedKey, changeSeason]);
 
   // When the modal was opened with a target episode that lives in a
   // different season than `initialSeasonKey`, fetch it to discover its

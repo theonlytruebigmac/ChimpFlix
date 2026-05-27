@@ -51,11 +51,32 @@ export function PlexSignInButton({
   const [phase, setPhase] = useState<"idle" | "authorizing" | "polling">("idle");
   const pollTimer = useRef<number | null>(null);
   const aliveRef = useRef(true);
+  // Single-flight guard on the poll request. The Plex round-trips
+  // (poll_pin + fetch_user) can take >2s under load, which is longer
+  // than our poll interval. Without this guard the second tick fires
+  // while the first is still in flight; both server handlers race
+  // through `finalize_signup`, the second one finds the freshly-
+  // inserted auth-provider row, and returns a Conflict error AFTER
+  // the first call already set the session cookie. The user sees a
+  // "this Plex account is already linked" error even though they're
+  // actually signed in.
+  const inflightRef = useRef(false);
+  // Reference to the popup tab we opened so the Plex auth flow could
+  // run there. Held as a ref so `finish` can close it on terminal
+  // results — without this the user is left with a stray "Authorized"
+  // tab open after every successful sign-in.
+  const placeholderRef = useRef<Window | null>(null);
   useEffect(() => {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
       if (pollTimer.current) window.clearInterval(pollTimer.current);
+      // If the component unmounts mid-flow (route change, parent
+      // unmount), don't leave the Plex tab orphaned.
+      if (placeholderRef.current && !placeholderRef.current.closed) {
+        placeholderRef.current.close();
+      }
+      placeholderRef.current = null;
     };
   }, []);
 
@@ -64,6 +85,7 @@ export function PlexSignInButton({
       window.clearInterval(pollTimer.current);
       pollTimer.current = null;
     }
+    inflightRef.current = false;
     setPhase("idle");
     setBusy(false);
   }, []);
@@ -71,6 +93,10 @@ export function PlexSignInButton({
   const finish = useCallback(
     (cb: () => void) => {
       stopPolling();
+      if (placeholderRef.current && !placeholderRef.current.closed) {
+        placeholderRef.current.close();
+      }
+      placeholderRef.current = null;
       cb();
     },
     [stopPolling],
@@ -105,6 +131,7 @@ export function PlexSignInButton({
       );
       return;
     }
+    placeholderRef.current = placeholder;
     try {
       const start = await plex.start(intent);
       if (!placeholder.closed) {
@@ -118,12 +145,18 @@ export function PlexSignInButton({
       }
       setPhase("polling");
       const tick = async () => {
-        if (!aliveRef.current) return;
+        // aliveRef gates against post-unmount runs; inflightRef is
+        // the single-flight guard against an interval tick stepping
+        // on a still-running poll (see inflightRef declaration).
+        if (!aliveRef.current || inflightRef.current) return;
+        inflightRef.current = true;
         try {
           const result = await plex.poll(start.pin_handle);
           handlePollResult(result);
         } catch (e) {
           finish(() => onError?.(parseError(e)));
+        } finally {
+          inflightRef.current = false;
         }
       };
       // First tick promptly, then on a 2s interval. The user typically
@@ -132,9 +165,6 @@ export function PlexSignInButton({
       tick();
       pollTimer.current = window.setInterval(tick, 2000);
     } catch (e) {
-      // Close the placeholder tab we opened proactively so the user
-      // isn't left with a stray blank tab on a failure path.
-      if (placeholder && !placeholder.closed) placeholder.close();
       finish(() => onError?.(parseError(e)));
     }
   }

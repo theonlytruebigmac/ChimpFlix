@@ -237,7 +237,11 @@ pub fn router(state: AppState) -> Router {
         .route("/trakt/recommendations", get(trakt::recommendations))
         .route("/trakt/lists", get(trakt::user_lists))
         .route("/trakt/favorites", get(trakt::favorites))
-        // Per-user ratings (Trakt-synced when linked)
+        // Per-user ratings (Trakt-synced when linked). The bulk
+        // `/ratings` endpoint exists so home-page rails can render
+        // Like state without firing one request per visible card —
+        // that fan-out was tripping the global rate limiter.
+        .route("/ratings", get(trakt::list_my_ratings))
         .route(
             "/items/{id}/rating",
             get(trakt::get_item_rating)

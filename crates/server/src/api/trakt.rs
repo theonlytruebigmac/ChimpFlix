@@ -932,6 +932,29 @@ pub async fn put_episode_rating(
     }))
 }
 
+/// Bulk fetch — returns the calling user's complete rating set so the
+/// browse rails can render Like state for every visible card from a
+/// single request. Replaces the per-card `GET /items/{id}/rating`
+/// fan-out that was tripping the global rate limiter on the home page.
+#[derive(Debug, Serialize)]
+pub struct AllRatingsResponse {
+    pub items: HashMap<i64, i32>,
+    pub episodes: HashMap<i64, i32>,
+}
+
+pub async fn list_my_ratings(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<AllRatingsResponse>, ApiError> {
+    let (items, episodes) = queries::list_user_ratings(&state.pool, user.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(AllRatingsResponse {
+        items: items.into_iter().collect(),
+        episodes: episodes.into_iter().collect(),
+    }))
+}
+
 pub async fn delete_episode_rating(
     State(state): State<AppState>,
     user: AuthUser,

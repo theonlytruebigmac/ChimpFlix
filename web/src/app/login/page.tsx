@@ -45,6 +45,12 @@ function LoginContent() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Display name of an already-signed-in user when they land on an
+  // invite-bearing /login URL. Surfaced as a banner so they know
+  // accepting the invite will replace their current session — without
+  // it, signing up via Plex silently swapped the cookie and the
+  // helping admin was left confused about who they were logged in as.
+  const [signedInAs, setSignedInAs] = useState<string | null>(null);
 
   // First-run detection. The invite-present path is handled at useState
   // init above; here we only need the async server status check when
@@ -91,6 +97,30 @@ function LoginContent() {
       cancelled = true;
     };
   }, [mode, invite, next, router]);
+
+  // Independent of the setup/login-mode resolution above: if we landed
+  // here with an invite code AND a live session, surface a banner so
+  // the user understands accepting the invite will replace their
+  // current sign-in. Plex signup doesn't roundtrip through the
+  // server's "already signed in" guard, so without this banner the
+  // session swap happens silently.
+  useEffect(() => {
+    if (!invite) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await auth.me();
+        if (!cancelled && me) {
+          setSignedInAs(me.user.display_name || me.user.username);
+        }
+      } catch {
+        // 401 — nobody's signed in, no banner needed.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [invite]);
 
   function setModeAndReset(next: Mode) {
     setMode(next);
@@ -203,6 +233,17 @@ function LoginContent() {
                   ? "Two-factor authentication"
                   : "Sign in to continue"}
         </h2>
+
+        {signedInAs && mode === "register" && (
+          <div
+            className="mb-4 rounded bg-amber-500/10 px-3 py-2 text-sm text-amber-200 ring-1 ring-amber-500/30"
+            role="status"
+            aria-live="polite"
+          >
+            You&apos;re signed in as <strong>{signedInAs}</strong>. Accepting this
+            invite will replace your current session.
+          </div>
+        )}
 
         <form className="space-y-3" onSubmit={onSubmit}>
           {mode === "two_factor" ? (
@@ -378,8 +419,21 @@ function LoginContent() {
                   : { intent: "login" }
               }
               onSuccess={() => {
-                router.push(next);
-                router.refresh();
+                // Brief visible confirmation before navigating away.
+                // Without it the page silently transitions and a user
+                // who was looking at the Plex tab when polling
+                // completed lands back on the original tab thinking
+                // nothing happened.
+                setError(null);
+                setNotice(
+                  mode === "register"
+                    ? "Account created — taking you in…"
+                    : "Signed in — taking you in…",
+                );
+                window.setTimeout(() => {
+                  router.push(next);
+                  router.refresh();
+                }, 600);
               }}
               onNotLinked={(plexUsername) =>
                 setError(

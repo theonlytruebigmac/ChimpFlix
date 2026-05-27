@@ -25,6 +25,8 @@ const INPUT_CHANGED_CLASS =
 export function AdminLibrarySettingsClient({ settings }: Props) {
   const [baseline, setBaseline] = useState({
     scan_automatically: settings.scan_automatically,
+    file_watcher_use_polling: settings.file_watcher_use_polling,
+    file_watcher_poll_interval_secs: settings.file_watcher_poll_interval_secs,
     audio_normalize_enabled: settings.audio_normalize_enabled,
     subtitle_default_offset_ms: settings.subtitle_default_offset_ms,
     scanner_nice_level: settings.scanner_nice_level,
@@ -39,6 +41,12 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     recently_added_days: settings.recently_added_days,
   });
   const [scanAuto, setScanAuto] = useState(baseline.scan_automatically);
+  const [watcherPolling, setWatcherPolling] = useState(
+    baseline.file_watcher_use_polling,
+  );
+  const [watcherPollSecs, setWatcherPollSecs] = useState(
+    baseline.file_watcher_poll_interval_secs,
+  );
   const [audioNormalize, setAudioNormalize] = useState(
     baseline.audio_normalize_enabled,
   );
@@ -72,6 +80,10 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
 
   const dirtyFields: Record<string, boolean> = {
     "Auto-scan": scanAuto !== baseline.scan_automatically,
+    "Watcher polling":
+      watcherPolling !== baseline.file_watcher_use_polling,
+    "Watcher poll interval":
+      watcherPollSecs !== baseline.file_watcher_poll_interval_secs,
     "Audio normalize": audioNormalize !== baseline.audio_normalize_enabled,
     "Subtitle default offset":
       subtitleDefaultOffsetMs !== baseline.subtitle_default_offset_ms,
@@ -96,6 +108,8 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const dirtyCount = dirtyLabels.length;
 
   const scanAutoChanged = dirtyFields["Auto-scan"];
+  const watcherPollingChanged = dirtyFields["Watcher polling"];
+  const watcherPollSecsChanged = dirtyFields["Watcher poll interval"];
   const dbCacheChanged = dirtyFields["DB page cache"];
   const niceChanged = dirtyFields["Scanner nice level"];
   const metadataLanguageChanged = dirtyFields["Metadata language"];
@@ -104,6 +118,8 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     setError(null);
     const patch: ServerSettingsUpdate = {
       scan_automatically: scanAuto,
+      file_watcher_use_polling: watcherPolling,
+      file_watcher_poll_interval_secs: watcherPollSecs,
       audio_normalize_enabled: audioNormalize,
       subtitle_default_offset_ms: subtitleDefaultOffsetMs,
       scanner_nice_level: scannerNice,
@@ -119,6 +135,8 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     await adminApi.settings.patch(patch);
     setBaseline({
       scan_automatically: scanAuto,
+      file_watcher_use_polling: watcherPolling,
+      file_watcher_poll_interval_secs: watcherPollSecs,
       audio_normalize_enabled: audioNormalize,
       subtitle_default_offset_ms: subtitleDefaultOffsetMs,
       scanner_nice_level: scannerNice,
@@ -135,6 +153,8 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
 
   function discard() {
     setScanAuto(baseline.scan_automatically);
+    setWatcherPolling(baseline.file_watcher_use_polling);
+    setWatcherPollSecs(baseline.file_watcher_poll_interval_secs);
     setAudioNormalize(baseline.audio_normalize_enabled);
     setSubtitleDefaultOffsetMs(baseline.subtitle_default_offset_ms);
     setScannerNice(baseline.scanner_nice_level);
@@ -174,6 +194,51 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
             <span>Watch the filesystem and scan on change</span>
             {scanAutoChanged && <Pill tone="warn">Restart pending</Pill>}
           </label>
+        </SettingsRow>
+        <SettingsRow
+          label="Use polling watcher (NFS/SMB)"
+          help={
+            watcherPollingChanged
+              ? "Server restart required for changes to take effect."
+              : "Inotify (the default) does not see filesystem events on NFS/SMB mounts or bind-mounts that don't propagate inotify into the container. If you've been adding files and they only show up after a manual scan, turn this on. Costs more CPU + I/O than inotify."
+          }
+          changed={watcherPollingChanged}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={watcherPolling}
+              disabled={!scanAuto}
+              onChange={(e) => setWatcherPolling(e.target.checked)}
+            />
+            <span>Recursively stat watched roots on an interval</span>
+            {watcherPollingChanged && <Pill tone="warn">Restart pending</Pill>}
+          </label>
+        </SettingsRow>
+        <SettingsRow
+          label="Polling interval"
+          help={
+            watcherPollSecsChanged
+              ? "Server restart required for changes to take effect."
+              : "How often the polling watcher rescans every watched root. Lower = faster detection but more I/O. Default 30s. Only consulted when polling is on."
+          }
+          changed={watcherPollSecsChanged}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={5}
+              max={3600}
+              value={watcherPollSecs}
+              disabled={!watcherPolling}
+              onChange={(e) => setWatcherPollSecs(Number(e.target.value))}
+              className={`w-24 tabular-nums ${
+                watcherPollSecsChanged ? INPUT_CHANGED_CLASS : INPUT_CLASS
+              } disabled:opacity-40`}
+            />
+            <span className="text-sm text-white/55">seconds</span>
+            {watcherPollSecsChanged && <Pill tone="warn">Restart pending</Pill>}
+          </div>
         </SettingsRow>
         <SettingsRow
           label="Scanner ffmpeg priority"

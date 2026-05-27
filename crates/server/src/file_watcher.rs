@@ -6,19 +6,34 @@
 //! within seconds. Debounced (5s of silence) so a `cp -r` doesn't fan
 //! into dozens of scan jobs.
 //!
-//! Per-library reconfiguration is intentionally out of scope for v1 —
-//! the watcher is built once at startup from current library paths.
-//! Adding/removing a library requires a server restart to re-arm.
+//! Per-library reconfiguration is supported via a 30s periodic re-sync:
+//! the watcher polls `library_paths` and arms newly-added roots / drops
+//! removed ones without needing a restart. The `scan_automatically`
+//! setting is re-read every loop iteration so the operator can pause
+//! event processing live.
+//!
+//! Backend selection:
+//!   * Default — `notify::RecommendedWatcher` (inotify on Linux). Cheap,
+//!     low-latency, but **does not see events on NFS / SMB mounts** and
+//!     can miss events from bind-mounts that don't propagate inotify
+//!     into the container namespace.
+//!   * `file_watcher_use_polling=true` — `notify::PollWatcher`. Stat-
+//!     walks every watched root every N seconds. Higher CPU + I/O, but
+//!     works on remote filesystems. Required for Docker-on-NAS setups
+//!     where the media drive is NFS on the host and bind-mounted in.
+//!
+//! Backend is chosen at startup from settings; toggling requires a
+//! restart to re-arm with the new backend.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chimpflix_library::queries;
 use notify::{
-    EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind},
 };
 use sqlx::Row;
@@ -33,6 +48,30 @@ use crate::state::AppState;
 /// short enough that the user sees the library refresh on the order of
 /// seconds, not minutes.
 const DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// Backend-agnostic wrapper. `notify::Watcher` is object-safe but the
+/// concrete watcher types differ enough (`RecommendedWatcher` vs
+/// `PollWatcher`) that an enum is clearer than a `Box<dyn Watcher>` —
+/// no virtual dispatch tax and the dispatch matches at the call site.
+enum WatcherBackend {
+    Recommended(RecommendedWatcher),
+    Polling(PollWatcher),
+}
+
+impl WatcherBackend {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Self::Recommended(w) => w.watch(path, mode),
+            Self::Polling(w) => w.watch(path, mode),
+        }
+    }
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        match self {
+            Self::Recommended(w) => w.unwatch(path),
+            Self::Polling(w) => w.unwatch(path),
+        }
+    }
+}
 
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
@@ -54,23 +93,58 @@ async fn run(state: AppState) -> Result<()> {
     let overflow_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let overflow_flag_cb = overflow_flag.clone();
     let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(16384);
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+    let dispatch = move |res: notify::Result<notify::Event>| {
         if tx.try_send(res).is_err() {
             // Channel full — record the drop so the main loop can
             // trigger a full library rescan when it next wakes.
             overflow_flag_cb.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-    })?;
+    };
+    // Decide backend once at startup. The settings struct mirrors the
+    // DB row reloaded on PATCH /admin/settings, but the running watcher
+    // can't be hot-swapped without re-arming every watch and risking a
+    // window where new files land in neither backend — so we treat the
+    // backend choice as restart-required, like scan_automatically.
+    let (use_polling, poll_interval_secs) = {
+        let s = state.settings.read().await;
+        (
+            s.file_watcher_use_polling,
+            s.file_watcher_poll_interval_secs,
+        )
+    };
+    let mut watcher: WatcherBackend = if use_polling {
+        let interval = Duration::from_secs(poll_interval_secs.clamp(5, 3600) as u64);
+        info!(
+            poll_interval_secs = poll_interval_secs,
+            "file watcher: using PollWatcher backend (set for NFS/SMB compat)"
+        );
+        let cfg = NotifyConfig::default().with_poll_interval(interval);
+        WatcherBackend::Polling(PollWatcher::new(dispatch, cfg)?)
+    } else {
+        info!("file watcher: using RecommendedWatcher backend (inotify on Linux)");
+        WatcherBackend::Recommended(notify::recommended_watcher(dispatch)?)
+    };
 
     // Track currently-watched paths so the periodic re-poll only arms
-    // newcomers and unwatches removed roots.
+    // newcomers and unwatches removed roots. The companion `sorted`
+    // Vec is kept in deepest-first order so event paths get matched
+    // against the most-specific root first (fixes nested roots like
+    // `/media` + `/media/movies` ascribing events to the wrong library).
     let mut watched: HashMap<PathBuf, i64> = HashMap::new();
+    let mut sorted: Vec<(PathBuf, i64)> = Vec::new();
     // Paths we've already warned about being inaccessible. Throttle so
     // a partially-mounted/permission-denied root doesn't spam WARN
     // every 30s for the lifetime of the process. Cleared when the path
     // recovers; if it goes missing again later, a fresh WARN fires.
     let mut warned_missing: HashSet<PathBuf> = HashSet::new();
-    sync_watched(&state, &mut watcher, &mut watched, &mut warned_missing).await;
+    sync_watched(
+        &state,
+        &mut watcher,
+        &mut watched,
+        &mut sorted,
+        &mut warned_missing,
+    )
+    .await;
     let mut last_resync = Instant::now();
     const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -101,11 +175,27 @@ async fn run(state: AppState) -> Result<()> {
                         if !is_interesting(&ev.kind) {
                             continue;
                         }
-                        let paths_vec: Vec<(PathBuf, i64)> =
-                            watched.iter().map(|(p, id)| (p.clone(), *id)).collect();
                         for p in &ev.paths {
-                            if let Some(lib_id) = match_library(&paths_vec, p) {
+                            if let Some(lib_id) = match_library(&sorted, p) {
+                                let first = !pending.contains_key(&lib_id);
                                 pending.insert(lib_id, Instant::now());
+                                if first {
+                                    // Per-library debounce-window-opened log
+                                    // so operators can confirm the watcher
+                                    // is seeing their writes without having
+                                    // to enable DEBUG for the whole crate.
+                                    info!(
+                                        library_id = lib_id,
+                                        path = %p.display(),
+                                        "file watcher: event matched, debouncing"
+                                    );
+                                } else {
+                                    debug!(
+                                        library_id = lib_id,
+                                        path = %p.display(),
+                                        "file watcher: event matched (window still open)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -123,7 +213,14 @@ async fn run(state: AppState) -> Result<()> {
                     pending.clear();
                     if now.duration_since(last_resync) >= RESYNC_INTERVAL {
                         last_resync = now;
-                        sync_watched(&state, &mut watcher, &mut watched, &mut warned_missing).await;
+                        sync_watched(
+                            &state,
+                            &mut watcher,
+                            &mut watched,
+                            &mut sorted,
+                            &mut warned_missing,
+                        )
+                        .await;
                     }
                     continue;
                 }
@@ -147,12 +244,35 @@ async fn run(state: AppState) -> Result<()> {
                     .map(|(id, _)| *id)
                     .collect();
                 for lib_id in due {
-                    pending.remove(&lib_id);
-                    spawn_scan(state.clone(), lib_id).await;
+                    if spawn_scan(state.clone(), lib_id).await {
+                        pending.remove(&lib_id);
+                    } else {
+                        // A scan is already running for this library —
+                        // we couldn't acquire the per-library lock.
+                        // Keep the pending entry alive so we re-check
+                        // after another DEBOUNCE window. Reset the
+                        // timestamp to `now` so the retry cadence is
+                        // bounded and we don't tight-loop. Without
+                        // this, the events that landed during the
+                        // in-flight scan are silently dropped — and
+                        // a long scan that's already iterated past
+                        // the new file's directory won't pick them
+                        // up either. (This was the most likely root
+                        // cause of operators reporting "I have to
+                        // run manual scans to find new files.")
+                        pending.insert(lib_id, now);
+                    }
                 }
                 if now.duration_since(last_resync) >= RESYNC_INTERVAL {
                     last_resync = now;
-                    sync_watched(&state, &mut watcher, &mut watched, &mut warned_missing).await;
+                    sync_watched(
+                        &state,
+                        &mut watcher,
+                        &mut watched,
+                        &mut sorted,
+                        &mut warned_missing,
+                    )
+                    .await;
                 }
             }
         }
@@ -164,8 +284,9 @@ async fn run(state: AppState) -> Result<()> {
 /// watcher in sync with admin library changes without a server restart.
 async fn sync_watched(
     state: &AppState,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut WatcherBackend,
     watched: &mut HashMap<PathBuf, i64>,
+    sorted: &mut Vec<(PathBuf, i64)>,
     warned_missing: &mut HashSet<PathBuf>,
 ) {
     let current = match library_paths(state).await {
@@ -183,6 +304,7 @@ async fn sync_watched(
         .filter(|p| !current_set.contains_key(*p))
         .cloned()
         .collect();
+    let any_changes = !removed.is_empty();
     for path in removed {
         let _ = watcher.unwatch(&path);
         watched.remove(&path);
@@ -201,36 +323,36 @@ async fn sync_watched(
     // transition, then DEBUG on subsequent retries until the path
     // recovers (at which point a fresh "watching for changes" INFO
     // fires from the success branch below).
+    let mut added_any = false;
     for (path, id) in current_set {
         if watched.contains_key(&path) {
             continue;
         }
         match std::fs::metadata(&path) {
-            Ok(_) => {
-                match watcher.watch(&path, RecursiveMode::Recursive) {
-                    Ok(()) => {
-                        if warned_missing.remove(&path) {
-                            info!(
-                                path = %path.display(),
-                                library_id = id,
-                                "watching for changes (path recovered)"
-                            );
-                        } else {
-                            info!(
-                                path = %path.display(),
-                                library_id = id,
-                                "watching for changes"
-                            );
-                        }
-                        watched.insert(path, id);
+            Ok(_) => match watcher.watch(&path, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    if warned_missing.remove(&path) {
+                        info!(
+                            path = %path.display(),
+                            library_id = id,
+                            "watching for changes (path recovered)"
+                        );
+                    } else {
+                        info!(
+                            path = %path.display(),
+                            library_id = id,
+                            "watching for changes"
+                        );
                     }
-                    Err(e) => warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to watch library path"
-                    ),
+                    watched.insert(path, id);
+                    added_any = true;
                 }
-            }
+                Err(e) => warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to watch library path"
+                ),
+            },
             Err(e) => {
                 let kind = e.kind();
                 if warned_missing.insert(path.clone()) {
@@ -256,6 +378,18 @@ async fn sync_watched(
             }
         }
     }
+    // Rebuild the sorted vec only when the set changed. Deepest path
+    // first so `match_library`'s linear scan picks the most-specific
+    // root for nested setups (e.g. `/media` + `/media/movies` both
+    // configured — events under the subpath must go to the deeper id).
+    if any_changes || added_any {
+        let mut next: Vec<(PathBuf, i64)> = watched
+            .iter()
+            .map(|(p, id)| (p.clone(), *id))
+            .collect();
+        next.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+        *sorted = next;
+    }
 }
 
 fn is_interesting(kind: &EventKind) -> bool {
@@ -270,8 +404,8 @@ fn is_interesting(kind: &EventKind) -> bool {
     )
 }
 
-fn match_library(paths: &[(PathBuf, i64)], event_path: &std::path::Path) -> Option<i64> {
-    paths
+fn match_library(sorted: &[(PathBuf, i64)], event_path: &std::path::Path) -> Option<i64> {
+    sorted
         .iter()
         .find(|(root, _)| event_path.starts_with(root))
         .map(|(_, id)| *id)
@@ -299,19 +433,21 @@ async fn library_paths(state: &AppState) -> Result<Vec<(PathBuf, i64)>> {
     Ok(out)
 }
 
-async fn spawn_scan(state: AppState, library_id: i64) {
-    // Coordinate with the scheduled scan + admin-triggered scan via
-    // the shared per-library lock. A burst of file events during a
-    // scheduled scan otherwise piles up parallel scanner runs that
-    // hammer the same disk live transcodes are reading from. Bail
-    // when the lock is held — whatever scan is already running will
-    // sweep up the newly-landed file when it iterates the library.
+/// Try to queue a scan for `library_id`. Returns true if a scan was
+/// queued (or the create-job step hit a recoverable DB error and the
+/// caller shouldn't retry), false if another scan is already running
+/// for this library — in which case the caller should keep the pending
+/// entry alive and retry after the next DEBOUNCE window. (See the
+/// retry comment at the call site for why dropping these events was
+/// the most likely root cause of "files I added aren't showing up
+/// without a manual scan.")
+async fn spawn_scan(state: AppState, library_id: i64) -> bool {
     if !state.try_acquire_library_scan(library_id).await {
-        info!(
+        debug!(
             library_id,
-            "file watcher: skipping (another scan for this library is in progress)"
+            "file watcher: deferring (another scan for this library is in progress)"
         );
-        return;
+        return false;
     }
     // Reuse the same orchestration as the manual /libraries/{id}/scan
     // route — create a scan_job row, then spawn the scanner with the
@@ -322,7 +458,10 @@ async fn spawn_scan(state: AppState, library_id: i64) {
         Err(e) => {
             warn!(library_id, error = %format!("{e:#}"), "file watcher: create_scan_job failed");
             state.release_library_scan(library_id).await;
-            return;
+            // DB-level failure: don't retry-loop; operator needs to
+            // intervene. Returning true drops the pending entry so we
+            // don't pile retries on a structurally broken pool.
+            return true;
         }
     };
     info!(library_id, job_id = job.id, "file watcher: queued scan");
@@ -369,19 +508,10 @@ async fn spawn_scan(state: AppState, library_id: i64) {
                 false
             }
         };
-        // Optional post-scan trigger: detect markers for any file the
-        // (Previously: a post-scan block enqueued marker detection
-        // for new files, gated on the `detect_markers_on_add`
-        // setting. That's now handled by the discovery pipeline
-        // wrapper around the emitter — every FileAdded event fans
-        // out into detect_markers_file / loudness jobs
-        // automatically. The wrapper's enqueue_job_unique dedup
-        // means re-triggers are no-ops. Marker `detect_markers_on_add`
-        // setting is effectively always-on with the new pipeline;
-        // the knob now affects only the scheduled safety-net task.)
         let _ = scan_ok;
         // Release the lock as the final act so a concurrent scheduled
         // scan or manual trigger can proceed cleanly.
         state_for_release.release_library_scan(library_id).await;
     });
+    true
 }

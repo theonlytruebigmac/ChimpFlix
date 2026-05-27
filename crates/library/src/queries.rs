@@ -9784,6 +9784,21 @@ pub async fn update_server_settings(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(v) = patch.file_watcher_use_polling {
+        sqlx::query("UPDATE server_settings SET file_watcher_use_polling = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.file_watcher_poll_interval_secs {
+        // Clamp on the way in so the watcher startup doesn't have to
+        // defend against a 0-second poll loop (which would peg CPU).
+        let clamped = v.clamp(5, 3600);
+        sqlx::query("UPDATE server_settings SET file_watcher_poll_interval_secs = ? WHERE id = 1")
+            .bind(clamped)
+            .execute(&mut *tx)
+            .await?;
+    }
     if let Some(v) = patch.continue_watching_max_items {
         sqlx::query("UPDATE server_settings SET continue_watching_max_items = ? WHERE id = 1")
             .bind(v)
@@ -12027,6 +12042,49 @@ pub async fn get_user_rating_for_episode(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.try_get::<i32, _>("rating").unwrap_or(0)))
+}
+
+/// All of a user's stored ratings in two flat lists. Callers (the
+/// browse rails' Like buttons) need to know whether each visible item
+/// is rated without firing one request per card — the per-id endpoint
+/// fan-out was tripping the global rate limiter on the home page.
+pub async fn list_user_ratings(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<(Vec<(i64, i32)>, Vec<(i64, i32)>)> {
+    let item_rows = sqlx::query(
+        "SELECT item_id, rating FROM user_ratings \
+         WHERE user_id = ? AND item_id IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let episode_rows = sqlx::query(
+        "SELECT episode_id, rating FROM user_ratings \
+         WHERE user_id = ? AND episode_id IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let items = item_rows
+        .into_iter()
+        .map(|r| {
+            let id: i64 = r.try_get("item_id").unwrap_or(0);
+            let rating: i32 = r.try_get("rating").unwrap_or(0);
+            (id, rating)
+        })
+        .filter(|(id, _)| *id > 0)
+        .collect();
+    let episodes = episode_rows
+        .into_iter()
+        .map(|r| {
+            let id: i64 = r.try_get("episode_id").unwrap_or(0);
+            let rating: i32 = r.try_get("rating").unwrap_or(0);
+            (id, rating)
+        })
+        .filter(|(id, _)| *id > 0)
+        .collect();
+    Ok((items, episodes))
 }
 
 // ─── Tags (Phase 14) ───────────────────────────────────────────────────────

@@ -50,16 +50,40 @@ export function loadCastSdk(): Promise<boolean> {
   const w = window as CastWindow;
   if (castSdkLoad) return castSdkLoad;
   castSdkLoad = new Promise<boolean>((resolve) => {
+    // Hard ceiling on how long we'll wait for the SDK to phone home.
+    // On Android Chrome installed as a standalone PWA, the SDK script
+    // *loads* (no onerror) but never calls __onGCastApiAvailable — the
+    // system Cast media-router IPC isn't proxied through to standalone
+    // web apps. Without a timeout the promise hangs and `cast.available`
+    // never flips, with no log line to tell the operator why.
+    const timeoutMs = 8000;
+    let resolved = false;
+    const finalize = (ok: boolean, reason: string) => {
+      if (resolved) return;
+      resolved = true;
+      if (!ok) devWarn(`[cast] not available: ${reason}`);
+      resolve(ok);
+    };
+    const timer = window.setTimeout(() => {
+      finalize(
+        false,
+        "SDK timeout — __onGCastApiAvailable never fired. Likely cause: Android standalone PWA (Cast IPC not proxied) or browser without Cast support.",
+      );
+    }, timeoutMs);
     w.__onGCastApiAvailable = (available: boolean) => {
+      window.clearTimeout(timer);
       if (!available) {
-        resolve(false);
+        // Most common reasons we land here in production: non-Chromium
+        // browser (Firefox/Safari), Android standalone-PWA stripping
+        // Cast IPC, or `chrome://flags` Cast disabled.
+        finalize(false, "__onGCastApiAvailable(false)");
         return;
       }
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const framework = (w.cast as any)?.framework;
         if (!framework) {
-          resolve(false);
+          finalize(false, "SDK loaded but cast.framework is missing");
           return;
         }
         const context = framework.CastContext.getInstance();
@@ -71,10 +95,10 @@ export function loadCastSdk(): Promise<boolean> {
           // its handle on the session.
           autoJoinPolicy: framework.AutoJoinPolicy.ORIGIN_SCOPED,
         });
-        resolve(true);
+        finalize(true, "ready");
       } catch (e) {
         devError("[cast] init failed", e);
-        resolve(false);
+        finalize(false, "init threw");
       }
     };
     const existing = document.querySelector<HTMLScriptElement>(
@@ -85,19 +109,43 @@ export function loadCastSdk(): Promise<boolean> {
       // when the SDK signals ready. If the SDK has already loaded
       // before we wired the callback, `chrome.cast` is set; we can
       // resolve immediately.
-      if (w.chrome?.cast) resolve(true);
+      if (w.chrome?.cast) finalize(true, "ready (cached)");
       return;
     }
     const script = document.createElement("script");
     script.src = CAST_SDK_URL;
     script.async = true;
-    script.onerror = () => {
-      devWarn("[cast] sender SDK failed to load");
-      resolve(false);
-    };
+    script.onerror = () => finalize(false, "sender SDK failed to load");
     document.head.appendChild(script);
   });
   return castSdkLoad;
+}
+
+/// Inspector probe — run `__cf_castDebug()` in DevTools to dump SDK
+/// state without waiting on the React component tree. Useful when the
+/// toolbar button is hidden and we want to confirm whether the SDK
+/// actually loaded.
+if (typeof window !== "undefined") {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (window as any).__cf_castDebug = () => {
+    const w = window as CastWindow;
+    const scriptInDom = !!document.querySelector(
+      `script[src="${CAST_SDK_URL}"]`,
+    );
+    return {
+      scriptInDom,
+      hasChromeCast: !!w.chrome?.cast,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      hasFramework: !!(w.cast as any)?.framework,
+      displayMode: window.matchMedia("(display-mode: standalone)").matches
+        ? "standalone"
+        : window.matchMedia("(display-mode: minimal-ui)").matches
+          ? "minimal-ui"
+          : "browser",
+      secureContext: window.isSecureContext,
+      userAgent: navigator.userAgent,
+    };
+  };
 }
 
 /// Cast session state surfaced to the React tree. `available` flips

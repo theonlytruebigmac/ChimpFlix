@@ -1951,6 +1951,18 @@ pub struct ServerSettings {
     /// scheduled scans run. Read once at startup — toggling requires
     /// a server restart.
     pub scan_automatically: bool,
+    /// Swap the inotify-backed watcher for `notify::PollWatcher`.
+    /// Required for NFS/SMB mounts and bind-mounted-into-container
+    /// setups where inotify events don't propagate. Off by default
+    /// because polling costs more CPU + I/O than inotify; only flip
+    /// on if your library lives on a remote filesystem. Read once
+    /// at startup; toggling requires a server restart.
+    pub file_watcher_use_polling: bool,
+    /// How often (seconds) the polling watcher rescans every watched
+    /// root. Trade-off between detection latency and disk I/O for
+    /// the recursive stat walk. Default 30s. Only consulted when
+    /// `file_watcher_use_polling` is true.
+    pub file_watcher_poll_interval_secs: i64,
     /// When true, completing a library scan (via file_watcher) queues
     // (Removed in the discovery-pipeline migration: the
     // `detect_markers_on_add` toggle is now effectively always-on
@@ -2198,6 +2210,17 @@ impl ServerSettings {
                 .flatten()
                 .unwrap_or(1)
                 != 0,
+            file_watcher_use_polling: row
+                .try_get::<Option<i64>, _>("file_watcher_use_polling")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            file_watcher_poll_interval_secs: row
+                .try_get::<Option<i64>, _>("file_watcher_poll_interval_secs")
+                .ok()
+                .flatten()
+                .unwrap_or(30),
             continue_watching_max_items: row
                 .try_get::<Option<i64>, _>("continue_watching_max_items")
                 .ok()
@@ -2441,6 +2464,10 @@ pub struct ServerSettingsUpdate {
     pub maintenance_window_end: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_automatically: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_watcher_use_polling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_watcher_poll_interval_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_watching_max_items: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
