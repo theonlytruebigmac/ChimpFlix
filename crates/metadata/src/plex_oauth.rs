@@ -67,10 +67,7 @@ impl PlexOAuthClient {
         // every request — pin creation, polling, /user — uses the same
         // identity. Mismatching identifiers across the dance returns
         // 401 from `/pins/{id}` even when the PIN was approved.
-        headers.insert(
-            "X-Plex-Product",
-            HeaderValue::from_static(PLEX_PRODUCT),
-        );
+        headers.insert("X-Plex-Product", HeaderValue::from_static(PLEX_PRODUCT));
         headers.insert(
             "X-Plex-Client-Identifier",
             HeaderValue::from_str(id).context("Plex client_identifier has non-ASCII bytes")?,
@@ -78,7 +75,10 @@ impl PlexOAuthClient {
         headers.insert("X-Plex-Device", HeaderValue::from_static(PLEX_DEVICE));
         headers.insert("X-Plex-Device-Name", HeaderValue::from_static(PLEX_PRODUCT));
         headers.insert("X-Plex-Platform", HeaderValue::from_static("Web"));
-        headers.insert("X-Plex-Version", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
+        headers.insert(
+            "X-Plex-Version",
+            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+        );
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(15))
@@ -112,15 +112,10 @@ impl PlexOAuthClient {
             );
         }
         crate::http::bounded_json::<PlexPin>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Plex /pins response",
-
         )
-
         .await
     }
 
@@ -150,7 +145,12 @@ impl PlexOAuthClient {
                 text.chars().take(200).collect::<String>()
             );
         }
-        let pin: PlexPin = crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "parse Plex /pins/{id} response").await?;
+        let pin: PlexPin = crate::http::bounded_json(
+            resp,
+            crate::http::DEFAULT_METADATA_BYTES,
+            "parse Plex /pins/{id} response",
+        )
+        .await?;
         if let Some(token) = pin.auth_token {
             return Ok(PinPollResult::Ready(token));
         }
@@ -184,15 +184,10 @@ impl PlexOAuthClient {
             );
         }
         crate::http::bounded_json::<PlexUser>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Plex /user response",
-
         )
-
         .await
     }
 
@@ -308,8 +303,7 @@ mod tests {
 
     #[test]
     fn constructs_with_uuid() {
-        let client =
-            PlexOAuthClient::new("3f0b54c0-1ad3-4a8a-9c52-2e0a7b1f5b3a").expect("client");
+        let client = PlexOAuthClient::new("3f0b54c0-1ad3-4a8a-9c52-2e0a7b1f5b3a").expect("client");
         assert!(client.auth_url("ABCD", None).contains("code=ABCD"));
     }
 

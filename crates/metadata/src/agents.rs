@@ -376,10 +376,7 @@ impl MetadataAgent for TmdbAgent {
         else {
             return Ok(None);
         };
-        let still_url = ep
-            .still_path
-            .as_deref()
-            .map(|p| tmdb_image_url(p, "w300"));
+        let still_url = ep.still_path.as_deref().map(|p| tmdb_image_url(p, "w300"));
         Ok(Some(EpisodeData {
             title: Some(ep.title.clone()),
             summary: ep.summary.clone(),
@@ -521,7 +518,11 @@ impl MetadataAgent for TvdbAgent {
         // extra HTTP call per episode. Failures degrade `people` to
         // empty but don't fail the whole episode lookup.
         let people = match self.client.fetch_episode_extended(ep.tvdb_id).await {
-            Ok(ext) => ext.characters.into_iter().map(tvdb_char_to_person).collect(),
+            Ok(ext) => ext
+                .characters
+                .into_iter()
+                .map(tvdb_char_to_person)
+                .collect(),
             Err(_) => Vec::new(),
         };
         Ok(Some(EpisodeData {
@@ -764,9 +765,7 @@ impl AniListAgent {
                     if meta.anilist_id != primary_anilist_id {
                         let id = meta.anilist_id;
                         let mut guard = self.season_id_cache.lock().await;
-                        guard
-                            .entry(key)
-                            .or_insert(CachedAniListSeasonId::Found(id));
+                        guard.entry(key).or_insert(CachedAniListSeasonId::Found(id));
                         return Some(id);
                     }
                 }
@@ -901,7 +900,8 @@ impl MetadataAgent for AniListAgent {
                         }
                         Err(e) => {
                             let mut g = self.episode_cache.lock().await;
-                            g.entry(anilist_id).or_insert(CachedAniListEpisodes::Errored);
+                            g.entry(anilist_id)
+                                .or_insert(CachedAniListEpisodes::Errored);
                             return Err(e);
                         }
                     }
@@ -922,9 +922,7 @@ impl MetadataAgent for AniListAgent {
             // and would mask a future better-source enrichment.
             return Ok(None);
         }
-        if self.language.to_ascii_lowercase().starts_with("en")
-            && !title_looks_english(&ep.title)
-        {
+        if self.language.to_ascii_lowercase().starts_with("en") && !title_looks_english(&ep.title) {
             // Operator picked en-* but AniList's streamingEpisodes
             // listing for this episode is in Japanese (or romaji that
             // didn't survive the heuristic). Skip so TVDB/TMDB get to
@@ -983,10 +981,7 @@ fn title_looks_english(title: &str) -> bool {
 ///
 /// On non-en-* locales the cascade is unchanged: english → romaji →
 /// native, which is what AniList itself does in its desktop UI.
-fn anilist_show_to_data(
-    meta: &crate::anilist::AniListShow,
-    language: &str,
-) -> Option<ShowData> {
+fn anilist_show_to_data(meta: &crate::anilist::AniListShow, language: &str) -> Option<ShowData> {
     let title = pick_anilist_title(meta, language)?;
     let mut posters = Vec::new();
     if let Some(url) = &meta.poster_url {

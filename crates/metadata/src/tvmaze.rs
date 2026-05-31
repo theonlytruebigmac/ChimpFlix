@@ -135,7 +135,11 @@ impl From<RawEpisode> for TvMazeEpisode {
             season_number: r.season.unwrap_or(0),
             episode_number: r.number.unwrap_or(0),
             title: r.name.unwrap_or_default(),
-            summary: r.summary.as_deref().map(strip_html).filter(|s| !s.is_empty()),
+            summary: r
+                .summary
+                .as_deref()
+                .map(strip_html)
+                .filter(|s| !s.is_empty()),
             runtime_minutes: r.runtime,
             air_date: r.airdate,
             still_url: r.image.and_then(|i| i.original.or(i.medium)),

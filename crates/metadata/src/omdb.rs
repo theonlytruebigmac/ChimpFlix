@@ -128,11 +128,7 @@ impl OmdbClient {
     /// Returns the full OMDb payload mapped into the shared `OmdbTitle`
     /// shape so the chain dispatch can treat it uniformly with the
     /// other agents.
-    pub async fn lookup_movie(
-        &self,
-        title: &str,
-        year: Option<i32>,
-    ) -> Result<Option<OmdbTitle>> {
+    pub async fn lookup_movie(&self, title: &str, year: Option<i32>) -> Result<Option<OmdbTitle>> {
         if self.is_disabled() {
             return Ok(None);
         }
@@ -179,13 +175,10 @@ impl OmdbClient {
         if !resp.status().is_success() {
             anyhow::bail!("omdb http {}", resp.status());
         }
-        let raw: RawResponse = crate::http::bounded_json(
-            resp,
-            crate::http::DEFAULT_METADATA_BYTES,
-            "OMDb GET",
-        )
-        .await
-        .context("omdb body decode")?;
+        let raw: RawResponse =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "OMDb GET")
+                .await
+                .context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             return Ok(None);
         }
@@ -224,13 +217,10 @@ impl OmdbClient {
         if !resp.status().is_success() {
             anyhow::bail!("omdb http {}", resp.status());
         }
-        let raw: RawResponse = crate::http::bounded_json(
-            resp,
-            crate::http::DEFAULT_METADATA_BYTES,
-            "OMDb GET",
-        )
-        .await
-        .context("omdb body decode")?;
+        let raw: RawResponse =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "OMDb GET")
+                .await
+                .context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             // Title not in OMDb — treat as a clean miss so the chain
             // moves to the next agent.
@@ -269,13 +259,10 @@ impl OmdbClient {
                 resp.text().await.unwrap_or_default()
             );
         }
-        let raw: RawResponse = crate::http::bounded_json(
-            resp,
-            crate::http::DEFAULT_METADATA_BYTES,
-            "OMDb GET",
-        )
-        .await
-        .context("omdb body decode")?;
+        let raw: RawResponse =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "OMDb GET")
+                .await
+                .context("omdb body decode")?;
         if raw.Response.as_deref() == Some("False") {
             // OMDb returns these two error strings for both unknown
             // IMDb ids and unindexed-yet-released titles. Treat as a

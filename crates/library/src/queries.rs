@@ -50,12 +50,18 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
 
     let mut tx = pool.begin().await?;
 
-    // Anime libraries default to TVDB primary; everything else defaults
-    // to TMDB. The operator can flip this via PATCH /libraries/{id}.
-    let primary_agent = if matches!(input.kind, crate::models::LibraryKind::Anime) {
-        "tvdb"
-    } else {
+    // Movies default to TMDB primary; TV shows AND anime default to TVDB
+    // primary (TVDB has far better TV/anime title + art + original-name
+    // coverage than TMDB). The operator can flip this via PATCH
+    // /libraries/{id}. NB: this must agree with the seeded chain below —
+    // `AgentChain::load` runs `reorder_for_primary`, which hoists
+    // `primary_metadata_agent` to index 0, so a mismatch silently overrides
+    // the seed order (the bug this replaced: shows seeded tvdb-first but
+    // primary_metadata_agent="tmdb", so they scanned TMDB-primary).
+    let primary_agent = if matches!(input.kind, crate::models::LibraryKind::Movies) {
         "tmdb"
+    } else {
+        "tvdb"
     };
     let lib_id: i64 = sqlx::query(
         "INSERT INTO libraries
@@ -96,12 +102,12 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
     // Seed the default metadata agent chain.
     //   Movies: TMDB primary, then TVDB + OMDb for fill-nulls.
     //   Shows:  TVDB primary, then TMDB + TVMaze + OMDb.
-    //   Anime:  TVDB primary (English titles), then AniList for
-    //           per-episode coverage + absolute-numbering id, then OMDb.
-    // Putting AniList behind TVDB avoids native-Japanese titles
-    // overwriting English ones in primary-mode writes, while keeping
-    // AniList available for the episodes TVDB doesn't have. Operators
-    // can reorder via /admin/libraries/{id}/agents.
+    //   Anime:  TVDB primary, then OMDb (ratings) + TMDB (episodes/fill).
+    // AniList is intentionally NOT in the anime default: it rate-limits
+    // hard (429 storms) on a big first scan and there's no circuit breaker
+    // here yet. TVDB stays primary so English titles win; TMDB supplies the
+    // episode data. Operators who want AniList's anime-native absolute
+    // numbering can add it per-library via /admin/libraries/{id}/agents.
     match input.kind {
         crate::models::LibraryKind::Movies => {
             sqlx::query(
@@ -125,8 +131,8 @@ pub async fn create_library(pool: &SqlitePool, input: NewLibrary) -> Result<Libr
         crate::models::LibraryKind::Anime => {
             sqlx::query(
                 "INSERT INTO library_agents (library_id, agent_name, priority, enabled, config_json)
-                 VALUES (?, 'tvdb', 0, 1, '{}'), (?, 'anilist', 1, 1, '{}'),
-                        (?, 'omdb', 2, 1, '{}')",
+                 VALUES (?, 'tvdb', 0, 1, '{}'), (?, 'omdb', 1, 1, '{}'),
+                        (?, 'tmdb', 2, 1, '{}')",
             )
             .bind(lib_id).bind(lib_id).bind(lib_id)
             .execute(&mut *tx)

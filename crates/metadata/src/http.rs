@@ -35,16 +35,13 @@ pub async fn bounded_bytes(
     // server promising to send a huge payload.
     if let Some(len) = resp.content_length() {
         if len > max_bytes {
-            anyhow::bail!(
-                "{context_label}: content-length {len} > cap {max_bytes}"
-            );
+            anyhow::bail!("{context_label}: content-length {len} > cap {max_bytes}");
         }
     }
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .with_context(|| format!("{context_label}: read chunk"))?;
+        let chunk = chunk.with_context(|| format!("{context_label}: read chunk"))?;
         buf.extend_from_slice(&chunk);
         if buf.len() as u64 > max_bytes {
             anyhow::bail!(
@@ -75,6 +72,5 @@ pub async fn bounded_json<T: DeserializeOwned>(
     context_label: &str,
 ) -> Result<T> {
     let bytes = bounded_bytes(resp, max_bytes, context_label).await?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("{context_label}: JSON parse"))
+    serde_json::from_slice(&bytes).with_context(|| format!("{context_label}: JSON parse"))
 }

@@ -249,13 +249,10 @@ impl AniListClient {
             );
             anyhow::bail!("AniList POST returned {status}");
         }
-        let parsed: GraphQlResponse<T> = crate::http::bounded_json(
-            resp,
-            crate::http::DEFAULT_METADATA_BYTES,
-            "AniList POST",
-        )
-        .await
-        .context("parse AniList JSON")?;
+        let parsed: GraphQlResponse<T> =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "AniList POST")
+                .await
+                .context("parse AniList JSON")?;
         if let Some(errs) = &parsed.errors {
             if !errs.is_empty() {
                 let msg = errs
@@ -600,9 +597,7 @@ fn parse_streaming_episode_title(s: &str) -> Option<ParsedStreamingEpisode> {
     }
     // S<n> E<m> shape → episode is the second number; otherwise the
     // first (and usually only) number.
-    let raw = if prefix.to_ascii_lowercase().contains('s')
-        && digits.len() >= 2
-    {
+    let raw = if prefix.to_ascii_lowercase().contains('s') && digits.len() >= 2 {
         &digits[1]
     } else {
         digits.first()?

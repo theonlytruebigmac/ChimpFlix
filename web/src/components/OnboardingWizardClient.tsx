@@ -1,11 +1,14 @@
 "use client";
 
-/// First-run wizard. Four steps: Welcome → Add a library → Paste a
-/// TMDB read-token → Done. Reuses the existing admin endpoints
-/// (`/libraries`, `/admin/secrets/tmdb`, `/admin/settings`) rather
-/// than introducing a dedicated onboarding API surface — the
-/// wizard is just an opinionated client over the same primitives
-/// the regular admin pages use.
+/// First-run wizard. Four steps: Welcome → Connect metadata sources
+/// (TheTVDB / TMDB / OMDb) → Add a library → Done. Metadata keys come
+/// BEFORE the library step on purpose: creating the library kicks off the
+/// first scan immediately, so the keys must already be in the vault or the
+/// scan runs keyless and every title comes back unmatched. Reuses the
+/// existing admin endpoints (`/libraries`, `/admin/secrets/{slot}`,
+/// `/admin/settings`) rather than introducing a dedicated onboarding API
+/// surface — the wizard is just an opinionated client over the same
+/// primitives the regular admin pages use.
 ///
 /// Flips `server_settings.setup_completed = true` on finish (and
 /// also on Skip) so the auto-redirect from `/` only happens once.
@@ -27,16 +30,55 @@ interface Props {
   initialSettings: ServerSettings;
 }
 
-type StepId = "welcome" | "library" | "tmdb" | "done";
+type StepId = "welcome" | "metadata" | "library" | "done";
 
-const STEP_ORDER: StepId[] = ["welcome", "library", "tmdb", "done"];
+const STEP_ORDER: StepId[] = ["welcome", "metadata", "library", "done"];
 
 const STEP_LABEL: Record<StepId, string> = {
   welcome: "Welcome",
+  metadata: "Metadata",
   library: "Add a library",
-  tmdb: "Metadata",
   done: "All set",
 };
+
+/// Metadata key slots offered in the wizard, in display order. TheTVDB is
+/// listed first because it's the primary source for shows + anime (the
+/// `create_library` agent seed makes it priority 0 for those kinds). Each
+/// maps to a `/admin/secrets/{slot}` vault slot; `secrets.set` validates the
+/// key on save (the backend tests the provider and 400s on a bad value).
+const METADATA_SLOTS: {
+  slot: string;
+  label: string;
+  placeholder: string;
+  docsUrl: string;
+  docsLabel: string;
+  hint: string;
+}[] = [
+  {
+    slot: "tvdb",
+    label: "TheTVDB API key",
+    placeholder: "your TheTVDB v4 API key",
+    docsUrl: "https://thetvdb.com/dashboard/account/apikey",
+    docsLabel: "TheTVDB API key",
+    hint: "Primary source for TV shows and anime — best coverage of titles, original-language names, and art.",
+  },
+  {
+    slot: "tmdb",
+    label: "TMDB v4 read-token",
+    placeholder: "eyJhbGciOiJIUzI1NiJ9...",
+    docsUrl: "https://www.themoviedb.org/settings/api",
+    docsLabel: "read-only API token",
+    hint: "Primary for movies; supplies episode data and fills any gaps TheTVDB leaves on shows/anime.",
+  },
+  {
+    slot: "omdb",
+    label: "OMDb API key",
+    placeholder: "your OMDb API key",
+    docsUrl: "https://www.omdbapi.com/apikey.aspx",
+    docsLabel: "free OMDb key",
+    hint: "Adds IMDb / Rotten Tomatoes / Metacritic ratings. Optional.",
+  },
+];
 
 export function OnboardingWizardClient({ initialSettings }: Props) {
   const router = useRouter();
@@ -50,7 +92,7 @@ export function OnboardingWizardClient({ initialSettings }: Props) {
     id: number;
     name: string;
   } | null>(null);
-  const [tmdbSaved, setTmdbSaved] = useState(false);
+  const [savedSecrets, setSavedSecrets] = useState<string[]>([]);
 
   const next = STEP_ORDER[STEP_ORDER.indexOf(step) + 1] ?? "done";
 
@@ -76,8 +118,8 @@ export function OnboardingWizardClient({ initialSettings }: Props) {
         </div>
         <h1 className="mt-1 text-3xl font-bold tracking-tight text-white/95">
           {step === "welcome" && `Welcome, ${greeting(initialSettings)}`}
+          {step === "metadata" && "Connect your metadata sources"}
           {step === "library" && "Add your first library"}
-          {step === "tmdb" && "Connect a metadata source"}
           {step === "done" && "You're ready to go"}
         </h1>
         <Progress current={step} />
@@ -92,9 +134,21 @@ export function OnboardingWizardClient({ initialSettings }: Props) {
       <main className="flex-1">
         {step === "welcome" && (
           <WelcomeStep
-            onContinue={() => setStep("library")}
+            onContinue={() => setStep("metadata")}
             onSkip={complete}
             busy={busy}
+          />
+        )}
+        {step === "metadata" && (
+          <MetadataStep
+            onSaved={(slots) => {
+              setSavedSecrets(slots);
+              setStep(next);
+            }}
+            onSkip={() => setStep(next)}
+            onError={setError}
+            busy={busy}
+            setBusy={setBusy}
           />
         )}
         {step === "library" && (
@@ -109,22 +163,10 @@ export function OnboardingWizardClient({ initialSettings }: Props) {
             setBusy={setBusy}
           />
         )}
-        {step === "tmdb" && (
-          <TmdbStep
-            onSaved={() => {
-              setTmdbSaved(true);
-              setStep(next);
-            }}
-            onSkip={() => setStep(next)}
-            onError={setError}
-            busy={busy}
-            setBusy={setBusy}
-          />
-        )}
         {step === "done" && (
           <DoneStep
             createdLibrary={createdLibrary}
-            tmdbSaved={tmdbSaved}
+            savedSecrets={savedSecrets}
             onFinish={complete}
             busy={busy}
           />
@@ -212,8 +254,8 @@ function WelcomeStep({
           body="Tell ChimpFlix which folders to watch. It scans automatically and keeps the library in sync as you add files."
         />
         <Bullet
-          title="Plug in a metadata source"
-          body="TMDB powers posters, descriptions, and recommendations. The free read-token tier is plenty for personal use."
+          title="Plug in metadata sources"
+          body="TheTVDB (best for TV & anime), TMDB (movies + episodes), and OMDb (ratings) power posters, descriptions, and recommendations. Add your keys first so the scan matches titles from the start."
         />
         <Bullet
           title="Start watching"
@@ -373,9 +415,9 @@ function LibraryStep({
         <div className="grid grid-cols-3 gap-2">
           {(
             [
-              { v: "movies", label: "Movies", sub: "TMDB movies" },
-              { v: "shows", label: "TV Shows", sub: "TMDB shows" },
-              { v: "anime", label: "Anime", sub: "AniList + TMDB" },
+              { v: "movies", label: "Movies", sub: "TMDB" },
+              { v: "shows", label: "TV Shows", sub: "TheTVDB" },
+              { v: "anime", label: "Anime", sub: "TheTVDB" },
             ] as const
           ).map((opt) => (
             <button
@@ -445,86 +487,111 @@ function LibraryStep({
   );
 }
 
-// ─── TMDB step ─────────────────────────────────────────────────────────
+// ─── Metadata-keys step ────────────────────────────────────────────────
 
-function TmdbStep({
+function MetadataStep({
   onSaved,
   onSkip,
   onError,
   busy,
   setBusy,
 }: {
-  onSaved: () => void;
+  onSaved: (savedSlots: string[]) => void;
   onSkip: () => void;
   onError: (msg: string | null) => void;
   busy: boolean;
   setBusy: (v: boolean) => void;
 }) {
-  const [token, setToken] = useState("");
+  const [values, setValues] = useState<Record<string, string>>({});
+  // Per-slot result after a save attempt: "ok" or an error string.
+  const [results, setResults] = useState<Record<string, string>>({});
 
   async function save() {
     onError(null);
-    if (!token.trim()) {
-      onError("Paste your TMDB read-token, or click Skip.");
+    const filled = METADATA_SLOTS.filter((s) => (values[s.slot] ?? "").trim());
+    if (filled.length === 0) {
+      onError("Add at least one key, or click Skip.");
       return;
     }
     setBusy(true);
-    try {
-      // PUT validates the token (the secrets handler tests TMDB on
-      // save and 400s on a bad value), so a successful response
-      // means the key works.
-      await adminApi.secrets.set("tmdb", token.trim());
-      onSaved();
-    } catch (e) {
-      onError(friendlyErrorMessage(e));
-    } finally {
-      setBusy(false);
+    // Validate + store each filled key. `secrets.set` PUTs to the vault and
+    // the backend tests the provider, 400-ing on a bad value — so a
+    // resolved call means the key actually works.
+    const nextResults: Record<string, string> = {};
+    const saved: string[] = [];
+    for (const s of filled) {
+      const value = (values[s.slot] ?? "").trim();
+      try {
+        await adminApi.secrets.set(s.slot, value);
+        nextResults[s.slot] = "ok";
+        saved.push(s.slot);
+      } catch (e) {
+        nextResults[s.slot] = friendlyErrorMessage(e);
+      }
+    }
+    setResults(nextResults);
+    setBusy(false);
+    // Advance only when every key the operator entered validated. If any
+    // failed, stay on the step so they can fix or clear the bad one.
+    if (filled.every((s) => nextResults[s.slot] === "ok")) {
+      onSaved(saved);
+    } else {
+      onError("Some keys didn't validate — fix or clear them, then continue.");
     }
   }
 
   return (
     <div className="space-y-5">
       <p className="text-sm text-white/65">
-        TMDB provides posters, descriptions, cast, and recommendations for
-        movies and TV shows. The{" "}
-        <a
-          href="https://www.themoviedb.org/settings/api"
-          target="_blank"
-          rel="noreferrer"
-          className="text-white/85 underline underline-offset-2 hover:text-white"
-        >
-          read-only API token
-        </a>{" "}
-        is free — sign in, request a v4 token, paste it here.
+        These power posters, descriptions, episode data, and ratings. Add them{" "}
+        <strong className="text-white/85">now</strong> — they need to be in
+        place before your first library scan runs, since a keyless scan leaves
+        every title unmatched. All are optional and stored encrypted; enter
+        what you have and add the rest later under Server → Credentials.
       </p>
 
-      <Field label="TMDB v4 read-token">
-        <input
-          // `type="text"` rather than "password" so the operator can
-          // visually verify the paste (TMDB JWTs are long; getting a
-          // wrong/truncated paste with no way to see it is the
-          // common failure mode). `autoComplete="off"` keeps the
-          // browser's password manager out of it.
-          type="text"
-          name="tmdb-token"
-          autoComplete="off"
-          spellCheck={false}
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          placeholder="eyJhbGciOiJIUzI1NiJ9..."
-          disabled={busy}
-          className="w-full rounded-md border border-white/15 bg-black/30 px-3 py-2 font-mono text-[12px] text-white/90 focus:border-white/35 focus:outline-none"
-        />
-        <p className="mt-1 text-[11.5px] text-white/45">
-          Stored encrypted in the credential vault. We test it on save and
-          reject malformed tokens.
-        </p>
-      </Field>
-
-      <div className="rounded-md border border-emerald-500/25 bg-emerald-500/5 px-3 py-2.5 text-[12.5px] text-emerald-200">
-        ✓ AniList enrichment is already enabled for anime libraries — no API
-        key required.
-      </div>
+      {METADATA_SLOTS.map((s) => (
+        <Field key={s.slot} label={s.label}>
+          <input
+            // type="text" (not password) so a long key/JWT paste can be
+            // visually verified — a truncated paste with no way to see it
+            // is the common failure mode. autoComplete="off" keeps the
+            // browser password manager out of it.
+            type="text"
+            name={`${s.slot}-key`}
+            autoComplete="off"
+            spellCheck={false}
+            value={values[s.slot] ?? ""}
+            onChange={(e) =>
+              setValues((prev) => ({ ...prev, [s.slot]: e.target.value }))
+            }
+            placeholder={s.placeholder}
+            disabled={busy}
+            className="w-full rounded-md border border-white/15 bg-black/30 px-3 py-2 font-mono text-[12px] text-white/90 focus:border-white/35 focus:outline-none"
+          />
+          <p className="mt-1 text-[11.5px] text-white/45">
+            {s.hint}{" "}
+            <a
+              href={s.docsUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="text-white/70 underline underline-offset-2 hover:text-white"
+            >
+              Get a {s.docsLabel} →
+            </a>
+          </p>
+          {results[s.slot] === "ok" && (
+            <p className="mt-1 text-[11.5px] text-emerald-300">
+              ✓ Saved &amp; verified.
+            </p>
+          )}
+          {results[s.slot] !== undefined && results[s.slot] !== "ok" && (
+            <p className="mt-1 text-[11.5px] text-red-300">
+              ✗ {results[s.slot]}
+            </p>
+          )}
+        </Field>
+      ))}
 
       <div className="flex items-center justify-between pt-2">
         <button
@@ -533,7 +600,7 @@ function TmdbStep({
           disabled={busy}
           className="text-sm text-white/55 underline-offset-2 hover:text-white/85 hover:underline disabled:opacity-50"
         >
-          Skip — I&apos;ll add it later
+          Skip — I&apos;ll add them later
         </button>
         <button
           type="button"
@@ -541,7 +608,7 @@ function TmdbStep({
           disabled={busy}
           className="rounded-md bg-accent px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-accent/85 disabled:opacity-50"
         >
-          {busy ? "Verifying…" : "Save token →"}
+          {busy ? "Verifying…" : "Save & continue →"}
         </button>
       </div>
     </div>
@@ -552,15 +619,21 @@ function TmdbStep({
 
 function DoneStep({
   createdLibrary,
-  tmdbSaved,
+  savedSecrets,
   onFinish,
   busy,
 }: {
   createdLibrary: { id: number; name: string } | null;
-  tmdbSaved: boolean;
+  savedSecrets: string[];
   onFinish: () => void;
   busy: boolean;
 }) {
+  const slotLabels: Record<string, string> = {
+    tvdb: "TheTVDB",
+    tmdb: "TMDB",
+    omdb: "OMDb",
+  };
+  const savedLabels = savedSecrets.map((s) => slotLabels[s] ?? s);
   return (
     <div className="space-y-6">
       <p className="text-sm text-white/65">Here&apos;s what you set up:</p>
@@ -579,22 +652,22 @@ function DoneStep({
           }
         />
         <Recap
-          done={tmdbSaved}
+          done={savedSecrets.length > 0}
           label={
-            tmdbSaved
-              ? "TMDB token saved — metadata will fill in as files are discovered"
-              : "TMDB — skipped"
+            savedSecrets.length > 0
+              ? `Metadata keys saved: ${savedLabels.join(", ")}`
+              : "Metadata keys — skipped"
           }
           tip={
-            tmdbSaved
-              ? null
-              : "Paste a token later under Server → Credentials."
+            savedSecrets.length > 0
+              ? "Posters and details fill in as files are discovered."
+              : "Add keys later under Server → Credentials."
           }
         />
         <Recap
           done
-          label="AniList enrichment is on for anime"
-          tip="No action needed — it's free and keyless."
+          label="Shows & anime use TheTVDB first; movies use TMDB"
+          tip="Change the per-library agent order under Library → Libraries → Agents."
         />
       </ul>
 

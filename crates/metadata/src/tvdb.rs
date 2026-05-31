@@ -124,18 +124,14 @@ impl TvdbClient {
         // language `name` field. Critical for Japanese-origin anime
         // where the primary `name` is the kanji title.
         let raw: Envelope<RawSeriesExtended> = self
-            .get(&format!(
-                "/series/{tvdb_id}/extended?meta=translations"
-            ))
+            .get(&format!("/series/{tvdb_id}/extended?meta=translations"))
             .await?;
         Ok(TvdbShow::from_raw(raw.data, &self.language))
     }
 
     pub async fn fetch_movie(&self, tvdb_id: i64) -> Result<TvdbMovie> {
         let raw: Envelope<RawMovieExtended> = self
-            .get(&format!(
-                "/movies/{tvdb_id}/extended?meta=translations"
-            ))
+            .get(&format!("/movies/{tvdb_id}/extended?meta=translations"))
             .await?;
         Ok(TvdbMovie::from_raw(raw.data, &self.language))
     }
@@ -652,7 +648,10 @@ impl TvdbMovie {
 /// "eng") from a `?meta=translations` response. Returns `None` when no
 /// translation block was returned or no matching entry exists.
 fn pick_translated_name(translations: &Option<RawTranslations>, language: &str) -> Option<String> {
-    translations.as_ref()?.name_translations.iter()
+    translations
+        .as_ref()?
+        .name_translations
+        .iter()
         .find(|t| t.language.as_deref() == Some(language))
         .and_then(|t| t.name.clone())
         .filter(|s| !s.is_empty())
@@ -662,7 +661,10 @@ fn pick_translated_overview(
     translations: &Option<RawTranslations>,
     language: &str,
 ) -> Option<String> {
-    translations.as_ref()?.overview_translations.iter()
+    translations
+        .as_ref()?
+        .overview_translations
+        .iter()
         .find(|t| t.language.as_deref() == Some(language))
         .and_then(|t| t.overview.clone())
         .filter(|s| !s.is_empty())

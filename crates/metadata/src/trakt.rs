@@ -121,15 +121,10 @@ impl TraktClient {
             );
         }
         crate::http::bounded_json::<DeviceCodeResponse>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt device-code response",
-
         )
-
         .await
     }
 
@@ -199,15 +194,10 @@ impl TraktClient {
             );
         }
         crate::http::bounded_json::<TokenPair>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt refresh response",
-
         )
-
         .await
     }
 
@@ -260,11 +250,7 @@ impl TraktClient {
     /// [`push_history`] — same JSON shape, posted to `/sync/history/remove`.
     /// Used by the un-mark-watched code path so the local + Trakt
     /// states stay in lock-step (two-way sync).
-    pub async fn remove_history(
-        &self,
-        access_token: &str,
-        entries: &[HistoryPush],
-    ) -> Result<()> {
+    pub async fn remove_history(&self, access_token: &str, entries: &[HistoryPush]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -405,15 +391,10 @@ impl TraktClient {
             return Err(api_error("GET /users/me/stats", resp).await);
         }
         crate::http::bounded_json::<UserStats>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt user stats",
-
         )
-
         .await
     }
 
@@ -442,15 +423,10 @@ impl TraktClient {
             return Err(api_error(&format!("GET {path}"), resp).await);
         }
         crate::http::bounded_json::<Vec<RecommendationEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt recommendations",
-
         )
-
         .await
     }
 
@@ -474,15 +450,10 @@ impl TraktClient {
         // watchlist GET — flat array of `{ type, movie?, show? }`.
         // Reusing TraktListItem keeps the parse layer DRY.
         crate::http::bounded_json::<Vec<TraktListItem>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt favorites",
-
         )
-
         .await
     }
 
@@ -503,15 +474,10 @@ impl TraktClient {
             return Err(api_error("GET /users/me/lists", resp).await);
         }
         crate::http::bounded_json::<Vec<TraktList>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt lists",
-
         )
-
         .await
     }
 
@@ -540,15 +506,10 @@ impl TraktClient {
             return Err(api_error("GET /users/me/lists/{list_id}/items", resp).await);
         }
         crate::http::bounded_json::<Vec<TraktListItem>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt list items",
-
         )
-
         .await
     }
 
@@ -575,15 +536,10 @@ impl TraktClient {
             return Err(api_error("GET /users/hidden/recommendations", resp).await);
         }
         crate::http::bounded_json::<Vec<HiddenEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt hidden recommendations",
-
         )
-
         .await
     }
 
@@ -650,15 +606,10 @@ impl TraktClient {
             return Err(api_error(&format!("GET /calendars/my/shows{suffix}"), resp).await);
         }
         crate::http::bounded_json::<Vec<CalendarEpisodeEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt calendar",
-
         )
-
         .await
     }
 
@@ -684,15 +635,10 @@ impl TraktClient {
             return Err(api_error("GET /calendars/my/movies", resp).await);
         }
         crate::http::bounded_json::<Vec<CalendarMovieEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt movie calendar",
-
         )
-
         .await
     }
 
@@ -713,8 +659,10 @@ impl TraktClient {
             .iter()
             .map(|tmdb_id| json!({ "ids": { "tmdb": tmdb_id } }))
             .collect();
-        let mut shows_map: std::collections::BTreeMap<i64, std::collections::BTreeMap<i32, Vec<i32>>> =
-            std::collections::BTreeMap::new();
+        let mut shows_map: std::collections::BTreeMap<
+            i64,
+            std::collections::BTreeMap<i32, Vec<i32>>,
+        > = std::collections::BTreeMap::new();
         for (show_tmdb, season, episode) in episodes {
             shows_map
                 .entry(*show_tmdb)
@@ -767,15 +715,10 @@ impl TraktClient {
             return Err(api_error("GET /sync/last_activities", resp).await);
         }
         crate::http::bounded_json::<LastActivities>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt last_activities",
-
         )
-
         .await
     }
 
@@ -801,8 +744,10 @@ impl TraktClient {
         // (show_tmdb, season, episode) tuple flattens into one show
         // entry with season → episodes nested under it; many tuples
         // sharing a show_tmdb collapse into a single entry.
-        let mut shows_map: std::collections::BTreeMap<i64, std::collections::BTreeMap<i32, Vec<i32>>> =
-            std::collections::BTreeMap::new();
+        let mut shows_map: std::collections::BTreeMap<
+            i64,
+            std::collections::BTreeMap<i32, Vec<i32>>,
+        > = std::collections::BTreeMap::new();
         for (show_tmdb, season, episode) in episodes {
             shows_map
                 .entry(*show_tmdb)
@@ -817,10 +762,8 @@ impl TraktClient {
                 let seasons_json: Vec<_> = seasons
                     .into_iter()
                     .map(|(season, eps)| {
-                        let eps_json: Vec<_> = eps
-                            .into_iter()
-                            .map(|n| json!({ "number": n }))
-                            .collect();
+                        let eps_json: Vec<_> =
+                            eps.into_iter().map(|n| json!({ "number": n })).collect();
                         json!({ "number": season, "episodes": eps_json })
                     })
                     .collect();
@@ -854,49 +797,76 @@ impl TraktClient {
             return Err(api_error("GET /sync/watchlist", resp).await);
         }
         crate::http::bounded_json::<Vec<WatchlistEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt watchlist",
-
         )
-
         .await
     }
 
+    /// Pull the user's full `/sync/history`, walking **every** page.
+    ///
+    /// Trakt paginates this endpoint: a single request returns at most
+    /// `limit` entries (most-recent first) and reports the total page count
+    /// in the `X-Pagination-Page-Count` response header. The previous
+    /// implementation fetched one `?limit=200` page and stopped, so any user
+    /// with more than 200 history entries silently lost everything older —
+    /// the import looked "done" but only covered the newest 200 watches.
+    ///
+    /// We now loop `page=1..page_count`, accumulating entries. Termination is
+    /// belt-and-suspenders: the page-count header bounds it when present; a
+    /// short page (`< limit` rows) ends it when the header is absent; and a
+    /// hard `MAX_PAGES` ceiling guarantees the loop can't run away on a
+    /// pathological account.
     pub async fn pull_history(
         &self,
         access_token: &str,
         start_at_iso: Option<&str>,
     ) -> Result<Vec<HistoryEntry>> {
-        let mut url = format!("{}/sync/history?limit=200", self.base_url);
-        if let Some(s) = start_at_iso {
-            url.push_str("&start_at=");
-            url.push_str(&urlencode(s));
+        const LIMIT: u32 = 200;
+        // 200 pages * 200 = 40k entries — far beyond any real personal
+        // history, but a firm stop against a runaway loop / unbounded memory.
+        const MAX_PAGES: u32 = 200;
+
+        let mut all: Vec<HistoryEntry> = Vec::new();
+        let mut page: u32 = 1;
+        loop {
+            let mut url = format!("{}/sync/history?limit={LIMIT}&page={page}", self.base_url);
+            if let Some(s) = start_at_iso {
+                url.push_str("&start_at=");
+                url.push_str(&urlencode(s));
+            }
+            let resp = self
+                .http
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?;
+            if !resp.status().is_success() {
+                return Err(api_error("GET /sync/history", resp).await);
+            }
+            // Read the total-page-count header BEFORE the body is consumed.
+            let page_count = resp
+                .headers()
+                .get("x-pagination-page-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            let batch = crate::http::bounded_json::<Vec<HistoryEntry>>(
+                resp,
+                crate::http::DEFAULT_METADATA_BYTES,
+                "parse Trakt history",
+            )
+            .await?;
+            let full_page = batch.len() == LIMIT as usize;
+            all.extend(batch);
+
+            if !history_has_more_pages(page, page_count, full_page, MAX_PAGES) {
+                break;
+            }
+            page += 1;
         }
-        let resp = self
-            .http
-            .get(&url)
-            .header(AUTHORIZATION, format!("Bearer {access_token}"))
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        if !resp.status().is_success() {
-            return Err(api_error("GET /sync/history", resp).await);
-        }
-        crate::http::bounded_json::<Vec<HistoryEntry>>(
-
-            resp,
-
-            crate::http::DEFAULT_METADATA_BYTES,
-
-            "parse Trakt history",
-
-        )
-
-        .await
+        Ok(all)
     }
 
     pub async fn pull_playback(&self, access_token: &str) -> Result<Vec<PlaybackEntry>> {
@@ -912,15 +882,10 @@ impl TraktClient {
             return Err(api_error("GET /sync/playback", resp).await);
         }
         crate::http::bounded_json::<Vec<PlaybackEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt playback",
-
         )
-
         .await
     }
 
@@ -970,9 +935,7 @@ impl TraktClient {
 
     pub async fn remove_rating(&self, access_token: &str, entry: RatingPush) -> Result<()> {
         let (movies, episodes) = match entry {
-            RatingPush::Movie { ids, .. } => {
-                (vec![json!({ "ids": ids.to_json() })], vec![])
-            }
+            RatingPush::Movie { ids, .. } => (vec![json!({ "ids": ids.to_json() })], vec![]),
             RatingPush::Episode {
                 show_ids,
                 season,
@@ -1008,15 +971,10 @@ impl TraktClient {
             return Err(api_error("GET /sync/ratings", resp).await);
         }
         crate::http::bounded_json::<Vec<RatingEntry>>(
-
             resp,
-
             crate::http::DEFAULT_METADATA_BYTES,
-
             "parse Trakt ratings",
-
         )
-
         .await
     }
 
@@ -1346,7 +1304,9 @@ pub enum WatchlistPush {
     Show { tmdb_id: i64 },
 }
 
-fn watchlist_buckets(entries: &[WatchlistPush]) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+fn watchlist_buckets(
+    entries: &[WatchlistPush],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
     let mut movies = Vec::new();
     let mut shows = Vec::new();
     for e in entries {
@@ -1484,9 +1444,65 @@ pub struct RatingEntry {
     pub show: Option<TraktShow>,
 }
 
+/// Pagination-loop termination decision for [`TraktClient::pull_history`],
+/// factored out so it's unit-testable without an HTTP mock. Returns whether
+/// another page should be fetched after `page`.
+///
+/// * `page_count_header` — Trakt's `X-Pagination-Page-Count` (authoritative
+///   when present): keep going while `page < page_count`.
+/// * `full_page` — whether the page just fetched returned a full `limit`
+///   worth of rows. Used as the end-of-data signal when the header is
+///   missing/garbled (a short page means we've hit the end).
+/// * `max_pages` — hard ceiling; never page past it regardless.
+fn history_has_more_pages(
+    page: u32,
+    page_count_header: Option<u32>,
+    full_page: bool,
+    max_pages: u32,
+) -> bool {
+    if page >= max_pages {
+        return false;
+    }
+    match page_count_header {
+        Some(page_count) => page < page_count,
+        None => full_page,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_pagination_walks_all_pages() {
+        // Header present (authoritative): keep going until the last page.
+        assert!(history_has_more_pages(1, Some(3), true, 200), "page 1 of 3");
+        assert!(history_has_more_pages(2, Some(3), true, 200), "page 2 of 3");
+        assert!(
+            !history_has_more_pages(3, Some(3), true, 200),
+            "page 3 of 3 is the last"
+        );
+        assert!(
+            !history_has_more_pages(1, Some(1), true, 200),
+            "single page (the >200-entries bug: must NOT stop early when pc>1)"
+        );
+
+        // Header absent: a full page implies more; a short page ends it.
+        assert!(
+            history_has_more_pages(1, None, true, 200),
+            "no header + full page => keep going"
+        );
+        assert!(
+            !history_has_more_pages(1, None, false, 200),
+            "no header + short page => done"
+        );
+
+        // Hard ceiling wins regardless of header / fullness.
+        assert!(
+            !history_has_more_pages(200, Some(9999), true, 200),
+            "MAX_PAGES ceiling stops a runaway"
+        );
+    }
 
     #[test]
     fn rejects_empty_creds() {
