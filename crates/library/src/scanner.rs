@@ -268,6 +268,41 @@ pub async fn run_scan(
             )
             .await?;
             queries::touch_library_last_scan(&pool, library_id).await?;
+            // "Empty trash automatically after every scan" (Plex parity).
+            // When enabled, immediately hard-delete this library's
+            // soft-removed files instead of waiting for the 7-day grace
+            // window. Scoped to this library so a temporary unmount
+            // elsewhere can't nuke an unrelated library's files. Best-
+            // effort: a purge failure must not fail an otherwise-good
+            // scan. (Per-file WebVTT cache for the purged paths is left
+            // for lazy cleanup — orphaned entries are keyed by path+mtime
+            // so they never serve stale content.)
+            let empty_trash = queries::get_server_settings(&pool)
+                .await
+                .map(|s| s.empty_trash_after_scan)
+                .unwrap_or(false);
+            if empty_trash {
+                match queries::purge_removed_media_files_for_library(
+                    &pool,
+                    library_id,
+                    chimpflix_common::now_ms(),
+                )
+                .await
+                {
+                    Ok(report) if report.files_purged > 0 => info!(
+                        library_id,
+                        files_purged = report.files_purged,
+                        items_purged = report.items_purged,
+                        "empty-trash-after-scan purged removed files"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        library_id,
+                        error = %format!("{e:#}"),
+                        "empty-trash-after-scan purge failed (non-fatal)"
+                    ),
+                }
+            }
             emitter(ScanEvent::Completed {
                 job_id,
                 library_id,

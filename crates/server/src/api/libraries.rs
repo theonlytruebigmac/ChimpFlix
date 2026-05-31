@@ -118,7 +118,16 @@ pub async fn trigger_scan(
     // reads never block on the writer). The gate is raised by an RAII guard
     // inside the scan task below, so it clears on every exit path including a
     // panic in `run_scan`.
-    let job = queries::create_scan_job(&state.pool, library_id).await?;
+    // Release the lock if creating the scan_job row fails — the RAII gate
+    // guard below lives inside the spawned task, so a `?` here would leak
+    // the per-library lock and wedge the library until a restart.
+    let job = match queries::create_scan_job(&state.pool, library_id).await {
+        Ok(j) => j,
+        Err(e) => {
+            state.release_library_scan(library_id).await;
+            return Err(e.into());
+        }
+    };
     let job_id = job.id;
 
     let pool = state.pool.clone();

@@ -17,6 +17,19 @@ const INPUT_CLASS =
 const INPUT_CHANGED_CLASS =
   "rounded-md border border-amber-400/40 bg-black/30 px-3 py-2 text-sm outline-none focus:border-amber-300";
 
+/// Periodic-scan interval options, mirroring Plex's "Library scan
+/// interval" dropdown. `value` matches the scheduler frequency tokens the
+/// backend understands (validated server-side in admin/settings::validate).
+const SCAN_INTERVALS: { value: string; label: string }[] = [
+  { value: "every_15_minutes", label: "every 15 minutes" },
+  { value: "every_30_minutes", label: "every 30 minutes" },
+  { value: "hourly", label: "hourly" },
+  { value: "every_2_hours", label: "every 2 hours" },
+  { value: "every_6_hours", label: "every 6 hours" },
+  { value: "every_12_hours", label: "every 12 hours" },
+  { value: "daily", label: "daily" },
+];
+
 /// Consolidated Library settings — Plex's "Settings → Library" page
 /// shape. One stack of SettingsCards over fields that mostly hit
 /// /admin/settings PATCH. Some take effect immediately (CW dials,
@@ -27,6 +40,9 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     scan_automatically: settings.scan_automatically,
     file_watcher_use_polling: settings.file_watcher_use_polling,
     file_watcher_poll_interval_secs: settings.file_watcher_poll_interval_secs,
+    periodic_scan_enabled: settings.periodic_scan_enabled,
+    periodic_scan_frequency: settings.periodic_scan_frequency,
+    empty_trash_after_scan: settings.empty_trash_after_scan,
     audio_normalize_enabled: settings.audio_normalize_enabled,
     subtitle_default_offset_ms: settings.subtitle_default_offset_ms,
     scanner_nice_level: settings.scanner_nice_level,
@@ -46,6 +62,15 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   );
   const [watcherPollSecs, setWatcherPollSecs] = useState(
     baseline.file_watcher_poll_interval_secs,
+  );
+  const [periodicScanEnabled, setPeriodicScanEnabled] = useState(
+    baseline.periodic_scan_enabled,
+  );
+  const [periodicScanFrequency, setPeriodicScanFrequency] = useState(
+    baseline.periodic_scan_frequency,
+  );
+  const [emptyTrashAfterScan, setEmptyTrashAfterScan] = useState(
+    baseline.empty_trash_after_scan,
   );
   const [audioNormalize, setAudioNormalize] = useState(
     baseline.audio_normalize_enabled,
@@ -84,6 +109,11 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
       watcherPolling !== baseline.file_watcher_use_polling,
     "Watcher poll interval":
       watcherPollSecs !== baseline.file_watcher_poll_interval_secs,
+    "Periodic scan": periodicScanEnabled !== baseline.periodic_scan_enabled,
+    "Scan interval":
+      periodicScanFrequency !== baseline.periodic_scan_frequency,
+    "Empty trash after scan":
+      emptyTrashAfterScan !== baseline.empty_trash_after_scan,
     "Audio normalize": audioNormalize !== baseline.audio_normalize_enabled,
     "Subtitle default offset":
       subtitleDefaultOffsetMs !== baseline.subtitle_default_offset_ms,
@@ -110,6 +140,9 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const scanAutoChanged = dirtyFields["Auto-scan"];
   const watcherPollingChanged = dirtyFields["Watcher polling"];
   const watcherPollSecsChanged = dirtyFields["Watcher poll interval"];
+  const periodicScanChanged = dirtyFields["Periodic scan"];
+  const scanIntervalChanged = dirtyFields["Scan interval"];
+  const emptyTrashChanged = dirtyFields["Empty trash after scan"];
   const dbCacheChanged = dirtyFields["DB page cache"];
   const niceChanged = dirtyFields["Scanner nice level"];
   const metadataLanguageChanged = dirtyFields["Metadata language"];
@@ -120,6 +153,9 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
       scan_automatically: scanAuto,
       file_watcher_use_polling: watcherPolling,
       file_watcher_poll_interval_secs: watcherPollSecs,
+      periodic_scan_enabled: periodicScanEnabled,
+      periodic_scan_frequency: periodicScanFrequency,
+      empty_trash_after_scan: emptyTrashAfterScan,
       audio_normalize_enabled: audioNormalize,
       subtitle_default_offset_ms: subtitleDefaultOffsetMs,
       scanner_nice_level: scannerNice,
@@ -137,6 +173,9 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
       scan_automatically: scanAuto,
       file_watcher_use_polling: watcherPolling,
       file_watcher_poll_interval_secs: watcherPollSecs,
+      periodic_scan_enabled: periodicScanEnabled,
+      periodic_scan_frequency: periodicScanFrequency,
+      empty_trash_after_scan: emptyTrashAfterScan,
       audio_normalize_enabled: audioNormalize,
       subtitle_default_offset_ms: subtitleDefaultOffsetMs,
       scanner_nice_level: scannerNice,
@@ -155,6 +194,9 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
     setScanAuto(baseline.scan_automatically);
     setWatcherPolling(baseline.file_watcher_use_polling);
     setWatcherPollSecs(baseline.file_watcher_poll_interval_secs);
+    setPeriodicScanEnabled(baseline.periodic_scan_enabled);
+    setPeriodicScanFrequency(baseline.periodic_scan_frequency);
+    setEmptyTrashAfterScan(baseline.empty_trash_after_scan);
     setAudioNormalize(baseline.audio_normalize_enabled);
     setSubtitleDefaultOffsetMs(baseline.subtitle_default_offset_ms);
     setScannerNice(baseline.scanner_nice_level);
@@ -239,6 +281,54 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
             <span className="text-sm text-white/55">seconds</span>
             {watcherPollSecsChanged && <Pill tone="warn">Restart pending</Pill>}
           </div>
+        </SettingsRow>
+        <SettingsRow
+          label="Scan my library periodically"
+          help="A safety-net full rescan on a fixed interval, independent of the filesystem watcher. Recommended for libraries on NFS/SMB or in containers, where inotify can miss changes. Takes effect immediately — no restart needed."
+          changed={periodicScanChanged}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={periodicScanEnabled}
+              onChange={(e) => setPeriodicScanEnabled(e.target.checked)}
+            />
+            <span>Rescan every library on a schedule</span>
+          </label>
+        </SettingsRow>
+        <SettingsRow
+          label="Library scan interval"
+          help="How often the periodic scan runs. A library is only rescanned if its last scan is older than this, so a recent manual or watcher scan won't be repeated."
+          changed={scanIntervalChanged}
+        >
+          <select
+            value={periodicScanFrequency}
+            disabled={!periodicScanEnabled}
+            onChange={(e) => setPeriodicScanFrequency(e.target.value)}
+            className={`${
+              scanIntervalChanged ? INPUT_CHANGED_CLASS : INPUT_CLASS
+            } disabled:opacity-40`}
+          >
+            {SCAN_INTERVALS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </SettingsRow>
+        <SettingsRow
+          label="Empty trash automatically after every scan"
+          help="When on, files that vanished from disk are removed from the library immediately after each scan, instead of being kept for 7 days. Leave off if your media lives on a removable or network drive that can go offline — otherwise a temporary disconnect would purge those titles (and their watched state) right away."
+          changed={emptyTrashChanged}
+        >
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={emptyTrashAfterScan}
+              onChange={(e) => setEmptyTrashAfterScan(e.target.checked)}
+            />
+            <span>Purge removed files on scan completion</span>
+          </label>
         </SettingsRow>
         <SettingsRow
           label="Scanner ffmpeg priority"

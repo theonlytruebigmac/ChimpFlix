@@ -136,6 +136,23 @@ pub fn validate(patch: &ServerSettingsUpdate) -> Result<(), ApiError> {
             ));
         }
     }
+    if let Some(ref s) = patch.periodic_scan_frequency {
+        if !matches!(
+            s.as_str(),
+            "every_15_minutes"
+                | "every_30_minutes"
+                | "hourly"
+                | "every_2_hours"
+                | "every_6_hours"
+                | "every_12_hours"
+                | "daily"
+        ) {
+            return Err(ApiError::validation(
+                "periodic_scan_frequency must be one of: every_15_minutes, every_30_minutes, \
+                 hourly, every_2_hours, every_6_hours, every_12_hours, daily",
+            ));
+        }
+    }
     if let Some(ref s) = patch.transcoder_hw_accel {
         if !matches!(
             s.as_str(),

@@ -811,14 +811,19 @@ export function ChimpFlixPlayer({
   }, [activeMediaFileId, subtitleOffsetMs]);
 
   // Move WebVTT cues vertically so they (1) honor the user's
-  // bottom-inset preference, (2) auto-shift up while the player
-  // controls overlay is visible (otherwise controls cover the
-  // bottom-most line), AND (3) account for letterboxing so the
+  // bottom-inset preference AND (2) account for letterboxing so the
   // user's "5% from bottom" means 5% above the visible video,
   // not 5% above the player element. Native WebVTT positioning
   // is element-relative — without the letterbox math, anything
   // under ~10% from bottom on a 16:9 video in a 21:9 container
   // lands in the bottom black bar.
+  //
+  // The cue position is deliberately INDEPENDENT of the controls
+  // overlay: we used to bump cues up ~16% whenever the controls
+  // faded in, but that made subtitles visibly jump up/down on every
+  // hover, which is more annoying than the controls briefly grazing
+  // the bottom line. Position stays put; only `bottomInsetPct` (a
+  // user setting) and the video geometry move it.
   //
   // We operate on TextTrack.cues directly (`cue.line` +
   // `snapToLines=false`) because that's the only standardized way
@@ -852,9 +857,8 @@ export function ChimpFlixPlayer({
         // positioning, so we leave letterboxBottomPct at 0.
       }
       const baseBottomPct = Math.max(0, Math.min(60, subtitleStyle.bottomInsetPct));
-      const controlsBumpPct = showControls ? 16 : 0;
       const effectiveBottomPct = Math.min(
-        baseBottomPct + letterboxBottomPct + controlsBumpPct,
+        baseBottomPct + letterboxBottomPct,
         80,
       );
       const lineFromTop = 100 - effectiveBottomPct;
@@ -901,7 +905,7 @@ export function ChimpFlixPlayer({
       ro.disconnect();
       document.removeEventListener("fullscreenchange", fsHandler);
     };
-  }, [showControls, subtitleStyle.bottomInsetPct]);
+  }, [subtitleStyle.bottomInsetPct]);
 
   // Inject a global `::cue` stylesheet so the user's appearance
   // prefs apply to BOTH the HLS.js-managed WebVTT sidecar and any
@@ -4660,7 +4664,8 @@ function EpisodesControl({
         thumb: plexImage(e.thumb_path ?? undefined, 320, 180) ?? undefined,
         summary: e.summary ?? undefined,
         duration: e.duration_ms ?? undefined,
-        viewOffset: e.play_state?.position_ms,
+        // Display-only progress bar → furthest-watched, not resume point.
+        viewOffset: e.play_state?.max_position_ms,
         index: e.episode_number,
         parentTitle: `Season ${e.season_number}`,
       }));

@@ -38,8 +38,8 @@ export async function GET(
         const seasonDetail = await seasonsApi.get(firstSeason.id);
         initialEpisodes = seasonDetail.episodes.map((ep) => {
           const base = adaptEpisode(ep, detail);
-          if (ep.play_state && ep.play_state.position_ms > 0) {
-            base.viewOffset = ep.play_state.position_ms;
+          if (ep.play_state && ep.play_state.max_position_ms > 0) {
+            base.viewOffset = ep.play_state.max_position_ms;
           }
           if (ep.play_state?.watched) {
             base.watched = true;

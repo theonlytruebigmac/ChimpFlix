@@ -70,10 +70,17 @@ const NEVER_RUN_AT_MS: i64 = 4_102_444_800_000; // 2100-01-01 UTC
 /// milliseconds. Returns `None` for non-interval frequencies
 /// (`manual`, `on_change`, `custom`).
 pub fn frequency_interval_ms(frequency: &str) -> Option<i64> {
-    let hour: i64 = 60 * 60 * 1000;
+    let minute: i64 = 60 * 1000;
+    let hour: i64 = 60 * minute;
     let day: i64 = 24 * hour;
     match frequency {
+        // Sub-hour cadences — added for the Plex-style periodic library
+        // scan, whose finest interval is 15 minutes. The scheduler tick
+        // (30s) is well under these, so they fire on time.
+        "every_15_minutes" => Some(15 * minute),
+        "every_30_minutes" => Some(30 * minute),
         "hourly" => Some(hour),
+        "every_2_hours" => Some(2 * hour),
         "every_3_hours" => Some(3 * hour),
         "every_6_hours" => Some(6 * hour),
         "every_12_hours" => Some(12 * hour),
@@ -340,6 +347,21 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             requires_window: true,
             params_json: "{\"grace_days\":7}",
             cron_placeholder: "0 30 3 * * *",
+        },
+        // Plex-style periodic library scan. Seeded at a 15-minute POLL
+        // cadence — the effective interval is the `periodic_scan_frequency`
+        // server setting, enforced per-library inside the handler against
+        // last_scan_at. Never window-gated (Plex runs periodic scans on
+        // their interval regardless of maintenance hours). Default-on is
+        // governed by the `periodic_scan_enabled` setting, not this row's
+        // enabled flag, so the handler no-ops cheaply when disabled.
+        Seed {
+            kind: "periodic_library_scan",
+            name: "Periodic library scan",
+            frequency: "every_15_minutes",
+            requires_window: false,
+            params_json: "{}",
+            cron_placeholder: "0 */15 * * * *",
         },
         Seed {
             kind: "cleanup_audit_log",
@@ -777,11 +799,23 @@ async fn dispatch(
             let (succ_removed, dead_removed) =
                 queries::cleanup_old_jobs(&state.pool, succ_days * day_ms, dead_days * day_ms)
                     .await?;
+            // Trim task_runs history alongside the job queue. Without this
+            // the scheduler's own run-log grows without bound — acute now
+            // that the periodic-scan poll fires every 15 min (~96 rows/day).
+            // params.task_run_retention_days overrides the default (30).
+            let task_run_days = params
+                .get("task_run_retention_days")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(30)
+                .clamp(1, 3650);
+            let task_runs_removed =
+                queries::cleanup_old_task_runs(&state.pool, task_run_days * day_ms).await?;
             append_log(
                 log,
                 format!(
                     "trimmed {succ_removed} succeeded rows (>{succ_days}d), \
-                     {dead_removed} dead rows (>{dead_days}d)"
+                     {dead_removed} dead rows (>{dead_days}d), \
+                     {task_runs_removed} task_runs (>{task_run_days}d)"
                 ),
             );
             Ok(())
@@ -872,96 +906,13 @@ async fn dispatch(
                 .get("library_id")
                 .and_then(|v| v.as_i64())
                 .context("scan_library requires params.library_id")?;
-            // Per-library scan lock: prevents the scheduled scan, an
-            // operator-triggered manual scan, and the filesystem
-            // watcher from running concurrent ffmpeg/IO work on the
-            // same library. The dominant symptom of overlap was live
-            // playback stalling during maintenance windows because all
-            // three pathways were hammering the same disk holding the
-            // transcoder cache. Bail out cleanly when the lock is
-            // already held — the in-flight scan will pick up whatever
-            // this task would have noticed.
-            if !state.try_acquire_library_scan(library_id).await {
-                append_log(
+            match spawn_library_scan(state, library_id).await? {
+                Some(job_id) => append_log(log, format!("queued scan job #{job_id}")),
+                None => append_log(
                     log,
                     format!("skipped: a scan for library {library_id} is already in progress"),
-                );
-                return Ok(());
+                ),
             }
-            // Reuse the existing trigger-scan flow: create a scan_job row
-            // and spawn the scanner. The handler returns immediately —
-            // long-running scan progress is tracked in scan_jobs, not
-            // task_runs.
-            let job = queries::create_scan_job(&state.pool, library_id).await?;
-            let pool = state.pool.clone();
-            let ffmpeg = state.ffmpeg.clone();
-            let tmdb = state.tmdb_snapshot().await;
-            let tvdb = state.tvdb_snapshot().await;
-            let anilist = state.anilist_snapshot().await;
-            let tvmaze = state.tvmaze.clone();
-            let omdb = state.omdb_snapshot().await;
-            let job_id = job.id;
-            let hub = state.hub.clone();
-            let cache_root = state.transcoder.cache_root().to_path_buf();
-            let release_state = state.clone();
-            let pipeline_state = state.clone();
-            let gate_state = state.clone();
-            tokio::spawn(async move {
-                // RAII guard: release the scan lock on every exit path
-                // including a panic inside `run_scan`. Without it, a
-                // panic between the acquire above and the release below
-                // would leak the entry and the library would be stuck
-                // until a process restart. Spawned in its own thread so
-                // the destructor runs in `tokio::spawn`'s catch_unwind
-                // boundary even when the future panics.
-                struct ScanLockGuard {
-                    state: AppState,
-                    library_id: i64,
-                }
-                impl Drop for ScanLockGuard {
-                    fn drop(&mut self) {
-                        let st = self.state.clone();
-                        let lib = self.library_id;
-                        tokio::spawn(async move {
-                            st.release_library_scan(lib).await;
-                        });
-                    }
-                }
-                let _guard = ScanLockGuard {
-                    state: release_state,
-                    library_id,
-                };
-                // Pause background jobs + the scheduler tick while this
-                // scheduled scan runs so it finishes uncontended (released on
-                // drop, panic-safe). Foreground reads stay responsive (WAL).
-                let _scan_gate = gate_state
-                    .library_scan_exclusive
-                    .scan_guard()
-                    .await;
-                let inner_emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
-                    hub.publish(crate::events::Event::Scan(evt));
-                });
-                let emitter =
-                    crate::jobs::pipeline::wrap_emitter_for_pipeline(pipeline_state, inner_emitter);
-                if let Err(e) = scanner::run_scan(
-                    pool,
-                    ffmpeg,
-                    tmdb,
-                    tvdb,
-                    anilist,
-                    tvmaze,
-                    omdb,
-                    library_id,
-                    job_id,
-                    Some(cache_root),
-                    emitter,
-                )
-                .await
-                {
-                    warn!(library_id, job_id, error = %format!("{e:#}"), "scheduled scan failed");
-                }
-            });
-            append_log(log, format!("queued scan job #{job_id}"));
             Ok(())
         }
         "refresh_metadata" => {
@@ -1085,6 +1036,7 @@ async fn dispatch(
         "rollup_task_metrics" => rollup_task_metrics_task(state, log).await,
         "verify_libraries" => verify_libraries_task(state, task, log).await,
         "purge_removed_files" => purge_removed_files_task(state, task, log).await,
+        "periodic_library_scan" => periodic_library_scan_task(state, task, log).await,
         "optimize_versions" => {
             // Process up to `batch_size` queued rows. Per-row failures are
             // captured in the optimized_versions table, not in the task
@@ -1280,6 +1232,19 @@ pub fn registry() -> Vec<TaskKindInfo> {
             // File watcher fires on-change scans; operator can still set
             // a periodic safety-net schedule if they want one.
             default_frequency: "on_change",
+            default_requires_maintenance_window: false,
+        },
+        TaskKindInfo {
+            kind: "periodic_library_scan",
+            display_name: "Periodic library scan",
+            description: "Plex-style safety-net rescan of every library. \
+                          Polls every 15 min; the effective interval is the \
+                          `periodic_scan_frequency` server setting, enforced \
+                          per-library against last_scan_at. No-ops when \
+                          `periodic_scan_enabled` is off. Configure it from \
+                          Settings → Library, not by editing this row.",
+            params_schema: r#"{}"#,
+            default_frequency: "every_15_minutes",
             default_requires_maintenance_window: false,
         },
         TaskKindInfo {
@@ -1879,6 +1844,159 @@ async fn purge_removed_files_task(
     } else {
         append_log(log, format!("grace={grace_days}d nothing to purge"));
     }
+    Ok(())
+}
+
+/// Acquire the per-library scan lock and spawn a scanner run for one
+/// library, returning immediately. `Ok(Some(job_id))` when a scan was
+/// started, `Ok(None)` when a scan for that library is already in
+/// progress (lock held) — the caller decides whether that's worth
+/// logging.
+///
+/// The per-library lock prevents the scheduled scan, an operator-
+/// triggered manual scan, the filesystem watcher, and the periodic scan
+/// from running concurrent ffmpeg/IO work on the same library (the
+/// dominant overlap symptom was live playback stalling because several
+/// pathways hammered the same disk). The spawned task releases the lock
+/// on every exit path including a panic (RAII), and holds the library-
+/// scan exclusivity gate for its duration so background jobs + the
+/// scheduler tick park while it runs (foreground reads stay responsive
+/// via WAL).
+async fn spawn_library_scan(state: &AppState, library_id: i64) -> Result<Option<i64>> {
+    if !state.try_acquire_library_scan(library_id).await {
+        return Ok(None);
+    }
+    // If creating the scan_job row fails we must release the lock we just
+    // took, otherwise the library would be wedged until a restart.
+    let job = match queries::create_scan_job(&state.pool, library_id).await {
+        Ok(j) => j,
+        Err(e) => {
+            state.release_library_scan(library_id).await;
+            return Err(e);
+        }
+    };
+    let pool = state.pool.clone();
+    let ffmpeg = state.ffmpeg.clone();
+    let tmdb = state.tmdb_snapshot().await;
+    let tvdb = state.tvdb_snapshot().await;
+    let anilist = state.anilist_snapshot().await;
+    let tvmaze = state.tvmaze.clone();
+    let omdb = state.omdb_snapshot().await;
+    let job_id = job.id;
+    let hub = state.hub.clone();
+    let cache_root = state.transcoder.cache_root().to_path_buf();
+    let release_state = state.clone();
+    let pipeline_state = state.clone();
+    let gate_state = state.clone();
+    tokio::spawn(async move {
+        // RAII guard: release the scan lock on every exit path including a
+        // panic inside `run_scan`. Spawned in its own task so the
+        // destructor runs inside `tokio::spawn`'s catch_unwind boundary
+        // even when the future panics.
+        struct ScanLockGuard {
+            state: AppState,
+            library_id: i64,
+        }
+        impl Drop for ScanLockGuard {
+            fn drop(&mut self) {
+                let st = self.state.clone();
+                let lib = self.library_id;
+                tokio::spawn(async move {
+                    st.release_library_scan(lib).await;
+                });
+            }
+        }
+        let _guard = ScanLockGuard {
+            state: release_state,
+            library_id,
+        };
+        let _scan_gate = gate_state.library_scan_exclusive.scan_guard().await;
+        let inner_emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
+            hub.publish(crate::events::Event::Scan(evt));
+        });
+        let emitter =
+            crate::jobs::pipeline::wrap_emitter_for_pipeline(pipeline_state, inner_emitter);
+        if let Err(e) = scanner::run_scan(
+            pool, ffmpeg, tmdb, tvdb, anilist, tvmaze, omdb, library_id, job_id,
+            Some(cache_root), emitter,
+        )
+        .await
+        {
+            warn!(library_id, job_id, error = %format!("{e:#}"), "scan failed");
+        }
+    });
+    Ok(Some(job_id))
+}
+
+/// Plex-style periodic library scan. This task is seeded at a fixed 15-
+/// minute poll cadence (the finest interval Plex offers); the *effective*
+/// interval is the `periodic_scan_frequency` server setting, enforced
+/// here via a per-library due check against `last_scan_at`. Single source
+/// of truth for the schedule is the setting — not this task's frequency.
+///
+/// On each run: bail if `periodic_scan_enabled` is off, else enqueue a
+/// scan for every library whose last scan is older than the configured
+/// interval (minus a small slack so the 15-min poll reliably catches a
+/// 15-min interval). Libraries with a scan already in progress are
+/// skipped — the in-flight scan covers whatever this run would notice.
+/// Respecting `last_scan_at` means a library that was just manually
+/// scanned (or scanned by the file watcher) won't be redundantly
+/// rescanned.
+async fn periodic_library_scan_task(
+    state: &AppState,
+    _task: &chimpflix_library::ScheduledTask,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    let (enabled, frequency) = {
+        let s = state.settings.read().await;
+        (s.periodic_scan_enabled, s.periodic_scan_frequency.clone())
+    };
+    if !enabled {
+        append_log(log, "periodic scan disabled — skipping");
+        return Ok(());
+    }
+    let Some(interval_ms) = frequency_interval_ms(&frequency) else {
+        append_log(log, format!("unknown periodic_scan_frequency `{frequency}` — skipping"));
+        return Ok(());
+    };
+    // Slack absorbs poll-vs-interval jitter: without it a 15-min interval
+    // polled every 15 min could drift to ~30 min because a poll firing a
+    // second early would see "not quite due" and wait a full cadence.
+    const DUE_SLACK_MS: i64 = 2 * 60 * 1000;
+    let now = now_ms();
+    let due_after_ms = (interval_ms - DUE_SLACK_MS).max(0);
+
+    let libraries = queries::list_libraries(&state.pool, None).await?;
+    let mut queued = 0usize;
+    let mut skipped_locked = 0usize;
+    let mut not_due = 0usize;
+    for lib in &libraries {
+        // last_scan_at is the epoch-ms of the last *completed* scan; None
+        // (never scanned) is always due.
+        let elapsed = lib.last_scan_at.map(|t| now - t);
+        let due = match elapsed {
+            None => true,
+            Some(e) => e >= due_after_ms,
+        };
+        if !due {
+            not_due += 1;
+            continue;
+        }
+        match spawn_library_scan(state, lib.id).await? {
+            Some(job_id) => {
+                queued += 1;
+                append_log(log, format!("library {} ({}): queued scan job #{job_id}", lib.id, lib.name));
+            }
+            None => skipped_locked += 1,
+        }
+    }
+    append_log(
+        log,
+        format!(
+            "interval={frequency} — queued={queued} skipped_in_progress={skipped_locked} not_due={not_due} of {} libraries",
+            libraries.len()
+        ),
+    );
     Ok(())
 }
 

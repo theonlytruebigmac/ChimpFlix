@@ -781,7 +781,13 @@ export interface ManualCollectionUpdate {
 }
 
 export interface PlayStateForItem {
+  /// Resume point — where the player seeks to on "Resume". Moves
+  /// backward when the user seeks back and quits (correct for resume).
   position_ms: number;
+  /// Furthest point ever reached. Monotonic — never shrinks on a backward
+  /// seek. Drives the progress bar + "X min left" so skipping around
+  /// doesn't make a finished episode look un-watched.
+  max_position_ms: number;
   duration_ms: number | null;
   watched: boolean;
   view_count: number;
@@ -1438,6 +1444,17 @@ export interface ServerSettings {
   /** Seconds between polling-watcher rescans. Only consulted when
    *  `file_watcher_use_polling` is true. Default 30. */
   file_watcher_poll_interval_secs: number;
+  /** Plex-style periodic full rescan of every library, independent of the
+   *  filesystem watcher. Default on. Takes effect immediately. */
+  periodic_scan_enabled: boolean;
+  /** Periodic-scan interval as a scheduler frequency token (one of
+   *  SCAN_INTERVALS): every_15_minutes | every_30_minutes | hourly |
+   *  every_2_hours | every_6_hours | every_12_hours | daily. Default hourly. */
+  periodic_scan_frequency: string;
+  /** When on, a completed scan immediately hard-deletes that library's
+   *  soft-removed files instead of waiting for the 7-day grace window.
+   *  Default off. */
+  empty_trash_after_scan: boolean;
   /** Server-wide default for ffmpeg loudnorm. When ON, every transcode
    *  session gets the filter applied (uses stored per-file
    *  measurements when available, else generic targets). Per-session
@@ -1538,6 +1555,9 @@ export interface ServerSettingsUpdate {
   scan_automatically?: boolean;
   file_watcher_use_polling?: boolean;
   file_watcher_poll_interval_secs?: number;
+  periodic_scan_enabled?: boolean;
+  periodic_scan_frequency?: string;
+  empty_trash_after_scan?: boolean;
   audio_normalize_enabled?: boolean;
   subtitle_default_offset_ms?: number;
   scanner_nice_level?: number;

@@ -1090,7 +1090,14 @@ pub struct ListedItem {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlayStateForItem {
+    /// Resume point — the literal place the user last stopped. The player
+    /// seeks here on "Resume". Moves backward when the user seeks back and
+    /// quits, which is correct for resume.
     pub position_ms: i64,
+    /// Furthest point ever reached. Monotonic (never shrinks on a backward
+    /// seek). The progress bar + "X min left" label read this so skipping
+    /// around doesn't make a finished episode look un-watched.
+    pub max_position_ms: i64,
     pub duration_ms: Option<i64>,
     pub watched: bool,
     pub view_count: i64,
@@ -1103,8 +1110,15 @@ impl PlayStateForItem {
         let Some(position_ms) = position else {
             return Ok(None);
         };
+        // Tolerant read: SELECTs that predate the max_position_ms column
+        // (or bespoke ones that don't alias it) fall back to position_ms,
+        // i.e. the old single-column behaviour, instead of erroring.
+        let max_position_ms = row
+            .try_get::<i64, _>("ps_max_position_ms")
+            .unwrap_or(position_ms);
         Ok(Some(Self {
             position_ms,
+            max_position_ms,
             duration_ms: row.try_get("ps_duration_ms")?,
             watched: row.try_get::<i64, _>("ps_watched")? != 0,
             view_count: row.try_get("ps_view_count")?,
@@ -1963,6 +1977,24 @@ pub struct ServerSettings {
     /// the recursive stat walk. Default 30s. Only consulted when
     /// `file_watcher_use_polling` is true.
     pub file_watcher_poll_interval_secs: i64,
+    // ---- Periodic scan (phase 94) ---------------------------------------
+    /// Master toggle for the Plex-style periodic library scan. When true
+    /// (default), the `periodic_library_scan` scheduled task rescans every
+    /// library on `periodic_scan_frequency` as a safety net for changes
+    /// the filesystem watcher misses (NFS/SMB, inotify-limit, container
+    /// mount-namespace gaps). Hot-read by the task on every run.
+    pub periodic_scan_enabled: bool,
+    /// How often the periodic scan runs. One of the scheduler frequency
+    /// tokens: every_15_minutes | every_30_minutes | hourly (default) |
+    /// every_2_hours | every_6_hours | every_12_hours | daily. The
+    /// settings PATCH path syncs this into the scheduled task's frequency.
+    pub periodic_scan_frequency: String,
+    /// When true, a completed scan immediately hard-deletes that
+    /// library's soft-removed files (Plex's "Empty trash automatically
+    /// after every scan") instead of waiting for the 7-day
+    /// `purge_removed_files` grace window. Off by default — a temporary
+    /// unmount shouldn't destroy play state / markers.
+    pub empty_trash_after_scan: bool,
     /// When true, completing a library scan (via file_watcher) queues
     // (Removed in the discovery-pipeline migration: the
     // `detect_markers_on_add` toggle is now effectively always-on
@@ -2221,6 +2253,23 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(30),
+            periodic_scan_enabled: row
+                .try_get::<Option<i64>, _>("periodic_scan_enabled")
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+                != 0,
+            periodic_scan_frequency: row
+                .try_get::<Option<String>, _>("periodic_scan_frequency")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "hourly".to_string()),
+            empty_trash_after_scan: row
+                .try_get::<Option<i64>, _>("empty_trash_after_scan")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
             continue_watching_max_items: row
                 .try_get::<Option<i64>, _>("continue_watching_max_items")
                 .ok()
@@ -2468,6 +2517,12 @@ pub struct ServerSettingsUpdate {
     pub file_watcher_use_polling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_watcher_poll_interval_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub periodic_scan_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub periodic_scan_frequency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_trash_after_scan: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_watching_max_items: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -525,6 +525,7 @@ const ITEM_SELECT: &str = "
             WHERE item_id = i.id AND kind = 'backdrop'
             ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path,
         ps.position_ms     AS ps_position_ms,
+        ps.max_position_ms AS ps_max_position_ms,
         ps.duration_ms     AS ps_duration_ms,
         ps.watched         AS ps_watched,
         ps.view_count      AS ps_view_count,
@@ -986,6 +987,7 @@ pub async fn list_items(
                     WHERE item_id = i.id AND kind = 'backdrop' \
                     ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path, \
                 ps.position_ms     AS ps_position_ms, \
+                ps.max_position_ms AS ps_max_position_ms, \
                 ps.duration_ms     AS ps_duration_ms, \
                 ps.watched         AS ps_watched, \
                 ps.view_count      AS ps_view_count, \
@@ -1148,6 +1150,7 @@ pub async fn list_watch_history(
             SELECT
                 src.item_id AS item_id,
                 src.position_ms AS position_ms,
+                src.max_position_ms AS max_position_ms,
                 src.duration_ms AS duration_ms,
                 src.watched AS watched,
                 src.view_count AS view_count,
@@ -1160,7 +1163,7 @@ pub async fn list_watch_history(
                 -- Movie-style: item-level play state. `item_id` already
                 -- points at the movie's items row.
                 SELECT ps.item_id AS item_id,
-                       ps.position_ms, ps.duration_ms, ps.watched,
+                       ps.position_ms, ps.max_position_ms, ps.duration_ms, ps.watched,
                        ps.view_count, ps.last_played_at
                   FROM play_state ps
                  WHERE ps.user_id = ?1
@@ -1172,7 +1175,7 @@ pub async fn list_watch_history(
                 -- episode this row represents; the window function above
                 -- picks the most-recent one per show.
                 SELECT s.show_id AS item_id,
-                       ps.position_ms, ps.duration_ms, ps.watched,
+                       ps.position_ms, ps.max_position_ms, ps.duration_ms, ps.watched,
                        ps.view_count, ps.last_played_at
                   FROM play_state ps
                   JOIN episodes e ON e.id = ps.episode_id
@@ -1190,6 +1193,7 @@ pub async fn list_watch_history(
                 WHERE item_id = i.id AND kind = 'backdrop'
                 ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path,
             eff.position_ms     AS ps_position_ms,
+            eff.max_position_ms AS ps_max_position_ms,
             eff.duration_ms     AS ps_duration_ms,
             eff.watched         AS ps_watched,
             eff.view_count      AS ps_view_count,
@@ -1674,6 +1678,7 @@ pub async fn list_trending_in_library(
                 WHERE item_id = i.id AND kind = 'backdrop' \
                 ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path, \
             ps.position_ms     AS ps_position_ms, \
+            ps.max_position_ms AS ps_max_position_ms, \
             ps.duration_ms     AS ps_duration_ms, \
             ps.watched         AS ps_watched, \
             ps.view_count      AS ps_view_count, \
@@ -2163,6 +2168,7 @@ pub async fn get_season_detail(
                     WHERE episode_id = e.id AND kind = 'thumb'
                     ORDER BY is_primary DESC, id ASC LIMIT 1) AS thumb_path,
                 ps.position_ms    AS ps_position_ms,
+                ps.max_position_ms AS ps_max_position_ms,
                 ps.duration_ms    AS ps_duration_ms,
                 ps.watched        AS ps_watched,
                 ps.view_count     AS ps_view_count,
@@ -2205,6 +2211,7 @@ pub async fn get_episode_detail(
                     WHERE episode_id = e.id AND kind = 'thumb'
                     ORDER BY is_primary DESC, id ASC LIMIT 1) AS thumb_path,
                 ps.position_ms    AS ps_position_ms,
+                ps.max_position_ms AS ps_max_position_ms,
                 ps.duration_ms    AS ps_duration_ms,
                 ps.watched        AS ps_watched,
                 ps.view_count     AS ps_view_count,
@@ -4294,14 +4301,16 @@ pub async fn upsert_external_position(
         (Some(id), None) => {
             sqlx::query(
                 "INSERT INTO play_state
-                    (user_id, item_id, position_ms, duration_ms, watched, view_count, last_played_at)
-                 VALUES (?, ?, ?, NULL, 0, 0, ?)
+                    (user_id, item_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+                 VALUES (?, ?, ?, ?, NULL, 0, 0, ?)
                  ON CONFLICT (user_id, item_id) WHERE item_id IS NOT NULL DO UPDATE SET
                     position_ms     = excluded.position_ms,
+                    max_position_ms = MAX(play_state.max_position_ms, excluded.position_ms),
                     last_played_at  = excluded.last_played_at",
             )
             .bind(user_id)
             .bind(id)
+            .bind(position_ms)
             .bind(position_ms)
             .bind(now)
             .execute(pool)
@@ -4310,14 +4319,16 @@ pub async fn upsert_external_position(
         (None, Some(id)) => {
             sqlx::query(
                 "INSERT INTO play_state
-                    (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
-                 VALUES (?, ?, ?, NULL, 0, 0, ?)
+                    (user_id, episode_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+                 VALUES (?, ?, ?, ?, NULL, 0, 0, ?)
                  ON CONFLICT (user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
                     position_ms     = excluded.position_ms,
+                    max_position_ms = MAX(play_state.max_position_ms, excluded.position_ms),
                     last_played_at  = excluded.last_played_at",
             )
             .bind(user_id)
             .bind(id)
+            .bind(position_ms)
             .bind(position_ms)
             .bind(now)
             .execute(pool)
@@ -4379,16 +4390,25 @@ async fn upsert_play_state_movie_tx<'a>(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO play_state
-            (user_id, item_id, position_ms, duration_ms, watched, view_count, last_played_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?)
+            (user_id, item_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)
          ON CONFLICT (user_id, item_id) WHERE item_id IS NOT NULL DO UPDATE SET
             position_ms     = excluded.position_ms,
+            -- Furthest-watched point: monotonic so a backward seek (which
+            -- lowers position_ms for resume) never shrinks the progress
+            -- bar. Display reads max_position_ms; resume reads position_ms.
+            max_position_ms = MAX(play_state.max_position_ms, excluded.position_ms),
             duration_ms     = COALESCE(excluded.duration_ms, play_state.duration_ms),
-            watched         = excluded.watched,
+            -- Monotonic: a periodic position tick (which carries no
+            -- `watched` flag, so excluded.watched defaults to 0) must
+            -- never un-watch an already-scrobbled row. Clearing watched
+            -- is done explicitly via set_watched(), not this path.
+            watched         = MAX(play_state.watched, excluded.watched),
             last_played_at  = excluded.last_played_at",
     )
     .bind(user_id)
     .bind(item_id)
+    .bind(position_ms)
     .bind(position_ms)
     .bind(duration_ms)
     .bind(watched as i64)
@@ -4409,16 +4429,25 @@ async fn upsert_play_state_episode_tx<'a>(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO play_state
-            (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?)
+            (user_id, episode_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)
          ON CONFLICT (user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
             position_ms     = excluded.position_ms,
+            -- Furthest-watched point: monotonic so a backward seek (which
+            -- lowers position_ms for resume) never shrinks the progress
+            -- bar. Display reads max_position_ms; resume reads position_ms.
+            max_position_ms = MAX(play_state.max_position_ms, excluded.position_ms),
             duration_ms     = COALESCE(excluded.duration_ms, play_state.duration_ms),
-            watched         = excluded.watched,
+            -- Monotonic: a periodic position tick (which carries no
+            -- `watched` flag, so excluded.watched defaults to 0) must
+            -- never un-watch an already-scrobbled row. Clearing watched
+            -- is done explicitly via set_watched(), not this path.
+            watched         = MAX(play_state.watched, excluded.watched),
             last_played_at  = excluded.last_played_at",
     )
     .bind(user_id)
     .bind(episode_id)
+    .bind(position_ms)
     .bind(position_ms)
     .bind(duration_ms)
     .bind(watched as i64)
@@ -4574,6 +4603,7 @@ pub async fn on_deck(
 
         let play_state = PlayStateForItem {
             position_ms: r.try_get("position_ms")?,
+            max_position_ms: r.try_get("max_position_ms")?,
             duration_ms: r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
             watched: r.try_get::<i64, _>("watched")? != 0,
             view_count: r.try_get("view_count")?,
@@ -4636,6 +4666,7 @@ pub async fn on_deck(
             // ahead of genuine in-progress items on subsequent renders.
             let play_state = PlayStateForItem {
                 position_ms: 0,
+                max_position_ms: 0,
                 duration_ms: detail.episode.duration_ms,
                 watched: false,
                 view_count: 0,
@@ -4677,6 +4708,7 @@ pub async fn on_deck(
             // without any progress indicator.
             let play_state = PlayStateForItem {
                 position_ms: 0,
+                max_position_ms: 0,
                 duration_ms: detail.episode.duration_ms,
                 watched: false,
                 view_count: 0,
@@ -5039,6 +5071,81 @@ pub struct PurgeReport {
     /// serialized — internal-only.
     #[serde(skip)]
     pub purged_paths: Vec<String>,
+}
+
+/// Hard-delete the soft-removed files of ONE library whose `removed_at`
+/// is older than `older_than_ms`, then sweep orphaned episodes/seasons/
+/// items. This is the "empty trash after scan" path — scoped to the
+/// library that was just scanned so a temporary unmount elsewhere can't
+/// purge an unrelated library's still-within-grace files.
+///
+/// media_files has no library_id column, so membership is resolved
+/// through the item (movies) / episode→season→show (episodes) ownership
+/// chain. The orphan sweep runs globally afterwards — it only removes
+/// genuinely childless rows, which is always safe regardless of which
+/// library triggered it.
+pub async fn purge_removed_media_files_for_library(
+    pool: &SqlitePool,
+    library_id: i64,
+    older_than_ms: i64,
+) -> Result<PurgeReport> {
+    let mut report = PurgeReport::default();
+
+    // The membership predicate, shared by the path-collection SELECT and
+    // the DELETE so they target exactly the same rows.
+    const MEMBERSHIP: &str = "removed_at IS NOT NULL AND removed_at < ?1 AND (
+            item_id IN (SELECT id FROM items WHERE library_id = ?2)
+         OR episode_id IN (
+                SELECT e.id FROM episodes e
+                JOIN seasons s ON s.id = e.season_id
+                JOIN items sh ON sh.id = s.show_id
+                WHERE sh.library_id = ?2))";
+
+    let path_rows = sqlx::query_scalar::<_, String>(&format!(
+        "SELECT path FROM media_files WHERE {MEMBERSHIP}"
+    ))
+    .bind(older_than_ms)
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+    report.purged_paths = path_rows;
+
+    let mut tx = pool.begin().await?;
+    let r = sqlx::query(&format!("DELETE FROM media_files WHERE {MEMBERSHIP}"))
+        .bind(older_than_ms)
+        .bind(library_id)
+        .execute(&mut *tx)
+        .await?;
+    report.files_purged = r.rows_affected();
+
+    // Same global orphan sweep as the scheduled purge — order matters
+    // (episodes → seasons → items); each delete only removes childless
+    // rows so it's safe to run across all libraries.
+    let r = sqlx::query(
+        "DELETE FROM episodes
+         WHERE NOT EXISTS (SELECT 1 FROM media_files WHERE episode_id = episodes.id)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    report.episodes_purged = r.rows_affected();
+    let r = sqlx::query(
+        "DELETE FROM seasons
+         WHERE NOT EXISTS (SELECT 1 FROM episodes WHERE season_id = seasons.id)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    report.seasons_purged = r.rows_affected();
+    let r = sqlx::query(
+        "DELETE FROM items
+         WHERE (kind = 'movie' AND NOT EXISTS (SELECT 1 FROM media_files WHERE item_id = items.id))
+            OR (kind = 'show'  AND NOT EXISTS (SELECT 1 FROM seasons WHERE show_id = items.id))",
+    )
+    .execute(&mut *tx)
+    .await?;
+    report.items_purged = r.rows_affected();
+    tx.commit().await?;
+
+    Ok(report)
 }
 
 pub async fn purge_removed_media_files(
@@ -7942,10 +8049,15 @@ pub async fn set_watched(
     if let Some(id) = item_id {
         sqlx::query(
             "INSERT INTO play_state
-                (user_id, item_id, position_ms, duration_ms, watched, view_count, last_played_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_id, item_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(user_id, item_id) WHERE item_id IS NOT NULL DO UPDATE SET
                 position_ms = excluded.position_ms,
+                -- Explicit mark-watched/unwatched is the one path allowed
+                -- to move the furthest-watched point DOWN: unwatching
+                -- resets the bar to empty (position_ms = max = 0), watching
+                -- fills it (position_ms = max = duration).
+                max_position_ms = excluded.max_position_ms,
                 duration_ms = COALESCE(excluded.duration_ms, play_state.duration_ms),
                 watched = excluded.watched,
                 view_count = play_state.view_count + ?,
@@ -7953,6 +8065,7 @@ pub async fn set_watched(
         )
         .bind(user_id)
         .bind(id)
+        .bind(position_ms)
         .bind(position_ms)
         .bind(duration_ms)
         .bind(watched as i64)
@@ -7964,10 +8077,13 @@ pub async fn set_watched(
     } else if let Some(id) = episode_id {
         sqlx::query(
             "INSERT INTO play_state
-                (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_id, episode_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
                 position_ms = excluded.position_ms,
+                -- See item branch above: explicit mark un/watched resets or
+                -- fills the bar deliberately, so max tracks position here.
+                max_position_ms = excluded.max_position_ms,
                 duration_ms = COALESCE(excluded.duration_ms, play_state.duration_ms),
                 watched = excluded.watched,
                 view_count = play_state.view_count + ?,
@@ -7975,6 +8091,7 @@ pub async fn set_watched(
         )
         .bind(user_id)
         .bind(id)
+        .bind(position_ms)
         .bind(position_ms)
         .bind(duration_ms)
         .bind(watched as i64)
@@ -8055,8 +8172,8 @@ pub async fn store_trakt_history(
 pub async fn reconcile_trakt_history(pool: &SqlitePool, user_id: i64) -> Result<(u64, u64)> {
     let movies = sqlx::query(
         "INSERT INTO play_state
-            (user_id, item_id, position_ms, duration_ms, watched, view_count, last_played_at)
-         SELECT h.user_id, i.id, COALESCE(i.duration_ms, 0), i.duration_ms, 1, 1, MAX(h.watched_at)
+            (user_id, item_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+         SELECT h.user_id, i.id, COALESCE(i.duration_ms, 0), COALESCE(i.duration_ms, 0), i.duration_ms, 1, 1, MAX(h.watched_at)
          FROM items i
          JOIN user_trakt_history h
            ON h.user_id = ?
@@ -8069,6 +8186,8 @@ pub async fn reconcile_trakt_history(pool: &SqlitePool, user_id: i64) -> Result<
          ON CONFLICT(user_id, item_id) WHERE item_id IS NOT NULL DO UPDATE SET
             watched = 1,
             position_ms = COALESCE(play_state.duration_ms, excluded.position_ms),
+            -- Trakt says watched → fill the progress bar.
+            max_position_ms = COALESCE(play_state.duration_ms, excluded.max_position_ms),
             last_played_at = MAX(COALESCE(play_state.last_played_at, 0), excluded.last_played_at)
          WHERE play_state.watched = 0",
     )
@@ -8079,8 +8198,8 @@ pub async fn reconcile_trakt_history(pool: &SqlitePool, user_id: i64) -> Result<
 
     let episodes = sqlx::query(
         "INSERT INTO play_state
-            (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
-         SELECT h.user_id, e.id, COALESCE(e.duration_ms, 0), e.duration_ms, 1, 1, MAX(h.watched_at)
+            (user_id, episode_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+         SELECT h.user_id, e.id, COALESCE(e.duration_ms, 0), COALESCE(e.duration_ms, 0), e.duration_ms, 1, 1, MAX(h.watched_at)
          FROM episodes e
          JOIN seasons s ON s.id = e.season_id
          JOIN items sh ON sh.id = s.show_id
@@ -8096,6 +8215,8 @@ pub async fn reconcile_trakt_history(pool: &SqlitePool, user_id: i64) -> Result<
          ON CONFLICT(user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
             watched = 1,
             position_ms = COALESCE(play_state.duration_ms, excluded.position_ms),
+            -- Trakt says watched → fill the progress bar.
+            max_position_ms = COALESCE(play_state.duration_ms, excluded.max_position_ms),
             last_played_at = MAX(COALESCE(play_state.last_played_at, 0), excluded.last_played_at)
          WHERE play_state.watched = 0",
     )
@@ -8737,6 +8858,25 @@ pub async fn cleanup_old_jobs(
     .await?
     .rows_affected();
     Ok((succ, dead))
+}
+
+/// Trim finished `task_runs` history older than `ttl_ms`. The scheduler
+/// writes one task_runs row per task firing; high-cadence tasks (e.g. the
+/// 15-min periodic-scan poll) would otherwise accumulate indefinitely
+/// since — unlike `jobs` (cleanup_jobs) and `audit_log` (cleanup_audit_log)
+/// — task_runs had no retention. Never touches `status = 'running'` rows
+/// (an in-flight run), and keys off `started_at` (always set) so an
+/// interrupted run with a NULL `finished_at` still ages out.
+pub async fn cleanup_old_task_runs(pool: &SqlitePool, ttl_ms: i64) -> Result<u64> {
+    let cutoff = now_ms() - ttl_ms;
+    let n = sqlx::query(
+        "DELETE FROM task_runs WHERE status != 'running' AND started_at < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
 }
 
 /// Outcome of a [merge_items] call. All counts are zero on failure
@@ -9922,6 +10062,41 @@ pub async fn update_server_settings(
         let clamped = v.clamp(5, 3600);
         sqlx::query("UPDATE server_settings SET file_watcher_poll_interval_secs = ? WHERE id = 1")
             .bind(clamped)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.periodic_scan_enabled {
+        sqlx::query("UPDATE server_settings SET periodic_scan_enabled = ? WHERE id = 1")
+            .bind(i64::from(v))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(v) = patch.periodic_scan_frequency {
+        // Validate against the interval tokens the scheduler understands
+        // so a typo can't wedge the periodic scan task with an "unknown
+        // frequency" error. Unknown values are rejected (the existing
+        // setting stays put).
+        const ALLOWED: &[&str] = &[
+            "every_15_minutes",
+            "every_30_minutes",
+            "hourly",
+            "every_2_hours",
+            "every_6_hours",
+            "every_12_hours",
+            "daily",
+        ];
+        if ALLOWED.contains(&v.as_str()) {
+            sqlx::query("UPDATE server_settings SET periodic_scan_frequency = ? WHERE id = 1")
+                .bind(v)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            anyhow::bail!("invalid periodic_scan_frequency `{v}`");
+        }
+    }
+    if let Some(v) = patch.empty_trash_after_scan {
+        sqlx::query("UPDATE server_settings SET empty_trash_after_scan = ? WHERE id = 1")
+            .bind(i64::from(v))
             .execute(&mut *tx)
             .await?;
     }
@@ -14104,6 +14279,179 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    /// In-memory `play_state` table mirroring the real schema's partial
+    /// unique indexes (FKs dropped — no users/episodes tables here).
+    async fn play_state_test_pool() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE play_state (
+                user_id         INTEGER NOT NULL,
+                item_id         INTEGER,
+                episode_id      INTEGER,
+                position_ms     INTEGER NOT NULL DEFAULT 0,
+                max_position_ms INTEGER NOT NULL DEFAULT 0,
+                duration_ms     INTEGER,
+                watched         INTEGER NOT NULL DEFAULT 0,
+                view_count      INTEGER NOT NULL DEFAULT 0,
+                last_played_at  INTEGER NOT NULL,
+                CHECK ((item_id IS NULL) <> (episode_id IS NULL))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for sql in [
+            "CREATE UNIQUE INDEX uq_play_state_item ON play_state(user_id, item_id) WHERE item_id IS NOT NULL",
+            "CREATE UNIQUE INDEX uq_play_state_episode ON play_state(user_id, episode_id) WHERE episode_id IS NOT NULL",
+            // set_watched() looks up a duration from items / episodes; the
+            // tables just need to exist (empty is fine — a missing row maps
+            // to a 0 position, which is the unwatched case).
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, duration_ms INTEGER)",
+            "CREATE TABLE episodes (id INTEGER PRIMARY KEY, duration_ms INTEGER)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    /// Regression: a periodic position update (which carries no `watched`
+    /// flag) must NOT un-watch an episode that was already scrobbled.
+    /// Before the fix, `apply_play_state_batch` wrote `watched = 0`
+    /// unconditionally, so any 10s tick after the 90% scrobble (or a
+    /// `seeked` event) reverted the flag while leaving position near the
+    /// duration — the "0m left, full bar, but not marked watched" bug.
+    #[tokio::test]
+    async fn position_tick_does_not_unwatch_scrobbled_episode() {
+        let pool = play_state_test_pool().await;
+        let user_id = 1;
+        let episode_id = 7;
+
+        // 1. Scrobble at the 90% threshold marks the episode watched.
+        scrobble(&pool, user_id, None, Some(episode_id))
+            .await
+            .unwrap();
+        let watched: i64 =
+            sqlx::query_scalar("SELECT watched FROM play_state WHERE user_id = ? AND episode_id = ?")
+                .bind(user_id)
+                .bind(episode_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(watched, 1, "scrobble should mark watched");
+
+        // 2. A later position tick (playing past 90% to the end) carries
+        //    only position/duration — `watched` is None.
+        apply_play_state_batch(
+            &pool,
+            user_id,
+            PlayStateBatch {
+                updates: vec![crate::models::PlayStateUpdate {
+                    item_id: None,
+                    episode_id: Some(episode_id),
+                    position_ms: 1_440_000, // ~end of a 24m episode
+                    duration_ms: Some(1_440_000),
+                    watched: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        // 3. The flag must survive; position/duration still update.
+        let row = sqlx::query(
+            "SELECT watched, position_ms, duration_ms FROM play_state WHERE user_id = ? AND episode_id = ?",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.try_get::<i64, _>("watched").unwrap(),
+            1,
+            "position tick must not un-watch a scrobbled episode"
+        );
+        assert_eq!(row.try_get::<i64, _>("position_ms").unwrap(), 1_440_000);
+        assert_eq!(row.try_get::<i64, _>("duration_ms").unwrap(), 1_440_000);
+    }
+
+    /// max_position_ms tracks the FURTHEST point watched and is monotonic
+    /// under position ticks: a backward seek lowers position_ms (the resume
+    /// point) but must NOT shrink max_position_ms (the progress bar). The
+    /// "skipping forward/backward made the bar inaccurate" report.
+    #[tokio::test]
+    async fn backward_seek_keeps_max_position_but_lowers_resume() {
+        let pool = play_state_test_pool().await;
+        let user_id = 1;
+        let episode_id = 9;
+
+        async fn tick(pool: &SqlitePool, user_id: i64, episode_id: i64, pos: i64) {
+            apply_play_state_batch(
+                pool,
+                user_id,
+                PlayStateBatch {
+                    updates: vec![crate::models::PlayStateUpdate {
+                        item_id: None,
+                        episode_id: Some(episode_id),
+                        position_ms: pos,
+                        duration_ms: Some(1_440_000),
+                        watched: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        async fn read(pool: &SqlitePool, user_id: i64, episode_id: i64) -> (i64, i64) {
+            let row = sqlx::query(
+                "SELECT position_ms, max_position_ms FROM play_state \
+                 WHERE user_id = ? AND episode_id = ?",
+            )
+            .bind(user_id)
+            .bind(episode_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            (
+                row.try_get::<i64, _>("position_ms").unwrap(),
+                row.try_get::<i64, _>("max_position_ms").unwrap(),
+            )
+        }
+
+        // Watch forward to 1,200,000 ms.
+        tick(&pool, user_id, episode_id, 1_200_000).await;
+        assert_eq!(read(&pool, user_id, episode_id).await, (1_200_000, 1_200_000));
+
+        // Seek backward to 300,000 ms and report. Resume point moves back;
+        // the furthest-watched (bar) must hold at 1,200,000.
+        tick(&pool, user_id, episode_id, 300_000).await;
+        assert_eq!(
+            read(&pool, user_id, episode_id).await,
+            (300_000, 1_200_000),
+            "backward seek must lower resume but keep the progress bar"
+        );
+
+        // Watch forward past the old max — both advance.
+        tick(&pool, user_id, episode_id, 1_400_000).await;
+        assert_eq!(read(&pool, user_id, episode_id).await, (1_400_000, 1_400_000));
+
+        // Explicitly mark unwatched: the bar resets to empty (this is the
+        // one path allowed to lower max).
+        set_watched(&pool, user_id, None, Some(episode_id), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&pool, user_id, episode_id).await,
+            (0, 0),
+            "mark-unwatched clears both resume and the progress bar"
+        );
     }
 
     #[test]

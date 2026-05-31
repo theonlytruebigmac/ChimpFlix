@@ -36,8 +36,11 @@ export function adaptItem(item: Item | ListedItem): MediaItem {
   // ListedItem flattens play_state into the same object. When present,
   // expose it as viewOffset so Card's progress bar renders.
   const ps = (item as ListedItem).play_state;
-  if (ps && ps.position_ms > 0) {
-    media.viewOffset = ps.position_ms;
+  // Progress bar tracks the furthest-watched point, not the resume point,
+  // so seeking backward doesn't shrink it. Resume still uses position_ms
+  // server-side (start_position_ms).
+  if (ps && ps.max_position_ms > 0) {
+    media.viewOffset = ps.max_position_ms;
   }
   const h = (item as ListedItem).best_quality_height;
   if (typeof h === "number") media.bestQualityHeight = h;
@@ -49,8 +52,8 @@ export function adaptItem(item: Item | ListedItem): MediaItem {
 export function adaptItemDetail(detail: ItemDetail): MediaItem {
   const base = adaptItem(detail);
   base.genres = detail.genres;
-  if (detail.play_state && detail.play_state.position_ms > 0) {
-    base.viewOffset = detail.play_state.position_ms;
+  if (detail.play_state && detail.play_state.max_position_ms > 0) {
+    base.viewOffset = detail.play_state.max_position_ms;
   }
   if (detail.kind === "show") {
     base.childCount = detail.seasons.length;
@@ -94,14 +97,14 @@ export function adaptEpisode(ep: Episode, show: Item): MediaItem {
 export function adaptOnDeck(entry: OnDeckEntry): MediaItem {
   if (entry.kind === "movie") {
     const m = adaptItem(entry.item);
-    if (entry.play_state.position_ms > 0) {
-      m.viewOffset = entry.play_state.position_ms;
+    if (entry.play_state.max_position_ms > 0) {
+      m.viewOffset = entry.play_state.max_position_ms;
     }
     return m;
   }
   const m = adaptEpisode(entry.episode, entry.show);
-  if (entry.play_state.position_ms > 0) {
-    m.viewOffset = entry.play_state.position_ms;
+  if (entry.play_state.max_position_ms > 0) {
+    m.viewOffset = entry.play_state.max_position_ms;
   }
   return m;
 }

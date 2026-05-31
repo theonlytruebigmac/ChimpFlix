@@ -296,7 +296,8 @@ async function resolveEpisode(
       thumb: plexImage(e.thumb_path ?? undefined, 320, 180) ?? undefined,
       summary: e.summary ?? undefined,
       duration: e.duration_ms ?? undefined,
-      viewOffset: e.play_state?.position_ms,
+      // Display-only progress bar → furthest-watched, not resume point.
+      viewOffset: e.play_state?.max_position_ms,
       index: e.episode_number,
       parentTitle: `Season ${e.season_number}`,
     }),

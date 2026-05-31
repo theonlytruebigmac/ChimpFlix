@@ -107,7 +107,11 @@ export function SeasonEpisodes({
           summary: string | null;
           duration_ms: number | null;
           thumb_path: string | null;
-          play_state: { position_ms: number; watched?: boolean } | null;
+          play_state: {
+            position_ms: number;
+            max_position_ms: number;
+            watched?: boolean;
+          } | null;
         }[];
       };
       if (!aliveRef.current || requestIdRef.current !== myRequestId) return;
@@ -120,7 +124,10 @@ export function SeasonEpisodes({
           summary: e.summary ?? undefined,
           thumb: e.thumb_path ?? undefined,
           duration: e.duration_ms ?? undefined,
-          viewOffset: e.play_state?.position_ms ?? undefined,
+          // Furthest-watched drives the bar + "X min left" (resume still
+          // uses position_ms server-side), so skipping around no longer
+          // makes a finished episode look un-watched.
+          viewOffset: e.play_state?.max_position_ms ?? undefined,
           watched: e.play_state?.watched ?? false,
           index: e.episode_number,
         })),
