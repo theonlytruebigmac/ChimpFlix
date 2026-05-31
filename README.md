@@ -20,9 +20,14 @@ style web UI, packaged for Docker, and easy to self-host.
 
 **v0.1 scope (shipped):**
 
-- Library scan + multi-agent metadata (TMDB, TVDB, TVMaze, AniList) for
+- Library scan (manual, filesystem-watch, and Plex-style scheduled
+  periodic) + multi-agent metadata (TMDB, TVDB, TVMaze, AniList) for
   movies, TV shows, and anime.
 - Direct-play streaming + per-user watch state.
+- Discovery rails: a home Top 10 (TMDB weekly trending) plus per-library,
+  type-aware Top 10 rails — TMDB top-rated for movie/TV libraries,
+  MyAnimeList ranking for anime libraries — each blended with the
+  library's local top-watched.
 - HLS transcoding via ffmpeg, including HEVC, ABR ladders, hardware
   decode/encode (NVENC / VAAPI / QSV / VideoToolbox / AMF), HDR→SDR
   tonemap, two-pass loudness normalization, and burned/sidecar
@@ -101,6 +106,14 @@ The backend reads a small set of environment variables:
 | `BIND_ADDR` | `0.0.0.0:8080` | Listening address. |
 | `DATA_DIR` | `./data` | Where `chimpflix.db` and caches live. |
 | `RUST_LOG` | `info,sqlx=warn` | `tracing-subscriber` filter. |
+| `CHIMPFLIX_CIRCUIT_BREAKER_THRESHOLD` | `3` | Optional. Consecutive rate-limit failures from an external provider (TMDB, OMDb, MyAnimeList, …) before its circuit opens and calls fast-fail. |
+| `CHIMPFLIX_CIRCUIT_BREAKER_OPEN_SECS` | `60` | Optional. How long a provider's circuit stays open before a probe is allowed. |
+
+Most operator settings (periodic scan interval, Continue Watching tuning,
+file-watcher backend, etc.) live in the admin UI under **Settings**, not
+in env vars. External provider keys — TMDB, TVDB, OMDb, Trakt,
+OpenSubtitles, and the **MyAnimeList** Client ID — are stored in the
+encrypted credential vault under **Settings → Server → Credentials**.
 
 Configuration for the web frontend lives in
 [web/.env.example](web/.env.example). The frontend points at the
@@ -122,8 +135,12 @@ image builds on every PR. See [.github/workflows/ci.yml](.github/workflows/ci.ym
 ## Privacy
 
 The server makes outbound HTTP calls **only** to services the operator
-explicitly configures (TMDB, AniList, Trakt, OpenSubtitles, and SMTP).
-No analytics. No phone-home. No auto-update check. No third-party
+explicitly configures (TMDB, TVDB, AniList, OMDb, Trakt, OpenSubtitles,
+MyAnimeList, and SMTP). The one exception is the anime Top 10: when an
+anime library exists, the server fetches a public anime-id mapping file
+from GitHub (`raw.githubusercontent.com`) so it can match MyAnimeList
+rankings to titles in your library — no account, no credentials, no data
+sent. No analytics. No phone-home. No auto-update check. No third-party
 JavaScript in the web bundle (no Google Fonts, no CDN scripts, no
 tracking). Everything stays on the box the operator runs.
 
