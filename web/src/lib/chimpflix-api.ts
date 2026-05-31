@@ -2729,6 +2729,14 @@ export const items = {
     apiFetch<{ items: Array<ListedItem & { rank: number }> }>("/items/trending", {
       query: { kind, limit, library_ids },
     }),
+  /// Per-library, type-aware Top 10 (Movies/Shows → TMDB top-rated,
+  /// Anime → MyAnimeList ranking, blended with local top-watched). The
+  /// source is decided server-side from the library's kind.
+  libraryTop: (libraryId: number, limit = 10) =>
+    apiFetch<{ items: Array<ListedItem & { rank: number }> }>(
+      `/libraries/${libraryId}/top`,
+      { query: { limit } },
+    ),
   get: (id: number) => apiFetch<ItemDetail>(`/items/${id}`),
   trailer: (id: number) =>
     apiFetch<{ video_id: string | null }>(`/items/${id}/trailer`),

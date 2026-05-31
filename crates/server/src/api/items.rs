@@ -8,7 +8,8 @@ use axum::response::Response;
 use chimpflix_library::queries;
 use chimpflix_library::scanner;
 use chimpflix_library::{
-    CreditsEditInput, ItemDetail, ItemEdit, ItemFilter, ItemKind, ItemPage, ListedItem, Review,
+    CreditsEditInput, ItemDetail, ItemEdit, ItemFilter, ItemKind, ItemPage, LibraryKind,
+    ListedItem, Review,
 };
 use chimpflix_metadata::{TmdbCandidate, TmdbKind, TmdbPoster, TmdbUpstreamError};
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,56 @@ pub async fn trending(
     let rows =
         queries::list_trending_in_library(&state.pool, kind, user.id, limit, effective.as_deref())
             .await?;
+    let items = rows
+        .into_iter()
+        .map(|(rank, item)| TrendingItem { rank, item })
+        .collect();
+    Ok(Json(TrendingResponse { items }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LibraryTopQuery {
+    /// 1-50. Defaults to 10.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/v1/libraries/{id}/top` — the per-library, type-aware
+/// "Top 10": the external top-rated/ranked list for this library's KIND
+/// (Movies/Shows → TMDB top-rated, Anime → MyAnimeList ranking),
+/// intersected with the library's items and topped up with local
+/// top-watched. Reuses the trending response shape. Returns an empty
+/// list (not an error) when the user can't see the library or the
+/// source hasn't been refreshed yet.
+pub async fn library_top(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(library_id): Path<i64>,
+    Query(q): Query<LibraryTopQuery>,
+) -> Result<Json<TrendingResponse>, ApiError> {
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    let Some(library) = queries::get_library(&state.pool, library_id).await? else {
+        return Err(ApiError::NotFound);
+    };
+    // Source is chosen by library KIND, not item kind (anime items are
+    // stored as "show"). Anime → MAL ranking; everything else → TMDB
+    // top-rated. media_kind is the items.kind to match against.
+    let (media_kind, source): (&str, &str) = match library.kind {
+        LibraryKind::Movies => ("movie", "tmdb_top_rated"),
+        LibraryKind::Shows => ("show", "tmdb_top_rated"),
+        LibraryKind::Anime => ("show", "mal_ranking"),
+    };
+    let acc = access(&state, &user).await?;
+    let rows = queries::list_library_top(
+        &state.pool,
+        library_id,
+        media_kind,
+        source,
+        user.id,
+        limit,
+        acc.as_deref(),
+    )
+    .await?;
     let items = rows
         .into_iter()
         .map(|(rank, item)| TrendingItem { rank, item })

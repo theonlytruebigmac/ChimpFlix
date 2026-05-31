@@ -184,6 +184,22 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         }
     }
 
+    // Per-provider circuit breaker state (one line per breaker; the
+    // current state rides as a label, value 1 — the Prometheus enum
+    // idiom). Alert on `chimpflix_circuit_breaker_state{state="open"}`.
+    let _ = writeln!(
+        out,
+        "# HELP chimpflix_circuit_breaker_state External-provider circuit breaker state."
+    );
+    let _ = writeln!(out, "# TYPE chimpflix_circuit_breaker_state gauge");
+    for (client, st) in state.circuit_breakers.snapshot() {
+        let _ = writeln!(
+            out,
+            "chimpflix_circuit_breaker_state{{client=\"{client}\",state=\"{}\"}} 1",
+            st.as_str()
+        );
+    }
+
     let mut resp = (StatusCode::OK, out).into_response();
     // Use the actual content type Prometheus expects so its scrape
     // parser doesn't fall back to autodetection.

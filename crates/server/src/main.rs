@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod circuit_breaker;
 mod cli;
 mod client_ip;
 mod events;
@@ -285,6 +286,12 @@ async fn main() -> anyhow::Result<()> {
         None => info!("OMDb disabled — no key under /admin/server/credentials"),
     }
     let omdb = Arc::new(RwLock::new(omdb));
+    let mal = build_mal_from_vault(&pool, &vault).await?;
+    match &mal {
+        Some(_) => info!("MyAnimeList ranking enabled (anime Top 10)"),
+        None => info!("MyAnimeList disabled — no client id under /admin/server/credentials"),
+    }
+    let mal = Arc::new(RwLock::new(mal));
     // TVMaze is a free fallback for shows; no key required. We always
     // try to construct it — a failure here just means we skip the fallback
     // (it's not fatal to enrichment).
@@ -432,10 +439,25 @@ async fn main() -> anyhow::Result<()> {
         opensubtitles,
         trakt,
         omdb,
+        mal,
         plex_oauth: Arc::new(tokio::sync::RwLock::new(None)),
         plex_pin_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         tvmaze,
         hub,
+        // Per-provider circuit breakers. Tunable via env (defaults: open
+        // after 3 consecutive rate-limit trips, 60s cooldown).
+        circuit_breakers: Arc::new(circuit_breaker::CircuitBreakers::new(
+            std::env::var("CHIMPFLIX_CIRCUIT_BREAKER_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            std::time::Duration::from_secs(
+                std::env::var("CHIMPFLIX_CIRCUIT_BREAKER_OPEN_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(60),
+            ),
+        )),
         auth: AuthConfig {
             session_secret: Arc::new(session_secret),
             cookie_secure,
@@ -532,6 +554,32 @@ async fn main() -> anyhow::Result<()> {
     *state.worker_pool.write().await = Some(worker_pool);
     webhooks::spawn(state.clone());
     session_watcher::spawn(state.hub.clone(), state.transcoder.clone());
+    // Bridge scan-completion → client refresh: when a library finishes
+    // scanning, push a `library_changed` Refresh so every connected
+    // client re-fetches its (access-filtered) rails — push, not poll. No
+    // feedback loop: it only reacts to Scan(Completed) and emits Refresh.
+    {
+        let hub = state.hub.clone();
+        let mut rx = state.hub.subscribe();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match rx.recv().await {
+                    Ok(events::Event::Scan(chimpflix_library::ScanEvent::Completed {
+                        library_id,
+                        ..
+                    })) => {
+                        hub.publish(events::Event::Refresh(
+                            events::RefreshEvent::library_changed(library_id),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     // Filesystem watcher is always spawned — it consults the live
     // `scan_automatically` setting on every event tick so admins can
     // toggle real-time ingestion without restarting. When the toggle
@@ -821,6 +869,16 @@ async fn build_omdb_from_vault(
         return Ok(None);
     };
     Ok(Some(OmdbClient::new(key)?))
+}
+
+async fn build_mal_from_vault(
+    pool: &SqlitePool,
+    vault: &Vault,
+) -> anyhow::Result<Option<chimpflix_metadata::MalClient>> {
+    let Some(client_id) = vault_get_or_warn(pool, vault, "mal").await else {
+        return Ok(None);
+    };
+    Ok(Some(chimpflix_metadata::MalClient::new(&client_id)?))
 }
 
 async fn shutdown_signal(transcoder: chimpflix_transcoder::TranscodeManager) {

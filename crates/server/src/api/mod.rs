@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/libraries/{id}/scan", post(libraries::trigger_scan))
         .route("/libraries/{id}/scans", get(libraries::list_scans))
         .route("/libraries/{id}/stats", get(libraries::library_stats))
+        .route("/libraries/{id}/top", get(items::library_top))
         .route("/libraries/{id}/verify", post(libraries::verify_library))
         .route("/libraries/{id}/purge", post(libraries::purge_library))
         .route(

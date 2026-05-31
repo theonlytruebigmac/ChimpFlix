@@ -320,6 +320,17 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{}",
             cron_placeholder: "0 0 3 * * *",
         },
+        // Refreshes the anime-id mapping mirror that the MAL-ranking
+        // Top-10 resolves through. Weekly + windowed (one ~12 MB fetch);
+        // no-ops cheaply when there are no anime libraries.
+        Seed {
+            kind: "refresh_anime_id_map",
+            name: "Refresh anime id map (MAL/TVDB/TMDB)",
+            frequency: "weekly",
+            requires_window: true,
+            params_json: "{}",
+            cron_placeholder: "0 0 6 * * 1",
+        },
         Seed {
             kind: "refresh_trending",
             name: "Refresh global trending (Top 10)",
@@ -1037,6 +1048,7 @@ async fn dispatch(
         "verify_libraries" => verify_libraries_task(state, task, log).await,
         "purge_removed_files" => purge_removed_files_task(state, task, log).await,
         "periodic_library_scan" => periodic_library_scan_task(state, task, log).await,
+        "refresh_anime_id_map" => refresh_anime_id_map_task(state, log).await,
         "optimize_versions" => {
             // Process up to `batch_size` queued rows. Per-row failures are
             // captured in the optimized_versions table, not in the task
@@ -1340,10 +1352,22 @@ pub fn registry() -> Vec<TaskKindInfo> {
             kind: "refresh_trending",
             display_name: "Refresh trending (Top 10)",
             description: "Pull the weekly global trending list from TMDB \
-                          (movies + shows). The home page intersects this \
-                          with the local library to render a Top 10 rail.",
+                          (movies + shows) for the home Top 10, plus TMDB \
+                          top-rated and the MyAnimeList anime ranking for \
+                          the per-library Top 10 rails.",
             params_schema: r#"{}"#,
             default_frequency: "daily",
+            default_requires_maintenance_window: true,
+        },
+        TaskKindInfo {
+            kind: "refresh_anime_id_map",
+            display_name: "Refresh anime id map",
+            description: "Mirror the community anime-id mapping file \
+                          (MyAnimeList ↔ TVDB ↔ TMDB ↔ AniList) so the \
+                          anime Top 10 can resolve MAL ranking ids to local \
+                          items. No-ops when there are no anime libraries.",
+            params_schema: r#"{}"#,
+            default_frequency: "weekly",
             default_requires_maintenance_window: true,
         },
         TaskKindInfo {
@@ -1679,50 +1703,215 @@ async fn refresh_trending_task(
     state: &AppState,
     log: &Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
-    let Some(tmdb) = state.tmdb_snapshot().await else {
-        append_log(log, "TMDB disabled — skipping trending refresh");
+    let trip = crate::circuit_breaker::trips_on_rate_limit;
+
+    // --- TMDB: home "trending" rail + per-library "top-rated" source ---
+    // Only when TMDB is configured; an anime-only install with just a MAL
+    // key still gets its anime Top-10 from the MAL block below.
+    if let Some(tmdb) = state.tmdb_snapshot().await {
+        // Through the TMDB circuit breaker (shared with the logo/detail
+        // jobs) so a rate-limited TMDB fails this sweep fast.
+        let cb = &state.circuit_breakers.tmdb;
+        let movies = cb.run(trip, || tmdb.trending_movies()).await?;
+        let shows = cb.run(trip, || tmdb.trending_shows()).await?;
+        let m_count = queries::replace_trending(
+            &state.pool,
+            "tmdb",
+            "movie",
+            &movies
+                .iter()
+                .take(10)
+                .enumerate()
+                .map(|(i, m)| chimpflix_library::TrendingEntry {
+                    rank: (i as i64) + 1,
+                    tmdb_id: m.tmdb_id,
+                    title: Some(m.title.clone()),
+                    poster_path: m.poster_path.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let s_count = queries::replace_trending(
+            &state.pool,
+            "tmdb",
+            "show",
+            &shows
+                .iter()
+                .take(10)
+                .enumerate()
+                .map(|(i, s)| chimpflix_library::TrendingEntry {
+                    rank: (i as i64) + 1,
+                    tmdb_id: s.tmdb_id,
+                    title: Some(s.title.clone()),
+                    poster_path: s.poster_path.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        // Per-library "Top 10" source for movie/show libraries: TMDB
+        // *top-rated* (distinct from *trending*). Stored GLOBALLY under
+        // source='tmdb_top_rated'; the per-library intersection happens at
+        // read time in list_library_top. Store more than we display (20)
+        // so a given library has a decent chance of overlapping it.
+        let top_movies = cb.run(trip, || tmdb.top_rated_movies()).await?;
+        let top_shows = cb.run(trip, || tmdb.top_rated_shows()).await?;
+        let to_ranked = |entries: &[chimpflix_metadata::tmdb::TmdbTrendingEntry]| {
+            entries
+                .iter()
+                .take(20)
+                .enumerate()
+                .map(|(i, e)| chimpflix_library::TopRankedEntry {
+                    rank: (i as i64) + 1,
+                    tmdb_id: Some(e.tmdb_id),
+                    title: Some(e.title.clone()),
+                    poster_path: e.poster_path.clone(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let tr_m = queries::replace_ranked_cache(
+            &state.pool,
+            "tmdb_top_rated",
+            "movie",
+            &to_ranked(&top_movies),
+        )
+        .await?;
+        let tr_s = queries::replace_ranked_cache(
+            &state.pool,
+            "tmdb_top_rated",
+            "show",
+            &to_ranked(&top_shows),
+        )
+        .await?;
+        append_log(
+            log,
+            format!(
+                "TMDB: {m_count} trending movies, {s_count} trending shows, \
+                 {tr_m} top-rated movies, {tr_s} top-rated shows"
+            ),
+        );
+    } else {
+        append_log(log, "TMDB disabled — skipping trending/top-rated refresh");
+    }
+
+    // --- MyAnimeList: per-library "Top 10" source for ANIME libraries ---
+    // Top anime by score, resolved to local cross-ids via anime_id_map
+    // (populated by refresh_anime_id_map). Stored under source='mal_ranking'
+    // (media_kind='show', since anime items are show-shaped). Only when a
+    // MAL client id is configured; otherwise anime libraries fall back to
+    // local top-watched. Unresolved mal_ids still get a cache row (so the
+    // rank order is preserved) but won't match any local item.
+    if let Some(mal) = state.mal_snapshot().await {
+        match state
+            .circuit_breakers
+            .mal
+            .run(trip, || mal.top_anime("all", 50))
+            .await
+        {
+            Ok(ranking) => {
+                let mal_ids: Vec<i64> = ranking.iter().map(|e| e.mal_id).collect();
+                let map = queries::anime_id_map_lookup(&state.pool, &mal_ids)
+                    .await
+                    .unwrap_or_default();
+                let entries: Vec<chimpflix_library::TopRankedEntry> = ranking
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let (anilist_id, tvdb_id, tmdb_id) =
+                            map.get(&e.mal_id).copied().unwrap_or((None, None, None));
+                        chimpflix_library::TopRankedEntry {
+                            rank: (i as i64) + 1,
+                            tmdb_id,
+                            tvdb_id,
+                            anilist_id,
+                            mal_id: Some(e.mal_id),
+                            title: Some(e.title.clone()),
+                            poster_path: e.poster_url.clone(),
+                        }
+                    })
+                    .collect();
+                let resolved = entries
+                    .iter()
+                    .filter(|e| {
+                        e.tvdb_id.is_some() || e.anilist_id.is_some() || e.tmdb_id.is_some()
+                    })
+                    .count();
+                let n = queries::replace_ranked_cache(&state.pool, "mal_ranking", "show", &entries)
+                    .await?;
+                append_log(
+                    log,
+                    format!("MAL: cached {n} ranked anime ({resolved} resolved to local ids)"),
+                );
+            }
+            Err(e) => append_log(log, format!("MAL ranking refresh skipped: {e:#}")),
+        }
+    }
+    Ok(())
+}
+
+/// Community anime-id mapping file (mal ↔ anilist ↔ tvdb ↔ tmdb). Widely
+/// used by Sonarr/Plex anime tooling; a single ~12 MB JSON refreshed
+/// periodically upstream.
+const ANIME_ID_MAP_URL: &str =
+    "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json";
+
+/// Refresh the local `anime_id_map` mirror from the community mapping
+/// file so the MAL-ranking Top-10 can resolve MAL ids to the tvdb/tmdb/
+/// anilist ids local anime items carry. Skips the (large) fetch when the
+/// server has no anime libraries. Best-effort: a fetch/parse failure logs
+/// and leaves the existing map in place (the anime rail just keeps using
+/// whatever's already mapped, or falls back to local top-watched).
+async fn refresh_anime_id_map_task(
+    state: &AppState,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    let has_anime = queries::list_libraries(&state.pool, None)
+        .await?
+        .iter()
+        .any(|l| matches!(l.kind, chimpflix_library::LibraryKind::Anime));
+    if !has_anime {
+        append_log(log, "no anime libraries — skipping anime id map refresh");
         return Ok(());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("build anime-id-map http client")?;
+    let body: serde_json::Value = client
+        .get(ANIME_ID_MAP_URL)
+        .send()
+        .await
+        .context("fetch anime id map")?
+        .error_for_status()
+        .context("anime id map: non-success status")?
+        .json()
+        .await
+        .context("anime id map: decode JSON")?;
+    let arr = body
+        .as_array()
+        .context("anime id map: expected a JSON array")?;
+    // The file mixes numeric and string/"unknown" id values per source;
+    // `as_i64` tolerantly extracts only clean integers, dropping the rest.
+    let as_id = |v: &serde_json::Value, key: &str| -> Option<i64> {
+        v.get(key).and_then(|x| x.as_i64())
     };
-    let movies = tmdb.trending_movies().await?;
-    let shows = tmdb.trending_shows().await?;
-    let m_count = queries::replace_trending(
-        &state.pool,
-        "tmdb",
-        "movie",
-        &movies
-            .iter()
-            .take(10)
-            .enumerate()
-            .map(|(i, m)| chimpflix_library::TrendingEntry {
-                rank: (i as i64) + 1,
-                tmdb_id: m.tmdb_id,
-                title: Some(m.title.clone()),
-                poster_path: m.poster_path.clone(),
-            })
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    let s_count = queries::replace_trending(
-        &state.pool,
-        "tmdb",
-        "show",
-        &shows
-            .iter()
-            .take(10)
-            .enumerate()
-            .map(|(i, s)| chimpflix_library::TrendingEntry {
-                rank: (i as i64) + 1,
-                tmdb_id: s.tmdb_id,
-                title: Some(s.title.clone()),
-                poster_path: s.poster_path.clone(),
-            })
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    append_log(
-        log,
-        format!("cached {m_count} trending movies, {s_count} trending shows"),
-    );
+    let mut rows: Vec<chimpflix_library::queries::AnimeIdMapRow> = Vec::new();
+    for e in arr {
+        let Some(mal_id) = as_id(e, "mal_id") else {
+            continue;
+        };
+        let anilist_id = as_id(e, "anilist_id");
+        let tvdb_id = as_id(e, "thetvdb_id");
+        let tmdb_id = as_id(e, "themoviedb_id");
+        // Drop entries with no usable cross-id — they can't match a local
+        // item and would just bloat the table.
+        if anilist_id.is_none() && tvdb_id.is_none() && tmdb_id.is_none() {
+            continue;
+        }
+        rows.push((mal_id, anilist_id, tvdb_id, tmdb_id));
+    }
+    let n = queries::upsert_anime_id_map(&state.pool, &rows).await?;
+    append_log(log, format!("anime id map: upserted {n} mappings"));
     Ok(())
 }
 

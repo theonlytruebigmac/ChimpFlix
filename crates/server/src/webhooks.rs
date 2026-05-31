@@ -84,7 +84,7 @@ pub fn spawn(state: AppState) {
         loop {
             match rx.recv().await {
                 Ok(Event::Webhook(evt)) => fan_out(&dispatch_state, evt).await,
-                Ok(Event::Scan(_)) | Ok(Event::Sessions(_)) => {}
+                Ok(Event::Scan(_)) | Ok(Event::Sessions(_)) | Ok(Event::Refresh(_)) => {}
                 Err(RecvError::Lagged(n)) => {
                     warn!(skipped = n, "webhook subscriber lagged; events lost");
                 }

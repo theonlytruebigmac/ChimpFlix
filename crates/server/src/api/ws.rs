@@ -237,6 +237,15 @@ fn serialize_for(event: &Event, user: &AuthUser) -> anyhow::Result<Option<String
             };
             Ok(Some(serde_json::to_string(&filtered)?))
         }
+        Event::Refresh(r) => {
+            // `playstate_changed` is private to its user; `library_changed`
+            // (user_id = None) goes to everyone. The client re-fetch is
+            // access-filtered server-side, so a broadcast leaks nothing.
+            match r.user_id {
+                Some(uid) if uid != user.id => Ok(None),
+                _ => Ok(Some(serde_json::to_string(r)?)),
+            }
+        }
         // Webhook events are an internal pub/sub variant; not forwarded
         // to WebSocket clients today.
         Event::Webhook(_) => Ok(None),

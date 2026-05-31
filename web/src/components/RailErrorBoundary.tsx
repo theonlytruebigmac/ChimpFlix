@@ -25,8 +25,14 @@ interface State {
 /// returning `null`. Silent omission was the old behavior; it left a
 /// confusing gap on Home where a rail used to be, with no way for the
 /// operator to know something had broken. The placeholder matches the
-/// rail's vertical footprint (so the rest of the page doesn't reflow)
-/// and labels the rail by name so the operator can spot it.
+/// rail's vertical footprint (so the rest of the page doesn't reflow).
+///
+/// `label` is a developer diagnostic (e.g. `HomeHero`, `Lib:Anime`) and
+/// is NEVER rendered to the user — it only goes to the console via
+/// `devError` so an operator skimming devtools can tell which rail blew
+/// up. It used to be painted as a visible `<h2>`, which leaked raw
+/// component-ish names (`ContinueWatching`, `MovieGenre:Action`) onto the
+/// home page. The card copy alone communicates the failure.
 export class RailErrorBoundary extends Component<Props, State> {
   state: State = { failed: false };
 
@@ -42,9 +48,6 @@ export class RailErrorBoundary extends Component<Props, State> {
     if (this.state.failed) {
       return (
         <section className="px-4 sm:px-8 md:px-12 pb-1 pt-1">
-          <h2 className="mb-3 text-[1.4rem] font-semibold tracking-tight text-white/55">
-            {this.props.label}
-          </h2>
           <div className="-mx-1 flex items-center gap-2 rounded-md border border-dashed border-white/15 bg-white/2 px-4 py-6 text-[12.5px] text-white/55">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
               <circle cx="12" cy="12" r="10" />

@@ -5,6 +5,7 @@ import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
 import { Rail } from "@/components/Rail";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
+import { Top10Rail } from "@/components/Top10Rail";
 import { pickHeroIndex } from "@/lib/hero";
 import {
   items as itemsApi,
@@ -71,6 +72,9 @@ export default async function LibraryPage({
         <LibraryHero lib={lib} kind={kind} />
       </Suspense>
       <div className="relative z-20 space-y-1 pb-24 pt-4">
+        <Suspense fallback={null}>
+          <LibraryTop10Rail lib={lib} />
+        </Suspense>
         <Suspense fallback={<RailSkeleton title="Recently Added" />}>
           <RecentlyAddedRail lib={lib} kind={kind} />
         </Suspense>
@@ -135,6 +139,41 @@ async function LibraryHero({ lib, kind }: { lib: Library; kind: ItemKind }) {
     return <div className="h-20 md:h-24" aria-hidden />;
   }
   return <Hero item={pool[pickHeroIndex(pool, `library-${lib.id}`)]} />;
+}
+
+/// Per-library, type-aware Top 10. The source is decided server-side
+/// from the library's kind (Movies/Shows → TMDB top-rated, Anime →
+/// MyAnimeList ranking), blended with the library's local top-watched.
+/// Renders nothing when the source hasn't been refreshed / configured
+/// (the endpoint returns an empty list, not an error), so a fresh
+/// install or a key-less MAL setup just shows no rail.
+async function LibraryTop10Rail({ lib }: { lib: Library }) {
+  let entries: Array<{ rank: number; item: ReturnType<typeof adaptItem> }>;
+  try {
+    const res = await itemsApi.libraryTop(lib.id, 10);
+    // Dedupe by local item id (always present; tmdb_id may be null for
+    // anime) and re-rank to a clean 1..N for the Netflix-style numerals.
+    const seen = new Set<number>();
+    const unique = res.items.filter((it) => {
+      if (seen.has(it.id)) return false;
+      seen.add(it.id);
+      return true;
+    });
+    entries = unique.map(({ rank: _rank, ...item }, idx) => ({
+      rank: idx + 1,
+      item: adaptItem(item),
+    }));
+  } catch {
+    return null;
+  }
+  if (entries.length === 0) return null;
+  return (
+    <Top10Rail
+      title="Top 10"
+      items={entries}
+      href={`/library/${lib.id}/browse?sort=rating_desc`}
+    />
+  );
 }
 
 async function RecentlyAddedRail({

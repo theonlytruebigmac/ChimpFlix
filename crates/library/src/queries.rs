@@ -1760,6 +1760,236 @@ pub async fn list_trending_in_library(
         .collect()
 }
 
+/// Overwrite a per-library Top-10 source slice (e.g. source
+/// `tmdb_top_rated` / `mal_ranking`) in `trending_cache`. Unlike
+/// `replace_trending` this writes the full cross-id set so non-TMDB
+/// sources can be matched to local items by tvdb/anilist id. The list is
+/// GLOBAL per (source, media_kind) — the per-library intersection happens
+/// at read time in `list_library_top`.
+pub async fn replace_ranked_cache(
+    pool: &SqlitePool,
+    source: &str,
+    media_kind: &str,
+    entries: &[crate::TopRankedEntry],
+) -> Result<usize> {
+    let now = chimpflix_common::now_ms();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM trending_cache WHERE source = ? AND media_kind = ?")
+        .bind(source)
+        .bind(media_kind)
+        .execute(&mut *tx)
+        .await?;
+    for e in entries {
+        sqlx::query(
+            "INSERT INTO trending_cache \
+             (source, media_kind, rank, tmdb_id, tvdb_id, anilist_id, mal_id, title, poster_path, fetched_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(source)
+        .bind(media_kind)
+        .bind(e.rank)
+        .bind(e.tmdb_id.unwrap_or(0)) // 0 sentinel: "no tmdb id" (column is NOT NULL)
+        .bind(e.tvdb_id)
+        .bind(e.anilist_id)
+        .bind(e.mal_id)
+        .bind(&e.title)
+        .bind(&e.poster_path)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(entries.len())
+}
+
+/// One anime-id mapping row: `(mal_id, anilist_id, tvdb_id, tmdb_id)`.
+pub type AnimeIdMapRow = (i64, Option<i64>, Option<i64>, Option<i64>);
+/// Resolved cross-ids for a mal_id: `(anilist_id, tvdb_id, tmdb_id)`.
+pub type AnimeCrossIds = (Option<i64>, Option<i64>, Option<i64>);
+
+/// Upsert anime-id mappings (mal_id → anilist/tvdb/tmdb) from the
+/// community mapping file. One transaction; existing rows for a mal_id
+/// are overwritten with the latest cross-ids.
+pub async fn upsert_anime_id_map(pool: &SqlitePool, rows: &[AnimeIdMapRow]) -> Result<u64> {
+    let now = now_ms();
+    let mut tx = pool.begin().await?;
+    let mut n = 0u64;
+    for (mal_id, anilist_id, tvdb_id, tmdb_id) in rows {
+        sqlx::query(
+            "INSERT INTO anime_id_map (mal_id, anilist_id, tvdb_id, tmdb_id, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(mal_id) DO UPDATE SET \
+                anilist_id = excluded.anilist_id, \
+                tvdb_id = excluded.tvdb_id, \
+                tmdb_id = excluded.tmdb_id, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(mal_id)
+        .bind(anilist_id)
+        .bind(tvdb_id)
+        .bind(tmdb_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        n += 1;
+    }
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Resolve a batch of `mal_id`s to their `(anilist_id, tvdb_id, tmdb_id)`
+/// cross-ids via the local mapping mirror. Used by the MAL-ranking
+/// refresh to turn MAL's ids into something local anime items match on.
+/// Missing mal_ids are simply absent from the map.
+pub async fn anime_id_map_lookup(
+    pool: &SqlitePool,
+    mal_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, AnimeCrossIds>> {
+    let mut out = std::collections::HashMap::new();
+    if mal_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = std::iter::repeat_n("?", mal_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT mal_id, anilist_id, tvdb_id, tmdb_id FROM anime_id_map WHERE mal_id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&sql);
+    for id in mal_ids {
+        q = q.bind(id);
+    }
+    for r in q.fetch_all(pool).await? {
+        let mal_id: i64 = r.try_get("mal_id")?;
+        out.insert(
+            mal_id,
+            (
+                r.try_get("anilist_id")?,
+                r.try_get("tvdb_id")?,
+                r.try_get("tmdb_id")?,
+            ),
+        );
+    }
+    Ok(out)
+}
+
+/// Per-library "Top 10": the external top-rated/ranked list for `source`
+/// intersected with ONE library's items, blended with that library's
+/// local top-watched + highest-rated so it always fills `limit` slots.
+///
+/// `media_kind` is the item kind to match ("movie"/"show" — anime items
+/// are stored as "show"); `source` is chosen by the caller from the
+/// library's KIND (Movies/Shows → 'tmdb_top_rated', Anime → 'mal_ranking').
+/// Multi-id match (tmdb OR tvdb OR anilist) so MAL entries resolved only
+/// to a tvdb/anilist id still land. Tie-breakers: external rank, then
+/// local play_count, audience rating, recency.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_library_top(
+    pool: &SqlitePool,
+    library_id: i64,
+    media_kind: &str,
+    source: &str,
+    user_id: i64,
+    limit: i64,
+    accessible: Option<&[i64]>,
+) -> Result<Vec<(i64, ListedItem)>> {
+    let lib_filter = library_filter_sql("i.library_id", accessible);
+    let sql = format!(
+        "SELECT i.*, \
+            (SELECT source_url FROM images \
+                WHERE item_id = i.id AND kind = 'poster' \
+                ORDER BY is_primary DESC, id ASC LIMIT 1) AS poster_path, \
+            (SELECT source_url FROM images \
+                WHERE item_id = i.id AND kind = 'backdrop' \
+                ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path, \
+            ps.position_ms     AS ps_position_ms, \
+            ps.max_position_ms AS ps_max_position_ms, \
+            ps.duration_ms     AS ps_duration_ms, \
+            ps.watched         AS ps_watched, \
+            ps.view_count      AS ps_view_count, \
+            ps.last_played_at  AS ps_last_played_at, \
+            (CASE i.kind \
+                WHEN 'movie' THEN (SELECT MAX(height) FROM media_files \
+                    WHERE item_id = i.id AND removed_at IS NULL AND height IS NOT NULL) \
+                WHEN 'show' THEN (SELECT MAX(mf.height) FROM media_files mf \
+                    JOIN episodes e ON e.id = mf.episode_id \
+                    JOIN seasons s  ON s.id = e.season_id \
+                    WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.height IS NOT NULL) \
+             END) AS best_height, \
+            (CASE i.kind \
+                WHEN 'movie' THEN (SELECT mf.hdr_format FROM media_files mf \
+                    WHERE mf.item_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL \
+                    ORDER BY (mf.hdr_format = 'dolby_vision') DESC, \
+                             (mf.hdr_format LIKE 'hdr10_plus%') DESC, \
+                             (mf.hdr_format LIKE 'hdr10%') DESC, \
+                             (mf.hdr_format = 'hlg') DESC LIMIT 1) \
+                WHEN 'show' THEN (SELECT mf.hdr_format FROM media_files mf \
+                    JOIN episodes e ON e.id = mf.episode_id \
+                    JOIN seasons s  ON s.id = e.season_id \
+                    WHERE s.show_id = i.id AND mf.removed_at IS NULL AND mf.hdr_format IS NOT NULL \
+                    ORDER BY (mf.hdr_format = 'dolby_vision') DESC, \
+                             (mf.hdr_format LIKE 'hdr10_plus%') DESC, \
+                             (mf.hdr_format LIKE 'hdr10%') DESC, \
+                             (mf.hdr_format = 'hlg') DESC LIMIT 1) \
+             END) AS best_hdr_format, \
+            ( SELECT MIN(tc.rank) FROM trending_cache tc \
+               WHERE tc.source = ? \
+                 AND tc.media_kind = ? \
+                 AND ( (tc.tmdb_id > 0 AND tc.tmdb_id = i.tmdb_id) \
+                    OR (tc.tvdb_id IS NOT NULL AND tc.tvdb_id = i.tvdb_id) \
+                    OR (tc.anilist_id IS NOT NULL AND tc.anilist_id = i.anilist_id) ) \
+            ) AS top_rank \
+         FROM items i \
+         LEFT JOIN play_state ps \
+           ON ps.item_id = i.id AND ps.user_id = ? \
+         LEFT JOIN ( \
+            SELECT i2.id AS item_id, COUNT(*) AS play_count FROM ( \
+                SELECT pe.item_id AS rolled_id \
+                FROM playback_events pe \
+                WHERE pe.event_type = 'start' AND pe.item_id IS NOT NULL \
+                UNION ALL \
+                SELECT s.show_id AS rolled_id \
+                FROM playback_events pe \
+                JOIN episodes ep ON ep.id = pe.episode_id \
+                JOIN seasons s ON s.id = ep.season_id \
+                WHERE pe.event_type = 'start' AND pe.episode_id IS NOT NULL \
+            ) ev JOIN items i2 ON i2.id = ev.rolled_id \
+            GROUP BY i2.id \
+         ) pop ON pop.item_id = i.id \
+         WHERE i.kind = ? AND i.library_id = ? AND {lib_filter} \
+         ORDER BY (top_rank IS NULL), top_rank ASC, \
+                  COALESCE(pop.play_count, 0) DESC, \
+                  COALESCE(i.rating_audience, 0) DESC, \
+                  COALESCE(ps.last_played_at, 0) DESC, \
+                  i.added_at DESC \
+         LIMIT ?"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(source) // tc.source
+        .bind(media_kind) // tc.media_kind
+        .bind(user_id) // ps.user_id
+        .bind(media_kind) // i.kind
+        .bind(library_id) // i.library_id
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| -> Result<(i64, ListedItem)> {
+            let (best_quality_height, best_hdr_format) = ListedItem::quality_from_columns(row);
+            Ok((
+                (idx as i64) + 1,
+                ListedItem {
+                    item: Item::from_row(row)?,
+                    play_state: PlayStateForItem::from_columns(row)?,
+                    best_quality_height,
+                    best_hdr_format,
+                },
+            ))
+        })
+        .collect()
+}
+
 pub async fn get_item(
     pool: &SqlitePool,
     id: i64,

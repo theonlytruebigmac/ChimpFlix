@@ -2697,6 +2697,24 @@ pub struct TrendingEntry {
     pub poster_path: Option<String>,
 }
 
+/// Entry for a per-library "Top 10" source (TMDB top-rated, MAL ranking)
+/// written into `trending_cache` under a non-`tmdb` source. Unlike
+/// `TrendingEntry` it carries the full set of cross-ids so non-TMDB
+/// sources (MAL, resolved via the anime-id map) can be matched to local
+/// items by tvdb_id / anilist_id when no tmdb_id is known. `tmdb_id`
+/// falls back to the `0` sentinel ("no tmdb id") since the column is
+/// NOT NULL; the read query guards with `tmdb_id > 0`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TopRankedEntry {
+    pub rank: i64,
+    pub tmdb_id: Option<i64>,
+    pub tvdb_id: Option<i64>,
+    pub anilist_id: Option<i64>,
+    pub mal_id: Option<i64>,
+    pub title: Option<String>,
+    pub poster_path: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Credential vault metadata
 // ---------------------------------------------------------------------------

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use chimpflix_common::Vault;
 use chimpflix_library::ServerSettings;
 use chimpflix_metadata::{
-    AniListClient, OmdbClient, OpenSubtitlesClient, PlexOAuthClient, TmdbClient, TraktClient,
-    TvMazeClient, TvdbClient,
+    AniListClient, MalClient, OmdbClient, OpenSubtitlesClient, PlexOAuthClient, TmdbClient,
+    TraktClient, TvMazeClient, TvdbClient,
 };
 use chimpflix_transcoder::{FfmpegConfig, TranscodeManager, TranscoderCapabilities};
 use ipnet::IpNet;
@@ -52,6 +52,10 @@ pub type TraktHandle = Arc<RwLock<Option<TraktClient>>>;
 /// OMDb API key in the vault (`omdb` slot). Consumed by the
 /// `fetch_external_ratings` per-item handler.
 pub type OmdbHandle = Arc<RwLock<Option<OmdbClient>>>;
+
+/// Hot-swappable MyAnimeList client (anime ranking, X-MAL-CLIENT-ID).
+/// `None` until the operator stores a `mal` client id in the vault.
+pub type MalHandle = Arc<RwLock<Option<MalClient>>>;
 
 /// Hot-swappable Plex OAuth client. Built lazily from the per-install
 /// client identifier stored on `server_settings`; the `/auth/plex/start`
@@ -121,6 +125,10 @@ pub struct AppState {
     /// OMDb client for the `fetch_external_ratings` per-item handler.
     /// `None` until an OMDb API key is stored in the credential vault.
     pub omdb: OmdbHandle,
+    /// MyAnimeList client for the anime "Top 10" ranking. `None` until a
+    /// `mal` client id is stored in the credential vault — anime libraries
+    /// fall back to local top-watched while unset.
+    pub mal: MalHandle,
     /// Plex OAuth client. Lazily constructed from
     /// `server_settings.plex_client_identifier` on the first
     /// `/auth/plex/start` call.
@@ -133,6 +141,12 @@ pub struct AppState {
     /// required); `None` only if HTTP client init fails.
     pub tvmaze: Option<TvMazeClient>,
     pub hub: Hub,
+    /// Per-provider circuit breakers for external metadata APIs. Job
+    /// handlers wrap their TMDB/OMDb/Trakt/… calls in
+    /// `circuit_breakers.<provider>.run(...)` so a rate-limited provider
+    /// fails fast for all in-flight jobs instead of each burning a worker
+    /// slot rediscovering the outage. Read-only from handlers.
+    pub circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakers>,
     pub auth: AuthConfig,
     pub transcoder: TranscodeManager,
     /// On-disk path of the DATA_DIR. Used by the admin backup endpoint to
@@ -307,6 +321,14 @@ impl AppState {
 
     pub async fn set_omdb(&self, client: Option<OmdbClient>) {
         *self.omdb.write().await = client;
+    }
+
+    pub async fn mal_snapshot(&self) -> Option<MalClient> {
+        self.mal.read().await.clone()
+    }
+
+    pub async fn set_mal(&self, client: Option<MalClient>) {
+        *self.mal.write().await = client;
     }
 
     /// Return the live `PlexOAuthClient`, building it from the

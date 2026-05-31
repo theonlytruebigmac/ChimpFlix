@@ -472,3 +472,82 @@ async fn status_filters_aggregate_show_state_from_episodes() {
     let all = run_filter(&pool, ItemKind::Show, false, false, false).await;
     assert_eq!(all, vec![101, 102, 103, 104], "no-filter baseline");
 }
+
+/// Regression: the per-library Top 10 (`list_library_top`) must surface
+/// each library item AT MOST ONCE, even when several `trending_cache`
+/// rows of the same source resolve to the same item. This is the real
+/// anime/MAL case: MAL ranks each cour as a separate `mal_id`, the id map
+/// collapses them onto ONE `tvdb_id`, and the local series carries that
+/// single `tvdb_id` — so a naive `OR`-JOIN would emit the show once per
+/// cour. The fix uses a `MIN(rank)` scalar subquery (best cour wins).
+#[tokio::test]
+async fn library_top_dedupes_one_item_matching_multiple_ranked_rows() {
+    use chimpflix_library::{db, queries};
+
+    let data_dir = fresh_data_dir();
+    let _cleanup = Cleanup(data_dir.clone());
+    let pool = db::open(&data_dir).await.expect("db::open succeeds");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) \
+         VALUES (1, 'tester', '', 'owner', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind, created_at, updated_at) \
+         VALUES (7, 'Anime', 'anime', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert anime library");
+
+    // One local anime series, matched via tvdb_id (the anime default).
+    sqlx::query(
+        "INSERT INTO items (id, library_id, kind, title, sort_title, tvdb_id, added_at, updated_at) \
+         VALUES (900, 7, 'show', 'My Anime', 'my anime', 555, ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert anime show");
+
+    // Two MAL-ranking cache rows (different ranks, distinct mal_ids) that
+    // BOTH resolve to the same tvdb_id 555 — exactly the per-cour collision.
+    for (rank, mal_id) in [(3_i64, 1001_i64), (7, 1002)] {
+        sqlx::query(
+            "INSERT INTO trending_cache \
+                (source, media_kind, rank, tmdb_id, tvdb_id, mal_id, title, fetched_at) \
+             VALUES ('mal_ranking', 'show', ?, 0, 555, ?, 'My Anime', ?)",
+        )
+        .bind(rank)
+        .bind(mal_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert mal_ranking cache row");
+    }
+
+    let rows = queries::list_library_top(&pool, 7, "show", "mal_ranking", 1, 10, None)
+        .await
+        .expect("list_library_top");
+
+    // The show must appear exactly once (best rank wins), not twice.
+    let ids: Vec<i64> = rows.iter().map(|(_, li)| li.item.id).collect();
+    assert_eq!(
+        ids,
+        vec![900],
+        "anime show matching two MAL cours must appear exactly once"
+    );
+    assert_eq!(rows[0].0, 1, "displayed rank is the row position (1-based)");
+}

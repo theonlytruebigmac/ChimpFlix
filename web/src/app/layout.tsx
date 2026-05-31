@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
+import { LiveRefresh } from "@/components/LiveRefresh";
 import { NavPrefetch } from "@/components/NavPrefetch";
 import { RouteFocusReset } from "@/components/RouteFocusReset";
 import { ServiceWorker } from "@/components/ServiceWorker";
@@ -70,6 +71,10 @@ export default async function RootLayout({
         <NavPrefetch />
         <RouteFocusReset />
         <TopNavGate />
+        {/* Push-based freshness: re-renders Server Components on WS
+            "refresh" events (scan complete / own play-state change)
+            instead of polling. No-ops gracefully when unauthenticated. */}
+        <LiveRefresh />
         {children}
       </body>
     </html>

@@ -73,7 +73,18 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         return Ok(());
     };
 
-    match client.fetch_ratings(&imdb_id).await {
+    // Through the OMDb circuit breaker: once OMDb starts rate-limiting,
+    // every other in-flight ratings job fails fast instead of each
+    // burning a worker slot rediscovering the 429. Benign misses (no
+    // row, parse) don't trip it — only rate-limit-class errors do.
+    match state
+        .circuit_breakers
+        .omdb
+        .run(crate::circuit_breaker::trips_on_rate_limit, || {
+            client.fetch_ratings(&imdb_id)
+        })
+        .await
+    {
         Ok(Some(ratings)) => {
             let json = serde_json::to_string(&ratings).context("serialize OmdbRatings")?;
             sqlx::query(

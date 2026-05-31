@@ -197,6 +197,33 @@ impl TmdbClient {
             .collect())
     }
 
+    /// All-time top-rated movies, ranked. Drives the per-library "Top 10"
+    /// rail (distinct from the home page's *trending* rail). `/movie/top_rated`
+    /// returns the same entry shape as trending; first page (20) is plenty
+    /// to overlap a Top 10 after the per-library intersection.
+    pub async fn top_rated_movies(&self) -> Result<Vec<TmdbTrendingEntry>> {
+        let raw: SearchPage<RawTrendingEntry> = self
+            .get("/movie/top_rated", &[("language", self.language.clone())])
+            .await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .map(TmdbTrendingEntry::from_raw)
+            .collect())
+    }
+
+    /// All-time top-rated TV shows. Mirror of `top_rated_movies`.
+    pub async fn top_rated_shows(&self) -> Result<Vec<TmdbTrendingEntry>> {
+        let raw: SearchPage<RawTrendingEntry> = self
+            .get("/tv/top_rated", &[("language", self.language.clone())])
+            .await?;
+        Ok(raw
+            .results
+            .into_iter()
+            .map(TmdbTrendingEntry::from_raw)
+            .collect())
+    }
+
     pub async fn lookup_show(&self, query: &str, year: Option<i32>) -> Result<Option<TmdbShow>> {
         let mut params: Vec<(&str, String)> = vec![
             ("query", query.to_string()),

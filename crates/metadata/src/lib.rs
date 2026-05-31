@@ -15,6 +15,7 @@ pub mod agents;
 pub mod anilist;
 pub mod anilist_cache;
 pub mod http;
+pub mod mal;
 pub mod omdb;
 pub mod opensubtitles;
 pub mod plex_oauth;
@@ -35,6 +36,7 @@ pub use anilist_cache::{
 };
 
 pub use anilist::{AniListClient, AniListEpisode, AniListShow};
+pub use mal::{MalClient, MalRankingEntry};
 pub use omdb::{OmdbClient, OmdbRatings, OmdbTitle};
 pub use opensubtitles::{OpenSubtitlesClient, OpenSubtitlesCreds, SearchParams, SubtitleHit};
 pub use plex_oauth::{PinPollResult, PlexOAuthClient, PlexPin, PlexUser};

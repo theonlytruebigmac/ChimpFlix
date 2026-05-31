@@ -92,6 +92,17 @@ const KNOWN_SLOTS: &[SlotSpec] = &[
         managed: false,
     },
     SlotSpec {
+        name: "mal",
+        display_name: "MyAnimeList",
+        description: "MyAnimeList API Client ID — powers the anime Top 10 \
+                      rail (the public /v2/anime/ranking endpoint, no user \
+                      login needed). Create an app at \
+                      myanimelist.net/apiconfig and paste the Client ID \
+                      here. Leave blank and anime libraries fall back to \
+                      local top-watched.",
+        managed: false,
+    },
+    SlotSpec {
         name: "session_hmac",
         display_name: "Session HMAC",
         description: "Signs your session cookies. System-managed — \
@@ -405,6 +416,22 @@ pub async fn test(
                 })),
             }
         }
+        "mal" => match chimpflix_metadata::MalClient::new(&value) {
+            Ok(client) => match client.validate().await {
+                Ok(()) => Ok(Json(TestResponse {
+                    ok: true,
+                    detail: "MyAnimeList accepted the Client ID".into(),
+                })),
+                Err(e) => Ok(Json(TestResponse {
+                    ok: false,
+                    detail: format!("MyAnimeList rejected the Client ID: {e:#}"),
+                })),
+            },
+            Err(e) => Ok(Json(TestResponse {
+                ok: false,
+                detail: format!("MyAnimeList Client ID not usable: {e:#}"),
+            })),
+        },
         "session_hmac" => Ok(Json(TestResponse {
             ok: true,
             detail: "session HMAC is internal; no external test applies".into(),
@@ -482,6 +509,16 @@ async fn refresh_runtime_client(
                 None => None,
             };
             state.set_omdb(client).await;
+            Ok(())
+        }
+        "mal" => {
+            let client = match new_value {
+                Some(v) => {
+                    Some(chimpflix_metadata::MalClient::new(v).map_err(ApiError::Internal)?)
+                }
+                None => None,
+            };
+            state.set_mal(client).await;
             Ok(())
         }
         // session_hmac is rejected upstream so we never get here for it.

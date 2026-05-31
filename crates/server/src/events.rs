@@ -20,6 +20,46 @@ pub enum Event {
     /// Emitted whenever the membership of the set changes (start / end /
     /// reap). Subscribers should treat this as the authoritative state.
     Sessions(SessionsEvent),
+    /// "Content the client is showing may be stale — re-fetch" nudge.
+    /// Pushed to WS clients so the home/library rails refresh without
+    /// polling (the perf north-star: push, not poll). Carries no data;
+    /// the client re-requests through the normal access-filtered paths.
+    Refresh(RefreshEvent),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshEvent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// `"library_changed"` (broadcast to all) or `"playstate_changed"`
+    /// (scoped to `user_id`).
+    pub topic: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_id: Option<i64>,
+}
+
+impl RefreshEvent {
+    /// A library's content changed (scan completed). Broadcast to every
+    /// connected user; their re-fetch is access-filtered server-side.
+    pub fn library_changed(library_id: i64) -> Self {
+        Self {
+            kind: "refresh",
+            topic: "library_changed",
+            user_id: None,
+            library_id: Some(library_id),
+        }
+    }
+    /// This user's watch progress changed; only their own sockets act.
+    pub fn playstate_changed(user_id: i64) -> Self {
+        Self {
+            kind: "refresh",
+            topic: "playstate_changed",
+            user_id: Some(user_id),
+            library_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

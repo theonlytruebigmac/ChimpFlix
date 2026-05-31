@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::client_ip::EffectiveClientIp;
+use crate::events::{Event, RefreshEvent};
 use crate::state::AppState;
 use crate::trakt_sync;
 
@@ -97,6 +98,11 @@ pub async fn set_watched(
                 push_unwatched_to_trakt(state.clone(), user.id, None, Some(ep_id));
             }
         }
+        // Nudge this user's other tabs/devices to re-fetch (Continue
+        // Watching membership just changed for a whole show).
+        state
+            .hub
+            .publish(Event::Refresh(RefreshEvent::playstate_changed(user.id)));
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -118,6 +124,10 @@ pub async fn set_watched(
     } else {
         push_unwatched_to_trakt(state.clone(), user.id, req.item_id, req.episode_id);
     }
+    // Nudge this user's other tabs/devices to re-fetch their rails.
+    state
+        .hub
+        .publish(Event::Refresh(RefreshEvent::playstate_changed(user.id)));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -142,6 +152,14 @@ pub async fn scrobble(
     // Same fire-and-forget Trakt push as set_watched — scrobble is
     // the threshold-crossing event the player emits at 90% playback.
     push_watched_to_trakt(state.clone(), user.id, req.item_id, req.episode_id);
+    // Watched state just flipped → nudge this user's other tabs/devices
+    // (their Continue Watching rail changes). Note: we deliberately do
+    // NOT publish on the periodic position `update` tick — that fires
+    // every ~10s during playback and a refresh-storm would fight the
+    // perf north-star (push, not poll-equivalent churn).
+    state
+        .hub
+        .publish(Event::Refresh(RefreshEvent::playstate_changed(user.id)));
     // Record a `complete` event for the admin Stats page. Paired with
     // the `start` event from POST /stream/sessions, this gives the
     // dashboard a started-vs-completed ratio per user / item without

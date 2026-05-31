@@ -65,9 +65,13 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         return Ok(());
     };
 
+    // Through the TMDB circuit breaker so a rate-limit storm fast-fails
+    // the rest of the logo sweep instead of each job hitting the 429.
+    let cb = &state.circuit_breakers.tmdb;
+    let trip = crate::circuit_breaker::trips_on_rate_limit;
     let result = match kind.as_str() {
-        "movie" => tmdb.fetch_movie_logo(tmdb_id).await,
-        "show" => tmdb.fetch_show_logo(tmdb_id).await,
+        "movie" => cb.run(trip, || tmdb.fetch_movie_logo(tmdb_id)).await,
+        "show" => cb.run(trip, || tmdb.fetch_show_logo(tmdb_id)).await,
         other => {
             // Unknown kinds (extras, special items) don't have a
             // TMDB logo endpoint — succeed quietly so the job
