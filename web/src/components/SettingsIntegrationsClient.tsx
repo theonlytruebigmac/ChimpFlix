@@ -267,18 +267,10 @@ export function SettingsIntegrationsClient() {
               </button>
             </div>
             {lastSync && (
-              <div className="space-y-0.5 text-xs text-emerald-300">
-                <div>
-                  Pushed {lastSync.movies_pushed} movies,{" "}
-                  {lastSync.episodes_pushed} episodes to Trakt.
-                </div>
-                <div>
-                  Pulled {lastSync.movies_marked} movies,{" "}
-                  {lastSync.episodes_marked} episodes,{" "}
-                  {lastSync.playback_applied} resume points,{" "}
-                  +{lastSync.watchlist_added}/-{lastSync.watchlist_removed}{" "}
-                  watchlist items.
-                </div>
+              <div className="text-xs text-emerald-300">
+                {lastSync.queued
+                  ? "Sync started — running in the background. Watched status and watchlist update as it completes."
+                  : "A sync is already running in the background. Watched status and watchlist update as it completes."}
               </div>
             )}
             {stats && (

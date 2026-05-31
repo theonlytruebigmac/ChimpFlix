@@ -7988,6 +7988,126 @@ pub async fn set_watched(
 }
 
 // ---------------------------------------------------------------------------
+// Trakt watch-history mirror
+// ---------------------------------------------------------------------------
+
+/// One Trakt history event normalized for the local mirror
+/// (`user_trakt_history`). For movies the ids are the movie's; for episodes
+/// they are the SHOW's ids plus the season/episode coordinates.
+#[derive(Debug, Clone)]
+pub struct TraktHistoryRow {
+    pub trakt_event_id: i64,
+    pub media_type: &'static str, // "movie" | "episode"
+    pub tmdb_id: Option<i64>,
+    pub tvdb_id: Option<i64>,
+    pub imdb_id: Option<String>,
+    pub season: Option<i32>,
+    pub episode: Option<i32>,
+    pub watched_at_ms: i64,
+}
+
+/// Upsert pulled Trakt history events into the local mirror. Keyed on
+/// Trakt's per-event id, so re-pulls and cursor overlap dedupe. Wrapped in
+/// one transaction — a first-sync full-history pull can be thousands of rows.
+pub async fn store_trakt_history(
+    pool: &SqlitePool,
+    user_id: i64,
+    rows: &[TraktHistoryRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await?;
+    for r in rows {
+        sqlx::query(
+            "INSERT INTO user_trakt_history
+                (user_id, trakt_event_id, media_type, tmdb_id, tvdb_id, imdb_id, season, episode, watched_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, trakt_event_id) DO UPDATE SET
+                watched_at = excluded.watched_at",
+        )
+        .bind(user_id)
+        .bind(r.trakt_event_id)
+        .bind(r.media_type)
+        .bind(r.tmdb_id)
+        .bind(r.tvdb_id)
+        .bind(r.imdb_id.as_deref())
+        .bind(r.season)
+        .bind(r.episode)
+        .bind(r.watched_at_ms)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.len())
+}
+
+/// Reconcile the local Trakt-history mirror against the current library:
+/// mark watched any movie/episode that has a stored history event and isn't
+/// already watched locally. Matching is multi-id (tmdb OR tvdb OR imdb), so
+/// anime matched only via TVDB is covered (the old matcher was tmdb-only).
+///
+/// Pure local SQL — NO Trakt API calls — so it's safe to run after every
+/// pull AND on scan completion, when newly-added items may now match history
+/// that was pulled before they existed. Only flips unwatched→watched (never
+/// clobbers an already-watched row's position). Returns (movies, episodes)
+/// rows touched.
+pub async fn reconcile_trakt_history(pool: &SqlitePool, user_id: i64) -> Result<(u64, u64)> {
+    let movies = sqlx::query(
+        "INSERT INTO play_state
+            (user_id, item_id, position_ms, duration_ms, watched, view_count, last_played_at)
+         SELECT h.user_id, i.id, COALESCE(i.duration_ms, 0), i.duration_ms, 1, 1, MAX(h.watched_at)
+         FROM items i
+         JOIN user_trakt_history h
+           ON h.user_id = ?
+          AND h.media_type = 'movie'
+          AND ( (h.tmdb_id IS NOT NULL AND i.tmdb_id = h.tmdb_id)
+             OR (h.tvdb_id IS NOT NULL AND i.tvdb_id = h.tvdb_id)
+             OR (h.imdb_id IS NOT NULL AND i.imdb_id = h.imdb_id) )
+         WHERE i.kind = 'movie'
+         GROUP BY i.id
+         ON CONFLICT(user_id, item_id) WHERE item_id IS NOT NULL DO UPDATE SET
+            watched = 1,
+            position_ms = COALESCE(play_state.duration_ms, excluded.position_ms),
+            last_played_at = MAX(COALESCE(play_state.last_played_at, 0), excluded.last_played_at)
+         WHERE play_state.watched = 0",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let episodes = sqlx::query(
+        "INSERT INTO play_state
+            (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
+         SELECT h.user_id, e.id, COALESCE(e.duration_ms, 0), e.duration_ms, 1, 1, MAX(h.watched_at)
+         FROM episodes e
+         JOIN seasons s ON s.id = e.season_id
+         JOIN items sh ON sh.id = s.show_id
+         JOIN user_trakt_history h
+           ON h.user_id = ?
+          AND h.media_type = 'episode'
+          AND s.season_number = h.season
+          AND e.episode_number = h.episode
+          AND ( (h.tmdb_id IS NOT NULL AND sh.tmdb_id = h.tmdb_id)
+             OR (h.tvdb_id IS NOT NULL AND sh.tvdb_id = h.tvdb_id)
+             OR (h.imdb_id IS NOT NULL AND sh.imdb_id = h.imdb_id) )
+         GROUP BY e.id
+         ON CONFLICT(user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
+            watched = 1,
+            position_ms = COALESCE(play_state.duration_ms, excluded.position_ms),
+            last_played_at = MAX(COALESCE(play_state.last_played_at, 0), excluded.last_played_at)
+         WHERE play_state.watched = 0",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok((movies, episodes))
+}
+
+// ---------------------------------------------------------------------------
 // Background job queue
 // ---------------------------------------------------------------------------
 
@@ -13833,6 +13953,126 @@ mod tests {
             "second subs enqueue for same item should dedup"
         );
         assert!(id_421 > 0);
+    }
+
+    /// Fully-migrated in-memory pool for tests that need the real schema
+    /// (items/seasons/episodes/play_state/user_trakt_history). FK
+    /// enforcement is disabled so a test can insert items/play_state without
+    /// seeding libraries/users parents — irrelevant to what's under test.
+    async fn migrated_pool() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn reconcile_trakt_history_marks_movies_and_episodes_watched() {
+        let pool = migrated_pool().await;
+        let now = 1_700_000_000_000i64;
+
+        // Movie matched by tmdb.
+        sqlx::query(
+            "INSERT INTO items (id, library_id, kind, title, sort_title, tmdb_id, duration_ms, added_at, updated_at)
+             VALUES (10, 1, 'movie', 'A Movie', 'a movie', 500, 7200000, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Show with ONLY a tvdb_id (no tmdb) + season 1 + episode 3 — exercises
+        // the multi-id match that the old tmdb-only matcher missed for anime.
+        sqlx::query(
+            "INSERT INTO items (id, library_id, kind, title, sort_title, tvdb_id, added_at, updated_at)
+             VALUES (20, 1, 'show', 'A Show', 'a show', 900, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let season_id: i64 = sqlx::query_scalar(
+            "INSERT INTO seasons (show_id, season_number) VALUES (20, 1) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let episode_id: i64 = sqlx::query_scalar(
+            "INSERT INTO episodes (season_id, episode_number, title, duration_ms, added_at, updated_at)
+             VALUES (?, 3, 'Ep 3', 1400000, ?, ?) RETURNING id",
+        )
+        .bind(season_id)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Mirror: movie keyed by tmdb, episode keyed by the SHOW's tvdb (tmdb null).
+        let rows = vec![
+            TraktHistoryRow {
+                trakt_event_id: 1,
+                media_type: "movie",
+                tmdb_id: Some(500),
+                tvdb_id: None,
+                imdb_id: None,
+                season: None,
+                episode: None,
+                watched_at_ms: now,
+            },
+            TraktHistoryRow {
+                trakt_event_id: 2,
+                media_type: "episode",
+                tmdb_id: None,
+                tvdb_id: Some(900),
+                imdb_id: None,
+                season: Some(1),
+                episode: Some(3),
+                watched_at_ms: now,
+            },
+        ];
+        assert_eq!(store_trakt_history(&pool, 1, &rows).await.unwrap(), 2);
+
+        let (movies, episodes) = reconcile_trakt_history(&pool, 1).await.unwrap();
+        assert_eq!(movies, 1, "movie marked watched via tmdb");
+        assert_eq!(
+            episodes, 1,
+            "episode marked watched via show tvdb_id (no tmdb) — the anime gap"
+        );
+
+        let movie_watched: i64 =
+            sqlx::query_scalar("SELECT watched FROM play_state WHERE user_id = 1 AND item_id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(movie_watched, 1);
+        let ep_watched: i64 = sqlx::query_scalar(
+            "SELECT watched FROM play_state WHERE user_id = 1 AND episode_id = ?",
+        )
+        .bind(episode_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ep_watched, 1);
+
+        // Re-reconcile is safe and leaves watched set (idempotent).
+        reconcile_trakt_history(&pool, 1).await.unwrap();
+        let still_watched: i64 =
+            sqlx::query_scalar("SELECT watched FROM play_state WHERE user_id = 1 AND item_id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_watched, 1);
     }
 
     async fn test_pool() -> SqlitePool {

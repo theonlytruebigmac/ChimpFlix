@@ -826,70 +826,105 @@ pub async fn bulk_push_user_history(
 /// Pull Trakt history since the last successful sync and mark matching
 /// items watched locally. Returns (movies_marked, episodes_marked).
 pub async fn pull_user_history(state: &AppState, user_id: i64) -> Result<(usize, usize)> {
-    let Some((mut movie_count, mut episode_count)) =
-        with_user_client(state, user_id, |client, token| {
-            let pool = state.pool.clone();
-            let vault = state.vault.clone();
-            async move {
-                let tokens = queries::get_trakt_tokens(&pool, &vault, user_id).await?;
-                let since_iso = tokens
-                    .as_ref()
-                    .and_then(|t| t.last_synced_at)
-                    .map(epoch_ms_to_iso);
-                let entries = client.pull_history(&token, since_iso.as_deref()).await?;
-                let mut movies = 0usize;
-                let mut episodes = 0usize;
-                for entry in entries {
-                    match entry.kind.as_str() {
-                        "movie" => {
-                            let Some(m) = entry.movie else { continue };
-                            let Some(tmdb_id) = m.ids.tmdb else { continue };
-                            if let Some(item_id) =
-                                find_local_item_by_tmdb(&pool, tmdb_id, "movie").await
-                            {
-                                let _ =
-                                    queries::set_watched(&pool, user_id, Some(item_id), None, true)
-                                        .await;
-                                movies += 1;
-                            }
-                        }
-                        "episode" => {
-                            let Some(show) = entry.show else { continue };
-                            let Some(ep) = entry.episode else { continue };
-                            let Some(show_tmdb) = show.ids.tmdb else {
-                                continue;
-                            };
-                            if let Some(episode_id) =
-                                find_local_episode(&pool, show_tmdb, ep.season, ep.number).await
-                            {
-                                let _ = queries::set_watched(
-                                    &pool,
-                                    user_id,
-                                    None,
-                                    Some(episode_id),
-                                    true,
-                                )
-                                .await;
-                                episodes += 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok::<_, anyhow::Error>((movies, episodes))
-            }
-        })
-        .await?
+    let Some((movies, episodes)) = with_user_client(state, user_id, |client, token| {
+        let pool = state.pool.clone();
+        let vault = state.vault.clone();
+        async move {
+            let tokens = queries::get_trakt_tokens(&pool, &vault, user_id).await?;
+            let since_iso = tokens
+                .as_ref()
+                .and_then(|t| t.last_synced_at)
+                .map(epoch_ms_to_iso);
+            // Pull the delta since our cursor (or the full, paginated history
+            // on first sync). Mirror EVERY entry locally — matched or not —
+            // keyed on Trakt's per-event id so re-pulls dedupe and a library
+            // added later reconciles against it WITHOUT re-pulling. Then
+            // reconcile the mirror against the current library to mark
+            // watched (multi-id match → also covers anime that has no tmdb).
+            let entries = client.pull_history(&token, since_iso.as_deref()).await?;
+            let rows: Vec<queries::TraktHistoryRow> =
+                entries.iter().filter_map(history_entry_to_row).collect();
+            queries::store_trakt_history(&pool, user_id, &rows).await?;
+            let (m, e) = queries::reconcile_trakt_history(&pool, user_id).await?;
+            Ok::<_, anyhow::Error>((m as usize, e as usize))
+        }
+    })
+    .await?
     else {
         return Ok((0, 0));
     };
     queries::update_trakt_last_synced(&state.pool, user_id, now_ms()).await?;
-    if movie_count == 0 && episode_count == 0 {
-        // No-op call still ran; nothing else to report.
-        movie_count = 0;
-        episode_count = 0;
+    Ok((movies, episodes))
+}
+
+/// Normalize a Trakt `/sync/history` entry into a mirror row. Movies carry
+/// the movie's ids; episodes carry the SHOW's ids + season/episode. Returns
+/// `None` for entries missing their movie/show/episode payload.
+fn history_entry_to_row(
+    entry: &chimpflix_metadata::HistoryEntry,
+) -> Option<queries::TraktHistoryRow> {
+    let watched_at_ms = iso_to_epoch_ms(&entry.watched_at).unwrap_or_else(now_ms);
+    match entry.kind.as_str() {
+        "movie" => {
+            let m = entry.movie.as_ref()?;
+            Some(queries::TraktHistoryRow {
+                trakt_event_id: entry.id,
+                media_type: "movie",
+                tmdb_id: m.ids.tmdb,
+                tvdb_id: m.ids.tvdb,
+                imdb_id: m.ids.imdb.clone(),
+                season: None,
+                episode: None,
+                watched_at_ms,
+            })
+        }
+        "episode" => {
+            let show = entry.show.as_ref()?;
+            let ep = entry.episode.as_ref()?;
+            Some(queries::TraktHistoryRow {
+                trakt_event_id: entry.id,
+                media_type: "episode",
+                tmdb_id: show.ids.tmdb,
+                tvdb_id: show.ids.tvdb,
+                imdb_id: show.ids.imdb.clone(),
+                season: Some(ep.season),
+                episode: Some(ep.number),
+                watched_at_ms,
+            })
+        }
+        _ => None,
     }
-    Ok((movie_count, episode_count))
+}
+
+/// Parse a Trakt RFC3339 `watched_at` timestamp to epoch ms.
+fn iso_to_epoch_ms(iso: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// Reconcile the local Trakt-history mirror against the library for EVERY
+/// linked user. Called on scan completion so newly-added items pick up their
+/// watched status from already-pulled history — no Trakt API calls.
+pub async fn reconcile_all_linked_users(state: &AppState) {
+    let user_ids = match queries::list_trakt_linked_user_ids(&state.pool).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "trakt reconcile: list linked users failed");
+            return;
+        }
+    };
+    for uid in user_ids {
+        match queries::reconcile_trakt_history(&state.pool, uid).await {
+            Ok((m, e)) if m + e > 0 => {
+                tracing::info!(user_id = uid, movies = m, episodes = e, "trakt history reconciled after scan")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(user_id = uid, error = %format!("{e:#}"), "trakt history reconcile failed")
+            }
+        }
+    }
 }
 
 /// Pull Trakt's `/sync/playback` and write any progress entry that's

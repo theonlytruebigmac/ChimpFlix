@@ -1774,21 +1774,14 @@ export interface TraktStatus {
 }
 
 export interface TraktSyncNowResult {
-  movies_marked: number;
-  episodes_marked: number;
-  playback_applied: number;
-  /** Locally-watched movies pushed up to Trakt in this sync. Typically
-   *  zero when the live mark-watched hook ran cleanly; non-zero after
-   *  a network blip or for items matched after the hook fired. */
-  movies_pushed: number;
-  episodes_pushed: number;
-  /** Trakt watchlist entries newly added to local My List during
-   *  this sync. Movies + shows combined. */
-  watchlist_added: number;
-  /** My List entries removed because the user removed them from
-   *  their Trakt watchlist since the last sync. Always 0 on the
-   *  first sync after linking (the snapshot baseline is empty). */
-  watchlist_removed: number;
+  /** True when a fresh sync was enqueued; false when an equivalent
+   *  pull/push pair was already queued or running (the button was
+   *  pressed again before the prior run finished). Either way the work
+   *  runs in the background — a real sync pushes the full local history
+   *  and pulls history + playback + watchlist, which can take over a
+   *  minute, so it no longer blocks the request. Watched status and
+   *  watchlist update as the jobs complete. */
+  queued: boolean;
 }
 
 export interface TraktUserStats {

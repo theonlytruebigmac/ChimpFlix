@@ -240,69 +240,70 @@ pub async fn unlink(
 
 #[derive(Debug, Serialize)]
 pub struct SyncNowResponse {
-    pub movies_marked: usize,
-    pub episodes_marked: usize,
-    pub playback_applied: usize,
-    /// Number of locally-watched movies pushed up to Trakt during this
-    /// sync. Includes anything since `last_synced_at` — typically zero
-    /// when the fire-and-forget mark-watched hook ran cleanly, non-zero
-    /// after a token expiry, network blip, or for items matched only
-    /// after the hook fired.
-    pub movies_pushed: usize,
-    pub episodes_pushed: usize,
-    /// Count of Trakt watchlist entries newly added to local My List
-    /// during this sync. Movies + shows combined.
-    pub watchlist_added: usize,
-    /// Count of My List entries removed because they were removed from
-    /// the user's Trakt watchlist since the previous sync. Movies +
-    /// shows combined. First-sync for a freshly-linked user always
-    /// reports 0 (the diff baseline is empty so we only emit adds).
-    pub watchlist_removed: usize,
+    /// True when a fresh sync was enqueued; false when an equivalent
+    /// pull/push pair was already queued or running (the user pressed
+    /// the button again before the prior run finished). Either way the
+    /// work happens in the background — this just reflects whether the
+    /// press kicked off a new run or rode an in-flight one.
+    pub queued: bool,
 }
 
+/// `POST /v1/trakt/sync-now` — kick off a manual two-way Trakt sync.
+///
+/// The work runs as background jobs rather than inline. A real sync
+/// pushes the user's full local watch history (rate-limited — roughly
+/// one request per batch) and pulls history + playback + watchlist;
+/// for an active account that easily runs over a minute, which used to
+/// blow the Next.js proxy's request timeout ("socket hang up") even
+/// though the sync completed server-side.
+///
+/// So we enqueue one `trakt_push_user_history` (full push — Trakt
+/// dedupes server-side) and one `trakt_pull_user` job, both at an
+/// elevated priority so they jump ahead of the periodic sweeps (the
+/// worker dequeues `priority DESC`), and return immediately. The jobs
+/// are deduped per-user, so double-clicking doesn't stack runs. Watched
+/// status + watchlist update as the jobs complete — the pull reconciles
+/// against the local Trakt-history mirror with no extra API calls.
 pub async fn sync_now(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<SyncNowResponse>, ApiError> {
-    // Capture the cursor *before* pulling so the push step doesn't
-    // miss rows the pull just upserted.
-    let since = chimpflix_library::queries::get_trakt_last_synced(&state.pool, user.id)
-        .await
-        .map_err(ApiError::Internal)?;
-    let (movies_pushed, episodes_pushed) =
-        trakt_sync::bulk_push_user_history(&state, user.id, since)
-            .await
-            .map_err(ApiError::Internal)?;
-    // Short-circuit the pull half when /sync/last_activities reports
-    // nothing has changed since the previous sync. The manual "Sync
-    // now" UI button still fires the push above so a local-side
-    // backlog flushes, but we don't burn three round-trips on a
-    // user pressing the button twice in a minute.
-    let should_pull = trakt_sync::check_last_activities(&state, user.id)
-        .await
-        .map_err(ApiError::Internal)?;
-    let (movies, episodes, playback, watchlist_added, watchlist_removed) = if should_pull {
-        let (m, e) = trakt_sync::pull_user_history(&state, user.id)
-            .await
-            .map_err(ApiError::Internal)?;
-        let p = trakt_sync::pull_user_playback(&state, user.id)
-            .await
-            .map_err(ApiError::Internal)?;
-        let (wa, wr) = trakt_sync::pull_user_watchlist(&state, user.id)
-            .await
-            .map_err(ApiError::Internal)?;
-        (m, e, p, wa, wr)
-    } else {
-        (0, 0, 0, 0, 0)
-    };
+    if state.trakt_snapshot().await.is_none() {
+        return Err(ApiError::validation(
+            "Trakt is not configured on the server — set client_id/client_secret in /admin/server/credentials first",
+        ));
+    }
+    // Elevated priority so a user pressing "Sync now" jumps ahead of the
+    // hourly/daily background sweeps that enqueue the same job kinds.
+    const SYNC_NOW_PRIORITY: i64 = 10;
+    let push = queries::enqueue_job_unique(
+        &state.pool,
+        queries::JobInput::new(
+            crate::jobs::handlers::trakt_push_user_history::KIND,
+            serde_json::json!({ "user_id": user.id }),
+        )
+        .with_priority(SYNC_NOW_PRIORITY),
+        "user_id",
+        user.id,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    let pull = queries::enqueue_job_unique(
+        &state.pool,
+        queries::JobInput::new(
+            crate::jobs::handlers::trakt_pull_user::KIND,
+            serde_json::json!({ "user_id": user.id }),
+        )
+        .with_priority(SYNC_NOW_PRIORITY),
+        "user_id",
+        user.id,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    // `queued` is true when at least one fresh job was inserted; if both
+    // deduped to `None`, a sync for this user is already in flight.
     Ok(Json(SyncNowResponse {
-        movies_marked: movies,
-        episodes_marked: episodes,
-        playback_applied: playback,
-        movies_pushed,
-        episodes_pushed,
-        watchlist_added,
-        watchlist_removed,
+        queued: push.is_some() || pull.is_some(),
     }))
 }
 

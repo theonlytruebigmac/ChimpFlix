@@ -85,33 +85,53 @@ pub fn wrap_emitter_for_pipeline(
 ) -> chimpflix_library::ScanEmitter {
     use std::sync::Arc;
     let (tx, rx) = mpsc::channel::<i64>(PIPELINE_CHANNEL_CAPACITY);
+    let reconcile_state = state.clone();
     spawn_pipeline_drainer(state, rx);
 
     Arc::new(move |evt: ScanEvent| {
         // Forward to the original consumer (hub publishes to WS).
         inner(evt.clone());
-        if let ScanEvent::FileAdded { media_file_id, .. } = evt {
-            // `try_send` never awaits — keeps the scanner's
-            // per-file loop fast. On capacity overflow we log and
-            // drop: the file still has a row in `media_files`, so
-            // the safety-net sweeps (`detect_markers`,
-            // `analyze_loudness`, …) pick it up on their next
-            // tick. Dropped events here are a hint that the DB
-            // pool is stuck or the worker pool is undersized.
-            if let Err(e) = tx.try_send(media_file_id) {
-                use tokio::sync::mpsc::error::TrySendError;
-                match e {
-                    TrySendError::Full(_) => warn!(
-                        media_file_id,
-                        capacity = PIPELINE_CHANNEL_CAPACITY,
-                        "discovery pipeline channel full; dropping FileAdded (safety-net sweeps will catch this file)"
-                    ),
-                    TrySendError::Closed(_) => {
-                        // Scanner outlived the drainer — only
-                        // happens on shutdown races. Silent.
+        match evt {
+            ScanEvent::FileAdded { media_file_id, .. } => {
+                // `try_send` never awaits — keeps the scanner's
+                // per-file loop fast. On capacity overflow we log and
+                // drop: the file still has a row in `media_files`, so
+                // the safety-net sweeps (`detect_markers`,
+                // `analyze_loudness`, …) pick it up on their next
+                // tick. Dropped events here are a hint that the DB
+                // pool is stuck or the worker pool is undersized.
+                if let Err(e) = tx.try_send(media_file_id) {
+                    use tokio::sync::mpsc::error::TrySendError;
+                    match e {
+                        TrySendError::Full(_) => warn!(
+                            media_file_id,
+                            capacity = PIPELINE_CHANNEL_CAPACITY,
+                            "discovery pipeline channel full; dropping FileAdded (safety-net sweeps will catch this file)"
+                        ),
+                        TrySendError::Closed(_) => {
+                            // Scanner outlived the drainer — only
+                            // happens on shutdown races. Silent.
+                        }
                     }
                 }
             }
+            // On scan completion, reconcile Trakt watched-status for any
+            // newly added/updated items against the local history mirror
+            // (no API calls) — this is how a freshly added library picks up
+            // watch history that was pulled before it existed.
+            ScanEvent::Completed {
+                files_added,
+                files_updated,
+                ..
+            } => {
+                if files_added > 0 || files_updated > 0 {
+                    let st = reconcile_state.clone();
+                    tokio::spawn(async move {
+                        crate::trakt_sync::reconcile_all_linked_users(&st).await;
+                    });
+                }
+            }
+            _ => {}
         }
     })
 }
