@@ -857,6 +857,118 @@ pub async fn pull_user_history(state: &AppState, user_id: i64) -> Result<(usize,
     Ok((movies, episodes))
 }
 
+/// Pull the user's COMPLETE watched-state snapshot from Trakt
+/// (`/sync/watched/{movies,shows}`) into the local mirror, then reconcile.
+///
+/// This is the AUTHORITATIVE seed for watched status. [`pull_user_history`]
+/// reads `/sync/history`, a dated event log that can omit titles marked
+/// watched outside ChimpFlix (or before linking) and is pruned/paginated —
+/// so a show sitting at "91% watched" on Trakt may have no history events
+/// for us to mirror. `/sync/watched` is the snapshot that powers Trakt's
+/// own "watched" badges, so it catches everything. One pull per direction,
+/// no pagination.
+///
+/// Rows synthesised here get a deterministic NEGATIVE `trakt_event_id`
+/// (see [`synthetic_watched_id`]) so they coexist in `user_trakt_history`
+/// with real (positive) history event ids without colliding, and re-pulls
+/// upsert rather than duplicate. Returns the (movies, episodes) rows
+/// reconciled to watched.
+pub async fn pull_user_watched(state: &AppState, user_id: i64) -> Result<(usize, usize)> {
+    let Some((movies, episodes)) = with_user_client(state, user_id, |client, token| {
+        let pool = state.pool.clone();
+        async move {
+            let watched_movies = client.pull_watched_movies(&token).await?;
+            let watched_shows = client.pull_watched_shows(&token).await?;
+            let mut rows: Vec<queries::TraktHistoryRow> =
+                Vec::with_capacity(watched_movies.len() + watched_shows.len() * 12);
+            for m in &watched_movies {
+                let watched_at_ms = m
+                    .last_watched_at
+                    .as_deref()
+                    .and_then(iso_to_epoch_ms)
+                    .unwrap_or_else(now_ms);
+                let key = format!(
+                    "mv:{:?}:{:?}:{:?}",
+                    m.movie.ids.tmdb, m.movie.ids.tvdb, m.movie.ids.imdb
+                );
+                rows.push(queries::TraktHistoryRow {
+                    trakt_event_id: synthetic_watched_id(&key),
+                    media_type: "movie",
+                    tmdb_id: m.movie.ids.tmdb,
+                    tvdb_id: m.movie.ids.tvdb,
+                    imdb_id: m.movie.ids.imdb.clone(),
+                    season: None,
+                    episode: None,
+                    watched_at_ms,
+                });
+            }
+            for s in &watched_shows {
+                // Fall back to the show-level last_watched_at when an
+                // episode row omits its own timestamp (rare, but Trakt
+                // allows it for very old plays).
+                let show_fallback_ms = s
+                    .last_watched_at
+                    .as_deref()
+                    .and_then(iso_to_epoch_ms)
+                    .unwrap_or_else(now_ms);
+                for season in &s.seasons {
+                    for ep in &season.episodes {
+                        let watched_at_ms = ep
+                            .last_watched_at
+                            .as_deref()
+                            .and_then(iso_to_epoch_ms)
+                            .unwrap_or(show_fallback_ms);
+                        let key = format!(
+                            "ep:{:?}:{:?}:{:?}:{}:{}",
+                            s.show.ids.tmdb,
+                            s.show.ids.tvdb,
+                            s.show.ids.imdb,
+                            season.number,
+                            ep.number
+                        );
+                        rows.push(queries::TraktHistoryRow {
+                            trakt_event_id: synthetic_watched_id(&key),
+                            media_type: "episode",
+                            tmdb_id: s.show.ids.tmdb,
+                            tvdb_id: s.show.ids.tvdb,
+                            imdb_id: s.show.ids.imdb.clone(),
+                            season: Some(season.number),
+                            episode: Some(ep.number),
+                            watched_at_ms,
+                        });
+                    }
+                }
+            }
+            queries::store_trakt_history(&pool, user_id, &rows).await?;
+            let (m, e) = queries::reconcile_trakt_history(&pool, user_id).await?;
+            Ok::<_, anyhow::Error>((m as usize, e as usize))
+        }
+    })
+    .await?
+    else {
+        return Ok((0, 0));
+    };
+    Ok((movies, episodes))
+}
+
+/// Deterministic synthetic mirror id for a watched-state row. Trakt's
+/// `/sync/watched` entries carry no per-event id (unlike `/sync/history`),
+/// but `user_trakt_history` is keyed on `(user_id, trakt_event_id)`. We
+/// FNV-1a hash the title's natural key and map it into the NEGATIVE i64
+/// space so it can never collide with a real (positive) history event id
+/// in the shared table, and so re-pulling the same watched-state upserts
+/// the same row instead of duplicating it.
+fn synthetic_watched_id(key: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Drop the sign bit, then map to the strictly-negative range so the
+    // id is always < 0 (Trakt history event ids are positive).
+    -((hash >> 1) as i64) - 1
+}
+
 /// Normalize a Trakt `/sync/history` entry into a mirror row. Movies carry
 /// the movie's ids; episodes carry the SHOW's ids + season/episode. Returns
 /// `None` for entries missing their movie/show/episode payload.
@@ -1120,5 +1232,38 @@ pub async fn episode_trakt_coords(
         Ok(None)
     } else {
         Ok(Some((ids, season, episode)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_watched_id_is_deterministic_and_negative() {
+        // Stable across calls — re-pulling the same watched-state must
+        // upsert the same mirror row, not duplicate it.
+        let a = synthetic_watched_id("ep:Some(366924):None:Some(\"tt9288030\"):1:1");
+        let b = synthetic_watched_id("ep:Some(366924):None:Some(\"tt9288030\"):1:1");
+        assert_eq!(a, b);
+        // Always strictly negative so it can NEVER collide with a real
+        // (positive) Trakt /sync/history event id in the shared table.
+        assert!(a < 0, "synthetic id must be negative, got {a}");
+    }
+
+    #[test]
+    fn synthetic_watched_id_separates_distinct_keys() {
+        // Different episodes / movies → different ids (no accidental merge).
+        let s1e1 = synthetic_watched_id("ep:Some(1):None:None:1:1");
+        let s1e2 = synthetic_watched_id("ep:Some(1):None:None:1:2");
+        let s2e1 = synthetic_watched_id("ep:Some(1):None:None:2:1");
+        let movie = synthetic_watched_id("mv:Some(1):None:None");
+        let ids = [s1e1, s1e2, s2e1, movie];
+        for (i, x) in ids.iter().enumerate() {
+            for y in &ids[i + 1..] {
+                assert_ne!(x, y, "distinct keys must not collide");
+            }
+            assert!(*x < 0);
+        }
     }
 }

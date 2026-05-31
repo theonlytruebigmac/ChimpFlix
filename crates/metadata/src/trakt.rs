@@ -889,6 +889,59 @@ impl TraktClient {
         .await
     }
 
+    /// Pull the user's complete **watched movies** state — GET
+    /// `/sync/watched/movies`. Unlike `/sync/history` (a dated, paginated
+    /// event log that can be pruned or never carry a play for a title
+    /// marked watched outside ChimpFlix), this is the authoritative
+    /// snapshot of *everything the user has ever watched* — the same data
+    /// that powers Trakt's "watched" badges. One request, no pagination.
+    pub async fn pull_watched_movies(&self, access_token: &str) -> Result<Vec<WatchedMovie>> {
+        let url = format!("{}/sync/watched/movies", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            return Err(api_error("GET /sync/watched/movies", resp).await);
+        }
+        crate::http::bounded_json::<Vec<WatchedMovie>>(
+            resp,
+            WATCHED_STATE_BYTES,
+            "parse Trakt watched movies",
+        )
+        .await
+    }
+
+    /// Pull the user's complete **watched shows** state — GET
+    /// `/sync/watched/shows`. Each entry carries the show's ids plus a
+    /// nested `seasons[].episodes[]` list of every watched episode (with
+    /// `last_watched_at`). This is the authoritative source for marking
+    /// episodes watched — see [`pull_watched_movies`] for why we don't
+    /// rely on `/sync/history` alone. The response is the largest Trakt
+    /// payload (every episode of every show), so it gets a wider byte cap.
+    pub async fn pull_watched_shows(&self, access_token: &str) -> Result<Vec<WatchedShow>> {
+        let url = format!("{}/sync/watched/shows", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            return Err(api_error("GET /sync/watched/shows", resp).await);
+        }
+        crate::http::bounded_json::<Vec<WatchedShow>>(
+            resp,
+            WATCHED_STATE_BYTES,
+            "parse Trakt watched shows",
+        )
+        .await
+    }
+
     pub async fn push_rating(&self, access_token: &str, entry: RatingPush) -> Result<()> {
         let (movies, episodes) = match entry {
             RatingPush::Movie {
@@ -1412,6 +1465,53 @@ pub struct PlaybackEntry {
     pub episode: Option<TraktEpisode>,
     #[serde(default)]
     pub show: Option<TraktShow>,
+}
+
+/// Byte cap for `/sync/watched/{shows,movies}` — the snapshot of every
+/// title the user has ever watched, which for a heavy account (every
+/// episode of every show, each ~80 bytes) can dwarf the other Trakt
+/// responses. 32 MiB covers tens of thousands of episodes; the streamed
+/// `bounded_json` still aborts past that rather than buffering unbounded.
+pub const WATCHED_STATE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// One row of GET `/sync/watched/movies` — a watched movie plus its play
+/// metadata. `last_watched_at` is the timestamp we mirror as the local
+/// `watched_at`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchedMovie {
+    #[serde(default)]
+    pub plays: u32,
+    #[serde(default)]
+    pub last_watched_at: Option<String>,
+    pub movie: TraktMovie,
+}
+
+/// One row of GET `/sync/watched/shows` — a watched show plus the nested
+/// per-season / per-episode watched list. We only consume the show ids
+/// and the season/episode coordinates; aggregate counts are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchedShow {
+    #[serde(default)]
+    pub last_watched_at: Option<String>,
+    pub show: TraktShow,
+    #[serde(default)]
+    pub seasons: Vec<WatchedSeason>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchedSeason {
+    pub number: i32,
+    #[serde(default)]
+    pub episodes: Vec<WatchedEpisode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchedEpisode {
+    pub number: i32,
+    #[serde(default)]
+    pub plays: u32,
+    #[serde(default)]
+    pub last_watched_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]

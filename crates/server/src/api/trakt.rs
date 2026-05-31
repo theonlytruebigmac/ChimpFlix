@@ -276,7 +276,9 @@ pub async fn sync_now(
     // Elevated priority so a user pressing "Sync now" jumps ahead of the
     // hourly/daily background sweeps that enqueue the same job kinds.
     const SYNC_NOW_PRIORITY: i64 = 10;
-    let push = queries::enqueue_job_unique(
+    // The push is the expensive, rate-limited leg, so dedup it per-user:
+    // mashing the button won't stack full-history pushes.
+    queries::enqueue_job_unique(
         &state.pool,
         queries::JobInput::new(
             crate::jobs::handlers::trakt_push_user_history::KIND,
@@ -288,23 +290,24 @@ pub async fn sync_now(
     )
     .await
     .map_err(ApiError::Internal)?;
-    let pull = queries::enqueue_job_unique(
+    // The pull is enqueued unconditionally (NOT deduped): the manual press
+    // carries `force: true`, and `enqueue_job_unique` would let a pending
+    // non-forced sweep job swallow it — dropping the authoritative
+    // watched-state seed the user actually asked for. `force` makes the
+    // pull bypass the `last_activities` gate and re-seed `/sync/watched`,
+    // so a "nothing changed on Trakt" rollup can't make the sync a no-op.
+    queries::enqueue_job(
         &state.pool,
         queries::JobInput::new(
             crate::jobs::handlers::trakt_pull_user::KIND,
-            serde_json::json!({ "user_id": user.id }),
+            serde_json::json!({ "user_id": user.id, "force": true }),
         )
         .with_priority(SYNC_NOW_PRIORITY),
-        "user_id",
-        user.id,
     )
     .await
     .map_err(ApiError::Internal)?;
-    // `queued` is true when at least one fresh job was inserted; if both
-    // deduped to `None`, a sync for this user is already in flight.
-    Ok(Json(SyncNowResponse {
-        queued: push.is_some() || pull.is_some(),
-    }))
+    // A forced pull is always enqueued, so a sync genuinely started.
+    Ok(Json(SyncNowResponse { queued: true }))
 }
 
 // ─── Calendar ──────────────────────────────────────────────────────────────
