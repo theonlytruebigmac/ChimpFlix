@@ -119,6 +119,32 @@ pub static REGISTRY: LazyLock<Vec<KindMetadata>> = LazyLock::new(|| {
             // consistency with other Periodic entries.
             concurrency: 1,
         },
+        // ─── Trakt two-way sync · Periodic (per-user fan-out jobs) ──
+        // The "trakt_pull" / "trakt_push" scheduled sweeps enqueue one
+        // of these per linked user (see scheduler::trakt_pull_task /
+        // trakt_push_history_task) so each user's sync is durable,
+        // retried independently, and bounded by the per-kind cap below
+        // — instead of running serially inline on the scheduler tick.
+        KindMetadata {
+            job_kind: "trakt_pull_user",
+            sweep_kind: Some("trakt_pull"),
+            display_name: "Trakt: pull (history, playback, watchlist)",
+            mode: TaskMode::Periodic,
+            scope: TaskScope::Global,
+            gate_setting_key: None,
+            // Network-bound (Trakt API); one job per user.
+            concurrency: 4,
+        },
+        KindMetadata {
+            job_kind: "trakt_push_user_history",
+            sweep_kind: Some("trakt_push"),
+            display_name: "Trakt: push watch history",
+            mode: TaskMode::Periodic,
+            scope: TaskScope::Global,
+            gate_setting_key: None,
+            // Conservative — Trakt rate-limits bulk /sync/history pushes.
+            concurrency: 2,
+        },
     ]
 });
 

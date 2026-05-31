@@ -413,6 +413,18 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<()> {
             params_json: "{}",
             cron_placeholder: "0 0 5 * * *",
         },
+        // Daily push of locally-watched history up to Trakt — the durable
+        // backstop behind the fire-and-forget per-event hooks. Lightweight
+        // (just enqueues per-user jobs), so it doesn't need the maintenance
+        // window. 02:00 to avoid colliding with the 05:00 collection push.
+        Seed {
+            kind: "trakt_push",
+            name: "Trakt: push watch history",
+            frequency: "daily",
+            requires_window: false,
+            params_json: "{}",
+            cron_placeholder: "0 0 2 * * *",
+        },
         // ---- Analyzer safety-net sweeps ----
         //
         // Each of the following is a "find work the scan pipeline
@@ -893,6 +905,7 @@ async fn dispatch(
             let cache_root = state.transcoder.cache_root().to_path_buf();
             let release_state = state.clone();
             let pipeline_state = state.clone();
+            let gate_state = state.clone();
             tokio::spawn(async move {
                 // RAII guard: release the scan lock on every exit path
                 // including a panic inside `run_scan`. Without it, a
@@ -918,6 +931,13 @@ async fn dispatch(
                     state: release_state,
                     library_id,
                 };
+                // Pause background jobs + the scheduler tick while this
+                // scheduled scan runs so it finishes uncontended (released on
+                // drop, panic-safe). Foreground reads stay responsive (WAL).
+                let _scan_gate = gate_state
+                    .library_scan_exclusive
+                    .scan_guard()
+                    .await;
                 let inner_emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
                     hub.publish(crate::events::Event::Scan(evt));
                 });
@@ -1055,6 +1075,7 @@ async fn dispatch(
         "analyze_loudness" => analyze_loudness_task(state, task, log).await,
         "verify_backups" => verify_backups_task(state, log).await,
         "trakt_pull" => trakt_pull_task(state, log).await,
+        "trakt_push" => trakt_push_history_task(state, log).await,
         "trakt_collection_push" => trakt_collection_push_task(state, log).await,
         "refresh_trending" => refresh_trending_task(state, log).await,
         "refresh_logos" => refresh_logos_task(state, task, log).await,
@@ -1337,6 +1358,18 @@ pub fn registry() -> Vec<TaskKindInfo> {
             params_schema: r#"{}"#,
             default_frequency: "daily",
             default_requires_maintenance_window: true,
+        },
+        TaskKindInfo {
+            kind: "trakt_push",
+            display_name: "Trakt: push watch history",
+            description: "Push each linked user's locally-watched movies \
+                          and episodes up to their Trakt history — the \
+                          durable backstop behind the per-event push hooks. \
+                          Enqueues one job per user; Trakt dedupes \
+                          server-side, so re-pushing is harmless.",
+            params_schema: r#"{}"#,
+            default_frequency: "daily",
+            default_requires_maintenance_window: false,
         },
         TaskKindInfo {
             kind: "refresh_trending",
@@ -2136,67 +2169,71 @@ async fn refresh_logos_task(
 /// Pull Trakt history + playback for every linked user. Per-user
 /// failures log and the task itself still succeeds — one bad token
 /// shouldn't poison the run.
+/// Hourly Trakt PULL sweep. Rather than doing the per-user pulls inline on
+/// the scheduler tick (serial, non-durable — a Trakt hiccup for one user
+/// used to drop the whole hour's sync), this enqueues one durable
+/// `trakt_pull_user` job per linked user. The worker pool drains them at
+/// the per-kind concurrency cap, each retries independently, and the
+/// per-user `check_last_activities` short-circuit now lives in the handler.
 async fn trakt_pull_task(state: &AppState, log: &Arc<std::sync::Mutex<String>>) -> Result<()> {
     if state.trakt_snapshot().await.is_none() {
-        append_log(log, "Trakt disabled — skipping pull");
+        append_log(log, "Trakt disabled — skipping pull enqueue");
         return Ok(());
     }
     let user_ids = queries::list_trakt_linked_user_ids(&state.pool).await?;
-    let mut total_movies = 0usize;
-    let mut total_episodes = 0usize;
-    let mut total_playback = 0usize;
-    let mut total_watchlist_added = 0usize;
-    let mut total_watchlist_removed = 0usize;
-    let mut skipped = 0usize;
-    for uid in &user_ids {
-        // Cheap rollup check — skip the expensive pulls when
-        // /sync/last_activities reports nothing has changed since
-        // our last visit. Saves three HTTP round-trips per linked
-        // user per hour on idle installs.
-        match crate::trakt_sync::check_last_activities(state, *uid).await {
-            Ok(false) => {
-                skipped += 1;
-                continue;
-            }
-            Ok(true) => {}
+    let total = user_ids.len();
+    let mut enqueued = 0usize;
+    for uid in user_ids {
+        let input = queries::JobInput::new(
+            crate::jobs::handlers::trakt_pull_user::KIND,
+            serde_json::json!({ "user_id": uid }),
+        );
+        match queries::enqueue_job(&state.pool, input).await {
+            Ok(_) => enqueued += 1,
             Err(e) => {
-                warn!(user_id = uid, error = %format!("{e:#}"), "trakt last_activities check errored; running full pull");
+                warn!(user_id = uid, error = %format!("{e:#}"), "failed to enqueue trakt_pull_user")
             }
-        }
-        match crate::trakt_sync::pull_user_history(state, *uid).await {
-            Ok((m, e)) => {
-                total_movies += m;
-                total_episodes += e;
-            }
-            Err(e) => warn!(user_id = uid, error = %format!("{e:#}"), "trakt pull history failed"),
-        }
-        match crate::trakt_sync::pull_user_playback(state, *uid).await {
-            Ok(n) => total_playback += n,
-            Err(e) => warn!(user_id = uid, error = %format!("{e:#}"), "trakt pull playback failed"),
-        }
-        match crate::trakt_sync::pull_user_watchlist(state, *uid).await {
-            Ok((a, r)) => {
-                total_watchlist_added += a;
-                total_watchlist_removed += r;
-            }
-            Err(e) => warn!(user_id = uid, error = %format!("{e:#}"), "trakt pull watchlist failed"),
         }
     }
     append_log(
         log,
-        format!(
-            "trakt pull: {} users ({} skipped via last_activities), \
-             {} movies, {} episodes marked watched, \
-             {} resume points applied, \
-             +{} / -{} watchlist items",
-            user_ids.len(),
-            skipped,
-            total_movies,
-            total_episodes,
-            total_playback,
-            total_watchlist_added,
-            total_watchlist_removed,
-        ),
+        format!("trakt pull: enqueued {enqueued}/{total} per-user pull jobs"),
+    );
+    Ok(())
+}
+
+/// Daily Trakt PUSH sweep — the durable backstop for the local→Trakt watch
+/// history direction. The per-event hooks (`push_history_event`) are
+/// fire-and-forget and lossy on a transient failure; this enqueues one
+/// `trakt_push_user_history` job per linked user (full-history bulk push,
+/// since_ms omitted) so anything the live hooks missed gets pushed and
+/// retried durably. Trakt dedupes server-side, so re-pushing is harmless.
+async fn trakt_push_history_task(
+    state: &AppState,
+    log: &Arc<std::sync::Mutex<String>>,
+) -> Result<()> {
+    if state.trakt_snapshot().await.is_none() {
+        append_log(log, "Trakt disabled — skipping push enqueue");
+        return Ok(());
+    }
+    let user_ids = queries::list_trakt_linked_user_ids(&state.pool).await?;
+    let total = user_ids.len();
+    let mut enqueued = 0usize;
+    for uid in user_ids {
+        let input = queries::JobInput::new(
+            crate::jobs::handlers::trakt_push_user_history::KIND,
+            serde_json::json!({ "user_id": uid }),
+        );
+        match queries::enqueue_job(&state.pool, input).await {
+            Ok(_) => enqueued += 1,
+            Err(e) => {
+                warn!(user_id = uid, error = %format!("{e:#}"), "failed to enqueue trakt_push_user_history")
+            }
+        }
+    }
+    append_log(
+        log,
+        format!("trakt push: enqueued {enqueued}/{total} per-user push jobs"),
     );
     Ok(())
 }

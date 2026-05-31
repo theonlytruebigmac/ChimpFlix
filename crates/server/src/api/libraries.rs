@@ -91,7 +91,8 @@ pub async fn trigger_scan(
     _owner: OwnerAuth,
     Path(library_id): Path<i64>,
 ) -> Result<(StatusCode, Json<ScanJob>), ApiError> {
-    let library = queries::get_library(&state.pool, library_id)
+    // Validate the library exists (404 otherwise) before kicking off a scan.
+    queries::get_library(&state.pool, library_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
@@ -109,27 +110,14 @@ pub async fn trigger_scan(
         ));
     }
 
-    // First-scan exclusivity: when this is the operator's initial
-    // scan of a brand-new library (no `last_scan_at` yet), pause the
-    // worker pool + scheduler tick until the scan completes. The
-    // pre-flag failure mode was: scanner racing 8 workers on the
-    // shared SQLite write lock → busy_timeout exhausted on some
-    // inserts → scan bails halfway through → half-populated library
-    // shown to the operator (e.g. 75 files visible out of 1560).
-    //
-    // Incremental scans (already-scanned libraries, file watcher
-    // adds, scheduled re-scans) DON'T set this — the library is
-    // already functional for users and pausing all background work
-    // for a few new files would be heavy-handed.
-    let is_first_scan = library.last_scan_at.is_none();
-    if is_first_scan {
-        state.library_scan_exclusive.acquire().await;
-        tracing::info!(
-            library_id,
-            "first scan: enabling exclusivity (pausing workers + scheduler until complete)"
-        );
-    }
-
+    // Scan exclusivity (priority tier 2): pause the worker pool + scheduler
+    // tick for the duration of EVERY scan — first-scan, incremental re-scan,
+    // file-watcher, or scheduled — so the scanner runs uncontended and
+    // finishes fast; other background jobs (markers, ratings, …) yield and
+    // drain afterward. Foreground stays responsive throughout (SQLite WAL
+    // reads never block on the writer). The gate is raised by an RAII guard
+    // inside the scan task below, so it clears on every exit path including a
+    // panic in `run_scan`.
     let job = queries::create_scan_job(&state.pool, library_id).await?;
     let job_id = job.id;
 
@@ -178,6 +166,14 @@ pub async fn trigger_scan(
     // webhook delivery.
     let emitter = crate::jobs::pipeline::wrap_emitter_for_pipeline(state.clone(), emitter);
     tokio::spawn(async move {
+        // Raise the scan-exclusivity gate for the whole scan; the guard
+        // releases it on drop (normal exit, error, or panic), resuming the
+        // worker pool + scheduler. Overlapping scans are counter-tracked, so
+        // the gate stays up until the last one finishes.
+        let _scan_gate = state_for_release
+            .library_scan_exclusive
+            .scan_guard()
+            .await;
         if let Err(e) = chimpflix_library::run_scan(
             pool,
             ffmpeg,
@@ -196,18 +192,6 @@ pub async fn trigger_scan(
             warn!(error = %format!("{e:#}"), library_id, job_id, "scan task ended with error");
         }
         state_for_release.release_library_scan(library_id).await;
-        // Release the first-scan exclusivity gate regardless of
-        // outcome. The counter inside `LibraryScanGate` correctly
-        // handles overlapping first-scans — workers + scheduler
-        // resume only when every outstanding first-scan has
-        // released.
-        if is_first_scan {
-            state_for_release.library_scan_exclusive.release().await;
-            tracing::info!(
-                library_id,
-                "first scan complete: releasing exclusivity"
-            );
-        }
     });
 
     Ok((StatusCode::ACCEPTED, Json(job)))

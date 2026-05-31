@@ -261,6 +261,12 @@ pub fn build_router() -> JobRouter {
         .register(handlers::bootstrap_season_refs::KIND, |s, p| {
             handlers::bootstrap_season_refs::run(s, p)
         })
+        .register(handlers::trakt_pull_user::KIND, |s, p| {
+            handlers::trakt_pull_user::run(s, p)
+        })
+        .register(handlers::trakt_push_user_history::KIND, |s, p| {
+            handlers::trakt_push_user_history::run(s, p)
+        })
         .build()
 }
 

@@ -1,11 +1,18 @@
-//! Counter-backed exclusivity gate for library first-scans.
+//! Counter-backed exclusivity gate for library scans.
 //!
-//! The operator-initiated scan of a brand-new library needs to run
-//! uncontended against the rest of the system — the failure mode
-//! before this gate existed was the scanner racing 8 active workers
-//! on the shared SQLite write lock, exhausting `busy_timeout` mid-
-//! run, and bailing with a half-populated library (e.g. 75 files
-//! visible out of 1560).
+//! While ANY scan is running — first-scan, incremental re-scan,
+//! file-watcher-triggered, or scheduled — this gate pauses the job
+//! worker pool and the scheduler tick so the scan runs uncontended.
+//! This is the **second tier** of a three-tier priority model:
+//! foreground (playback / play_state / interactive reads) is never
+//! blocked — SQLite WAL keeps reads non-blocking regardless — while
+//! the *scan* takes priority over *other background jobs* (marker
+//! detection, ratings, sprites, …), which yield until it finishes and
+//! then drain. The original failure mode this addresses: the scanner
+//! racing 8 active workers on the shared SQLite write lock, exhausting
+//! `busy_timeout` mid-run, and bailing with a half-populated library
+//! (e.g. 75 files out of 1560); the lighter everyday symptom is simply
+//! that concurrent jobs slow the scan down.
 //!
 //! Implementation: a counter wrapped behind a watch channel.
 //!   * `acquire` bumps the counter; if it transitioned from 0 to 1,
@@ -84,6 +91,37 @@ impl LibraryScanGate {
     /// single-shot read without subscribing.
     pub fn is_active(&self) -> bool {
         *self.tx.subscribe().borrow()
+    }
+
+    /// Acquire the gate and return an RAII guard that releases it on drop —
+    /// including across a panic inside the scan task. Use this at every scan
+    /// spawn site instead of bare `acquire`/`release`: a `run_scan` that
+    /// panics between a manual acquire and release would leak the counter
+    /// and wedge the worker pool + scheduler "paused" until a process
+    /// restart. The release is async, so the guard spawns it on drop — every
+    /// scan site already runs inside a `tokio::spawn`, so a runtime is live.
+    pub async fn scan_guard(self: &Arc<Self>) -> ScanGateGuard {
+        self.acquire().await;
+        ScanGateGuard {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+/// RAII guard returned by [`LibraryScanGate::scan_guard`]. Holds the gate
+/// raised for its lifetime; on drop it spawns the (async) release so the
+/// gate clears on every exit path — normal completion, early return, or a
+/// panic unwinding out of the scan task.
+pub struct ScanGateGuard {
+    gate: Arc<LibraryScanGate>,
+}
+
+impl Drop for ScanGateGuard {
+    fn drop(&mut self) {
+        let gate = Arc::clone(&self.gate);
+        tokio::spawn(async move {
+            gate.release().await;
+        });
     }
 }
 

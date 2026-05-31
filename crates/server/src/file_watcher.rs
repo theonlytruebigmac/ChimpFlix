@@ -477,6 +477,13 @@ async fn spawn_scan(state: AppState, library_id: i64) -> bool {
     let cache_root = state.transcoder.cache_root().to_path_buf();
     let state_for_release = state.clone();
     tokio::spawn(async move {
+        // Raise the scan-exclusivity gate so background jobs + the scheduler
+        // pause while this watcher-triggered scan runs (released on drop,
+        // panic-safe). Foreground reads stay responsive via WAL.
+        let _scan_gate = state_for_release
+            .library_scan_exclusive
+            .scan_guard()
+            .await;
         let inner_emitter: chimpflix_library::ScanEmitter = Arc::new(move |evt| {
             hub.publish(crate::events::Event::Scan(evt));
         });
