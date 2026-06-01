@@ -3,8 +3,9 @@
 import { useCallback, type RefObject } from "react";
 import {
   endCastSession,
+  loadCastMedia,
+  requestCastSession,
   showAirPlayPicker,
-  startCastSession,
   useAirPlayAvailability,
   useCastState,
   type CastMediaPayload,
@@ -50,9 +51,16 @@ export function CastButton({
       return;
     }
     if (cast.available) {
+      // Open the device picker FIRST, while we still hold this click's
+      // user activation. Minting the cast token (resolveMedia →
+      // /cast/sign) is a network round-trip; doing it before
+      // requestSession() consumes the gesture and the picker silently
+      // never opens on mobile Chrome ("tap does nothing").
+      const haveSession = await requestCastSession();
+      if (!haveSession) return;
       const media = await resolveMedia();
       if (!media) return;
-      const ok = await startCastSession(media);
+      const ok = await loadCastMedia(media);
       if (ok) onCastStart?.();
       return;
     }

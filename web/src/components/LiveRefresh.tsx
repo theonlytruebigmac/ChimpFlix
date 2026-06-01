@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 
 /**
  * Live freshness without polling.
@@ -20,6 +20,14 @@ import { useRouter } from "next/navigation";
  */
 export function LiveRefresh() {
   const router = useRouter();
+  // Read the live pathname through a ref so the long-lived socket effect
+  // (deps: [router]) can consult the *current* route without tearing down
+  // and re-opening the WebSocket on every client navigation.
+  const pathname = usePathname();
+  const pathnameRef = useRef(pathname);
+  useEffect(() => {
+    pathnameRef.current = pathname;
+  }, [pathname]);
   // Coalesce bursts (a scan can emit several events) into one refresh.
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -30,9 +38,21 @@ export function LiveRefresh() {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const scheduleRefresh = () => {
+      // Never refresh the Server Components under an actively-playing
+      // player. `router.refresh()` re-runs the /watch route's server
+      // render, which re-derives the player's props from the *live,
+      // advancing* play_state — flipping the PrerollGate wrapper and
+      // remounting <ChimpFlixPlayer>. That remount drops fullscreen,
+      // re-shows the "Resumed from…" pill, and autoplays a paused video.
+      // The watch page is self-contained (the player owns its own live
+      // state), so it has nothing to gain from a push-refresh anyway.
+      if (pathnameRef.current?.startsWith("/watch/")) return;
       if (pending.current) return;
       pending.current = setTimeout(() => {
         pending.current = null;
+        // Re-check on fire: the user may have navigated into /watch
+        // during the 800ms coalescing window.
+        if (pathnameRef.current?.startsWith("/watch/")) return;
         router.refresh();
       }, 800);
     };

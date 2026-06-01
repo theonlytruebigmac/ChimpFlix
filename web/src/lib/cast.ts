@@ -56,6 +56,33 @@ type CastWindow = Window & {
 
 let castSdkLoad: Promise<boolean> | null = null;
 
+/// Read the Cast framework off the window once the SDK has installed it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function castFramework(): any | null {
+  const w = window as CastWindow;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (w.cast as any)?.framework ?? null;
+}
+
+/// Point the Cast context at our receiver app. Safe to call more than
+/// once — the SDK just re-applies the options — so both the happy-path
+/// loader and the slow-load recovery in `useCastState` can call it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function configureCastContext(framework: any): boolean {
+  try {
+    framework.CastContext.getInstance().setOptions({
+      receiverApplicationId: RECEIVER_APP_ID,
+      // ORIGIN_SCOPED lets the SDK silently re-attach to a live session
+      // if the user navigates between pages while a cast is active.
+      autoJoinPolicy: framework.AutoJoinPolicy.ORIGIN_SCOPED,
+    });
+    return true;
+  } catch (e) {
+    devError("[cast] setOptions failed", e);
+    return false;
+  }
+}
+
 /// Lazy-load the Cast Web Sender SDK. Returns true if the SDK loaded
 /// and a receiver-discoverable browser is running, false otherwise.
 /// Memoised — calling twice doesn't double-inject the script.
@@ -70,7 +97,15 @@ export function loadCastSdk(): Promise<boolean> {
     // system Cast media-router IPC isn't proxied through to standalone
     // web apps. Without a timeout the promise hangs and `cast.available`
     // never flips, with no log line to tell the operator why.
-    const timeoutMs = 8000;
+    //
+    // 15s (was 8s): on a cold mobile load the chained framework script
+    // from gstatic can take >8s to initialise and fire the callback. The
+    // old budget routinely lost that race on phones and resolved
+    // "unavailable", and because this promise is memoised the cast button
+    // then stayed hidden for the whole page even after the SDK finished.
+    // `useCastState` now also polls for the framework as a backstop, but a
+    // roomier timeout keeps the happy path resolving true.
+    const timeoutMs = 15000;
     let resolved = false;
     const finalize = (ok: boolean, reason: string) => {
       if (resolved) return;
@@ -93,27 +128,13 @@ export function loadCastSdk(): Promise<boolean> {
         finalize(false, "__onGCastApiAvailable(false)");
         return;
       }
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const framework = (w.cast as any)?.framework;
-        if (!framework) {
-          finalize(false, "SDK loaded but cast.framework is missing");
-          return;
-        }
-        const context = framework.CastContext.getInstance();
-        context.setOptions({
-          receiverApplicationId: RECEIVER_APP_ID,
-          // RESUME_SESSION makes the SDK silently re-attach if the
-          // user navigates between pages while a cast is active.
-          // Without it, the receiver keeps playing but the page loses
-          // its handle on the session.
-          autoJoinPolicy: framework.AutoJoinPolicy.ORIGIN_SCOPED,
-        });
-        finalize(true, "ready");
-      } catch (e) {
-        devError("[cast] init failed", e);
-        finalize(false, "init threw");
+      const framework = castFramework();
+      if (!framework) {
+        finalize(false, "SDK loaded but cast.framework is missing");
+        return;
       }
+      configureCastContext(framework);
+      finalize(true, "ready");
     };
     const existing = document.querySelector<HTMLScriptElement>(
       `script[src="${CAST_SDK_URL}"]`,
@@ -188,60 +209,87 @@ export function useCastState(): CastState {
   });
   useEffect(() => {
     let cancelled = false;
-    let removeAvailability: (() => void) | null = null;
-    let removeSession: (() => void) | null = null;
-    (async () => {
-      const loaded = await loadCastSdk();
-      if (cancelled || !loaded) return;
-      const w = window as CastWindow;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const framework = (w.cast as any)?.framework;
-      if (!framework) return;
-      const ctx = framework.CastContext.getInstance();
+    let wired = false;
+    let pollTimer: number | null = null;
+    const cleanups: Array<() => void> = [];
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const wireUp = (framework: any) => {
+      if (wired || cancelled) return;
+      wired = true;
+      configureCastContext(framework);
+      const ctx = framework.CastContext.getInstance();
       const sync = () => {
+        if (cancelled) return;
         const session = ctx.getCurrentSession();
         const castState = ctx.getCastState();
-        if (cancelled) return;
         setState({
-          // SDK loaded successfully — surface the button so the user
-          // can discover the affordance even before a receiver wakes
-          // up. Picker handles the empty case with "No devices found".
+          // Framework is live — surface the button so the affordance is
+          // discoverable even before a receiver wakes up. The picker
+          // handles the empty case with "No devices found".
           available: true,
-          // `castState` strings: NO_DEVICES_AVAILABLE / NOT_CONNECTED /
-          // CONNECTING / CONNECTED. Anything other than the "no devices"
-          // state means a receiver is actually reachable right now.
+          // `castState`: NO_DEVICES_AVAILABLE / NOT_CONNECTED / CONNECTING
+          // / CONNECTED. Anything but "no devices" means one is reachable.
           hasDevices: castState !== framework.CastState.NO_DEVICES_AVAILABLE,
           connected: castState === framework.CastState.CONNECTED,
           deviceName: session?.getCastDevice?.()?.friendlyName ?? null,
         });
       };
       sync();
-      const onCastStateChange = () => sync();
-      const onSessionStateChange = () => sync();
-      ctx.addEventListener(
-        framework.CastContextEventType.CAST_STATE_CHANGED,
-        onCastStateChange,
-      );
-      ctx.addEventListener(
-        framework.CastContextEventType.SESSION_STATE_CHANGED,
-        onSessionStateChange,
-      );
-      removeAvailability = () =>
-        ctx.removeEventListener(
-          framework.CastContextEventType.CAST_STATE_CHANGED,
-          onCastStateChange,
-        );
-      removeSession = () =>
-        ctx.removeEventListener(
-          framework.CastContextEventType.SESSION_STATE_CHANGED,
-          onSessionStateChange,
-        );
+      const onChange = () => sync();
+      const evt = framework.CastContextEventType;
+      ctx.addEventListener(evt.CAST_STATE_CHANGED, onChange);
+      ctx.addEventListener(evt.SESSION_STATE_CHANGED, onChange);
+      cleanups.push(() => {
+        ctx.removeEventListener(evt.CAST_STATE_CHANGED, onChange);
+        ctx.removeEventListener(evt.SESSION_STATE_CHANGED, onChange);
+      });
+    };
+
+    const tryWire = (): boolean => {
+      const framework = castFramework();
+      if (framework) {
+        wireUp(framework);
+        return true;
+      }
+      return false;
+    };
+
+    (async () => {
+      const loaded = await loadCastSdk();
+      if (cancelled) return;
+      if (loaded) {
+        tryWire();
+        return;
+      }
+      // loadCastSdk reported unavailable. In a standalone PWA that's real:
+      // Android doesn't proxy the Cast media-router IPC into installed web
+      // apps, so the framework exists but the picker can't enumerate
+      // devices — keep the button hidden rather than show a dead one. In a
+      // normal browser tab the framework can still finish initialising
+      // after loadCastSdk's load-timeout already resolved false on a slow
+      // connection, so poll briefly and self-heal instead of needing a
+      // page reload.
+      const standalone =
+        window.matchMedia("(display-mode: standalone)").matches ||
+        window.matchMedia("(display-mode: minimal-ui)").matches;
+      if (standalone) return;
+      if (tryWire()) return;
+      let tries = 0;
+      pollTimer = window.setInterval(() => {
+        if (cancelled || wired || tries++ >= 40 || tryWire()) {
+          if (pollTimer != null) {
+            window.clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        }
+      }, 500);
     })();
+
     return () => {
       cancelled = true;
-      removeAvailability?.();
-      removeSession?.();
+      if (pollTimer != null) window.clearInterval(pollTimer);
+      cleanups.forEach((c) => c());
     };
   }, []);
   return state;
@@ -263,30 +311,52 @@ export interface CastMediaPayload {
   durationS?: number;
 }
 
-/// Open the Cast picker. If the user selects a device, load the given
-/// media on it. Returns true if the cast session started, false on
-/// user cancel or SDK error.
-export async function startCastSession(media: CastMediaPayload): Promise<boolean> {
+/// Open the Cast device picker and establish a session.
+///
+/// MUST be called directly from a user-gesture handler BEFORE any
+/// `await` of a network request. `requestSession()` (which opens the
+/// picker) needs transient user activation; an intervening awaited fetch
+/// — e.g. minting the cast token via `/cast/sign` — consumes that
+/// activation, after which the picker silently fails to open (most
+/// visibly on mobile Chrome: "tap does nothing"). So the click handler
+/// calls THIS first, then mints the token + loads the media. Returns
+/// true once a session is live (pre-existing or freshly picked).
+export async function requestCastSession(): Promise<boolean> {
+  const w = window as CastWindow;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const framework = (w.cast as any)?.framework;
+  if (!framework) {
+    devWarn("[cast] SDK not loaded; cannot start session");
+    return false;
+  }
+  const ctx = framework.CastContext.getInstance();
+  if (ctx.getCurrentSession()) return true;
+  try {
+    // requestSession resolves with a "success"/"cancel"/etc. string OR
+    // throws on hard failure / user cancel. Either way, success means
+    // "there is now a live session."
+    await ctx.requestSession();
+  } catch (e) {
+    devWarn("[cast] requestSession failed/cancelled", e);
+    return false;
+  }
+  return !!ctx.getCurrentSession();
+}
+
+/// Load media onto the CURRENT cast session. Call after
+/// [`requestCastSession`] has established one — the session already
+/// exists, so awaiting network work (the token mint) before this is
+/// fine; no user gesture is needed any more.
+export async function loadCastMedia(media: CastMediaPayload): Promise<boolean> {
   const w = window as CastWindow;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeCast = (w.chrome as any)?.cast;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const framework = (w.cast as any)?.framework;
-  if (!chromeCast || !framework) {
-    devWarn("[cast] SDK not loaded; cannot start session");
-    return false;
-  }
+  if (!chromeCast || !framework) return false;
+  const session = framework.CastContext.getInstance().getCurrentSession();
+  if (!session) return false;
   try {
-    const ctx = framework.CastContext.getInstance();
-    let session = ctx.getCurrentSession();
-    if (!session) {
-      // requestSession resolves with a "success"/"cancel"/etc. string
-      // OR throws on hard failure. Either way, treat anything that
-      // isn't a live session as "user backed out."
-      await ctx.requestSession();
-      session = ctx.getCurrentSession();
-    }
-    if (!session) return false;
     const mediaInfo = new chromeCast.media.MediaInfo(media.url, media.contentType);
     mediaInfo.streamType = chromeCast.media.StreamType.BUFFERED;
     if (media.durationS != null) mediaInfo.duration = media.durationS;
@@ -304,7 +374,7 @@ export async function startCastSession(media: CastMediaPayload): Promise<boolean
     await session.loadMedia(request);
     return true;
   } catch (e) {
-    devWarn("[cast] session start failed", e);
+    devWarn("[cast] loadMedia failed", e);
     return false;
   }
 }

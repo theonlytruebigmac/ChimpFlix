@@ -573,26 +573,35 @@ export default async function WatchPage({
     />
   );
 
-  if (prerollUrl) {
-    // Identity for the binge-suppression check: every episode of a
-    // show shares `show:<id>` so back-to-back episodes don't replay
-    // the sting; movies key by item so re-watches inside the window
-    // also skip. Falls through to undefined (always-play) when we
-    // somehow lack both — defensive, shouldn't happen in practice.
-    const prerollKey = resolved.showId
-      ? `show:${resolved.showId}`
-      : resolved.itemId
-        ? `item:${resolved.itemId}`
-        : undefined;
-    return (
-      <PrerollGate
-        prerollUrl={prerollUrl}
-        prerollVolume={prerollVolume}
-        prerollKey={prerollKey}
-      >
-        {player}
-      </PrerollGate>
-    );
-  }
-  return player;
+  // Identity for the binge-suppression check: every episode of a
+  // show shares `show:<id>` so back-to-back episodes don't replay
+  // the sting; movies key by item so re-watches inside the window
+  // also skip. Falls through to undefined (always-play) when we
+  // somehow lack both — defensive, shouldn't happen in practice.
+  const prerollKey = resolved.showId
+    ? `show:${resolved.showId}`
+    : resolved.itemId
+      ? `item:${resolved.itemId}`
+      : undefined;
+  // ALWAYS render the player inside the same <PrerollGate> parent, even
+  // when there's no pre-roll (PrerollGate no-ops to its children in that
+  // case). Previously we returned a bare `player` when prerollUrl was
+  // null and a wrapped one otherwise — but `prerollUrl` depends on
+  // `isResume`, which is re-derived from the live, advancing
+  // play_state.position_ms on every server render. A `router.refresh()`
+  // that crossed the 30s resume line would flip the tree from
+  // <PrerollGate><Player/></PrerollGate> to bare <Player/>, changing the
+  // element type at that slot and forcing React to UNMOUNT + REMOUNT the
+  // player (dropping fullscreen, re-showing the resume pill, autoplaying
+  // a paused video). Keeping the wrapper stable makes refreshes reconcile
+  // in place instead of remounting.
+  return (
+    <PrerollGate
+      prerollUrl={prerollUrl}
+      prerollVolume={prerollVolume}
+      prerollKey={prerollKey}
+    >
+      {player}
+    </PrerollGate>
+  );
 }

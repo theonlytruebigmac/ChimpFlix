@@ -4804,11 +4804,45 @@ pub async fn on_deck(
            AND position_ms > 0
            AND last_played_at >= ?
            AND (duration_ms IS NULL OR position_ms < duration_ms * ? / 100)
+           -- Chronology guard: don't surface an in-progress EPISODE as a
+           -- show's resume tile when an EARLIER SEASON of the same show
+           -- still has an unfinished, playable episode. Without this a
+           -- stray low-progress tap into a later season (e.g. an
+           -- accidental 8s into S3E1) hijacks the Continue Watching tile
+           -- while the viewer is really mid-S2 — which then becomes the
+           -- Home hero's Play target. Movies (episode_id IS NULL) are
+           -- unaffected. \"Unfinished\" mirrors the played-% threshold so
+           -- a near-complete-but-unscrobbled earlier episode doesn't keep
+           -- a later season pinned shut.
+           AND (
+             episode_id IS NULL
+             OR NOT EXISTS (
+               SELECT 1
+               FROM episodes e_self
+               JOIN seasons s_self ON s_self.id = e_self.season_id
+               JOIN seasons s_prev
+                 ON s_prev.show_id = s_self.show_id
+                AND s_prev.season_number < s_self.season_number
+               JOIN episodes e_prev ON e_prev.season_id = s_prev.id
+               JOIN media_files mf_prev
+                 ON mf_prev.episode_id = e_prev.id AND mf_prev.removed_at IS NULL
+               LEFT JOIN play_state ps_prev
+                 ON ps_prev.episode_id = e_prev.id AND ps_prev.user_id = play_state.user_id
+               WHERE e_self.id = play_state.episode_id
+                 AND COALESCE(ps_prev.watched, 0) = 0
+                 AND (
+                   ps_prev.position_ms IS NULL
+                   OR ps_prev.duration_ms IS NULL
+                   OR ps_prev.position_ms < ps_prev.duration_ms * ? / 100
+                 )
+             )
+           )
          ORDER BY last_played_at DESC
          LIMIT ?",
     )
     .bind(user_id)
     .bind(cutoff_ms)
+    .bind(threshold)
     .bind(threshold)
     .bind(fetch_limit)
     .fetch_all(pool)
@@ -4874,7 +4908,7 @@ pub async fn on_deck(
     // emitted from the in-progress pass, so an active mid-watch
     // takes precedence over its own "next up".
     if out.len() < cap {
-        let next_ups = list_user_next_episode_in_show(pool, user_id, cutoff_ms).await?;
+        let next_ups = list_user_next_episode_in_show(pool, user_id, cutoff_ms, threshold).await?;
         for (show_id, episode_id, last_played_at) in next_ups {
             if out.len() >= cap {
                 break;
@@ -4956,15 +4990,32 @@ pub async fn on_deck(
 }
 
 /// For each show the user has touched (watched or in-progress on any
-/// episode), find the chronologically next episode that has *no*
-/// play_state row — the natural "next to watch" tile. Returns
-/// `(show_id, episode_id, last_played_at_of_show)` ordered by recency
-/// of the show's most-recent activity, so the Continue Watching rail
-/// can keep its DESC ordering.
+/// episode) within `cutoff_ms`, return the chronologically-first episode
+/// that is NOT yet "done" — the natural "next to watch" tile. Returns
+/// `(show_id, episode_id, last_played_at_of_show)` ordered by recency of
+/// the show's most-recent activity, so the Continue Watching rail keeps
+/// its DESC ordering.
+///
+/// "Done" = `watched = 1` OR played past `threshold`% of its duration.
+/// Crucially this is **not** keyed on "has *any* play_state row": an
+/// episode that merely has a zero-progress / phantom row (opened then
+/// abandoned, scrub-hinted, or nudged by an external sync like Trakt)
+/// is NOT done and remains eligible. The previous `NOT EXISTS
+/// (play_state row)` form skipped such episodes, which is exactly how a
+/// viewer mid-Season-2 ended up pointed at Season 3 Episode 1: phantom
+/// rows on the remaining S2 episodes made every one of them look
+/// "watched" so the resolver walked off the end of the season.
+///
+/// We pick the *lowest* `(season, episode)` that isn't done rather than
+/// "next after the most-recently-played episode" so a stray low-progress
+/// tap into a later season can't drag the tile forward past unfinished
+/// earlier episodes. Combined with the in-progress pass's cross-season
+/// chronology guard, this keeps Continue Watching (and the Home hero's
+/// Play target) on the real next episode.
 ///
 /// Complements [`list_user_show_premieres`]: the premiere path only
 /// fires when the user is fully *between* seasons. This one covers the
-/// far more common mid-season case (finished ep N, ep N+1 is unstarted).
+/// far more common mid-season case (finished ep N, ep N+1 is next).
 ///
 /// `cutoff_ms` mirrors the in-progress filter — shows whose latest
 /// play is older than the cutoff are excluded so long-since-finished
@@ -4974,60 +5025,50 @@ async fn list_user_next_episode_in_show(
     pool: &SqlitePool,
     user_id: i64,
     cutoff_ms: i64,
+    threshold: i64,
 ) -> Result<Vec<(i64, i64, i64)>> {
     let rows = sqlx::query(
-        "WITH user_progress AS (
+        "WITH active_shows AS (
              SELECT s.show_id AS show_id,
-                    ps.last_played_at AS last_played_at,
-                    s.season_number AS season,
-                    e.episode_number AS episode
+                    MAX(ps.last_played_at) AS last_played_at
              FROM play_state ps
              JOIN episodes e ON ps.episode_id = e.id
              JOIN seasons s ON e.season_id = s.id
              WHERE ps.user_id = ?1
                AND (ps.watched = 1 OR ps.position_ms > 0)
-         ),
-         latest_per_show AS (
-             SELECT show_id, MAX(last_played_at) AS last_played_at
-             FROM user_progress
-             GROUP BY show_id
-         ),
-         tip AS (
-             SELECT up.show_id, up.last_played_at, up.season, up.episode
-             FROM user_progress up
-             JOIN latest_per_show lps
-               ON lps.show_id = up.show_id
-              AND lps.last_played_at = up.last_played_at
+             GROUP BY s.show_id
          )
-         SELECT t.show_id AS show_id,
-                t.last_played_at AS last_played_at,
+         SELECT a.show_id AS show_id,
+                a.last_played_at AS last_played_at,
                 (SELECT e2.id
                    FROM episodes e2
                    JOIN seasons s2 ON e2.season_id = s2.id
-                   WHERE s2.show_id = t.show_id
-                     AND (s2.season_number > t.season
-                          OR (s2.season_number = t.season AND e2.episode_number > t.episode))
-                     AND NOT EXISTS (
-                         SELECT 1 FROM play_state ps2
-                         WHERE ps2.user_id = ?1 AND ps2.episode_id = e2.id
+                   JOIN media_files mf2
+                     ON mf2.episode_id = e2.id AND mf2.removed_at IS NULL
+                   LEFT JOIN play_state ps2
+                     ON ps2.episode_id = e2.id AND ps2.user_id = ?1
+                   WHERE s2.show_id = a.show_id
+                     AND COALESCE(ps2.watched, 0) = 0
+                     AND (
+                       ps2.position_ms IS NULL
+                       OR ps2.duration_ms IS NULL
+                       OR ps2.position_ms < ps2.duration_ms * ?3 / 100
                      )
                    ORDER BY s2.season_number ASC, e2.episode_number ASC
                    LIMIT 1) AS episode_id
-         FROM tip t
-         WHERE t.last_played_at >= ?2
-         ORDER BY t.last_played_at DESC",
+         FROM active_shows a
+         WHERE a.last_played_at >= ?2
+         ORDER BY a.last_played_at DESC",
     )
     .bind(user_id)
     .bind(cutoff_ms)
+    .bind(threshold)
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     let mut seen = std::collections::HashSet::<i64>::new();
     for r in rows {
         let show_id: i64 = r.try_get("show_id")?;
-        // A show with two tied `last_played_at` rows would emit twice
-        // from the `tip` CTE — dedup here so the caller doesn't have
-        // to think about it.
         if !seen.insert(show_id) {
             continue;
         }

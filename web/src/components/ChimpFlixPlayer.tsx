@@ -549,6 +549,13 @@ export function ChimpFlixPlayer({
   // yanking currentTime in the middle of a user-initiated seek.
   const scrubbingRef = useRef(false);
   const scrobbledRef = useRef(false);
+  /// True once the user has *deliberately* paused (space/click/Media
+  /// Session pause), cleared when they deliberately resume. The `canplay`
+  /// handler consults this so an involuntary `canplay` re-fire — after an
+  /// HLS buffer dip refills, an error recovery, a tab refocus, or a
+  /// segment append — never silently un-pauses a video the user chose to
+  /// stop. Starts false so the genuine first-frame autoplay still fires.
+  const userPausedRef = useRef(false);
   /// Backend session id for the currently-mounted HLS stream. The
   /// session-creation effect sets this; the pause/resume + scrub
   /// pre-warm hooks read it. `null` for a direct-play session (no
@@ -584,6 +591,13 @@ export function ChimpFlixPlayer({
   // as media-time 0 — so source-time = video.currentTime + sessionStartMs.
   // All public reads/writes of position go through this offset.
   const sessionStartMsRef = useRef<number>(0);
+  // Most-recent scrub seek-hint transcode session id. Scrub hints
+  // intentionally leave a warm session for the server's find_compatible
+  // to adopt on release — but one per distinct scrub position. We keep
+  // at most ONE alive (delete the prior when a new position supersedes
+  // it; clear it once real playback starts) so a single drag can't stack
+  // orphan sessions against the global transcoder_max_concurrent cap.
+  const lastHintSessionRef = useRef<string | null>(null);
   // Bumped when the user seeks before the current session's start. The
   // session useEffect lists it as a dep so the bump tears the session
   // down and creates a new one rooted at `liveTimeMsRef.current`.
@@ -1291,6 +1305,18 @@ export function ChimpFlixPlayer({
 
       sessionId = resp.session.id !== "direct" ? resp.session.id : null;
       activeSessionIdRef.current = sessionId;
+      // Release any leftover scrub-hint session that real playback
+      // didn't adopt (find_compatible reuses it when positions match, in
+      // which case its id equals sessionId and we keep it). Otherwise a
+      // drag-then-play would leave the hint AND the real session both
+      // counting against transcoder_max_concurrent until the reaper.
+      {
+        const leftoverHint = lastHintSessionRef.current;
+        lastHintSessionRef.current = null;
+        if (leftoverHint && leftoverHint !== sessionId) {
+          streamApi.deleteSession(leftoverHint).catch(() => {});
+        }
+      }
       // For direct play, remember the file id so teardown can include
       // it in the close beacon — without it the server can't fire
       // Trakt scrobble Stop (no session snapshot to resolve from).
@@ -1959,7 +1985,10 @@ export function ChimpFlixPlayer({
     const onWaiting = () => setLoading(true);
     const onCanPlay = () => {
       setLoading(false);
-      if (video.paused && !autoplayBlocked) {
+      // Only auto-(re)start if the user hasn't deliberately paused.
+      // `canplay` re-fires on its own after buffer refills / recovery /
+      // refocus; without this guard each refire resumes a paused video.
+      if (video.paused && !autoplayBlocked && !userPausedRef.current) {
         attemptPlay();
       }
     };
@@ -2306,9 +2335,13 @@ export function ChimpFlixPlayer({
       artist: subtitle ?? undefined,
     });
     const onPlay = () => {
+      userPausedRef.current = false;
       void v.play().catch(() => {});
     };
-    const onPause = () => v.pause();
+    const onPause = () => {
+      userPausedRef.current = true;
+      v.pause();
+    };
     const onSeekBackward = (details: MediaSessionActionDetails) => {
       const offset = details.seekOffset ?? 10;
       seekByRef.current?.(-offset);
@@ -2635,8 +2668,13 @@ export function ChimpFlixPlayer({
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
-    if (v.paused) v.play().catch(() => {});
-    else v.pause();
+    if (v.paused) {
+      userPausedRef.current = false;
+      v.play().catch(() => {});
+    } else {
+      userPausedRef.current = true;
+      v.pause();
+    }
   }, []);
 
   // Schedule a session restart at the given source-time. 250ms debounce
@@ -2913,10 +2951,13 @@ export function ChimpFlixPlayer({
       }
       const livePrefs = getPrefs();
       const clientCaps = detectClientCapabilities();
-      // Fire-and-forget. The response (a new session id) doesn't
-      // need to flow back to the player — `find_compatible` on the
-      // backend will discover it when the player's eventual seek
-      // POSTs at the same position.
+      // Warm the seek target. The response session is kept as the
+      // single live "hint" — `find_compatible` on the backend adopts it
+      // when the player's eventual seek POSTs at the same position. To
+      // avoid stacking one orphan transcode session per scrub pause
+      // (each counts toward transcoder_max_concurrent until the ~90s
+      // reaper), we delete the PRIOR hint as soon as this newer one is
+      // live, so at most one hint session exists at a time.
       streamApi
         .createSession({
           media_file_id: activeMediaFileId,
@@ -2937,9 +2978,18 @@ export function ChimpFlixPlayer({
             supported_containers: clientCaps.containers,
           },
         })
+        .then((resp) => {
+          const prev = lastHintSessionRef.current;
+          const newId =
+            resp.session.mode === "transcode" ? resp.session.id : null;
+          lastHintSessionRef.current = newId;
+          if (prev && prev !== newId) {
+            streamApi.deleteSession(prev).catch(() => {});
+          }
+        })
         .catch(() => {
-          // Best-effort; failure just means the seek-on-release
-          // takes the normal cold-start path.
+          // Best-effort; failure (incl. a 429 when at capacity) just
+          // means the seek-on-release takes the normal cold-start path.
         });
     },
     [
