@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import { Switch } from "@/components/admin/ui";
 import { useState } from "react";
 import {
   admin as adminApi,
@@ -189,11 +190,7 @@ export function AdminGeneralForm({ initial }: Props) {
           changed={dirtyFields["Anonymous telemetry"]}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={telemetry}
-              onChange={(e) => setTelemetry(e.target.checked)}
-            />
+            <Switch checked={telemetry} onChange={setTelemetry} />
             <span>Send anonymous usage telemetry</span>
           </label>
         </SettingsRow>

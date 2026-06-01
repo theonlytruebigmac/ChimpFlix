@@ -59,41 +59,102 @@ pub async fn notify_admins(
         }
     };
 
-    // Insert + maybe-email each owner. We DO NOT short-circuit on the
-    // first failure — one owner's missing email shouldn't stop another
-    // from being notified.
+    // Per-owner: load the user, apply their notification prefs (per-kind
+    // mute + quiet hours), then insert the bell row and/or send email. We
+    // DO NOT short-circuit on the first failure — one owner's missing email
+    // shouldn't stop another from being notified.
+    let now = chimpflix_common::now_ms();
     for owner_id in owner_ids {
-        if let Err(e) =
-            queries::insert_notification(&state.pool, owner_id, kind, &payload_json).await
+        let user = match queries::find_user_by_id(&state.pool, owner_id).await {
+            Ok(Some(u)) => u,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), owner_id, "find_user_by_id during notify");
+                continue;
+            }
+        };
+        let delivery = delivery_for(&user, kind, now);
+        if delivery.bell
+            && let Err(e) =
+                queries::insert_notification(&state.pool, owner_id, kind, &payload_json).await
         {
             warn!(error = %format!("{e:#}"), owner_id, kind, "insert_notification");
-            continue;
         }
-        send_email_if_opted_in(state, owner_id, subject, body_text, body_html).await;
+        if delivery.email {
+            send_email(state, &user, subject, body_text, body_html).await;
+        }
     }
 }
 
-async fn send_email_if_opted_in(
+/// Which channels a notification should reach a user on, after applying
+/// their per-kind preferences + quiet hours.
+struct Delivery {
+    bell: bool,
+    email: bool,
+}
+
+/// Security events (2FA changes) can never be muted — the email templates
+/// promise as much. Everything else honors `notification_prefs_json`.
+fn is_security_kind(kind: &str) -> bool {
+    kind == KIND_USER_TWO_FACTOR_DISABLED || kind == KIND_USER_TWO_FACTOR_RESET
+}
+
+/// Resolve per-kind delivery for `user`. The bell always records when the
+/// kind is enabled (it's passive — seen when the menu opens); quiet hours
+/// only hold back the interruptive email channel.
+fn delivery_for(user: &User, kind: &str, now_ms: i64) -> Delivery {
+    if is_security_kind(kind) {
+        return Delivery {
+            bell: true,
+            email: user.notify_via_email,
+        };
+    }
+    let prefs: serde_json::Value =
+        serde_json::from_str(&user.notification_prefs_json).unwrap_or(serde_json::Value::Null);
+    let kp = prefs.get(kind);
+    let getf = |key: &str| kp.and_then(|k| k.get(key));
+    let enabled = getf("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    if !enabled {
+        return Delivery {
+            bell: false,
+            email: false,
+        };
+    }
+    let email_pref = getf("email").and_then(|v| v.as_bool()).unwrap_or(true);
+    let email = user.notify_via_email && email_pref && !in_quiet_hours(kp, now_ms);
+    Delivery { bell: true, email }
+}
+
+/// True when `now` falls inside the user's quiet-hours window for this
+/// kind. Hours are UTC 0–23; start > end wraps past midnight (22→7
+/// suppresses 22:00–06:59). Absent/equal bounds = no quiet hours.
+fn in_quiet_hours(kp: Option<&serde_json::Value>, now_ms: i64) -> bool {
+    let Some(kp) = kp else { return false };
+    let (Some(start), Some(end)) = (
+        kp.get("quiet_start_hour").and_then(|v| v.as_i64()),
+        kp.get("quiet_end_hour").and_then(|v| v.as_i64()),
+    ) else {
+        return false;
+    };
+    if !(0..24).contains(&start) || !(0..24).contains(&end) || start == end {
+        return false;
+    }
+    let hour = (now_ms / 3_600_000).rem_euclid(24);
+    if start < end {
+        hour >= start && hour < end
+    } else {
+        hour >= start || hour < end
+    }
+}
+
+async fn send_email(
     state: &AppState,
-    owner_id: i64,
+    user: &User,
     subject: &str,
     body_text: &str,
     body_html: &str,
 ) {
-    let user_opt = match queries::find_user_by_id(&state.pool, owner_id).await {
-        Ok(u) => u,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), owner_id, "find_user_by_id during notify");
-            return;
-        }
-    };
-    let Some(User {
-        notify_via_email: true,
-        email: Some(addr),
-        display_name,
-        ..
-    }) = user_opt
-    else {
+    let Some(addr) = user.email.as_deref() else {
         return;
     };
     let settings = state.settings.read().await.clone();
@@ -107,15 +168,15 @@ async fn send_email_if_opted_in(
     };
     if let Err(e) = mailer
         .send(OutgoingMessage {
-            to_address: &addr,
-            to_name: display_name.as_deref(),
+            to_address: addr,
+            to_name: user.display_name.as_deref(),
             subject,
             html: body_html,
             text: body_text,
         })
         .await
     {
-        warn!(error = %format!("{e:#}"), owner_id, "notification email send failed");
+        warn!(error = %format!("{e:#}"), user_id = user.id, "notification email send failed");
     }
 }
 

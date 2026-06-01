@@ -253,7 +253,7 @@ function render(n: Notification): Rendered {
       return {
         title: `${display} joined`,
         body: `@${username} accepted their invite. Grant library access if needed.`,
-        href: "/settings/admin/users/access",
+        href: "/settings/admin/users?tab=access",
       };
     }
     case "user.2fa.disabled": {

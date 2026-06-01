@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChimpFlix · Tasks & Jobs</title>
+<link rel="stylesheet" href="styles.css">
+<script src="app.js" defer></script>
+<style>
+  .node { border:1px solid var(--line); border-radius:var(--r); background:var(--surface); padding:11px 13px; min-width:170px; }
+  .node .nh { display:flex; align-items:center; gap:8px; font-weight:600; font-size:13px; }
+  .node .nc { margin-top:7px; display:flex; gap:10px; font-size:11px; color:var(--muted); }
+  .node .nc b { color:#fff; }
+  .node.run { border-color:var(--info-soft); box-shadow:0 0 0 1px rgba(96,165,250,.25); }
+  .node.fail { border-color:rgba(248,113,113,.35); }
+  .flow-col { display:flex; flex-direction:column; gap:12px; justify-content:center; }
+  .flow-arrow { display:grid; place-items:center; color:var(--ghost); font-size:22px; }
+  .ksort { font-variant-numeric:tabular-nums; }
+</style>
+</head>
+<body data-context="server" data-active="tasks" data-crumbs="Server / Tasks & jobs">
+<main class="content wide">
+  <div class="content-inner" data-tabset>
+
+    <div class="page-head">
+      <div class="head-row">
+        <div>
+          <div class="eyebrow">Server · Library</div>
+          <h1>Tasks &amp; jobs</h1>
+          <p>The background pipeline that keeps libraries fresh — scanning, marker detection, subtitle fetch, ratings, and maintenance. Live, auto-refreshing.</p>
+        </div>
+        <div class="actions"><span class="pill"><span class="dot" style="background:var(--ok)"></span>auto-refresh 5s</span></div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab on" data-tab="ov">Overview</button>
+      <button class="tab" data-tab="queue">Queue <span class="pillcount">128</span></button>
+      <button class="tab" data-tab="act">Activity</button>
+      <button class="tab" data-tab="flow">Flow</button>
+    </div>
+
+    <!-- ====================== OVERVIEW ====================== -->
+    <section class="tabpanel on" data-panel="ov">
+      <div class="grid c4" style="grid-template-columns:repeat(5,1fr)">
+        <div class="stat tone-blue" style="padding:14px"><div class="stat-top">Queued</div><div class="stat-val" style="font-size:24px">128</div></div>
+        <div class="stat tone-violet" style="padding:14px"><div class="stat-top">Running</div><div class="stat-val" style="font-size:24px">6</div></div>
+        <div class="stat tone-green" style="padding:14px"><div class="stat-top">Succeeded</div><div class="stat-val" style="font-size:24px">12.4k</div></div>
+        <div class="stat tone-amber" style="padding:14px"><div class="stat-top">Failed</div><div class="stat-val" style="font-size:24px">9</div></div>
+        <div class="stat tone-red" style="padding:14px"><div class="stat-top">Dead</div><div class="stat-val" style="font-size:24px">3</div></div>
+      </div>
+
+      <div class="card" style="margin-top:18px">
+        <div class="card-head"><div><div class="ttl">Scheduled tasks</div><div class="sub">Registry-driven — new kinds appear here automatically.</div></div></div>
+        <table class="table">
+          <thead><tr><th>Task</th><th>Status</th><th>In flight</th><th>Next run</th><th>Enabled</th><th></th></tr></thead>
+          <tbody>
+            <tr><td><b>Library scan</b><div class="faint" style="font-size:11px">library_scan</div></td><td><span class="pill"><span class="dot" style="background:var(--ghost)"></span>Idle</span></td><td class="ksort">0 queued · 0 running</td><td>in 42m</td><td><div class="switch on" style="display:inline-block;vertical-align:middle"></div></td><td class="num"><button class="btn ghost tiny">Open</button></td></tr>
+            <tr><td><b>Marker detection</b><div class="faint" style="font-size:11px">detect_markers</div></td><td><span class="pill info"><span class="dot"></span>Running</span></td><td class="ksort">14 queued · <b>4 running</b></td><td>continuous</td><td><div class="switch on" style="display:inline-block;vertical-align:middle"></div></td><td class="num"><button class="btn ghost tiny">Open</button></td></tr>
+            <tr><td><b>Subtitle fetch</b><div class="faint" style="font-size:11px">fetch_subtitles</div></td><td><span class="pill info"><span class="dot"></span>Running</span></td><td class="ksort">98 queued · <b>2 running</b></td><td>continuous</td><td><div class="switch on" style="display:inline-block;vertical-align:middle"></div></td><td class="num"><button class="btn ghost tiny">Open</button></td></tr>
+            <tr><td><b>Enrich (IMDb)</b><div class="faint" style="font-size:11px">enrich_imdb_movie</div></td><td><span class="pill err"><span class="dot"></span>Failing</span></td><td class="ksort">2 queued · 0 running</td><td>continuous</td><td><div class="switch on" style="display:inline-block;vertical-align:middle"></div></td><td class="num"><button class="btn ghost tiny">Open</button></td></tr>
+            <tr><td><b>Trakt pull</b><div class="faint" style="font-size:11px">trakt_pull_user</div></td><td><span class="pill"><span class="dot" style="background:var(--ghost)"></span>Idle</span></td><td class="ksort">0 queued · 0 running</td><td>in 1h 12m</td><td><div class="switch on" style="display:inline-block;vertical-align:middle"></div></td><td class="num"><button class="btn ghost tiny">Open</button></td></tr>
+            <tr><td><b>Verify libraries</b><div class="faint" style="font-size:11px">verify_libraries</div></td><td><span class="pill"><span class="dot" style="background:var(--ghost)"></span>Idle</span></td><td class="ksort">0 queued · 0 running</td><td>Sun 03:00</td><td><div class="switch" style="display:inline-block;vertical-align:middle"></div></td><td class="num"><button class="btn ghost tiny">Open</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card mb0">
+        <div class="card-head"><div><div class="ttl">Maintenance window</div><div class="sub">Heavy tasks defer to this window so daytime playback stays smooth.</div></div></div>
+        <div class="card-body">
+          <div class="row"><div class="row-main"><div class="row-label">Window</div><div class="row-help">Tasks scheduled outside the window wait until it opens.</div></div>
+            <div class="row-control"><input class="input w-auto" style="min-width:90px" value="02:00"><span class="faint">to</span><input class="input w-auto" style="min-width:90px" value="06:00"></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Job workers</div><div class="row-help">Parallel workers in the background pipeline.</div></div>
+            <div class="row-control"><input class="input w-auto" style="min-width:80px" value="4"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====================== QUEUE ====================== -->
+    <section class="tabpanel" data-panel="queue">
+      <div class="flex between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div class="seg"><button class="on">All</button><button>Queued</button><button>Running</button><button>Failed</button><button>Dead</button></div>
+        <div class="flex gap8">
+          <button class="btn sm">Process all failed</button>
+          <button class="btn danger sm">Clear dead</button>
+        </div>
+      </div>
+      <div class="flex wrap gap8" style="margin-bottom:14px">
+        <span class="pill accent">All kinds</span>
+        <span class="pill">classify_movie</span><span class="pill">match_and_upsert</span><span class="pill">enrich_imdb_movie</span><span class="pill">fetch_subtitles</span><span class="pill">detect_markers</span>
+      </div>
+      <div class="card mb0">
+        <table class="table">
+          <thead><tr><th>Job</th><th>Kind</th><th>Status</th><th>Last error</th><th>Created</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="mono">#48201</td><td>detect_markers</td><td><span class="pill info"><span class="dot"></span>Running</span></td><td class="faint">—</td><td class="faint">2s ago</td><td></td></tr>
+            <tr><td class="mono">#48198</td><td>fetch_subtitles</td><td><span class="pill info"><span class="dot"></span>Running</span></td><td class="faint">—</td><td class="faint">9s ago</td><td></td></tr>
+            <tr><td class="mono">#48190</td><td>enrich_imdb_movie</td><td><span class="pill err"><span class="dot"></span>Failed</span></td><td class="mono" style="color:#fca5a5">upstream 429</td><td class="faint">1m ago</td><td class="num"><button class="btn ghost tiny">Retry</button></td></tr>
+            <tr><td class="mono">#48155</td><td>enrich_imdb_movie</td><td><span class="pill err" style="background:rgba(248,113,113,.2)"><span class="dot"></span>Dead</span></td><td class="mono" style="color:#fca5a5">failed after 5 retries</td><td class="faint">8m ago</td><td class="num"><button class="btn ghost tiny">Retry</button></td></tr>
+            <tr><td class="mono">#48140</td><td>classify_movie</td><td><span class="pill"><span class="dot" style="background:var(--ghost)"></span>Queued</span></td><td class="faint">—</td><td class="faint">10m ago</td><td></td></tr>
+            <tr><td class="mono">#48002</td><td>match_and_upsert</td><td><span class="pill ok"><span class="dot"></span>Succeeded</span></td><td class="faint">—</td><td class="faint">14m ago</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ====================== ACTIVITY ====================== -->
+    <section class="tabpanel" data-panel="act">
+      <div class="grid c3">
+        <div class="card mb0"><div class="card-body pad"><div class="flex between"><b>detect_markers</b><span class="pill info" style="padding:1px 7px"><span class="dot"></span>working</span></div><div class="muted" style="font-size:12px;margin-top:8px">14 queued · 4 running<br>last run 1.2s · next continuous</div></div></div>
+        <div class="card mb0"><div class="card-body pad"><div class="flex between"><b>fetch_subtitles</b><span class="pill info" style="padding:1px 7px"><span class="dot"></span>working</span></div><div class="muted" style="font-size:12px;margin-top:8px">98 queued · 2 running<br>last run 640ms · next continuous</div></div></div>
+        <div class="card mb0"><div class="card-body pad"><div class="flex between"><b>enrich_imdb_movie</b><span class="pill err" style="padding:1px 7px"><span class="dot"></span>failing</span></div><div class="muted" style="font-size:12px;margin-top:8px">2 queued · 9 failed today<br>last error: upstream 429</div></div></div>
+      </div>
+
+      <div class="card" style="margin-top:18px"><div class="card-head"><div><div class="ttl">Recent runs</div></div></div>
+        <table class="table">
+          <thead><tr><th>When</th><th>Kind</th><th>Duration</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td class="faint">14:31:02</td><td>detect_markers</td><td class="mono">1.2s</td><td><span class="pill ok" style="padding:1px 7px"><span class="dot"></span>ok</span></td></tr>
+            <tr><td class="faint">14:30:58</td><td>fetch_subtitles</td><td class="mono">640ms</td><td><span class="pill ok" style="padding:1px 7px"><span class="dot"></span>ok</span></td></tr>
+            <tr><td class="faint">14:30:41</td><td>enrich_imdb_movie</td><td class="mono">2.0s</td><td><span class="pill err" style="padding:1px 7px"><span class="dot"></span>failed</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card mb0"><div class="card-head"><div><div class="ttl">Dead letter</div><div class="sub">Jobs that exhausted retries — resurrect manually.</div></div>
+        <div class="head-aside"><button class="btn danger sm">Clear all</button></div></div>
+        <table class="table">
+          <thead><tr><th>Job</th><th>Kind</th><th>Error</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="mono">#48155</td><td>enrich_imdb_movie</td><td class="mono" style="color:#fca5a5">failed after 5 retries: 429</td><td class="num"><button class="btn ghost tiny">Retry</button></td></tr>
+            <tr><td class="mono">#47980</td><td>enrich_imdb_movie</td><td class="mono" style="color:#fca5a5">failed after 5 retries: 429</td><td class="num"><button class="btn ghost tiny">Retry</button></td></tr>
+            <tr><td class="mono">#47712</td><td>optimize_versions</td><td class="mono" style="color:#fca5a5">ffmpeg exit 1</td><td class="num"><button class="btn ghost tiny">Retry</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ====================== FLOW ====================== -->
+    <section class="tabpanel" data-panel="flow">
+      <p class="muted" style="font-size:13px;margin-top:0">When a media file is added, work fans out through these stages. Live counts update in place — click any node to drill into that kind.</p>
+      <div class="card mb0"><div class="card-body pad" style="overflow-x:auto">
+        <div class="flex" style="gap:18px;align-items:stretch;min-width:760px">
+          <div class="flow-col">
+            <div class="node"><div class="nh"><svg class="ico" style="width:15px;height:15px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>Media file added</div><div class="nc"><span>trigger</span></div></div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-col">
+            <div class="node"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span>classify</div><div class="nc"><span><b>0</b> queued</span><span><b>1.2k</b> done</span></div></div>
+            <div class="node"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span>match &amp; upsert</div><div class="nc"><span><b>0</b> queued</span><span><b>1.2k</b> done</span></div></div>
+            <div class="node fail"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--err)"></span>enrich</div><div class="nc"><span><b>2</b> queued</span><span style="color:#fca5a5"><b>9</b> failed</span></div></div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-col">
+            <div class="node run"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--info)"></span>detect markers</div><div class="nc"><span><b>14</b> queued</span><span><b>4</b> running</span></div></div>
+            <div class="node run"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--info)"></span>fetch subtitles</div><div class="nc"><span><b>98</b> queued</span><span><b>2</b> running</span></div></div>
+            <div class="node"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--ghost)"></span>loudness scan</div><div class="nc"><span><b>0</b> queued</span><span>idle</span></div></div>
+            <div class="node"><div class="nh"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--ghost)"></span>optimize versions</div><div class="nc"><span><b>1</b> queued</span><span>idle</span></div></div>
+          </div>
+        </div>
+      </div></div>
+    </section>
+
+  </div>
+</main>
+</body>
+</html>

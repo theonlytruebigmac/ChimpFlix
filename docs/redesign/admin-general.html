@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChimpFlix · General</title>
+<link rel="stylesheet" href="styles.css">
+<script src="app.js" defer></script>
+</head>
+<body data-context="server" data-active="general" data-crumbs="Server / General">
+<main class="content">
+  <div class="content-inner">
+
+    <div class="page-head">
+      <div class="eyebrow">Server · System</div>
+      <h1>General</h1>
+      <p>Server-wide identity, security policy, and privacy.</p>
+    </div>
+
+    <!-- ====================== IDENTITY ====================== -->
+    <div class="card">
+      <div class="card-head"><div><div class="ttl">Identity</div><div class="sub">What this server calls itself and where clients reach it.</div></div></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="row-main"><div class="row-label">Server name</div>
+            <div class="row-help">Shown to clients on the network and in the sign-in screen.</div></div>
+          <div class="row-control"><input class="input w-auto changed" style="min-width:260px" value="ChimpFlix at Home"></div>
+        </div>
+        <div class="row">
+          <div class="row-main"><div class="row-label">Public URL</div>
+            <div class="row-help">The address remote clients and webhooks use to reach this server.</div></div>
+          <div class="row-control"><input class="input w-auto" style="min-width:300px" value="https://chimpflix.example.com"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====================== SECURITY ====================== -->
+    <div class="card">
+      <div class="card-head"><div><div class="ttl">Security</div><div class="sub">Account policy applied to everyone on this server.</div></div></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="row-main"><div class="row-label">Two-factor enforcement</div>
+            <div class="row-help">Required forces every account to set up 2FA.</div></div>
+          <div class="row-control"><select class="select w-auto"><option>Off</option><option>Optional</option><option selected>Required</option></select></div>
+        </div>
+        <div class="row">
+          <div class="row-main"><div class="row-label">Allow new sign-ups</div>
+            <div class="row-help">When off, users join by invite only.</div></div>
+          <div class="row-control"><div class="switch"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====================== PRIVACY ====================== -->
+    <div class="card">
+      <div class="card-head"><div><div class="ttl">Privacy</div><div class="sub">What, if anything, leaves this server.</div></div></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="row-main"><div class="row-label">Anonymous telemetry</div>
+            <div class="row-help">Opt in to share anonymous usage to help improve ChimpFlix. No media titles or personal data.</div></div>
+          <div class="row-control"><div class="switch"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====================== SETUP ====================== -->
+    <div class="card mb0">
+      <div class="card-head"><div><div class="ttl">Setup</div><div class="sub">First-run configuration and build facts.</div></div></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="row-main"><div class="row-label">Re-run setup wizard</div>
+            <div class="row-help">Walk through first-run configuration again.</div></div>
+          <div class="row-control"><button class="btn sm"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 7a4 4 0 0 0-5 5l-6 6 2 2 6-6a4 4 0 0 0 5-5l-2 2-2-2 2-2z"/></svg>Re-run wizard</button></div>
+        </div>
+        <div class="grid c2" style="padding:14px 0">
+          <div><div class="field-label">Version</div><div>v2.4.0</div></div>
+          <div><div class="field-label">Data directory</div><div class="mono">/data</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- sticky save bar -->
+    <div class="savebar">
+      <div class="sb-status"><span class="dot" style="background:var(--warn)"></span><b>1 unsaved change</b> · Server name</div>
+      <div class="sb-actions">
+        <button class="btn ghost sm">Discard</button>
+        <button class="btn primary sm">Save changes</button>
+      </div>
+    </div>
+
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChimpFlix · Transcoding</title>
+<link rel="stylesheet" href="styles.css">
+<script src="app.js" defer></script>
+<style>
+  .caps { display:flex; flex-wrap:wrap; gap:8px; }
+  .cap { display:inline-flex; align-items:center; gap:7px; padding:6px 11px; border-radius:8px; font-size:12px; font-weight:600;
+    border:1px solid var(--line); background:var(--surface-2); color:var(--muted); }
+  .cap.ok { color:var(--ok); border-color:rgba(52,211,153,.3); background:var(--ok-soft); }
+  .cap .ico { width:14px; height:14px; }
+  .dep { transition:opacity .2s; }
+  .dep.off { opacity:.4; pointer-events:none; }
+</style>
+</head>
+<body data-context="server" data-active="transcoding" data-crumbs="Server / Transcoding">
+<main class="content" data-tabset>
+  <div class="content-inner">
+
+    <div class="page-head">
+      <div class="eyebrow">Server · Library</div>
+      <h1>Transcoding</h1>
+      <p>Hardware acceleration, concurrency, quality, and the pre-roll bumper. Detected capabilities are probed at boot and shown up top so settings can't ask for hardware you don't have.</p>
+    </div>
+
+    <div class="tabs">
+      <button class="tab on" data-tab="engine">Engine</button>
+      <button class="tab" data-tab="presets">Presets</button>
+      <button class="tab" data-tab="preroll">Pre-roll</button>
+    </div>
+
+    <!-- ====================== ENGINE ====================== -->
+    <section class="tabpanel on" data-panel="engine">
+      <!-- detected hardware -->
+      <div class="card">
+        <div class="card-head">
+          <div><div class="ttl">Detected hardware</div><div class="sub">Probed via <span class="mono">ffmpeg -encoders</span> · 38 ms at boot</div></div>
+          <div class="head-aside"><button class="btn sm"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10a8 8 0 0 1 14-4l2 2M20 14a8 8 0 0 1-14 4l-2-2"/><path d="M18 4v4h-4M6 20v-4h4"/></svg>Re-probe</button></div>
+        </div>
+        <div class="card-body pad">
+          <div class="field-label">H.264 acceleration</div>
+          <div class="caps" style="margin-bottom:14px">
+            <span class="cap ok"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5 9-11"/></svg>NVENC</span>
+            <span class="cap ok"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5 9-11"/></svg>VAAPI</span>
+            <span class="cap">Quick Sync</span>
+            <span class="cap">VideoToolbox</span>
+            <span class="cap">AMF</span>
+          </div>
+          <div class="field-label">HEVC / others</div>
+          <div class="caps">
+            <span class="cap ok"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5 9-11"/></svg>NVENC HEVC</span>
+            <span class="cap">libx265 (software)</span>
+            <span class="cap ok"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5 9-11"/></svg>GPU 0 · RTX 4060</span>
+          </div>
+          <div class="banner ok" style="margin:16px 0 0">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>
+            <div>NVENC is active — CPU stays free during transcodes. Software fallback only kicks in if the GPU is saturated.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- acceleration -->
+      <div class="card">
+        <div class="card-head"><div><div class="ttl">Acceleration</div></div></div>
+        <div class="card-body">
+          <div class="row"><div class="row-main"><div class="row-label">Hardware acceleration</div><div class="row-help">Greyed options weren't detected on this host.</div></div>
+            <div class="row-control"><select class="select w-auto"><option>Auto</option><option selected>NVENC (NVIDIA)</option><option>VAAPI</option><option disabled>Quick Sync — not detected</option><option disabled>VideoToolbox — not detected</option><option>None (software / libx264)</option></select></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Fallback strictness</div><div class="row-help">What to do when the GPU is busy or a codec isn't HW-supported.</div></div>
+            <div class="row-control"><select class="select w-auto"><option selected>Prefer HW, fall back to software</option><option>HW only — fail if unavailable</option><option>Always software</option></select></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">GPU device</div><div class="row-help">Pin to a specific GPU when more than one is present.</div></div>
+            <div class="row-control"><input class="input w-auto" style="min-width:120px" value="auto"></div></div>
+        </div>
+      </div>
+
+      <!-- concurrency -->
+      <div class="card">
+        <div class="card-head"><div><div class="ttl">Concurrency</div><div class="sub">Slot limits so a busy night doesn't melt the box.</div></div></div>
+        <div class="card-body pad">
+          <div class="grid c4">
+            <div class="field mb0"><label class="field-label">Max concurrent</label><input class="input changed" value="4"></div>
+            <div class="field mb0"><label class="field-label">Max CPU-only</label><input class="input" value="1"></div>
+            <div class="field mb0"><label class="field-label">Background slots</label><input class="input" value="2"></div>
+            <div class="field mb0"><label class="field-label">Job workers</label><input class="input" value="4"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- quality -->
+      <div class="card">
+        <div class="card-head"><div><div class="ttl">Quality</div></div></div>
+        <div class="card-body">
+          <div class="row"><div class="row-main"><div class="row-label">Live encoder preset</div><div class="row-help">Speed vs quality for on-the-fly transcodes.</div></div>
+            <div class="row-control"><select class="select w-auto"><option>p1 (fastest)</option><option selected>p4 (balanced)</option><option>p7 (best)</option></select></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Background preset</div><div class="row-help">For unattended optimize jobs — can afford to be slower.</div></div>
+            <div class="row-control"><select class="select w-auto"><option>veryfast</option><option selected>slow</option><option>slower</option></select></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Quality ceiling</div><div class="row-help">Cap the max output bitrate. Blank = no cap.</div></div>
+            <div class="row-control"><input class="input w-auto" style="min-width:120px" placeholder="kbps" value="12000"><span class="faint">kbps</span></div></div>
+        </div>
+      </div>
+
+      <!-- advanced video -->
+      <div class="card mb0">
+        <div class="card-head"><div><div class="ttl">Advanced video</div><div class="sub">Leave defaults unless you know you need these.</div></div></div>
+        <div class="card-body">
+          <div class="row"><div class="row-main"><div class="row-label">HDR → SDR tonemapping</div><div class="row-help">Convert HDR10 / HLG / Dolby Vision for SDR clients.</div></div>
+            <div class="row-control"><div class="switch on" id="hdrToggle"></div></div></div>
+          <div class="row dep" id="hdrAlgoRow"><div class="row-main"><div class="row-label">Tonemap algorithm</div><div class="row-help">Only used when tonemapping is on.</div></div>
+            <div class="row-control"><select class="select w-auto"><option selected>Hable (filmic)</option><option>Reinhard</option><option>Mobius</option><option>BT.2390</option><option>Clip</option></select></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">HEVC encoding</div><div class="row-help">HEVC halves bitrate but only Safari plays it reliably.</div></div>
+            <div class="row-control"><select class="select w-auto"><option selected>Off — always H.264</option><option>When the client supports it</option><option>Always (Safari only)</option></select></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Two-pass loudness normalization</div><div class="row-help">EBU R128 measure pass. Higher quality, slower.</div></div>
+            <div class="row-control"><div class="switch"></div></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Burn in ASS/SSA subtitles</div><div class="row-help">Render styled subtitles into the video at source resolution.</div></div>
+            <div class="row-control"><div class="switch"></div></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Transcode cache</div><div class="row-help">Where HLS segments are written. Read-only.</div></div>
+            <div class="row-control mono faint">/data/transcode-cache</div></div>
+        </div>
+      </div>
+
+      <div class="savebar">
+        <div class="sb-status"><span class="dot" style="background:var(--warn)"></span><b>1 unsaved change</b> · Max concurrent</div>
+        <div class="sb-actions"><button class="btn ghost sm">Discard</button><button class="btn primary sm">Save changes</button></div>
+      </div>
+    </section>
+
+    <!-- ====================== PRESETS ====================== -->
+    <section class="tabpanel" data-panel="presets">
+      <div class="flex between" style="margin-bottom:14px"><div class="muted" style="font-size:13px">Quality ladders offered to clients and used by optimize jobs.</div><button class="btn primary sm">New preset</button></div>
+      <div class="card mb0">
+        <table class="table">
+          <thead><tr><th>Preset</th><th>Resolution</th><th>Bitrate</th><th>Codec</th><th>Default</th><th></th></tr></thead>
+          <tbody>
+            <tr><td><b>Original</b></td><td>source</td><td class="mono">—</td><td>copy</td><td><span class="pill ok" style="padding:1px 7px"><span class="dot"></span>yes</span></td><td></td></tr>
+            <tr><td><b>1080p High</b></td><td>1920×1080</td><td class="mono">8 Mbps</td><td>H.264</td><td><span class="pill ok" style="padding:1px 7px"><span class="dot"></span>yes</span></td><td class="num"><button class="btn ghost tiny">Edit</button></td></tr>
+            <tr><td><b>720p</b></td><td>1280×720</td><td class="mono">4 Mbps</td><td>H.264</td><td><span class="faint">—</span></td><td class="num"><button class="btn ghost tiny">Edit</button></td></tr>
+            <tr><td><b>480p Mobile</b></td><td>854×480</td><td class="mono">1.5 Mbps</td><td>H.264</td><td><span class="faint">—</span></td><td class="num"><button class="btn ghost tiny">Edit</button></td></tr>
+            <tr><td><b>1080p HEVC</b></td><td>1920×1080</td><td class="mono">5 Mbps</td><td>HEVC</td><td><span class="faint">—</span></td><td class="num"><button class="btn ghost tiny">Edit</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ====================== PRE-ROLL ====================== -->
+    <section class="tabpanel" data-panel="preroll">
+      <div class="card">
+        <div class="card-head"><div><div class="ttl">Pre-roll bumper</div><div class="sub">A short clip that plays before every title.</div></div>
+          <div class="head-aside"><span class="pill ok"><span class="dot"></span>Loaded</span></div></div>
+        <div class="card-body">
+          <div class="row"><div class="row-main"><div class="row-label">Enable pre-roll</div></div><div class="row-control"><div class="switch on"></div></div></div>
+          <div class="row col"><div class="row-main flex between" style="width:100%"><div class="row-label">Volume <span class="faint" style="font-weight:400">— 80%</span></div></div>
+            <div class="row-control"><input class="range" type="range" min="0" max="100" value="80"></div></div>
+          <div class="row"><div class="row-main"><div class="row-label">Current file</div><div class="row-help">intro-bumper.mp4 · 6.2s · 1080p H.264</div></div>
+            <div class="row-control"><button class="btn sm">Replace</button><button class="btn ghost sm">Test</button></div></div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<script>
+  // dependent field: tonemap algorithm dims when tonemapping is off
+  (function () {
+    var t = document.getElementById('hdrToggle'), row = document.getElementById('hdrAlgoRow');
+    if (!t || !row) return;
+    function sync() { row.classList.toggle('off', !t.classList.contains('on')); }
+    t.addEventListener('click', function () { setTimeout(sync, 0); }); // after app.js toggles .on
+    sync();
+  })();
+</script>
+</body>
+</html>

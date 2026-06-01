@@ -120,19 +120,19 @@ export function AdminTasksOverviewClient({
 
       <div className="flex items-center justify-end gap-2 text-xs text-white/60">
         <Link
-          href="/settings/admin/library/scheduled-tasks/flow"
+          href="/settings/admin/tasks?tab=flow"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           Pipeline flow
         </Link>
         <Link
-          href="/settings/admin/library/scheduled-tasks/queue"
+          href="/settings/admin/tasks?tab=queue"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           Job queue
         </Link>
         <Link
-          href="/settings/admin/library/scheduled-tasks/activity"
+          href="/settings/admin/tasks?tab=activity"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           Activity →
@@ -272,7 +272,7 @@ function KindRow({
   nowMs: number;
   onToggleGate: (kind: string, next: boolean) => Promise<void>;
 }) {
-  const detailHref = `/settings/admin/library/scheduled-tasks/kind/${encodeURIComponent(card.name)}`;
+  const detailHref = `/settings/admin/tasks/kind/${encodeURIComponent(card.name)}`;
   // One <Link> per row instead of four. The gate toggle is a
   // sibling `<button>` outside the link, so the toggle click
   // doesn't bubble into the link navigation. Screen readers

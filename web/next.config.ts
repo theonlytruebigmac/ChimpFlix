@@ -201,6 +201,165 @@ const nextConfig: NextConfig = {
         destination: "/settings/admin/:path*",
         permanent: true,
       },
+      // Settings/admin IA redesign (branch redesign/settings-admin-ia).
+      // Old paths keep resolving as routes consolidate. More mappings are
+      // added here as each phase lands its new route.
+      {
+        source: "/settings/player",
+        destination: "/settings/playback",
+        permanent: true,
+      },
+      // Phase 3: admin landing + stats promoted out of the deep tree.
+      {
+        source: "/settings/admin",
+        destination: "/settings/admin/overview",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/status/stats",
+        destination: "/settings/admin/activity",
+        permanent: true,
+      },
+      // Phase 4: server/transcoder + preroll -> transcoding (tabs);
+      // server/notifications + webhooks -> notifications (tabs).
+      {
+        source: "/settings/admin/server/transcoder",
+        destination: "/settings/admin/transcoding?tab=engine",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/server/preroll",
+        destination: "/settings/admin/transcoding?tab=preroll",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/server/notifications",
+        destination: "/settings/admin/notifications?tab=email",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/server/notifications/webhooks",
+        destination: "/settings/admin/notifications?tab=webhooks",
+        permanent: true,
+      },
+      // Phase 4b: library subtree -> single tabbed /libraries page.
+      {
+        source: "/settings/admin/library",
+        destination: "/settings/admin/libraries?tab=defaults",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/libraries",
+        destination: "/settings/admin/libraries?tab=libraries",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/collections",
+        destination: "/settings/admin/libraries?tab=collections",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/agents",
+        destination: "/settings/admin/libraries?tab=agents",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/versions",
+        destination: "/settings/admin/libraries?tab=optimized",
+        permanent: true,
+      },
+      // Phase 4b: scheduled-tasks subtree -> single tabbed /tasks page
+      // (per-kind drill-in moves under /tasks/kind).
+      {
+        source: "/settings/admin/library/scheduled-tasks",
+        destination: "/settings/admin/tasks",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/scheduled-tasks/queue",
+        destination: "/settings/admin/tasks?tab=queue",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/scheduled-tasks/activity",
+        destination: "/settings/admin/tasks?tab=activity",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/scheduled-tasks/flow",
+        destination: "/settings/admin/tasks?tab=flow",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/library/scheduled-tasks/kind/:kind*",
+        destination: "/settings/admin/tasks/kind/:kind*",
+        permanent: true,
+      },
+      // Phase 5: users sub-pages -> tabs on /users (base path unchanged).
+      {
+        source: "/settings/admin/users/access",
+        destination: "/settings/admin/users?tab=access",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/users/access-groups",
+        destination: "/settings/admin/users?tab=groups",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/users/devices",
+        destination: "/settings/admin/users?tab=devices",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/users/invites",
+        destination: "/settings/admin/users?tab=invites",
+        permanent: true,
+      },
+      // Phase 5: maintenance backup/bulk -> tabs; logs promoted to /logs.
+      {
+        source: "/settings/admin/maintenance/backup",
+        destination: "/settings/admin/maintenance?tab=backups",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/maintenance/bulk",
+        destination: "/settings/admin/maintenance?tab=bulk",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/maintenance/logs",
+        destination: "/settings/admin/logs",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/maintenance/logs/audit",
+        destination: "/settings/admin/logs?tab=audit",
+        permanent: true,
+      },
+      // Phase 5/6: flatten server/{general,network,credentials} up a level;
+      // personal libraries page splits into home (visibility) + the
+      // owner-only Server -> Libraries CRUD.
+      {
+        source: "/settings/admin/server/general",
+        destination: "/settings/admin/general",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/server/network",
+        destination: "/settings/admin/network",
+        permanent: true,
+      },
+      {
+        source: "/settings/admin/server/credentials",
+        destination: "/settings/admin/credentials",
+        permanent: true,
+      },
+      {
+        source: "/settings/libraries",
+        destination: "/settings/home",
+        permanent: true,
+      },
     ];
   },
 };

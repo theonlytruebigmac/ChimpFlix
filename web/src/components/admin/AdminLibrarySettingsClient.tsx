@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { Switch } from "@/components/admin/ui";
 import {
   admin as adminApi,
   type ServerSettings,
@@ -228,11 +229,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
           changed={scanAutoChanged}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={scanAuto}
-              onChange={(e) => setScanAuto(e.target.checked)}
-            />
+            <Switch checked={scanAuto} onChange={setScanAuto} />
             <span>Watch the filesystem and scan on change</span>
             {scanAutoChanged && <Pill tone="warn">Restart pending</Pill>}
           </label>
@@ -247,12 +244,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
           changed={watcherPollingChanged}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={watcherPolling}
-              disabled={!scanAuto}
-              onChange={(e) => setWatcherPolling(e.target.checked)}
-            />
+            <Switch checked={watcherPolling} onChange={setWatcherPolling} disabled={!scanAuto} />
             <span>Recursively stat watched roots on an interval</span>
             {watcherPollingChanged && <Pill tone="warn">Restart pending</Pill>}
           </label>
@@ -288,11 +280,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
           changed={periodicScanChanged}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={periodicScanEnabled}
-              onChange={(e) => setPeriodicScanEnabled(e.target.checked)}
-            />
+            <Switch checked={periodicScanEnabled} onChange={setPeriodicScanEnabled} />
             <span>Rescan every library on a schedule</span>
           </label>
         </SettingsRow>
@@ -322,11 +310,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
           changed={emptyTrashChanged}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={emptyTrashAfterScan}
-              onChange={(e) => setEmptyTrashAfterScan(e.target.checked)}
-            />
+            <Switch checked={emptyTrashAfterScan} onChange={setEmptyTrashAfterScan} />
             <span>Purge removed files on scan completion</span>
           </label>
         </SettingsRow>
@@ -439,11 +423,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
           changed={dirtyFields["CW include premieres"]}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={cwIncludePremieres}
-              onChange={(e) => setCwIncludePremieres(e.target.checked)}
-            />
+            <Switch checked={cwIncludePremieres} onChange={setCwIncludePremieres} />
             <span>Include season premieres alongside in-progress items</span>
           </label>
         </SettingsRow>
@@ -563,11 +543,7 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
           changed={dirtyFields["Audio normalize"]}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={audioNormalize}
-              onChange={(e) => setAudioNormalize(e.target.checked)}
-            />
+            <Switch checked={audioNormalize} onChange={setAudioNormalize} />
             <span>Normalize loudness on every transcode session</span>
           </label>
         </SettingsRow>

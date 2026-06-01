@@ -56,13 +56,13 @@ export function AdminTaskFlowClient({ initial }: Props) {
 
       <div className="flex items-center justify-end gap-2 text-xs text-white/60">
         <Link
-          href="/settings/admin/library/scheduled-tasks"
+          href="/settings/admin/tasks"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           ← Tasks
         </Link>
         <Link
-          href="/settings/admin/library/scheduled-tasks/activity"
+          href="/settings/admin/tasks?tab=activity"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           Activity →
@@ -234,7 +234,7 @@ function EventNode({ title, sub }: { title: string; sub: string }) {
 }
 
 function KindNode({ card }: { card: OverviewKindCard }) {
-  const href = `/settings/admin/library/scheduled-tasks/kind/${encodeURIComponent(card.name)}`;
+  const href = `/settings/admin/tasks/kind/${encodeURIComponent(card.name)}`;
   const isGated = card.mode === "gated";
   const off = isGated && !card.gate.enabled;
   return (

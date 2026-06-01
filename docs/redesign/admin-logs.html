@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChimpFlix · Logs & audit</title>
+<link rel="stylesheet" href="styles.css">
+<script src="app.js" defer></script>
+<style>
+  .logview { font-family: ui-monospace, 'SFMono-Regular', Menlo, monospace; font-size: 12px; line-height: 1.7; }
+  .logline { display: flex; align-items: baseline; gap: 10px; padding: 1px 0; white-space: nowrap; }
+  .logline .lt { color: var(--faint); flex: none; }
+  .logline .lvl { flex: none; }
+  .logline .ltarget { color: var(--violet); flex: none; }
+  .logline .lmsg { color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body data-context="server" data-active="logs" data-crumbs="Server / Logs & audit">
+<main class="content wide">
+  <div class="content-inner" data-tabset>
+
+    <div class="page-head">
+      <div class="head-row">
+        <div>
+          <div class="eyebrow">Server · System</div>
+          <h1>Logs &amp; audit</h1>
+          <p>Live server log stream and the audit trail of admin actions.</p>
+        </div>
+        <div class="actions"><span class="pill"><span class="dot" style="background:var(--ok)"></span>streaming</span></div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab on" data-tab="logs">Server logs</button>
+      <button class="tab" data-tab="audit">Audit</button>
+    </div>
+
+    <!-- ====================== SERVER LOGS ====================== -->
+    <section class="tabpanel on" data-panel="logs">
+      <div class="flex between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div class="seg">
+          <button>TRACE</button>
+          <button>DEBUG</button>
+          <button class="on">INFO</button>
+          <button>WARN</button>
+          <button>ERROR</button>
+        </div>
+        <div class="flex gap8" style="flex-wrap:wrap">
+          <input class="input w-auto" placeholder="Filter by module…">
+          <div class="flex gap8">
+            <div class="switch on" style="--w:36px;--h:21px"></div>
+            <span class="faint" style="font-size:12px;white-space:nowrap">Auto-scroll</span>
+          </div>
+          <button class="btn sm"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>Export</button>
+        </div>
+      </div>
+
+      <div class="card mb0">
+        <div class="card-head"><div><div class="ttl">Live log</div><div class="sub">tail -f · last 500 lines</div></div>
+          <div class="head-aside"><span class="pill accent"><span class="dot"></span>following</span></div></div>
+        <div class="card-body pad">
+          <div class="logview">
+            <div class="logline"><span class="lt">14:31:04.118</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">http</span><span class="lmsg">GET /api/items/movies 200 in 14ms · user=Maya</span></div>
+            <div class="logline"><span class="lt">14:31:03.902</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">scanner</span><span class="lmsg">Movies: discovered 4 new files under /media/movies</span></div>
+            <div class="logline"><span class="lt">14:31:02.671</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">jobs::detect_markers</span><span class="lmsg">#48201 completed in 1.2s · The Bear S3E4 intro=8.4s credits=2412.0s</span></div>
+            <div class="logline"><span class="lt">14:30:58.044</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">jobs::fetch_subtitles</span><span class="lmsg">#48198 fetched en sub for Spirited Away (opensubtitles) in 640ms</span></div>
+            <div class="logline"><span class="lt">14:30:55.310</span><span class="lvl"><span class="pill warn" style="padding:1px 7px">WARN</span></span><span class="ltarget">transcode</span><span class="lmsg">session sess_9f3 fell back to software encode — nvenc sessions exhausted</span></div>
+            <div class="logline"><span class="lt">14:30:51.998</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">transcode</span><span class="lmsg">session sess_9f3 started · Oppenheimer 4K→1080p HEVC for Leo</span></div>
+            <div class="logline"><span class="lt">14:30:49.205</span><span class="lvl"><span class="pill err" style="padding:1px 7px">ERROR</span></span><span class="ltarget">jobs::enrich</span><span class="lmsg">enrich_imdb_movie #48190 failed: upstream 429 Too Many Requests — backing off 30s</span></div>
+            <div class="logline"><span class="lt">14:30:42.677</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">jobs::enrich</span><span class="lmsg">enrich_tvdb_episode matched The Bear S3E4 → tvdb 81012 (chain tvdb→omdb)</span></div>
+            <div class="logline"><span class="lt">14:30:38.401</span><span class="lvl"><span class="pill warn" style="padding:1px 7px">WARN</span></span><span class="ltarget">scanner</span><span class="lmsg">Documentaries: 1 file unreadable, skipped /media/docs/Cosmos.S01E13.mkv</span></div>
+            <div class="logline"><span class="lt">14:30:31.119</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">http</span><span class="lmsg">POST /api/play-state 204 in 6ms · user=Remi · Spirited Away @ 00:42:18</span></div>
+            <div class="logline"><span class="lt">14:30:24.880</span><span class="lvl"><span class="pill info" style="padding:1px 7px">INFO</span></span><span class="ltarget">jobs::trakt_pull_user</span><span class="lmsg">pulled 312 history rows for Zach · reconciled 18 watched markers</span></div>
+            <div class="logline"><span class="lt">14:30:18.552</span><span class="lvl"><span class="pill err" style="padding:1px 7px">ERROR</span></span><span class="ltarget">transcode</span><span class="lmsg">ffmpeg exit 1 for optimize_versions #47712 · cache /data/transcode-cache cleared</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====================== AUDIT ====================== -->
+    <section class="tabpanel" data-panel="audit">
+      <div class="flex between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div class="flex gap8" style="flex-wrap:wrap">
+          <select class="select w-auto">
+            <option>All actors</option>
+            <option>Zach (Owner)</option>
+            <option>Maya (Admin)</option>
+            <option>Leo</option>
+            <option>Remi</option>
+          </select>
+          <input class="input w-auto" placeholder="Action…">
+          <div class="flex gap8">
+            <input class="input w-auto" style="min-width:130px" value="2026-05-25">
+            <span class="faint">to</span>
+            <input class="input w-auto" style="min-width:130px" value="2026-06-01">
+          </div>
+        </div>
+        <button class="btn sm"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>Export</button>
+      </div>
+
+      <div class="card mb0">
+        <div class="card-head"><div><div class="ttl">Audit trail</div><div class="sub">Admin actions · last 30 days</div></div></div>
+        <table class="table">
+          <thead><tr><th>When</th><th>Action</th><th>Actor</th><th>Target</th></tr></thead>
+          <tbody>
+            <tr><td class="faint">14:12</td><td class="mono">settings.patch</td><td><div class="flex gap8"><span class="avatar a1" style="width:24px;height:24px;font-size:10px">Z</span>Zach</div></td><td class="muted">transcoder · hw_accel=nvenc, max_concurrent=4</td></tr>
+            <tr><td class="faint">11:02</td><td class="mono">user.invite</td><td><div class="flex gap8"><span class="avatar a1" style="width:24px;height:24px;font-size:10px">Z</span>Zach</div></td><td class="muted">user · remi@…</td></tr>
+            <tr><td class="faint">Yesterday</td><td class="mono">library.delete</td><td><div class="flex gap8"><span class="avatar a1" style="width:24px;height:24px;font-size:10px">Z</span>Zach</div></td><td class="muted">library #7 · Trailers</td></tr>
+            <tr><td class="faint">2d ago</td><td class="mono">user.role-change</td><td><div class="flex gap8"><span class="avatar a1" style="width:24px;height:24px;font-size:10px">Z</span>Zach</div></td><td class="muted">Maya → <span class="tag">Admin</span></td></tr>
+            <tr><td class="faint">3d ago</td><td class="mono">secret.test</td><td><div class="flex gap8"><span class="avatar a2" style="width:24px;height:24px;font-size:10px">M</span>Maya</div></td><td class="muted">trakt · <span class="pill ok" style="padding:1px 7px"><span class="dot"></span>ok</span></td></tr>
+            <tr><td class="faint">4d ago</td><td class="mono">backup.create</td><td><div class="flex gap8"><span class="avatar a1" style="width:24px;height:24px;font-size:10px">Z</span>Zach</div></td><td class="muted">/data/backups/chimpflix-2026-05-28.db</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+</main>
+</body>
+</html>

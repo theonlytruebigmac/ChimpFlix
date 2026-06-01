@@ -786,7 +786,7 @@ function AccessTab({ entries }: { entries: AccessMatrixEntry[] }) {
       <p className="text-[12.5px] text-white/55">
         No library access. Grant some by editing the access matrix at{" "}
         <a
-          href="/settings/admin/users/access"
+          href="/settings/admin/users?tab=access"
           className="text-white/80 underline hover:text-white"
         >
           Users → Access
@@ -800,7 +800,7 @@ function AccessTab({ entries }: { entries: AccessMatrixEntry[] }) {
       <p className="mb-3 text-[11.5px] text-white/55">
         Edit grants under{" "}
         <a
-          href="/settings/admin/users/access"
+          href="/settings/admin/users?tab=access"
           className="text-white/80 underline hover:text-white"
         >
           Users → Access
@@ -963,7 +963,7 @@ function AuditTab({
       <p className="pt-1 text-[11px] text-white/40">
         Full server-wide log at{" "}
         <a
-          href="/settings/admin/maintenance/logs/audit"
+          href="/settings/admin/logs?tab=audit"
           className="text-white/55 underline hover:text-white"
         >
           Maintenance → Logs → Audit trail

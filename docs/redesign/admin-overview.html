@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChimpFlix · Server Overview</title>
+<link rel="stylesheet" href="styles.css">
+<script src="app.js" defer></script>
+</head>
+<body data-context="server" data-active="overview" data-crumbs="Server / Overview">
+<main class="content wide">
+  <div class="content-inner" data-tabset>
+
+    <div class="page-head">
+      <div class="head-row">
+        <div>
+          <div class="eyebrow">Server</div>
+          <h1>Overview</h1>
+          <p>System health, live playback, and anything that needs your attention — the first thing you see in the console.</p>
+        </div>
+        <div class="actions"><span class="pill ok"><span class="dot"></span>All systems healthy</span></div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab on" data-tab="dash">Dashboard</button>
+      <button class="tab" data-tab="activity">Activity &amp; stats</button>
+      <button class="tab" data-tab="alerts">Alerts <span class="pillcount">2</span></button>
+    </div>
+
+    <!-- ====================== DASHBOARD ====================== -->
+    <section class="tabpanel on" data-panel="dash">
+      <div class="grid c4">
+        <div class="stat tone-green">
+          <div class="stat-top"><span class="stat-ico"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg></span>System</div>
+          <div class="stat-val">Healthy</div>
+          <div class="stat-meta">v2.4.0 · up 11d 4h</div>
+        </div>
+        <div class="stat tone-blue">
+          <div class="stat-top"><span class="stat-ico"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="6 4 20 12 6 20 6 4"/></svg></span>Active sessions</div>
+          <div class="stat-val">4</div>
+          <div class="stat-meta">2 direct · 1 HW transcode · 1 remux</div>
+        </div>
+        <div class="stat tone-amber">
+          <div class="stat-top"><span class="stat-ico"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/></svg></span>Storage</div>
+          <div class="stat-val">71<small>%</small></div>
+          <div class="stat-meta">8.4 TB of 11.8 TB</div>
+          <div class="stat-bar"><i style="width:71%;background:var(--warn)"></i></div>
+        </div>
+        <div class="stat tone-red">
+          <div class="stat-top"><span class="stat-ico"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16"/></svg></span>Library</div>
+          <div class="stat-val">1,823</div>
+          <div class="stat-meta">5 libraries · 1,284 movies · 1,206 eps</div>
+        </div>
+      </div>
+
+      <div class="grid c2" style="margin-top:18px;align-items:start">
+        <!-- left column -->
+        <div>
+          <div class="card">
+            <div class="card-head"><div><div class="ttl">Now playing</div><div class="sub">Live · refreshes every 5s</div></div>
+              <div class="head-aside"><span class="pill accent"><span class="dot"></span>4 streams</span></div></div>
+            <table class="table">
+              <tbody>
+                <tr><td><div class="flex gap8"><span class="avatar a2" style="width:28px;height:28px;font-size:11px">M</span> Maya</div></td><td>Dune: Part Two</td><td><span class="tag">Direct play</span></td><td class="num mono">1080p</td></tr>
+                <tr><td><div class="flex gap8"><span class="avatar a4" style="width:28px;height:28px;font-size:11px">L</span> Leo</div></td><td>The Bear · S3E4</td><td><span class="tag" style="border-color:var(--info-soft);color:var(--info)">HW transcode</span></td><td class="num mono">720p</td></tr>
+                <tr><td><div class="flex gap8"><span class="avatar a5" style="width:28px;height:28px;font-size:11px">R</span> Remi</div></td><td>Spirited Away</td><td><span class="tag">Remux</span></td><td class="num mono">1080p</td></tr>
+                <tr><td><div class="flex gap8"><span class="avatar a1" style="width:28px;height:28px;font-size:11px">Z</span> Zach</div></td><td>Oppenheimer</td><td><span class="tag">Direct play</span></td><td class="num mono">4K</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card mb0">
+            <div class="card-head"><div><div class="ttl">Concurrent streams</div><div class="sub">Last 30 minutes</div></div></div>
+            <div class="card-body pad">
+              <div class="sparkline">
+                <i style="height:30%"></i><i style="height:45%"></i><i style="height:40%"></i><i style="height:60%"></i><i style="height:55%"></i><i style="height:75%"></i><i style="height:65%"></i><i style="height:80%"></i><i style="height:70%"></i><i style="height:90%"></i><i style="height:85%"></i><i style="height:100%"></i><i style="height:80%"></i><i style="height:75%"></i><i style="height:60%"></i>
+              </div>
+              <div class="flex between faint" style="font-size:11px;margin-top:8px"><span>30m ago</span><span>peak 6 · now 4</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- right column -->
+        <div>
+          <div class="card">
+            <div class="card-head"><div><div class="ttl">Needs attention</div><div class="sub">2 open items</div></div>
+              <div class="head-aside"><a class="btn ghost tiny" data-tab="alerts">View all →</a></div></div>
+            <div class="card-body">
+              <div class="row" style="padding:13px 0">
+                <div class="row-main"><div class="row-label" style="font-size:13px"><span class="pill warn" style="padding:1px 7px"><span class="dot"></span>Disk</span> Media volume 71% full</div>
+                  <div class="row-help">/media is filling up. Consider pruning the transcode cache.</div></div>
+                <div class="row-control"><button class="btn ghost tiny">Clear cache</button></div>
+              </div>
+              <div class="row" style="padding:13px 0">
+                <div class="row-main"><div class="row-label" style="font-size:13px"><span class="pill err" style="padding:1px 7px"><span class="dot"></span>Job</span> 3 dead jobs in the queue</div>
+                  <div class="row-help">enrich_imdb_movie failed after 5 retries.</div></div>
+                <div class="row-control"><a class="btn ghost tiny" href="admin-tasks.html">Inspect</a></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><div><div class="ttl">Recent activity</div></div></div>
+            <div class="card-body">
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">Scan completed · <b>Movies</b> (+4 ~12)</div></div><div class="row-control faint" style="font-size:12px">2h ago</div></div>
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">Maya started a session</div></div><div class="row-control faint" style="font-size:12px">18m ago</div></div>
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">Auto-backup written</div></div><div class="row-control faint" style="font-size:12px">3h ago</div></div>
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">New user <b>Remi</b> accepted invite</div></div><div class="row-control faint" style="font-size:12px">1d ago</div></div>
+            </div>
+          </div>
+
+          <div class="card mb0">
+            <div class="card-head"><div><div class="ttl">Next scheduled</div></div></div>
+            <div class="card-body">
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">Library scan</div></div><div class="row-control"><span class="pill"><span class="dot" style="background:var(--info)"></span>in 42m</span></div></div>
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">Trakt pull</div></div><div class="row-control"><span class="pill"><span class="dot" style="background:var(--info)"></span>in 1h 12m</span></div></div>
+              <div class="row" style="padding:11px 0"><div class="row-main"><div class="row-label" style="font-size:13px;font-weight:500">Verify libraries</div></div><div class="row-control faint" style="font-size:12px">Sun 03:00</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- quick actions -->
+      <div class="section-title">Quick actions</div>
+      <div class="grid c4">
+        <a class="btn" style="justify-content:flex-start;padding:14px" href="libraries.html"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10a8 8 0 0 1 14-4l2 2M20 14a8 8 0 0 1-14 4l-2-2"/><path d="M18 4v4h-4M6 20v-4h4"/></svg>Scan libraries</a>
+        <a class="btn" style="justify-content:flex-start;padding:14px"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/></svg>Back up now</a>
+        <a class="btn" style="justify-content:flex-start;padding:14px"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h11v14a2 2 0 0 0 2 2H7a2 2 0 0 1-2-2z"/></svg>Audit log</a>
+        <a class="btn primary" style="justify-content:flex-start;padding:14px" href="admin-users.html"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3.5"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M19 8v6M16 11h6"/></svg>Invite a user</a>
+      </div>
+    </section>
+
+    <!-- ====================== ACTIVITY ====================== -->
+    <section class="tabpanel" data-panel="activity">
+      <div class="flex between" style="margin-bottom:16px">
+        <div class="muted" style="font-size:13px">Playback over the selected window.</div>
+        <div class="seg accent"><button>7d</button><button class="on">30d</button><button>90d</button><button>1y</button></div>
+      </div>
+      <div class="grid c4">
+        <div class="stat tone-red"><div class="stat-top">Total plays</div><div class="stat-val">2,940</div></div>
+        <div class="stat tone-blue"><div class="stat-top">Minutes watched</div><div class="stat-val">184k</div></div>
+        <div class="stat tone-green"><div class="stat-top">Unique users</div><div class="stat-val">6</div></div>
+        <div class="stat tone-violet"><div class="stat-top">Transcodes</div><div class="stat-val">312</div><div class="stat-meta">11% of plays</div></div>
+      </div>
+      <div class="grid c2" style="margin-top:18px;align-items:start">
+        <div class="card mb0"><div class="card-head"><div><div class="ttl">Top titles</div></div></div>
+          <table class="table"><tbody>
+            <tr><td>The Bear</td><td class="num">214 plays</td></tr>
+            <tr><td>Dune: Part Two</td><td class="num">142 plays</td></tr>
+            <tr><td>Spirited Away</td><td class="num">98 plays</td></tr>
+            <tr><td>Oppenheimer</td><td class="num">87 plays</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card mb0"><div class="card-head"><div><div class="ttl">Top users</div></div></div>
+          <table class="table"><tbody>
+            <tr><td><div class="flex gap8"><span class="avatar a2" style="width:26px;height:26px;font-size:10px">M</span>Maya</div></td><td class="num">61h</td></tr>
+            <tr><td><div class="flex gap8"><span class="avatar a4" style="width:26px;height:26px;font-size:10px">L</span>Leo</div></td><td class="num">48h</td></tr>
+            <tr><td><div class="flex gap8"><span class="avatar a1" style="width:26px;height:26px;font-size:10px">Z</span>Zach</div></td><td class="num">39h</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====================== ALERTS ====================== -->
+    <section class="tabpanel" data-panel="alerts">
+      <div class="card"><div class="card-head"><div><div class="ttl">Warnings &amp; errors</div><div class="sub">≥ WARN, last 50</div></div></div>
+        <table class="table">
+          <thead><tr><th>When</th><th>Level</th><th>Source</th><th>Message</th></tr></thead>
+          <tbody>
+            <tr><td class="faint">14:22</td><td><span class="pill err" style="padding:1px 7px"><span class="dot"></span>ERROR</span></td><td class="mono">jobs::enrich</td><td>enrich_imdb_movie failed: upstream 429</td></tr>
+            <tr><td class="faint">13:08</td><td><span class="pill warn" style="padding:1px 7px"><span class="dot"></span>WARN</span></td><td class="mono">disk::watch</td><td>/media at 71% capacity</td></tr>
+            <tr><td class="faint">09:51</td><td><span class="pill warn" style="padding:1px 7px"><span class="dot"></span>WARN</span></td><td class="mono">scanner</td><td>Documentaries: 1 file unreadable, skipped</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card mb0"><div class="card-head"><div><div class="ttl">Audit feed</div><div class="sub">Admin actions</div></div></div>
+        <table class="table">
+          <thead><tr><th>When</th><th>Action</th><th>Actor</th><th>Target</th></tr></thead>
+          <tbody>
+            <tr><td class="faint">12:40</td><td class="mono">settings.patch</td><td>Zach</td><td class="muted">transcoder</td></tr>
+            <tr><td class="faint">11:02</td><td class="mono">user.invite</td><td>Zach</td><td class="muted">user · remi@…</td></tr>
+            <tr><td class="faint">Yesterday</td><td class="mono">library.delete</td><td>Zach</td><td class="muted">library #7</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+</main>
+</body>
+</html>

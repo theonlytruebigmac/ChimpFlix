@@ -4,7 +4,6 @@ import { SettingsEmailChangeClient } from "@/components/SettingsEmailChangeClien
 import { SettingsLinkedAccountsClient } from "@/components/SettingsLinkedAccountsClient";
 import { SettingsPasswordClient } from "@/components/SettingsPasswordClient";
 import { SettingsProfileClient } from "@/components/SettingsProfileClient";
-import { SettingsSessionsClient } from "@/components/SettingsSessionsClient";
 import { SettingsTwoFactorClient } from "@/components/SettingsTwoFactorClient";
 import { formatDate, formatDateTime } from "@/lib/format";
 
@@ -50,10 +49,6 @@ export default async function AccountSettingsPage() {
 
       <Section title="Linked accounts">
         <SettingsLinkedAccountsClient />
-      </Section>
-
-      <Section title="Sessions">
-        <SettingsSessionsClient />
       </Section>
 
       <Section title="Server">

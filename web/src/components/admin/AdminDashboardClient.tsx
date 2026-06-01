@@ -302,7 +302,7 @@ export function AdminDashboardClient({ initial }: Props) {
       {/* ── Quick actions ───────────────────────────────────────── */}
       <section className="grid grid-cols-2 gap-2.5 md:grid-cols-4">
         <QuickAction
-          href="/settings/admin/library/libraries"
+          href="/settings/admin/libraries"
           title="Scan libraries"
           subtitle={`${data.library_stats.length} libraries`}
           icon={
@@ -312,7 +312,7 @@ export function AdminDashboardClient({ initial }: Props) {
           }
         />
         <QuickAction
-          href="/settings/admin/maintenance/backup"
+          href="/settings/admin/maintenance?tab=backups"
           title="Backups"
           subtitle="VACUUM INTO + verify"
           icon={
@@ -323,7 +323,7 @@ export function AdminDashboardClient({ initial }: Props) {
           }
         />
         <QuickAction
-          href="/settings/admin/maintenance/logs/audit"
+          href="/settings/admin/logs?tab=audit"
           title="Audit log"
           subtitle="Recent admin actions"
           icon={
@@ -334,7 +334,7 @@ export function AdminDashboardClient({ initial }: Props) {
           }
         />
         <QuickAction
-          href="/settings/admin/users/invites"
+          href="/settings/admin/users?tab=invites"
           title="Invite a user"
           subtitle="Email or one-time link"
           icon={
@@ -424,7 +424,7 @@ export function AdminDashboardClient({ initial }: Props) {
           {data.library_stats.length === 0 ? (
             <EmptyInline>
               No libraries yet — add one under{" "}
-              <Link href="/settings/admin/library/libraries" className="underline hover:text-white">
+              <Link href="/settings/admin/libraries" className="underline hover:text-white">
                 Library → Libraries
               </Link>
               .
@@ -764,7 +764,7 @@ function VaultSummary({ slots }: { slots: SecretSlotView[] }) {
         return (
           <Link
             key={slot.name}
-            href="/settings/admin/server/credentials"
+            href="/settings/admin/credentials"
             className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/2 px-3 py-2 text-sm transition-colors hover:bg-white/4"
           >
             <span className="truncate text-white/85">{slot.display_name}</span>

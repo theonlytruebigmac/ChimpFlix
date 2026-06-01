@@ -1,12 +1,12 @@
 import { TopNav } from "@/components/TopNav";
-import { SettingsTabs } from "@/components/SettingsTabs";
+import { SettingsShell } from "@/components/SettingsShell";
 import { requireUser } from "@/lib/chimpflix-server";
 
-/// Unified shell for everything under /settings: the per-user tabs
-/// (Account, Player, Integrations, Libraries) plus the admin section
-/// when the signed-in user is an owner. The Admin tab is just another
-/// link on the same strip — the deeper admin sidebar nav is owned by
-/// /settings/admin/layout.tsx.
+/// Unified shell for everything under /settings. A single left sidebar
+/// (SettingsShell) switches between the personal ("You") and server
+/// ("Server", owner-only) contexts and hosts the ⌘K command palette;
+/// the page renders in the content column to its right. The breadcrumb +
+/// active sidebar item identify the page, so there's no page-title header.
 export default async function SettingsLayout({
   children,
 }: {
@@ -17,23 +17,13 @@ export default async function SettingsLayout({
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="mx-auto max-w-7xl px-4 pb-24 pt-24 sm:px-6 sm:pt-28">
-        <header className="mb-6 flex flex-col items-start gap-2 sm:flex-row sm:items-baseline sm:justify-between sm:gap-4">
-          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Settings</h1>
-          <div className="text-xs text-white/45">
-            Signed in as{" "}
-            <span className="text-white/80">
-              {user.display_name ?? user.username}
-            </span>
-            {user.role === "owner" && (
-              <span className="ml-2 rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
-                Owner
-              </span>
-            )}
+      <div className="mx-auto max-w-330 px-4 pb-24 pt-24 sm:px-6 sm:pt-28">
+        <div className="flex flex-col gap-6 lg:flex-row lg:gap-8">
+          <div className="lg:w-60 lg:shrink-0">
+            <SettingsShell isOwner={user.role === "owner"} />
           </div>
-        </header>
-        <SettingsTabs isOwner={user.role === "owner"} />
-        <div className="mt-6">{children}</div>
+          <div className="min-w-0 flex-1">{children}</div>
+        </div>
       </div>
     </main>
   );

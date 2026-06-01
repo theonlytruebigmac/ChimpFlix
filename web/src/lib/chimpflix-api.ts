@@ -43,6 +43,10 @@ export interface User {
   subtitle_bottom_inset_pct: number | null;
   /** Whether the user opted into email mirroring of in-app notifications. */
   notify_via_email: boolean;
+  /** Per-kind notification preferences as a JSON object keyed by kind
+   * discriminator (e.g. `{"job.failed":{"enabled":false}}`). Empty object
+   * = all defaults. Security kinds (`user.2fa.*`) always notify. */
+  notification_prefs_json: string;
   /** Most-recent successful login. null on first login. */
   last_login_at: number | null;
   last_login_ip: string | null;
@@ -72,6 +76,8 @@ export interface UpdateMeInput {
   subtitle_edge?: string;
   subtitle_bottom_inset_pct?: number;
   notify_via_email?: boolean;
+  /** JSON object of per-kind notification prefs; validated server-side. */
+  notification_prefs_json?: string;
 }
 
 export interface Notification {

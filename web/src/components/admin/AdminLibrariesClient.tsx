@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { Switch } from "@/components/admin/ui";
 import {
   admin as adminApi,
   libraries as librariesApi,
@@ -699,11 +700,7 @@ function LibraryDrawer({
                 changed={dirtyFields["Allow media deletion"]}
               >
                 <label className="inline-flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={allowMediaDeletion}
-                    onChange={(e) => setAllowMediaDeletion(e.target.checked)}
-                  />
+                  <Switch checked={allowMediaDeletion} onChange={setAllowMediaDeletion} />
                   <span>Enable</span>
                 </label>
               </SettingsRow>

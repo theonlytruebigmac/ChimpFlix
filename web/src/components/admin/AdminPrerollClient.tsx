@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Switch } from "@/components/admin/ui";
 import {
   admin as adminApi,
   preroll as prerollApi,
@@ -207,12 +208,7 @@ export function AdminPrerollClient({
           help="When on, the player runs the pre-roll then transitions to the main content. The viewer can skip after the first frame. Disabled automatically when no pre-roll is uploaded. Skipped when the viewer is resuming a partially-watched item."
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={enabled}
-              onChange={(e) => toggle(e.target.checked)}
-              disabled={!status.configured || busy === "toggle"}
-            />
+            <Switch checked={enabled} onChange={toggle} disabled={!status.configured || busy === "toggle"} />
             <span className="text-white/75">
               {enabled ? "Enabled" : "Disabled"}
             </span>

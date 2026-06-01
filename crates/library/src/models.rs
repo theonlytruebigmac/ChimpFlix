@@ -1536,6 +1536,11 @@ pub struct User {
     /// Defaults to false so misconfigured SMTP can't surprise users
     /// with mail they didn't expect.
     pub notify_via_email: bool,
+    /// Per-kind notification preferences as a JSON object keyed by kind
+    /// discriminator (e.g. `{"job.failed": {"enabled": false}}`). Empty
+    /// object = all defaults. Security kinds (`user.2fa.*`) ignore this
+    /// and always notify. Parsed lazily by the notifier.
+    pub notification_prefs_json: String,
     /// Most-recent successful login. `None` if the user has never
     /// logged in (e.g. just-registered).
     pub last_login_at: Option<i64>,
@@ -1596,6 +1601,11 @@ impl User {
                 .ok()
                 .flatten(),
             notify_via_email: row.try_get::<i64, _>("notify_via_email").ok().unwrap_or(0) != 0,
+            notification_prefs_json: row
+                .try_get::<String, _>("notification_prefs_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "{}".to_string()),
             last_login_at: row
                 .try_get::<Option<i64>, _>("last_login_at")
                 .ok()

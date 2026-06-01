@@ -172,7 +172,7 @@ export function AdminTaskDetailClient({ initial, initialNowMs }: Props) {
             </button>
           )}
           <Link
-            href="/settings/admin/library/scheduled-tasks"
+            href="/settings/admin/tasks"
             className="rounded border border-white/15 px-2.5 py-1 text-xs text-white/60 transition-colors hover:bg-white/5"
           >
             ← Back to tasks

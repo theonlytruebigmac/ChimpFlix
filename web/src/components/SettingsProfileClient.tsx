@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Switch } from "@/components/admin/ui";
 import {
   auth as authApi,
   ChimpFlixApiError,
@@ -176,13 +177,7 @@ export function SettingsProfileClient({ initial }: Props) {
       <div className="border-t border-white/10 pt-4">
         <h3 className="mb-3 text-sm font-semibold">Notifications</h3>
         <label className="flex items-start gap-3 text-xs">
-          <input
-            type="checkbox"
-            checked={notifyEmail}
-            onChange={(e) => setNotifyEmail(e.target.checked)}
-            disabled={!user.email}
-            className="mt-1"
-          />
+          <Switch checked={notifyEmail} onChange={setNotifyEmail} disabled={!user.email} />
           <div>
             <div className="text-white">Email me when I get a notification</div>
             <div className="mt-0.5 text-white/50">

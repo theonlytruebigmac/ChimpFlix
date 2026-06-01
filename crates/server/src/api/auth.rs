@@ -605,6 +605,9 @@ pub struct UpdateMeInput {
     pub subtitle_bottom_inset_pct: Option<i64>,
     /// Single-Option: present → set the boolean. Omit to leave as-is.
     pub notify_via_email: Option<bool>,
+    /// Per-kind notification preferences, a JSON object. Validated as
+    /// parseable JSON here; semantics enforced by the notifier.
+    pub notification_prefs_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -999,6 +1002,12 @@ pub async fn update_me(
             ));
         }
     }
+    // Notification prefs are an opaque JSON object to this layer — just
+    // ensure it parses so we never persist a blob the notifier can't read.
+    if let Some(ref raw) = input.notification_prefs_json {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| ApiError::validation("notification_prefs_json must be valid JSON"))?;
+    }
 
     let patch = queries::UserSelfUpdate {
         display_name: normalize(input.display_name),
@@ -1013,6 +1022,7 @@ pub async fn update_me(
         subtitle_edge: edge_normalized,
         subtitle_bottom_inset_pct: input.subtitle_bottom_inset_pct.map(Some),
         notify_via_email: input.notify_via_email,
+        notification_prefs_json: input.notification_prefs_json,
     };
     let updated = queries::update_user_self(&state.pool, user.id, patch)
         .await

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Switch } from "@/components/admin/ui";
 import {
   admin as adminApi,
   type DashboardSession,
@@ -616,11 +617,7 @@ export function AdminTranscoderClient({
           changed={dirtyFields["Tone map HDR sources"]}
         >
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={tonemapEnabled}
-              onChange={(e) => setTonemapEnabled(e.target.checked)}
-            />
+            <Switch checked={tonemapEnabled} onChange={setTonemapEnabled} />
             <span>Apply HDR → SDR tonemap during reencode</span>
           </label>
         </SettingsRow>

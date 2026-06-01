@@ -3023,6 +3023,7 @@ pub struct UserSelfUpdate {
     pub subtitle_edge: Option<Option<String>>,
     pub subtitle_bottom_inset_pct: Option<Option<i64>>,
     pub notify_via_email: Option<bool>,
+    pub notification_prefs_json: Option<String>,
 }
 
 /// Patch the caller's own profile/prefs. Each field is double-Option: `None`
@@ -3070,6 +3071,9 @@ pub async fn update_user_self(
     if patch.notify_via_email.is_some() {
         sets.push("notify_via_email = ?");
     }
+    if patch.notification_prefs_json.is_some() {
+        sets.push("notification_prefs_json = ?");
+    }
     if sets.is_empty() {
         return find_user_by_id(pool, user_id).await;
     }
@@ -3114,6 +3118,9 @@ pub async fn update_user_self(
     }
     if let Some(v) = patch.notify_via_email {
         q = q.bind(i64::from(v));
+    }
+    if let Some(v) = patch.notification_prefs_json {
+        q = q.bind(v);
     }
     q = q.bind(chimpflix_common::now_ms()).bind(user_id);
     let res = q.fetch_optional(pool).await?;

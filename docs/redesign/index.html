@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChimpFlix · Settings & Admin Redesign</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  .brief { max-width: 1120px; margin: 0 auto; padding: 0 34px 120px; }
+  .brief-top { display:flex; align-items:center; gap:16px; height: var(--topbar-h);
+    border-bottom:1px solid var(--line); position: sticky; top:0; z-index:10;
+    background: rgba(10,10,10,0.82); backdrop-filter: blur(14px); padding: 0 34px; margin: 0 -34px 32px; }
+  .princ { display:grid; grid-template-columns: repeat(2,1fr); gap:14px; }
+  @media (max-width:820px){ .princ { grid-template-columns:1fr; } }
+  .princ .p { border:1px solid var(--line); border-radius: var(--r-lg); padding:16px 18px; background:var(--surface); }
+  .princ .p .n { font-size:11px; font-weight:800; color:var(--accent); letter-spacing:.1em; }
+  .princ .p h4 { margin:6px 0 5px; font-size:15px; }
+  .princ .p p { margin:0; font-size:13px; color:var(--muted); }
+  .tokens { display:flex; flex-wrap:wrap; gap:10px; }
+  .tok { display:flex; align-items:center; gap:9px; border:1px solid var(--line); border-radius:8px; padding:7px 11px; font-size:12px; background:var(--surface); }
+  .tok i { width:18px; height:18px; border-radius:5px; display:inline-block; border:1px solid rgba(255,255,255,.15); }
+  .num-badge { display:inline-grid; place-items:center; min-width:30px; height:30px; padding:0 8px; border-radius:8px;
+    background:var(--accent-soft); color:#ff7a82; font-weight:800; font-size:15px; border:1px solid var(--accent-line); }
+</style>
+</head>
+<body>
+  <div class="brief">
+    <div class="brief-top">
+      <a class="brand" href="index.html">CHIMPFLIX</a>
+      <span class="pill accent">Redesign mockups</span>
+      <div class="topbar-spacer" style="flex:1"></div>
+      <span class="faint" style="font-size:12.5px">Static HTML · open any file in a browser</span>
+    </div>
+
+    <div class="brief-hero">
+      <span class="pill accent">Settings &amp; Admin · v2 IA proposal</span>
+      <h1>Everything after <span style="color:var(--accent)">/settings</span>, restructured.</h1>
+      <p>The app keeps growing &mdash; 5 user tabs and <b>27 admin pages</b> across a deep sidebar. It all works, but
+      it doesn't <i>flow</i>. This set keeps the Netflix look you already have and rethinks the <b>structure</b>:
+      how the areas are grouped, how you move between them, and how each value is presented. Click through &mdash;
+      every mockup is a live, navigable prototype sharing one shell.</p>
+      <div class="flex gap12" style="margin-top:22px;flex-wrap:wrap">
+        <a class="btn primary" href="account.html">Open the prototype →</a>
+        <a class="btn" href="admin-overview.html">Jump to the admin console</a>
+        <span class="pill"><span class="kbd">⌘K</span>&nbsp; command palette on every page</span>
+      </div>
+    </div>
+
+    <!-- problem / principles -->
+    <div class="section-title">What's changing</div>
+    <div class="princ">
+      <div class="p"><div class="n">01 · NAVIGATION</div><h4>Two contexts, one shell</h4>
+        <p>A clear switch between <b>You</b> (personal settings) and <b>Server</b> (the admin console). Same chrome, same patterns &mdash; no more "where did that live again?"</p></div>
+      <div class="p"><div class="n">02 · DEPTH</div><h4>27 admin pages → 11 sections</h4>
+        <p>Related pages collapse into one section with in-page tabs (Tasks = Overview·Queue·Activity·Flow). The sidebar gets short and scannable.</p></div>
+      <div class="p"><div class="n">03 · FINDABILITY</div><h4>Search any value (⌘K)</h4>
+        <p>A command palette jumps straight to a page, a single setting, or an action. "So much" stops being a problem when you can type to it.</p></div>
+      <div class="p"><div class="n">04 · PRESENTATION</div><h4>One row pattern everywhere</h4>
+        <p>Label + helper on the left, the control on the right, hairline between. Forms get a sticky save bar; lists get a master-detail drawer.</p></div>
+    </div>
+
+    <!-- before / after IA -->
+    <div class="section-title">Information architecture · before → after</div>
+    <div class="ba">
+      <div class="col before">
+        <h4>● Today</h4>
+        <ul class="tree">
+          <li class="h">Settings (horizontal tabs)</li>
+          <li>Account · Player · Integrations · Libraries · Admin</li>
+          <li class="h">Admin sidebar — 5 groups, 27 pages</li>
+          <li>Status: Home, Alerts, Stats</li>
+          <li>Server: General, Network, Transcoder, Credentials, Pre-roll, Notifications, Webhooks</li>
+          <li>Library: Settings, Libraries, Collections, Agents, Scheduled Tasks <span class="x">(+4 subpages)</span>, Versions</li>
+          <li>Users: Users, Access, Access Groups, Devices, Invites</li>
+          <li>Maintenance: Overview, Backup, Bulk, Logs, Audit</li>
+          <li class="x">↳ personal "Libraries" tab also does admin-grade CRUD — split brain</li>
+        </ul>
+      </div>
+      <div class="col after">
+        <h4>● Proposed</h4>
+        <ul class="tree">
+          <li class="h">You &nbsp;<span class="tag">personal</span></li>
+          <li>Account &nbsp;·&nbsp; Playback &nbsp;·&nbsp; Integrations</li>
+          <li>Notifications · Devices &amp; sessions · Home &amp; visibility</li>
+          <li class="h">Server &nbsp;<span class="tag">owner / admin</span></li>
+          <li>Overview &nbsp;·&nbsp; Activity &amp; stats</li>
+          <li>Libraries <span class="faint">(Libraries · Collections · Agents · Optimized)</span></li>
+          <li>Tasks &amp; jobs <span class="faint">(Overview · Queue · Activity · Flow)</span></li>
+          <li>Transcoding · Users &amp; access <span class="faint">(Users · Access · Groups · Devices · Invites)</span></li>
+          <li>Network · Notifications · Credentials · Maintenance · Logs · General</li>
+          <li style="color:var(--ok)">↳ library CRUD lives only under Server; "what's on my home" stays personal</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- gallery -->
+    <div class="section-title">The mockups <span class="num-badge" style="min-width:auto;height:22px;font-size:12px">19</span></div>
+
+    <div style="font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#ff7a82;margin:0 0 12px">Your settings · 6 pages</div>
+    <div class="mock-grid" style="margin-bottom:26px">
+      <a class="mock-card" href="account.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></div><div class="mc-body"><span class="pill accent mc-tag">You · Account</span><h3>Account &amp; security</h3><p>Profile, email, password, 2FA, linked accounts, sessions — as setting rows with a sticky save bar.</p></div></a>
+      <a class="mock-card" href="playback.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="6 4 20 12 6 20 6 4"/></svg></div><div class="mc-body"><span class="pill accent mc-tag">You · Playback</span><h3>Playback &amp; subtitles</h3><p>Device toggles vs synced prefs, segmented controls, and a live subtitle-style preview.</p></div></a>
+      <a class="mock-card" href="integrations.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 15l6-6"/><path d="M11 6l1-1a4 4 0 0 1 6 6l-1 1"/><path d="M13 18l-1 1a4 4 0 0 1-6-6l1-1"/></svg></div><div class="mc-body"><span class="pill accent mc-tag">You · Integrations</span><h3>Integrations hub</h3><p>A card grid of services with clear connected / not-configured states and a Trakt detail view.</p></div></a>
+      <a class="mock-card" href="notifications.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 9a6 6 0 0 1 12 0c0 7 2 8 2 8H4s2-1 2-8"/><path d="M10 21a2 2 0 0 0 4 0"/></svg></div><div class="mc-body"><span class="pill accent mc-tag">You · Notifications</span><h3>Notifications</h3><p>Delivery channels, per-category toggles, and quiet hours — what reaches you and when.</p></div></a>
+      <a class="mock-card" href="devices.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></div><div class="mc-body"><span class="pill accent mc-tag">You · Devices</span><h3>Devices &amp; sessions</h3><p>Every signed-in device with last-seen and one-tap revoke, plus sign-out-everywhere.</p></div></a>
+      <a class="mock-card" href="home-visibility.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></div><div class="mc-body"><span class="pill accent mc-tag">You · Home</span><h3>Home &amp; visibility</h3><p>Hide libraries, reorder home rails, and tune personal browse filters.</p></div></a>
+    </div>
+
+    <div style="font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin:0 0 12px">Server console · 12 pages</div>
+    <div class="mock-grid" style="margin-bottom:26px">
+      <a class="mock-card" href="admin-overview.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 18a9 9 0 1 1 17 0z"/><path d="M12 14l4-4"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Overview</span><h3>Operator dashboard</h3><p>At-a-glance health, live sessions, activity, alerts, and quick actions — the admin landing pad.</p></div></a>
+      <a class="mock-card" href="admin-activity.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Activity</span><h3>Activity &amp; stats</h3><p>Full playback analytics: daily trends, top users / titles / platforms, and live now-playing.</p></div></a>
+      <a class="mock-card" href="libraries.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Libraries</span><h3>Library management</h3><p>Master-detail: library list on the left, a tabbed drawer (Settings · Agents · Stats · Scans) on the right.</p></div></a>
+      <a class="mock-card" href="admin-tasks.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Tasks</span><h3>Tasks &amp; jobs console</h3><p>Live queue depth, the job table, per-kind health and the ingest flow — one place, four tabs.</p></div></a>
+      <a class="mock-card" href="admin-transcoding.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Transcoding</span><h3>Transcoding engine</h3><p>A dense settings form done right: detected hardware up top, grouped rows, dependent fields, save bar.</p></div></a>
+      <a class="mock-card" href="admin-users.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="8" r="3.5"/><path d="M3 20a6 6 0 0 1 12 0"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Users</span><h3>Users &amp; access</h3><p>Five old pages as one: tabbed master-detail plus a clickable per-library access matrix.</p></div></a>
+      <a class="mock-card" href="admin-network.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-2a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v2"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Network</span><h3>Network</h3><p>Public URL, CORS, LAN bypass, secure connections, and idle-session cleanup.</p></div></a>
+      <a class="mock-card" href="admin-notifications.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Notifications</span><h3>Email &amp; webhooks</h3><p>SMTP with a test send, plus webhook endpoints, events, and delivery status.</p></div></a>
+      <a class="mock-card" href="admin-credentials.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="14" r="4"/><path d="M11 11l9-9M17 5l2 2M14 8l2 2"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Credentials</span><h3>Credentials</h3><p>Encrypted API keys per metadata agent — masked values with test and clear.</p></div></a>
+      <a class="mock-card" href="admin-maintenance.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 7a4 4 0 0 0-5 5l-6 6 2 2 6-6a4 4 0 0 0 5-5l-2 2-2-2 2-2z"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Maintenance</span><h3>Maintenance</h3><p>Cleanup, library-health, backups, and bulk operations — four tabs of upkeep.</p></div></a>
+      <a class="mock-card" href="admin-logs.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 4h11v14a2 2 0 0 0 2 2H7a2 2 0 0 1-2-2z"/><path d="M16 4a2 2 0 0 1 2 2v2h-2"/><path d="M8 8h6M8 12h6"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · Logs</span><h3>Logs &amp; audit</h3><p>A live, filterable log stream alongside the admin audit trail.</p></div></a>
+      <a class="mock-card" href="admin-general.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.3 1a7 7 0 0 0-1.7-1l-.3-2.5h-4l-.3 2.5a7 7 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.3-1a7 7 0 0 0 1.7 1l.3 2.5h4l.3-2.5a7 7 0 0 0 1.7-1l2.3 1 2-3.4-2-1.5c.1-.3.1-.7.1-1z"/></svg></div><div class="mc-body"><span class="pill mc-tag">Server · General</span><h3>General</h3><p>Server identity, 2FA enforcement, telemetry, and the setup wizard.</p></div></a>
+    </div>
+
+    <div style="font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin:0 0 12px">Throughout</div>
+    <div class="mock-grid">
+      <a class="mock-card" href="account.html"><div class="thumb"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div><div class="mc-body"><span class="pill mc-tag">Every page</span><h3>Shell + ⌘K palette</h3><p>Shared topbar, context switcher, and command palette — press ⌘K anywhere to jump to a value.</p></div></a>
+    </div>
+
+    <!-- tokens -->
+    <div class="section-title">Same Netflix palette</div>
+    <p class="muted" style="margin-top:-4px;max-width:70ch">Tokens lifted straight from <span class="mono">web/src/app/globals.css</span> so the redesign drops into the existing theme. Nothing here invents a new brand &mdash; it just gives the structure more room to breathe.</p>
+    <div class="tokens" style="margin-top:14px">
+      <span class="tok"><i style="background:#0d0d0d"></i> bg #0d0d0d</span>
+      <span class="tok"><i style="background:#141414"></i> surface #141414</span>
+      <span class="tok"><i style="background:#1f1f1f"></i> elevated #1f1f1f</span>
+      <span class="tok"><i style="background:#e50914"></i> accent #e50914</span>
+      <span class="tok"><i style="background:#f6121d"></i> hover #f6121d</span>
+      <span class="tok"><i style="background:#b3b3b3"></i> muted #b3b3b3</span>
+      <span class="tok"><i style="background:#34d399"></i> ok</span>
+      <span class="tok"><i style="background:#fbbf24"></i> warn</span>
+      <span class="tok"><i style="background:#f87171"></i> error</span>
+      <span class="tok">Inter · 400–900</span>
+    </div>
+
+    <div class="divider"></div>
+    <p class="faint center" style="font-size:12.5px">ChimpFlix settings &amp; admin redesign · mockups only, no app code touched · <span class="mono">docs/redesign/</span></p>
+  </div>
+</body>
+</html>

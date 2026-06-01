@@ -116,13 +116,13 @@ export function AdminTasksActivityClient({
 
       <div className="flex items-center justify-end gap-2 text-xs text-white/60">
         <Link
-          href="/settings/admin/library/scheduled-tasks"
+          href="/settings/admin/tasks"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           ← Back to tasks
         </Link>
         <Link
-          href="/settings/admin/library/scheduled-tasks/queue"
+          href="/settings/admin/tasks?tab=queue"
           className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
         >
           Job queue
