@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>ChimpFlix</title>
+
+    <!--
+      Custom Google Cast CAF (v3) Web Receiver for ChimpFlix.
+
+      WHY THIS EXISTS (not the stock CC1AD845 receiver):
+      ChimpFlix streams transcoded video as HLS. The master playlist
+      (crates/transcoder/src/session.rs `master_playlist`) and the
+      ffmpeg-written variant playlists reference their children with
+      BARE RELATIVE URLs — `v0/index.m3u8`, `seg-000.ts`, `init.mp4`,
+      `URI="sub/index.m3u8"`. The sender hands us the master URL with
+      the auth token in the query string (`master.m3u8?ct=<token>`),
+      but a relative URL resolved against it DROPS the query string, so
+      every variant/segment/caption sub-request would arrive WITHOUT the
+      token and the server would 401 it. The stock receiver has no hook
+      to fix that, so HLS casting is impossible with CC1AD845.
+
+      The fix: capture `ct` from the LOAD content URL, then re-append it
+      to every same-origin manifest/segment/caption request via the
+      PlaybackConfig request handlers below. Direct-play (a single file
+      URL that already carries `?ct=` and has no sub-requests) works
+      either way; the handlers are idempotent and skip URLs that already
+      have a token.
+
+      Auth model + token format: crates/server/src/auth/cast_token.rs.
+      Sender glue: web/src/lib/cast.ts.
+    -->
+    <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+    <style>
+      :root {
+        --bg: #0a0a0b;
+        --fg: #f5f5f7;
+        --muted: #9a9aa2;
+        --accent: #4ade80;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        overflow: hidden;
+      }
+      /* The CAF default player UI. It renders the now-playing screen
+         (poster, title, subtitle, progress) from the media metadata the
+         sender supplies — so we get Plex-style art for free. */
+      cast-media-player {
+        position: absolute;
+        inset: 0;
+      }
+      /* Branded splash shown before the first media loads and whenever
+         the receiver returns to idle. Sits above the player only while
+         no media is active. */
+      #splash {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        background: radial-gradient(circle at 50% 35%, #16161a 0%, var(--bg) 70%);
+        transition: opacity 0.4s ease;
+        z-index: 10;
+      }
+      #splash[hidden] {
+        opacity: 0;
+        pointer-events: none;
+        display: flex; /* keep laid out so the fade can play */
+      }
+      .wordmark {
+        font-size: 4rem;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+      }
+      .wordmark .flix {
+        color: var(--accent);
+      }
+      .tagline {
+        color: var(--muted);
+        font-size: 1.25rem;
+      }
+      /* Error overlay — replaces the generic black screen + spinner the
+         stock receiver shows on a failed/expired stream with something
+         a viewer can act on. */
+      #error {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        padding: 0 2rem;
+        text-align: center;
+        background: rgba(10, 10, 11, 0.96);
+        z-index: 20;
+      }
+      #error[hidden] {
+        display: none;
+      }
+      #error .title {
+        font-size: 2rem;
+        font-weight: 700;
+      }
+      #error .detail {
+        color: var(--muted);
+        font-size: 1.15rem;
+        max-width: 40rem;
+      }
+    </style>
+  </head>
+  <body>
+    <cast-media-player></cast-media-player>
+
+    <div id="splash">
+      <div class="wordmark">Chimp<span class="flix">Flix</span></div>
+      <div class="tagline">Ready to cast</div>
+    </div>
+
+    <div id="error" hidden>
+      <div class="title">Can&rsquo;t play this right now</div>
+      <div class="detail" id="error-detail">
+        The stream stopped. Your cast session may have expired &mdash; try
+        casting again from your phone or browser.
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        "use strict";
+
+        var splash = document.getElementById("splash");
+        var errorBox = document.getElementById("error");
+        var errorDetail = document.getElementById("error-detail");
+
+        function showSplash(show) {
+          if (splash) splash.hidden = !show;
+        }
+        function showError(message) {
+          if (errorDetail && message) errorDetail.textContent = message;
+          if (errorBox) errorBox.hidden = false;
+          showSplash(false);
+        }
+        function clearError() {
+          if (errorBox) errorBox.hidden = true;
+        }
+
+        // Opened in a normal browser (no Cast runtime): make that obvious
+        // instead of throwing on `cast.framework`.
+        if (
+          typeof cast === "undefined" ||
+          !cast.framework ||
+          !cast.framework.CastReceiverContext
+        ) {
+          showError(
+            "This page is the ChimpFlix Chromecast receiver. It only does anything when launched on a Cast device."
+          );
+          return;
+        }
+
+        var context = cast.framework.CastReceiverContext.getInstance();
+        var playerManager = context.getPlayerManager();
+
+        // The per-user stream token, captured from the LOAD content URL.
+        var castToken = null;
+
+        // Re-attach the token to a same-origin URL that lacks it. Used by
+        // the manifest/segment/caption request handlers. Idempotent: a URL
+        // that already carries `ct` (e.g. the master playlist or a direct
+        // file) is returned unchanged, and cross-origin URLs (the gstatic
+        // SDK, image CDNs) are never touched.
+        function withToken(url) {
+          if (!castToken || !url) return url;
+          try {
+            var u = new URL(url, self.location.href);
+            if (u.origin === self.location.origin && !u.searchParams.has("ct")) {
+              u.searchParams.set("ct", castToken);
+            }
+            return u.toString();
+          } catch (e) {
+            return url;
+          }
+        }
+
+        function captureTokenFrom(url) {
+          if (!url) return;
+          try {
+            var u = new URL(url, self.location.href);
+            var t = u.searchParams.get("ct");
+            if (t) castToken = t;
+          } catch (e) {
+            /* ignore malformed URLs */
+          }
+        }
+
+        // --- LOAD interceptor: pull the token out of the content URL. ---
+        playerManager.setMessageInterceptor(
+          cast.framework.messages.MessageType.LOAD,
+          function (loadRequestData) {
+            clearError();
+            var media = loadRequestData && loadRequestData.media;
+            if (media) {
+              // CAF v3 prefers `contentUrl`; older senders use `contentId`.
+              captureTokenFrom(media.contentUrl || media.contentId);
+            }
+            return loadRequestData;
+          }
+        );
+
+        // --- Re-append the token to every sub-request. ---
+        // manifestRequestHandler  -> master + variant + subtitle playlists
+        // segmentRequestHandler   -> media segments + fMP4 init.mp4
+        // captionsRequestHandler  -> WebVTT caption files
+        var playbackConfig = new cast.framework.PlaybackConfig();
+        function attachToken(requestInfo) {
+          if (requestInfo && requestInfo.url) {
+            requestInfo.url = withToken(requestInfo.url);
+          }
+        }
+        playbackConfig.manifestRequestHandler = attachToken;
+        playbackConfig.segmentRequestHandler = attachToken;
+        playbackConfig.captionsRequestHandler = attachToken;
+
+        // --- Splash / error lifecycle. ---
+        var events = cast.framework.events.EventType;
+        playerManager.addEventListener(events.PLAYER_LOADING, function () {
+          clearError();
+          showSplash(false);
+        });
+        playerManager.addEventListener(events.MEDIA_FINISHED, function () {
+          showSplash(true);
+        });
+        // Returning to the idle state (no media) -> show the branded splash.
+        playerManager.addEventListener(events.MEDIA_STATUS, function (e) {
+          var state = e && e.mediaStatus && e.mediaStatus.playerState;
+          if (state === cast.framework.messages.PlayerState.IDLE) {
+            showSplash(true);
+          }
+        });
+        playerManager.addEventListener(events.ERROR, function (e) {
+          // A 401 mid-stream (expired/rotated token) surfaces here as a
+          // network/segment error. We can't always tell the exact HTTP
+          // status from the event, so the copy stays generic-but-useful.
+          var code = e && (e.detailedErrorCode || e.error);
+          showError(
+            "The stream stopped (error " +
+              (code != null ? code : "unknown") +
+              "). Your cast session may have expired — try casting again."
+          );
+        });
+
+        // CastReceiverOptions lets us hand the framework our request
+        // handlers and keep the receiver awake briefly between items so a
+        // quick next-episode cast doesn't tear down and relaunch the app.
+        var options = new cast.framework.CastReceiverOptions();
+        options.playbackConfig = playbackConfig;
+        // 5 min idle grace before the platform unloads us.
+        options.maxInactivity = 300;
+
+        context.start(options);
+      })();
+    </script>
+  </body>
+</html>

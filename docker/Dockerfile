@@ -35,11 +35,17 @@ ARG CHIMPFLIX_API_URL=http://server:8080
 ARG NEXT_PUBLIC_BRAND_NAME=ChimpFlix
 ARG NEXT_PUBLIC_BRAND_NAME_UPPER=
 ARG APP_PUBLIC_ORIGIN=
+# Custom Google Cast receiver app ID. Empty -> the sender falls back to
+# Google's stock receiver (CC1AD845), which only does direct-play casting.
+# Set this to your registered receiver to enable HLS casting. See
+# docs/cast-receiver.md.
+ARG NEXT_PUBLIC_CAST_RECEIVER_APP_ID=
 ENV NEXT_TELEMETRY_DISABLED=1 \
     CHIMPFLIX_API_URL=${CHIMPFLIX_API_URL} \
     NEXT_PUBLIC_BRAND_NAME=${NEXT_PUBLIC_BRAND_NAME} \
     NEXT_PUBLIC_BRAND_NAME_UPPER=${NEXT_PUBLIC_BRAND_NAME_UPPER} \
-    APP_PUBLIC_ORIGIN=${APP_PUBLIC_ORIGIN}
+    APP_PUBLIC_ORIGIN=${APP_PUBLIC_ORIGIN} \
+    NEXT_PUBLIC_CAST_RECEIVER_APP_ID=${NEXT_PUBLIC_CAST_RECEIVER_APP_ID}
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web ./

@@ -20,9 +20,23 @@
 import { useEffect, useState, type RefObject } from "react";
 import { devError, devWarn } from "@/lib/dev-log";
 
-/// Default Media Receiver — Google's stock receiver app that can
-/// play HLS / DASH / MP4 directly with no custom receiver.
-const DEFAULT_RECEIVER_APP_ID = "CC1AD845";
+/// Cast receiver application ID.
+///
+/// `CC1AD845` is Google's stock Default Media Receiver — it can play a
+/// single direct-play file URL (the token rides in the query string and
+/// there are no sub-requests), but it CANNOT play our HLS transcode
+/// streams: the master playlist references variants/segments with bare
+/// relative URLs, so the `?ct=` token is dropped on every sub-request
+/// and the server 401s them.
+///
+/// Set `NEXT_PUBLIC_CAST_RECEIVER_APP_ID` (baked at build time) to the
+/// custom receiver registered in the Google Cast SDK Developer Console
+/// — point that registration at `https://<origin>/cast/receiver.html`,
+/// which re-appends the token to every sub-request. We fall back to the
+/// stock receiver when the var is unset so casting still works for
+/// direct-play before the operator registers a custom receiver.
+const RECEIVER_APP_ID =
+  process.env.NEXT_PUBLIC_CAST_RECEIVER_APP_ID || "CC1AD845";
 
 /// URL the Cast SDK is loaded from. Google updates this script in
 /// place; we pin to v1 framework loader so the API surface stays
@@ -88,7 +102,7 @@ export function loadCastSdk(): Promise<boolean> {
         }
         const context = framework.CastContext.getInstance();
         context.setOptions({
-          receiverApplicationId: DEFAULT_RECEIVER_APP_ID,
+          receiverApplicationId: RECEIVER_APP_ID,
           // RESUME_SESSION makes the SDK silently re-attach if the
           // user navigates between pages while a cast is active.
           // Without it, the receiver keeps playing but the page loses
@@ -292,6 +306,61 @@ export async function startCastSession(media: CastMediaPayload): Promise<boolean
   } catch (e) {
     devWarn("[cast] session start failed", e);
     return false;
+  }
+}
+
+/// Snapshot of the casting receiver's playback, as the sender sees it.
+/// `currentTimeS` is the position within the media the receiver loaded
+/// (for our HLS that's media-time = source-time minus the transcode
+/// fast-seek offset; for direct play it's absolute source-time). The
+/// caller maps it back to source-time before persisting.
+export interface RemotePlaybackState {
+  currentTimeS: number;
+  durationS: number;
+  isPaused: boolean;
+  isMediaLoaded: boolean;
+}
+
+/// Observe the currently-casting receiver's playback. `onChange` fires
+/// whenever the position or paused/loaded state changes (the Cast SDK
+/// emits CURRENT_TIME_CHANGED roughly once a second). Returns an
+/// unsubscribe; a no-op if the SDK isn't loaded. Used by the player to
+/// keep watch-progress flowing while the local `<video>` is paused for
+/// casting — the sender still holds the session and the receiver reports
+/// its clock here, so we can scrobble with the user's normal cookie auth.
+export function subscribeRemotePlayback(
+  onChange: (state: RemotePlaybackState) => void,
+): () => void {
+  const w = window as CastWindow;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const framework = (w.cast as any)?.framework;
+  if (!framework) return () => {};
+  try {
+    const player = new framework.RemotePlayer();
+    const controller = new framework.RemotePlayerController(player);
+    const emit = () =>
+      onChange({
+        currentTimeS: player.currentTime ?? 0,
+        durationS: player.duration ?? 0,
+        isPaused: !!player.isPaused,
+        isMediaLoaded: !!player.isMediaLoaded,
+      });
+    const evt = framework.RemotePlayerEventType;
+    const types = [
+      evt.CURRENT_TIME_CHANGED,
+      evt.DURATION_CHANGED,
+      evt.IS_PAUSED_CHANGED,
+      evt.IS_MEDIA_LOADED_CHANGED,
+      evt.PLAYER_STATE_CHANGED,
+    ];
+    types.forEach((t) => controller.addEventListener(t, emit));
+    emit(); // seed the caller with the current state immediately
+    return () => {
+      types.forEach((t) => controller.removeEventListener(t, emit));
+    };
+  } catch (e) {
+    devWarn("[cast] RemotePlayer subscription failed", e);
+    return () => {};
   }
 }
 

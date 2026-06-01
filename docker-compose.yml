@@ -139,6 +139,7 @@ services:
         NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-ChimpFlix}
         NEXT_PUBLIC_BRAND_NAME_UPPER: ${NEXT_PUBLIC_BRAND_NAME_UPPER:-}
         APP_PUBLIC_ORIGIN: ${APP_PUBLIC_ORIGIN:-}
+        NEXT_PUBLIC_CAST_RECEIVER_APP_ID: ${NEXT_PUBLIC_CAST_RECEIVER_APP_ID:-}
     image: chimpflix-web:local
     container_name: chimpflix-web
     restart: unless-stopped

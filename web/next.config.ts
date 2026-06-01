@@ -55,6 +55,40 @@ function csp(): string {
   ].join("; ");
 }
 
+/**
+ * CSP for the Google Cast receiver page (/cast/receiver.html). The
+ * receiver runs on the Cast device, not in a normal browser, and has
+ * needs the main-app CSP doesn't:
+ *
+ *  - `script-src https://www.gstatic.com` loads the CAF receiver
+ *    framework (same host the sender SDK uses).
+ *  - `connect-src ws: wss:` — the CAF runtime talks to the Cast
+ *    platform over a local WebSocket control channel; `connect-src
+ *    'self'` would block it on devices that route that channel through
+ *    page CSP, and the receiver would never start.
+ *  - HLS manifests/segments are fetched same-origin (`'self'`); MSE
+ *    feeds the decoder via `blob:`; posters come from the same CDNs the
+ *    app uses.
+ *
+ * This is served ONLY for /cast/* (the global matcher below excludes
+ * that prefix) so the looser `ws:`/`wss:` connect-src never widens the
+ * policy on the main application surface.
+ */
+function castReceiverCsp(): string {
+  return [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob: https://image.tmdb.org https://static.tvmaze.com https://artworks.thetvdb.com https://s4.anilist.co",
+    "media-src 'self' blob:",
+    "connect-src 'self' https://www.gstatic.com ws: wss:",
+    "font-src 'self' data:",
+    "object-src 'none'",
+  ].join("; ");
+}
+
 const securityHeaders = [
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "X-Frame-Options", value: "DENY" },
@@ -119,9 +153,27 @@ const nextConfig: NextConfig = {
   // exact Next.js version is information an attacker doesn't need.
   poweredByHeader: false,
   async headers() {
+    // The Cast receiver gets the same hardening as the rest of the app
+    // (nosniff, frame-deny, COOP/CORP, HSTS) but a CSP tuned for the CAF
+    // runtime — see `castReceiverCsp`. Multiple matching CSP headers are
+    // enforced as an intersection (most restrictive wins), so the global
+    // matcher below MUST exclude /cast/ or the receiver would inherit the
+    // app's `connect-src 'self'` and the Cast control channel would break.
+    const castReceiverHeaders = securityHeaders.map((h) =>
+      h.key === "Content-Security-Policy"
+        ? { key: h.key, value: castReceiverCsp() }
+        : h,
+    );
     return [
       {
-        source: "/:path*",
+        source: "/cast/:path*",
+        headers: castReceiverHeaders,
+      },
+      {
+        // Everything except /cast/* (carved out above). Next.js supports
+        // a negative-lookahead in the path so the receiver isn't also
+        // served the app CSP, which would intersect and re-block ws:/wss:.
+        source: "/((?!cast/).*)",
         headers: securityHeaders,
       },
     ];

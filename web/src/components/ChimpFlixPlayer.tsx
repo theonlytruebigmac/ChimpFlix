@@ -22,7 +22,13 @@ import {
   readCsrfToken,
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
-import { buildCastUrl, useCastState, type CastMediaPayload } from "@/lib/cast";
+import {
+  buildCastUrl,
+  subscribeRemotePlayback,
+  useCastState,
+  type CastMediaPayload,
+  type RemotePlaybackState,
+} from "@/lib/cast";
 import { CastButton } from "./CastButton";
 import { TOAST_DISMISS_LONG_MS, TOAST_DISMISS_PLAYER_MS } from "@/lib/toast";
 import { devError, devWarn } from "@/lib/dev-log";
@@ -2331,36 +2337,27 @@ export function ChimpFlixPlayer({
     };
   }, [title, subtitle]);
 
-  // Periodic play-state updates + scrobble at threshold.
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    // Server validates that exactly one of item_id / episode_id is set, so
-    // pick the more specific one when both are passed in.
-    const target = episodeId
-      ? { episode_id: episodeId }
-      : itemId
-        ? { item_id: itemId }
-        : null;
-
-    function report() {
-      if (!video) return;
+  // Persist play position + run the watched-threshold scrobble for a
+  // given SOURCE-time position. Extracted so the local <video> reporter
+  // and the Cast reporter share one copy of the threshold / credits-
+  // marker logic — casting then records progress identically to local
+  // playback instead of freezing while the local element is paused.
+  const reportProgress = useCallback(
+    (positionMs: number, activelyPlaying: boolean) => {
+      // Server validates that exactly one of item_id / episode_id is set,
+      // so pick the more specific one when both are present.
+      const target = episodeId
+        ? { episode_id: episodeId }
+        : itemId != null
+          ? { item_id: itemId }
+          : null;
       if (!target) return;
-      // Persist source-time, not HLS media-time. video.duration is HLS
-      // duration (truncated for transcode sessions) and isn't usable —
-      // prefer the server's full-file `videoDuration`.
-      const positionMs = Math.floor(
-        video.currentTime * 1000 + sessionStartMsRef.current,
-      );
       const knownDurationMs =
         videoDuration > 0 ? Math.floor(videoDuration * 1000) : undefined;
-      // Position updates only while the user is actively watching.
-      // Paused/ended state has no new position to report (the pause /
-      // ended event handler captured the final position already) and
-      // we don't want to keep nudging `last_played_at` while the
-      // tile is sitting in the background.
-      if (!video.paused && !video.ended) {
+      // Position updates only while something is actively playing — a
+      // paused/ended surface has no new position to report and we don't
+      // want to keep nudging `last_played_at`.
+      if (activelyPlaying) {
         playStateApi
           .update({
             ...target,
@@ -2371,19 +2368,16 @@ export function ChimpFlixPlayer({
       }
       // Threshold scrobble has to run regardless of play state. The
       // common "binge to natural end → next episode auto-plays" path
-      // ends with `video.ended = true` *before* the next 10s tick
-      // ever fires — bailing here means the scrobble at 90% never
-      // gets sent, and the operator has to manually mark each
-      // finished episode. (This was the symptom users hit: "I
-      // watched the whole thing and it didn't mark watched.")
+      // ends with `video.ended = true` *before* the next 10s tick ever
+      // fires — bailing here means the scrobble at 90% never gets sent,
+      // and the operator has to manually mark each finished episode.
       if (!scrobbledRef.current && knownDurationMs) {
         // Threshold scrobble: position past the configured percentage.
-        const pastThreshold =
-          positionMs / knownDurationMs >= scrobbleThreshold;
+        const pastThreshold = positionMs / knownDurationMs >= scrobbleThreshold;
         // Credits-marker scrobble: any auto-detected `credits` marker
         // whose start_ms we've passed. Used when the operator picks
-        // `first_credits_marker` or `earliest_of_both`. The first
-        // such marker (markers are sorted by start_ms upstream) wins.
+        // `first_credits_marker` or `earliest_of_both`. The first such
+        // marker (markers are sorted by start_ms upstream) wins.
         const behaviour = completionBehaviour ?? "threshold_pct";
         const wantMarker =
           behaviour === "first_credits_marker" ||
@@ -2411,6 +2405,34 @@ export function ChimpFlixPlayer({
           playStateApi.scrobble(target).catch(() => {});
         }
       }
+    },
+    [
+      itemId,
+      episodeId,
+      videoDuration,
+      scrobbleThreshold,
+      markers,
+      completionBehaviour,
+    ],
+  );
+
+  // Periodic play-state updates from the local <video>.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    function report() {
+      if (!video) return;
+      // While casting, the local <video> is paused at the hand-off point;
+      // the Cast reporter below owns position so we don't clobber the
+      // receiver's advancing position with a stale local one.
+      if (isCasting) return;
+      // Persist source-time, not HLS media-time: video.duration is the
+      // (truncated) HLS duration for transcode sessions and isn't usable.
+      const positionMs = Math.floor(
+        video.currentTime * 1000 + sessionStartMsRef.current,
+      );
+      reportProgress(positionMs, !video.paused && !video.ended);
     }
 
     const interval = window.setInterval(report, PLAY_STATE_INTERVAL_MS);
@@ -2443,7 +2465,43 @@ export function ChimpFlixPlayer({
       video.removeEventListener("seeked", onSeeked);
       report();
     };
-  }, [itemId, episodeId, videoDuration, scrobbleThreshold, markers, completionBehaviour]);
+  }, [isCasting, reportProgress]);
+
+  // While casting, the local <video> is paused, so the periodic reporter
+  // above stays quiet. Mirror progress from the Cast receiver instead:
+  // poll the RemotePlayer position and feed it through the same
+  // reportProgress path (resume point + watched scrobble), authenticated
+  // by the sender's existing cookie. Final-flush on teardown so stopping
+  // the cast persists where the TV left off.
+  useEffect(() => {
+    if (!isCasting) return;
+    if (itemId == null && episodeId == null) return;
+    let snap: RemotePlaybackState | null = null;
+    let lastGoodMs: number | null = null;
+    const unsub = subscribeRemotePlayback((s) => {
+      snap = s;
+    });
+    // HLS receiver currentTime is media-time (source minus the transcode
+    // fast-seek offset); direct-play currentTime is absolute source-time.
+    const offsetMs = () =>
+      castSourceRef.current?.contentType?.includes("mpegurl")
+        ? sessionStartMsRef.current
+        : 0;
+    const tick = () => {
+      if (!snap || !snap.isMediaLoaded || !(snap.currentTimeS > 0)) return;
+      const ms = Math.floor(snap.currentTimeS * 1000 + offsetMs());
+      lastGoodMs = ms;
+      reportProgress(ms, !snap.isPaused);
+    };
+    const interval = window.setInterval(tick, PLAY_STATE_INTERVAL_MS);
+    return () => {
+      window.clearInterval(interval);
+      unsub();
+      // Persist the last known-good position (not the zeroed teardown
+      // snapshot) so ending the cast resumes where the TV stopped.
+      if (lastGoodMs != null) reportProgress(lastGoodMs, true);
+    };
+  }, [isCasting, itemId, episodeId, reportProgress]);
 
   // Stats: emit `pause` / `resume` events for the admin Stats engagement
   // metrics. Pause is debounced 3s so seek-driven micro-pauses don't
