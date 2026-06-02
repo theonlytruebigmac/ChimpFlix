@@ -263,10 +263,16 @@ pub async fn server_info(
     .try_get("n")
     .map_err(|e| ApiError::Internal(e.into()))?;
     let episodes: i64 = sqlx::query(&format!(
+        // Count only downloaded episodes. Placeholder rows (no media_files,
+        // materialized to complete a season for the finale flag / calendar)
+        // are not content the server has, so they're excluded from this
+        // public "episodes" stat.
         "SELECT COUNT(*) AS n FROM episodes e \
          JOIN seasons s ON s.id = e.season_id \
          JOIN items i ON i.id = s.show_id \
-         WHERE {join_filter}",
+         WHERE {join_filter} \
+           AND EXISTS (SELECT 1 FROM media_files mf \
+                       WHERE mf.episode_id = e.id AND mf.removed_at IS NULL)",
     ))
     .fetch_one(&state.pool)
     .await

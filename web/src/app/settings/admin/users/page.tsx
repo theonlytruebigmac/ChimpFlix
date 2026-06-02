@@ -28,30 +28,29 @@ export default async function AdminUsersPage({
     ? (sp.tab as string)
     : "people";
 
-  const [accessRes, groupsRes, usersRes, libsRes, sessionsRes] =
+  const [accessRes, groupsRes, usersRes, libsRes, sessionsRes, invitesRes] =
     await Promise.all([
       adminApi.access.get(),
       adminApi.accessGroups.list(),
       authApi.listUsers(),
       librariesApi.list(),
       adminApi.sessions.list(),
+      authApi.listInvites().catch(() => ({ invites: [] })),
     ]);
   // Drop the placeholder _default user so it isn't a membership target.
   const realUsers = usersRes.users.filter((u) => u.username !== "_default");
+  const pendingInvites = invitesRes.invites.filter((i) => !i.consumed_at).length;
 
   return (
     <AdminUsersTabs
       initialTab={initialTab}
+      usersCount={realUsers.length}
+      invitesCount={pendingInvites}
       people={
         <AdminUsersUnifiedClient
           currentUserId={actor.id}
           currentUserRole={actor.role}
         />
-      }
-      invites={
-        <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-          <SettingsInvitesClient />
-        </section>
       }
       access={<AdminAccessClient initial={accessRes.entries} />}
       groups={
@@ -62,6 +61,7 @@ export default async function AdminUsersPage({
         />
       }
       devices={<AdminDevicesClient initial={sessionsRes.sessions} />}
+      invites={<SettingsInvitesClient />}
     />
   );
 }

@@ -1105,14 +1105,23 @@ async fn optimize_one(
     state: &AppState,
     row: &chimpflix_library::OptimizedVersion,
 ) -> anyhow::Result<()> {
-    // Resolve source path + preset config.
+    // Resolve source path + preset config. `duration_ms` is the denominator
+    // for the determinate progress bar — when it's missing or zero (rare;
+    // very old scans, or a source ffprobe couldn't measure) we leave
+    // progress at NULL and the UI shows an indeterminate bar instead of a
+    // fake number.
     use sqlx::Row;
-    let source_row = sqlx::query("SELECT path FROM media_files WHERE id = ?")
+    let source_row = sqlx::query("SELECT path, duration_ms FROM media_files WHERE id = ?")
         .bind(row.source_file_id)
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("source media_file {} missing", row.source_file_id))?;
     let source_path: String = source_row.try_get("path")?;
+    let source_duration_ms: Option<i64> = source_row
+        .try_get::<Option<i64>, _>("duration_ms")
+        .ok()
+        .flatten()
+        .filter(|d| *d > 0);
 
     let preset = queries::get_transcoder_preset(&state.pool, row.preset_id)
         .await?
@@ -1142,6 +1151,12 @@ async fn optimize_one(
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        // Machine-readable progress on stdout (key=value blocks ending in
+        // `progress=continue|end`); suppress the human stats line on
+        // stderr so stderr stays clean for error capture.
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
         "-i".into(),
         source_path.clone(),
     ];
@@ -1171,23 +1186,124 @@ async fn optimize_one(
     args.push("+faststart".into());
     args.push(output_str.clone());
 
-    let out = tokio::process::Command::new(&state.ffmpeg.ffmpeg)
+    // Spawn ffmpeg (rather than the previous blocking `.output()`) so we
+    // can (a) tail its `-progress` stream to drive the determinate bar and
+    // (b) hold the child handle to kill it if the operator hits Cancel.
+    // `kill_on_drop` is belt-and-suspenders: if this task is dropped (e.g.
+    // server shutdown) the child is signalled too.
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new(&state.ffmpeg.ffmpeg)
         .args(&args)
-        .output()
-        .await?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    // Drain stderr concurrently into a bounded buffer so a chatty encoder
+    // can't deadlock by filling the pipe while we're blocked reading
+    // stdout. We keep at most the last ~8 KiB — enough to surface the
+    // failing line, bounded so a pathological run can't balloon memory.
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(se) = stderr {
+            let mut lines = BufReader::new(se).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                buf.push_str(&line);
+                buf.push('\n');
+                if buf.len() > 8192 {
+                    let cut = buf.len() - 8192;
+                    buf.drain(..cut);
+                }
+            }
+        }
+        buf
+    });
+
+    // Tail the progress stream. ffmpeg emits blocks of `key=value` lines
+    // terminated by `progress=continue` (mid-stream) or `progress=end`
+    // (final). We pull `out_time_us` / `out_time_ms` to compute permille
+    // against the source duration, throttling DB writes to "changed by ≥
+    // 1 permille" so a long encode doesn't hammer the writer.
+    let mut cancelled = false;
+    let mut last_permille_written: i64 = -1;
+    if let Some(stdout) = child.stdout.take() {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut last_out_time_ms: i64 = 0;
+        loop {
+            // Cancel is checked on every progress line AND on the
+            // read-timeout tick so a stalled encoder (no progress lines)
+            // can still be cancelled promptly.
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = (match line { Ok(l) => l, Err(_) => None }) else {
+                        break; // stdout closed → ffmpeg is exiting
+                    };
+                    if let Some(v) = line.strip_prefix("out_time_ms=") {
+                        if let Ok(us) = v.trim().parse::<i64>() {
+                            // ffmpeg's `out_time_ms` is actually microseconds.
+                            last_out_time_ms = us / 1000;
+                        }
+                    } else if let Some(v) = line.strip_prefix("out_time_us=") {
+                        if let Ok(us) = v.trim().parse::<i64>() {
+                            last_out_time_ms = us / 1000;
+                        }
+                    }
+                    if let Some(total) = source_duration_ms {
+                        let permille =
+                            ((last_out_time_ms.max(0) as i128 * 1000) / total as i128) as i64;
+                        let permille = permille.clamp(0, 1000);
+                        if permille != last_permille_written {
+                            last_permille_written = permille;
+                            let _ = queries::update_optimized_progress(
+                                &state.pool,
+                                row.id,
+                                permille,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            }
+            if state.optimize_cancel_requested(row.id).await {
+                cancelled = true;
+                let _ = child.start_kill();
+                break;
+            }
+        }
+    }
+
+    // Reap the child. On cancel we kill it above; otherwise this awaits
+    // natural exit. Either way we collect status + drained stderr.
+    let status = child.wait().await?;
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    if cancelled {
+        // The cancel route already flipped the DB row to `cancelled`; we
+        // just clean up the partial output file and drop the cancel flag.
+        let _ = tokio::fs::remove_file(&output).await;
+        state.clear_optimize_cancel(row.id).await;
+        return Ok(());
+    }
+    // Defensive: clear any stale cancel flag for this id (e.g. a cancel
+    // requested for a since-completed earlier row reusing the id is
+    // impossible, but a no-op clear costs nothing and keeps the set tidy).
+    state.clear_optimize_cancel(row.id).await;
+
+    if !status.success() {
         let _ = queries::mark_optimized_finished(
             &state.pool,
             row.id,
             false,
             None,
             None,
-            Some(&stderr.chars().take(1024).collect::<String>()),
+            Some(&stderr_text.chars().take(1024).collect::<String>()),
         )
         .await;
         let _ = tokio::fs::remove_file(&output).await;
-        anyhow::bail!("ffmpeg exited {}", out.status);
+        anyhow::bail!("ffmpeg exited {}", status);
     }
 
     let meta = tokio::fs::metadata(&output).await?;

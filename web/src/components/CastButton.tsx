@@ -33,6 +33,11 @@ export interface CastButtonProps {
   /// reflect the latest playback position rather than a stale snapshot
   /// from when the button mounted.
   resolveMedia: () => Promise<CastMediaPayload | null>;
+  /// Surface a short, transient message to the viewer. Wired to the
+  /// player's toast so a Cast attempt that can't proceed explains why
+  /// ("No Cast devices found…") instead of silently doing nothing —
+  /// the difference the user reported as "the button doesn't react".
+  onNotice?: (message: string) => void;
 }
 
 export function CastButton({
@@ -40,6 +45,7 @@ export function CastButton({
   onCastStart,
   onCastEnd,
   resolveMedia,
+  onNotice,
 }: CastButtonProps) {
   const cast = useCastState();
   const airplayAvailable = useAirPlayAvailability(videoRef);
@@ -56,12 +62,28 @@ export function CastButton({
       // /cast/sign) is a network round-trip; doing it before
       // requestSession() consumes the gesture and the picker silently
       // never opens on mobile Chrome ("tap does nothing").
-      const haveSession = await requestCastSession();
-      if (!haveSession) return;
+      const result = await requestCastSession();
+      if (result !== "ok") {
+        // Stay quiet on a deliberate cancel; explain the rest. The
+        // "no-devices" branch is the one users hit most when a
+        // Chromecast is on a different VLAN / not reachable via mDNS
+        // from this machine — previously this just looked like a dead
+        // button.
+        if (result === "no-devices") {
+          onNotice?.("No Cast devices found on this network.");
+        } else if (result === "error") {
+          onNotice?.("Couldn't open the Cast menu on this device.");
+        }
+        return;
+      }
       const media = await resolveMedia();
-      if (!media) return;
+      if (!media) {
+        onNotice?.("Start playback before casting.");
+        return;
+      }
       const ok = await loadCastMedia(media);
       if (ok) onCastStart?.();
+      else onNotice?.("The Cast device couldn't load this title.");
       return;
     }
     // Cast SDK not available — fall through to AirPlay.
@@ -77,6 +99,7 @@ export function CastButton({
     resolveMedia,
     onCastStart,
     onCastEnd,
+    onNotice,
   ]);
 
   // Hide entirely if neither protocol is usable. A button that

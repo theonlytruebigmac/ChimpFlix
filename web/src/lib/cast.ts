@@ -311,6 +311,13 @@ export interface CastMediaPayload {
   durationS?: number;
 }
 
+/// Outcome of a [`requestCastSession`] attempt. Lets the caller stay
+/// silent on a normal user cancel while surfacing actionable reasons
+/// ("no devices on the network", "couldn't reach the receiver") — the
+/// difference between a Cast button that "does nothing" and one that
+/// tells you why.
+export type CastSessionResult = "ok" | "cancel" | "no-devices" | "error";
+
 /// Open the Cast device picker and establish a session.
 ///
 /// MUST be called directly from a user-gesture handler BEFORE any
@@ -319,28 +326,37 @@ export interface CastMediaPayload {
 /// — e.g. minting the cast token via `/cast/sign` — consumes that
 /// activation, after which the picker silently fails to open (most
 /// visibly on mobile Chrome: "tap does nothing"). So the click handler
-/// calls THIS first, then mints the token + loads the media. Returns
-/// true once a session is live (pre-existing or freshly picked).
-export async function requestCastSession(): Promise<boolean> {
+/// calls THIS first, then mints the token + loads the media.
+export async function requestCastSession(): Promise<CastSessionResult> {
   const w = window as CastWindow;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const framework = (w.cast as any)?.framework;
   if (!framework) {
     devWarn("[cast] SDK not loaded; cannot start session");
-    return false;
+    return "error";
   }
   const ctx = framework.CastContext.getInstance();
-  if (ctx.getCurrentSession()) return true;
+  if (ctx.getCurrentSession()) return "ok";
   try {
-    // requestSession resolves with a "success"/"cancel"/etc. string OR
-    // throws on hard failure / user cancel. Either way, success means
-    // "there is now a live session."
+    // requestSession resolves once a session is live OR rejects with a
+    // chrome.cast.Error whose `.code` tells us why: "cancel" (user
+    // dismissed the picker), "receiver_unavailable" (no devices the
+    // sender can see — the common flaky-mDNS / segmented-LAN case),
+    // "timeout", etc.
     await ctx.requestSession();
   } catch (e) {
     devWarn("[cast] requestSession failed/cancelled", e);
-    return false;
+    // The SDK throws either a bare string code or an object with `.code`.
+    const code =
+      typeof e === "string"
+        ? e
+        : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ((e as any)?.code as string | undefined);
+    if (code === "cancel") return "cancel";
+    if (code === "receiver_unavailable") return "no-devices";
+    return "error";
   }
-  return !!ctx.getCurrentSession();
+  return ctx.getCurrentSession() ? "ok" : "cancel";
 }
 
 /// Load media onto the CURRENT cast session. Call after

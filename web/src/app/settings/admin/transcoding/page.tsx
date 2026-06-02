@@ -26,8 +26,10 @@ export default async function AdminTranscodingPage({
       engine={{
         capabilities: caps.capabilities,
         cacheRoot: caps.cache_root,
-        presets: presets.presets,
         settings,
+      }}
+      presets={{
+        presets: presets.presets,
       }}
       preroll={{
         initialStatus: prerollStatus,

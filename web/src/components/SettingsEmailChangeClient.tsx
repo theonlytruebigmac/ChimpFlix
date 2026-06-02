@@ -86,19 +86,29 @@ export function SettingsEmailChangeClient({ initial }: Props) {
   }
 
   return (
-    <div className="space-y-3">
-      <div className="text-xs">
-        <span className="text-white/55">Current email: </span>
-        <span className="font-medium text-white">
-          {currentEmail ?? <em className="text-white/50">none set</em>}
-        </span>
+    <div>
+      <div className="cf-row" style={{ paddingTop: 0 }}>
+        <div className="cf-row-main">
+          <div className="cf-row-label">Current email</div>
+        </div>
+        <div className="cf-row-control">
+          {currentEmail ? (
+            <span className="cf-mono">{currentEmail}</span>
+          ) : (
+            <span className="cf-faint">None set</span>
+          )}
+        </div>
       </div>
 
       {verifyStatus && (
-        <div className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
-          {verifyStatus}
+        <div className="cf-banner cf-ok">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+          <div>{verifyStatus}</div>
         </div>
       )}
+
       {!currentEmail && (
         <FirstTimeEmailForm
           onSet={(addr) => {
@@ -110,10 +120,10 @@ export function SettingsEmailChangeClient({ initial }: Props) {
       )}
 
       {currentEmail && (
-        <form onSubmit={request} className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <label className="block text-xs">
-              <span className="mb-1 block text-white/70">New email</span>
+        <form onSubmit={request}>
+          <div className="cf-grid cf-c2" style={{ marginTop: 14 }}>
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">New email</label>
               <input
                 type="email"
                 autoComplete="email"
@@ -122,11 +132,11 @@ export function SettingsEmailChangeClient({ initial }: Props) {
                 placeholder="new-address@example.com"
                 maxLength={320}
                 required
-                className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                className="cf-input"
               />
-            </label>
-            <label className="block text-xs">
-              <span className="mb-1 block text-white/70">Current password</span>
+            </div>
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Current password</label>
               <input
                 type="password"
                 autoComplete="current-password"
@@ -134,27 +144,36 @@ export function SettingsEmailChangeClient({ initial }: Props) {
                 onChange={(e) => setPassword(e.target.value)}
                 required
                 maxLength={1024}
-                className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+                className="cf-input"
               />
-            </label>
+            </div>
           </div>
           {error && (
-            <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-              {error}
+            <div className="cf-banner cf-err" style={{ marginTop: 14 }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 8v4M12 16v.5" />
+              </svg>
+              <div>{error}</div>
             </div>
           )}
           {requestStatus && (
-            <div className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
-              {requestStatus}
+            <div className="cf-banner cf-ok" style={{ marginTop: 14 }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M20 6L9 17l-5-5" />
+              </svg>
+              <div>{requestStatus}</div>
             </div>
           )}
-          <button
-            type="submit"
-            disabled={busy || !newEmail || !password}
-            className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
-          >
-            {busy ? "Sending…" : "Send verification email"}
-          </button>
+          <div className="cf-flex" style={{ marginTop: 16 }}>
+            <button
+              type="submit"
+              disabled={busy || !newEmail || !password}
+              className="cf-btn cf-primary"
+            >
+              {busy ? "Sending…" : "Send verification email"}
+            </button>
+          </div>
         </form>
       )}
     </div>
@@ -190,12 +209,12 @@ function FirstTimeEmailForm({
   }
 
   return (
-    <form onSubmit={submit} className="space-y-3">
-      <p className="text-xs text-white/55">
+    <form onSubmit={submit}>
+      <p className="cf-muted" style={{ fontSize: 12.5, margin: "10px 0" }}>
         Setting an email for the first time skips the verification round-trip.
         Future changes will require clicking a link sent to the new address.
       </p>
-      <div className="flex gap-2">
+      <div className="cf-flex cf-gap8">
         <input
           type="email"
           autoComplete="email"
@@ -204,12 +223,13 @@ function FirstTimeEmailForm({
           placeholder="you@example.com"
           maxLength={320}
           required
-          className="flex-1 rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+          className="cf-input"
+          style={{ flex: 1 }}
         />
         <button
           type="submit"
           disabled={busy || !email}
-          className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
+          className="cf-btn cf-primary"
         >
           {busy ? "…" : "Set email"}
         </button>

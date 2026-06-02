@@ -8,7 +8,6 @@ import {
   type SecretTestResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
-import { ErrorBanner } from "./ui";
 import { formatDateTime } from "@/lib/format";
 import { TOAST_DISMISS_LONG_MS } from "@/lib/toast";
 
@@ -43,6 +42,17 @@ const SLOT_FIELDS: Record<string, FieldSpec[]> = {
   ],
 };
 
+/// A small refresh/sync glyph reused for the per-slot "Test" action —
+/// matches the mockup's Test button icon.
+function TestIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 10a8 8 0 0 1 14-4l2 2M20 14a8 8 0 0 1-14 4l-2-2" />
+      <path d="M18 4v4h-4M6 20v-4h4" />
+    </svg>
+  );
+}
+
 export function AdminCredentialsClient({
   initial,
 }: {
@@ -60,33 +70,71 @@ export function AdminCredentialsClient({
   }
 
   return (
-    <div className="space-y-6">
-      {!encryptedAtRest && (
-        <div className="rounded-md border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-          <div className="font-semibold">
-            Secrets are stored in plaintext.
+    <div>
+      {/* Page title intentionally omitted — the sidebar + breadcrumb name
+          the page, per the dropped-page-titles decision. */}
+
+      {/* ── encrypted-at-rest banner ───────────────────────────────── */}
+      {encryptedAtRest ? (
+        <div className="cf-banner cf-ok">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />
+            <path d="M9 12l2 2 4-4" />
+          </svg>
+          <div>
+            Secrets are encrypted at rest (
+            <span className="cf-mono">CHIMPFLIX_SECRET_KEY</span> is set).
           </div>
-          <div className="mt-1 text-xs text-red-200/80">
-            Set the <code className="rounded bg-black/30 px-1">CHIMPFLIX_SECRET_KEY</code>{" "}
-            environment variable to a 32-byte hex value (64 characters) and
-            restart the server to encrypt every stored secret at rest. The
-            server logs print a ready-to-paste suggestion when running
-            without one.
+        </div>
+      ) : (
+        <div className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 3l9 16H3z" />
+            <path d="M12 10v4M12 17v.5" />
+          </svg>
+          <div>
+            <b>Secrets are stored in plaintext.</b> Set the{" "}
+            <span className="cf-mono">CHIMPFLIX_SECRET_KEY</span> environment
+            variable to a 32-byte hex value (64 characters) and restart the
+            server to encrypt every stored secret at rest. The server logs
+            print a ready-to-paste suggestion when running without one.
           </div>
         </div>
       )}
 
-      <ErrorBanner error={error} />
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
       {notice && (
         <div
           role="status"
           aria-live="polite"
-          className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
+          className="cf-banner cf-ok"
         >
-          {notice}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+          <div>{notice}</div>
         </div>
       )}
 
+      {/* ── per-provider credential cards ──────────────────────────── */}
+      {slots.map((slot) => (
+        <SlotCard
+          key={slot.name}
+          slot={slot}
+          onUpdated={replaceSlot}
+          onError={setError}
+        />
+      ))}
+
+      {/* ── Plex client identity (production superset) ─────────────── */}
       <PlexIdentitySection
         onError={setError}
         onNotice={(m) => {
@@ -97,17 +145,6 @@ export function AdminCredentialsClient({
           window.setTimeout(() => setNotice(null), TOAST_DISMISS_LONG_MS);
         }}
       />
-
-      <div className="space-y-3">
-        {slots.map((slot) => (
-          <SlotCard
-            key={slot.name}
-            slot={slot}
-            onUpdated={replaceSlot}
-            onError={setError}
-          />
-        ))}
-      </div>
     </div>
   );
 }
@@ -143,42 +180,44 @@ function PlexIdentitySection({
   }
 
   return (
-    <section className="rounded-lg border border-white/10 bg-white/2 p-5">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h3 className="text-sm font-semibold">Plex client identity</h3>
-          <p className="mt-1 text-xs leading-relaxed text-white/55">
-            Every install has a unique client identifier that ChimpFlix sends
-            to Plex during PIN-based sign-in. It&apos;s generated on first
-            use and reused across restarts so in-flight authorizations
-            survive a redeploy. Rotate it if you suspect the identifier has
-            leaked, or if you&apos;re handing the install to a new operator
-            who wants a clean Plex client identity.
-          </p>
-          <p className="mt-2 text-xs text-white/45">
-            Rotating <strong>does not</strong> sign out existing Plex-linked
-            users — their per-user tokens live separately. It only affects
-            future sign-in flows.
-          </p>
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">Plex client identity</div>
+          <div className="cf-sub">
+            Every install has a unique client identifier that ChimpFlix sends to
+            Plex during PIN-based sign-in. Rotating <strong>does not</strong>{" "}
+            sign out existing Plex-linked users — their per-user tokens live
+            separately. It only affects future sign-in flows.
+          </div>
         </div>
-        <button
-          type="button"
-          onClick={() => setConfirming(true)}
-          disabled={busy}
-          className="shrink-0 rounded-md border border-white/15 px-3 py-1.5 text-xs text-white/80 hover:border-white/30 hover:text-white disabled:opacity-50"
-        >
-          Rotate identifier
-        </button>
+        <div className="cf-head-aside">
+          <button
+            type="button"
+            className="cf-btn cf-sm"
+            onClick={() => setConfirming(true)}
+            disabled={busy}
+          >
+            {busy ? "Rotating…" : "Rotate identifier"}
+          </button>
+        </div>
+      </div>
+      <div className="cf-card-body cf-pad">
+        <p className="cf-muted" style={{ fontSize: 12.5, margin: 0 }}>
+          The identifier is generated on first use and reused across restarts so
+          in-flight authorizations survive a redeploy. Rotate it if you suspect
+          the identifier has leaked, or if you&apos;re handing the install to a
+          new operator who wants a clean Plex client identity.
+        </p>
       </div>
       {confirming && (
         <ConfirmDialog
           title="Rotate the Plex client identifier?"
           body={
             <>
-              The next <code>/auth/plex/start</code> call will mint a fresh
-              UUID and use it for all future PIN flows. Existing per-user
-              Plex links are unaffected. This action is logged to the
-              audit trail.
+              The next <code>/auth/plex/start</code> call will mint a fresh UUID
+              and use it for all future PIN flows. Existing per-user Plex links
+              are unaffected. This action is logged to the audit trail.
             </>
           }
           confirmLabel="Rotate"
@@ -187,7 +226,7 @@ function PlexIdentitySection({
           onCancel={() => setConfirming(false)}
         />
       )}
-    </section>
+    </div>
   );
 }
 
@@ -284,159 +323,208 @@ function SlotCard({
     }
   }
 
-  return (
-    <section className="rounded-lg border border-white/10 bg-white/2 p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <h3 className="text-base font-semibold">{slot.display_name}</h3>
-            <code className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-white/60">
-              {slot.name}
-            </code>
-            {slot.managed && (
-              <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-blue-200">
-                System
-              </span>
-            )}
-          </div>
-          <p className="mt-1 text-xs text-white/55">{slot.description}</p>
-          <div className="mt-2 text-xs text-white/40">
-            {isSet ? (
-              <>
-                <span className="text-emerald-300">Set</span>{" "}
-                <span className="font-mono">••••{last4}</span>
-                {slot.stored && (
-                  <span className="ml-2">
-                    · updated {formatDateTime(slot.stored.updated_at)}
-                  </span>
-                )}
-              </>
-            ) : (
-              <span className="text-white/40">Not set</span>
-            )}
-          </div>
-        </div>
+  // What goes in the right-hand control of the status row(s). Managed
+  // (system) slots are read-only; everything else gets Edit + (when set)
+  // the inline last4 readout.
+  const fieldsForDisplay: FieldSpec[] = fieldSpecs ?? [
+    { key: "value", label: "API key", type: "password" },
+  ];
 
-        {!slot.managed && (
-          <div className="flex shrink-0 flex-col items-end gap-2">
-            <div className="flex gap-2">
-              {!editing && (
-                <button
-                  onClick={() => {
-                    setEditing(true);
-                    resetDraft();
-                    setTestResult(null);
-                  }}
-                  className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium hover:bg-white/15"
-                >
-                  {isSet ? "Replace" : "Set"}
-                </button>
-              )}
+  return (
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">{slot.display_name}</div>
+          <div className="cf-sub">{slot.description}</div>
+        </div>
+        <div className="cf-head-aside">
+          {isSet ? (
+            <span className="cf-pill cf-ok">
+              <span className="cf-dot" />
+              Configured
+            </span>
+          ) : (
+            <span className="cf-pill cf-warn">
+              <span className="cf-dot" />
+              Not set
+            </span>
+          )}
+          {slot.managed ? (
+            <span className="cf-tag">System</span>
+          ) : (
+            <>
               {isSet && (
                 <button
+                  className="cf-btn cf-ghost cf-sm"
                   onClick={test}
                   disabled={busy !== null}
-                  className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium hover:bg-white/15 disabled:opacity-50"
                 >
+                  <TestIcon />
                   {busy === "test" ? "Testing…" : "Test"}
                 </button>
               )}
               {isSet && (
                 <button
+                  className="cf-btn cf-ghost cf-sm cf-danger"
                   onClick={() => setAskClear(true)}
                   disabled={busy !== null}
-                  className="rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50"
                 >
                   {busy === "clear" ? "Clearing…" : "Clear"}
                 </button>
               )}
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="cf-card-body">
+        {/* Status rows: one per logical field. For multi-field slots
+            (Trakt, OpenSubtitles) each field is its own row matching the
+            mockup; single-field slots get one "API key" row. */}
+        {!editing &&
+          fieldsForDisplay.map((f, idx) => (
+            <div className="cf-row" key={f.key}>
+              <div className="cf-row-main">
+                <div className="cf-row-label">{f.label}</div>
+              </div>
+              <div className="cf-row-control">
+                {isSet ? (
+                  // Never show cleartext — only the masked value (+ last4
+                  // on the final/primary field).
+                  <span className="cf-mono">
+                    {"••••••••"}
+                    {idx === fieldsForDisplay.length - 1 && last4
+                      ? last4
+                      : ""}
+                  </span>
+                ) : (
+                  <span className="cf-faint cf-mono">Not set</span>
+                )}
+                {!slot.managed && idx === 0 && (
+                  <button
+                    className="cf-btn cf-ghost cf-sm"
+                    onClick={() => {
+                      setEditing(true);
+                      resetDraft();
+                      setTestResult(null);
+                    }}
+                  >
+                    Edit
+                  </button>
+                )}
+              </div>
             </div>
+          ))}
+
+        {/* Last-updated footnote (production superset over the mockup). */}
+        {!editing && isSet && slot.stored && (
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-help">
+                Updated {formatDateTime(slot.stored.updated_at)}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── inline editor ─────────────────────────────────────── */}
+        {editing && !slot.managed && (
+          <div style={{ padding: "16px 0" }}>
+            {fieldSpecs ? (
+              fieldSpecs.map((f, idx) => (
+                <div className="cf-field" key={f.key}>
+                  <label className="cf-field-label">{f.label}</label>
+                  <input
+                    className="cf-input cf-mono"
+                    type={f.type ?? "text"}
+                    value={fields[f.key] ?? ""}
+                    onChange={(e) =>
+                      setFields((prev) => ({
+                        ...prev,
+                        [f.key]: e.target.value,
+                      }))
+                    }
+                    autoComplete="off"
+                    spellCheck={false}
+                    autoFocus={idx === 0}
+                  />
+                  {f.hint && (
+                    <p
+                      className="cf-faint"
+                      style={{ marginTop: 6, fontSize: 11.5 }}
+                    >
+                      {f.hint}
+                    </p>
+                  )}
+                </div>
+              ))
+            ) : (
+              <div className="cf-field">
+                <label className="cf-field-label">New value</label>
+                <input
+                  className="cf-input cf-mono"
+                  type="password"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  placeholder="paste credential"
+                  autoComplete="off"
+                  spellCheck={false}
+                  autoFocus
+                />
+              </div>
+            )}
+            <div className="cf-flex cf-gap8" style={{ marginTop: 4 }}>
+              <button
+                className="cf-btn cf-primary cf-sm"
+                onClick={save}
+                disabled={!hasContent() || busy !== null}
+              >
+                {busy === "save" ? "Saving…" : "Save"}
+              </button>
+              <button
+                className="cf-btn cf-sm"
+                onClick={test}
+                disabled={!hasContent() || busy !== null}
+              >
+                <TestIcon />
+                {busy === "test" ? "Testing…" : "Test before save"}
+              </button>
+              <button
+                className="cf-btn cf-ghost cf-sm"
+                onClick={() => {
+                  setEditing(false);
+                  resetDraft();
+                  setTestResult(null);
+                }}
+                disabled={busy !== null}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── test result ───────────────────────────────────────── */}
+        {testResult && (
+          <div
+            className={`cf-banner ${testResult.ok ? "cf-ok" : "cf-warn"}`}
+            style={{ marginTop: 12, marginBottom: 12 }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              {testResult.ok ? (
+                <path d="M20 6L9 17l-5-5" />
+              ) : (
+                <>
+                  <path d="M12 3l9 16H3z" />
+                  <path d="M12 10v4M12 17v.5" />
+                </>
+              )}
+            </svg>
+            <div>{testResult.detail}</div>
           </div>
         )}
       </div>
 
-      {editing && !slot.managed && (
-        <div className="mt-4 border-t border-white/10 pt-4">
-          {fieldSpecs ? (
-            <div className="space-y-3">
-              {fieldSpecs.map((f, idx) => (
-                <div key={f.key}>
-                  <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-white/50">
-                    {f.label}
-                  </label>
-                  <input
-                    type={f.type ?? "text"}
-                    value={fields[f.key] ?? ""}
-                    onChange={(e) =>
-                      setFields((prev) => ({ ...prev, [f.key]: e.target.value }))
-                    }
-                    autoComplete="off"
-                    spellCheck={false}
-                    className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-                    autoFocus={idx === 0}
-                  />
-                  {f.hint && (
-                    <p className="mt-1 text-[11px] text-white/40">{f.hint}</p>
-                  )}
-                </div>
-              ))}
-            </div>
-          ) : (
-            <>
-              <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-white/50">
-                New value
-              </label>
-              <input
-                type="password"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                placeholder="paste credential"
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-                autoFocus
-              />
-            </>
-          )}
-          <div className="mt-3 flex gap-2">
-            <button
-              onClick={save}
-              disabled={!hasContent() || busy !== null}
-              className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-            >
-              {busy === "save" ? "Saving…" : "Save"}
-            </button>
-            <button
-              onClick={test}
-              disabled={!hasContent() || busy !== null}
-              className="rounded-md bg-white/10 px-3 py-1.5 text-sm font-medium hover:bg-white/15 disabled:opacity-50"
-            >
-              {busy === "test" ? "Testing…" : "Test before save"}
-            </button>
-            <button
-              onClick={() => {
-                setEditing(false);
-                resetDraft();
-                setTestResult(null);
-              }}
-              disabled={busy !== null}
-              className="rounded-md px-3 py-1.5 text-sm text-white/60 hover:bg-white/5 hover:text-white"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {testResult && (
-        <div
-          className={`mt-3 rounded-md border px-3 py-2 text-xs ${
-            testResult.ok
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
-              : "border-amber-500/30 bg-amber-500/10 text-amber-200"
-          }`}
-        >
-          {testResult.detail}
-        </div>
-      )}
       {askClear && (
         <ConfirmDialog
           title={`Clear ${slot.display_name}?`}
@@ -448,6 +536,6 @@ function SlotCard({
           onCancel={() => setAskClear(false)}
         />
       )}
-    </section>
+    </div>
   );
 }

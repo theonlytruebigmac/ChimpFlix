@@ -46,6 +46,11 @@ axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# IANA timezone database for chrono. Used by the notifier to interpret a
+# user's quiet-hours window ("HH:MM" wall-clock) in their configured
+# timezone rather than raw UTC. Pure-Rust, bundles the tz database so
+# there's no dependency on the host's /usr/share/zoneinfo.
+chrono-tz = "0.10"
 cron = "0.12"
 futures = "0.3"
 hex = "0.4"

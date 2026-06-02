@@ -56,6 +56,20 @@ export type MediaItem = {
   // Card uses this to render the red "Recently Added" / "New Season"
   // ribbon when within the recency window.
   addedAt?: number;
+  /// Episode air date, epoch milliseconds (date-granular, midnight UTC).
+  /// Populated for episode rows so the season view can render a relative
+  /// "Tomorrow" / "In 2 weeks" badge for upcoming episodes. Undefined for
+  /// items without an air date and for non-episode kinds.
+  airDate?: number;
+  /// False marks a PLACEHOLDER episode — a row materialized from the
+  /// metadata agent's full season list for an in-progress / future season
+  /// that has no downloaded file behind it. `SeasonEpisodes` renders these
+  /// distinctly: show poster (no episode still), no play/watched/marker
+  /// affordances, a muted "Not downloaded / Airs <date>" treatment — like
+  /// Trakt's greyed upcoming rows. Undefined (defaults to "has a file") for
+  /// movies and for any episode source that predates the flag, so a missing
+  /// value never strips affordances from a real, downloaded episode.
+  hasFile?: boolean;
   markers?: Marker[];
   librarySectionID?: string;
   // Populated only when the source Plex response includes Media/Part/Stream

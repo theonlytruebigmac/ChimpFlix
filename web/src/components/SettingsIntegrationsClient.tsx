@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  auth as authApi,
   trakt as traktApi,
   type TraktLinkStart,
   type TraktStatus,
@@ -11,9 +12,14 @@ import {
 import { ConfirmDialog } from "./ConfirmDialog";
 import { formatDateTime } from "@/lib/format";
 
-/// Per-user integrations card. Right now the only integration here is
-/// Trakt — when more land (Trakt+anything-else), wrap each in its own
-/// subsection.
+/// Per-user integrations, rendered in the console design language: a
+/// service-tile grid up top, then the connected-service detail (Trakt
+/// today — device-code link flow, sync, unlink, and watch stats).
+///
+/// Discord is a real per-user integration: a personal webhook the user's
+/// notifications are mirrored to. Tiles for services that aren't wired
+/// per-user yet (Simkl) render as honest disabled "Coming soon" cards
+/// rather than fake controls — tracked as feature-gap decisions.
 export function SettingsIntegrationsClient() {
   const [status, setStatus] = useState<TraktStatus | null>(null);
   const [pending, setPending] = useState<TraktLinkStart | null>(null);
@@ -24,6 +30,14 @@ export function SettingsIntegrationsClient() {
   const [lastSync, setLastSync] = useState<TraktSyncNowResult | null>(null);
   const [stats, setStats] = useState<TraktUserStats | null>(null);
   const [askUnlink, setAskUnlink] = useState(false);
+  // Discord per-user webhook. `discordUrl` is the saved value (null = not
+  // configured); `discordEditing` reveals the inline input; `discordDraft`
+  // holds the in-progress URL; `discordBusy` gates Save/Disconnect.
+  const [discordUrl, setDiscordUrl] = useState<string | null>(null);
+  const [discordEditing, setDiscordEditing] = useState(false);
+  const [discordDraft, setDiscordDraft] = useState("");
+  const [discordBusy, setDiscordBusy] = useState(false);
+  const [discordError, setDiscordError] = useState<string | null>(null);
   const pollTimer = useRef<number | null>(null);
   // True while this component is mounted. The poll() callback runs on
   // a Trakt-suggested interval (~5s) and lives across many awaits; if
@@ -35,20 +49,69 @@ export function SettingsIntegrationsClient() {
   useEffect(() => {
     aliveRef.current = true;
     refresh();
+    loadDiscord();
     return () => {
       aliveRef.current = false;
       if (pollTimer.current) window.clearInterval(pollTimer.current);
     };
   }, []);
 
+  async function loadDiscord() {
+    try {
+      const { user } = await authApi.me();
+      if (!aliveRef.current) return;
+      setDiscordUrl(user.discord_webhook_url);
+    } catch {
+      // The Discord tile is a secondary surface — a failed /auth/me here
+      // shouldn't blow up the whole integrations page (Trakt loads on its
+      // own path). It just renders as "not connected" until a reload.
+    }
+  }
+
+  async function saveDiscord() {
+    const url = discordDraft.trim();
+    if (!url) return;
+    setDiscordBusy(true);
+    setDiscordError(null);
+    try {
+      const { user } = await authApi.updateMe({ discord_webhook_url: url });
+      if (!aliveRef.current) return;
+      setDiscordUrl(user.discord_webhook_url);
+      setDiscordEditing(false);
+      setDiscordDraft("");
+    } catch (e) {
+      if (aliveRef.current) {
+        setDiscordError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (aliveRef.current) setDiscordBusy(false);
+    }
+  }
+
+  async function disconnectDiscord() {
+    setDiscordBusy(true);
+    setDiscordError(null);
+    try {
+      // Empty string clears the webhook server-side (Some(None)).
+      const { user } = await authApi.updateMe({ discord_webhook_url: "" });
+      if (!aliveRef.current) return;
+      setDiscordUrl(user.discord_webhook_url);
+      setDiscordEditing(false);
+      setDiscordDraft("");
+    } catch (e) {
+      if (aliveRef.current) {
+        setDiscordError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (aliveRef.current) setDiscordBusy(false);
+    }
+  }
+
   async function refresh() {
     setBusy("load");
     try {
       const s = await traktApi.status();
       setStatus(s);
-      // Lazily pull stats only when we know we're linked. The endpoint
-      // gracefully returns null otherwise, but skipping the round-trip
-      // keeps the unlinked card snappy.
       if (s.linked) {
         try {
           setStats(await traktApi.stats());
@@ -72,8 +135,6 @@ export function SettingsIntegrationsClient() {
     try {
       const s = await traktApi.linkStart();
       setPending(s);
-      // Begin polling at the server-suggested interval (Trakt asks for
-      // ~5s) until the user approves or the code expires.
       const interval = Math.max(2, s.interval) * 1000;
       pollTimer.current = window.setInterval(() => poll(), interval);
     } catch (e) {
@@ -107,7 +168,6 @@ export function SettingsIntegrationsClient() {
           break;
         case "pending":
         case "slow_down":
-          // Keep polling; nothing to do here.
           break;
       }
     } catch (e) {
@@ -153,163 +213,462 @@ export function SettingsIntegrationsClient() {
     }
   }
 
+  const linked = !!status?.linked;
+  const configured = !!status?.app_configured;
+  const discordConnected = !!discordUrl;
+
   return (
-    <div className="space-y-6">
-      <div className="border-y border-white/5 py-4 text-sm">
-        <div className="flex items-baseline justify-between gap-3">
-          <div className="flex items-baseline gap-3">
-            <span className="text-white">Trakt.tv</span>
-            {status?.app_configured ? (
-              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">
-                Configured
-              </span>
+    <div>
+      {/* ── service grid ──────────────────────────────────────────── */}
+      <div className="cf-grid cf-c3" style={{ marginBottom: 8 }}>
+        {/* Trakt */}
+        <div className={`cf-itile${linked ? " cf-linked" : ""}`}>
+          <div className="cf-it-top">
+            <div
+              className="cf-it-logo"
+              style={{ background: "#ed1c24", color: "#fff" }}
+            >
+              T
+            </div>
+            <div>
+              <div className="cf-it-name">Trakt.tv</div>
+              {linked ? (
+                <span className="cf-pill cf-ok" style={{ marginTop: 5 }}>
+                  <span className="cf-dot" />
+                  Connected
+                </span>
+              ) : configured ? (
+                <span className="cf-pill" style={{ marginTop: 5 }}>
+                  Not connected
+                </span>
+              ) : (
+                <span className="cf-pill cf-warn" style={{ marginTop: 5 }}>
+                  Not configured
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="cf-it-desc">
+            Two-way scrobbling, watch history, resume points, and ratings sync.
+          </div>
+          <div className="cf-it-foot">
+            {linked ? (
+              <>
+                <a className="cf-btn cf-sm" href="#trakt">
+                  Manage
+                </a>
+                {status?.last_synced_at && (
+                  <span
+                    className="cf-faint"
+                    style={{ fontSize: 12, marginLeft: "auto" }}
+                  >
+                    Synced {formatDateTime(status.last_synced_at)}
+                  </span>
+                )}
+              </>
+            ) : configured ? (
+              <button
+                className="cf-btn cf-sm cf-primary"
+                onClick={startLink}
+                disabled={busy !== null || !!pending}
+              >
+                {busy === "link" ? "Starting…" : "Connect"}
+              </button>
             ) : (
-              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                Not configured
+              <span className="cf-faint" style={{ fontSize: 12 }}>
+                Server setup needed
               </span>
             )}
           </div>
         </div>
-        <p className="mt-1 text-xs text-white/55">
-          Two-way sync: every play scrobble and mark-watched lands in
-          your Trakt history; an hourly job pulls history + resume
-          points back. Ratings sync both directions.
-        </p>
 
-        {!status?.app_configured && (
-          <p className="mt-2 text-xs text-amber-300">
+        {/* TMDB · TVDB — server-managed metadata providers */}
+        <div className="cf-itile">
+          <div className="cf-it-top">
+            <div
+              className="cf-it-logo"
+              style={{ background: "#0d253f", color: "#01d277" }}
+            >
+              M
+            </div>
+            <div>
+              <div className="cf-it-name">TMDB · TVDB</div>
+              <span className="cf-pill cf-info" style={{ marginTop: 5 }}>
+                Server-managed
+              </span>
+            </div>
+          </div>
+          <div className="cf-it-desc">
+            Metadata providers. Configured once by the admin under Server →
+            Credentials.
+          </div>
+          <div className="cf-it-foot">
+            <span className="cf-faint" style={{ fontSize: 12 }}>
+              No action needed
+            </span>
+          </div>
+        </div>
+
+        {/* Discord — per-user notification webhook */}
+        <div className={`cf-itile${discordConnected ? " cf-linked" : ""}`}>
+          <div className="cf-it-top">
+            <div
+              className="cf-it-logo"
+              style={{ background: "#5865f2", color: "#fff" }}
+            >
+              D
+            </div>
+            <div>
+              <div className="cf-it-name">Discord</div>
+              {discordConnected ? (
+                <span className="cf-pill cf-ok" style={{ marginTop: 5 }}>
+                  <span className="cf-dot" />
+                  Connected
+                </span>
+              ) : (
+                <span className="cf-pill" style={{ marginTop: 5 }}>
+                  Not connected
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="cf-it-desc">
+            Pipe your notifications to a Discord webhook of your choice. They
+            follow your per-kind notification prefs and quiet hours.
+          </div>
+
+          {discordEditing && !discordConnected && (
+            <div className="cf-pad" style={{ paddingTop: 0 }}>
+              <input
+                className="cf-input"
+                type="url"
+                inputMode="url"
+                autoFocus
+                placeholder="https://discord.com/api/webhooks/…"
+                value={discordDraft}
+                onChange={(e) => setDiscordDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void saveDiscord();
+                  if (e.key === "Escape") {
+                    setDiscordEditing(false);
+                    setDiscordDraft("");
+                    setDiscordError(null);
+                  }
+                }}
+                disabled={discordBusy}
+              />
+              {discordError && (
+                <div
+                  className="cf-faint"
+                  style={{ marginTop: 6, fontSize: 12, color: "var(--err)" }}
+                >
+                  {discordError}
+                </div>
+              )}
+            </div>
+          )}
+
+          {discordConnected && (
+            <div className="cf-pad" style={{ paddingTop: 0 }}>
+              <span className="cf-mono cf-faint" style={{ fontSize: 12 }}>
+                {maskDiscordUrl(discordUrl!)}
+              </span>
+            </div>
+          )}
+
+          <div className="cf-it-foot">
+            {discordConnected ? (
+              <button
+                className="cf-btn cf-danger cf-sm"
+                onClick={() => void disconnectDiscord()}
+                disabled={discordBusy}
+              >
+                {discordBusy ? "Disconnecting…" : "Disconnect"}
+              </button>
+            ) : discordEditing ? (
+              <>
+                <button
+                  className="cf-btn cf-sm cf-primary"
+                  onClick={() => void saveDiscord()}
+                  disabled={discordBusy || !discordDraft.trim()}
+                >
+                  {discordBusy ? "Saving…" : "Save"}
+                </button>
+                <button
+                  className="cf-btn cf-sm"
+                  onClick={() => {
+                    setDiscordEditing(false);
+                    setDiscordDraft("");
+                    setDiscordError(null);
+                  }}
+                  disabled={discordBusy}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                className="cf-btn cf-sm"
+                onClick={() => setDiscordEditing(true)}
+              >
+                Connect
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Simkl — alternative scrobble target (feature-gap: not wired yet) */}
+        <div className="cf-itile" style={{ opacity: 0.6 }}>
+          <div className="cf-it-top">
+            <div
+              className="cf-it-logo"
+              style={{ background: "#202830", color: "#00d735" }}
+            >
+              S
+            </div>
+            <div>
+              <div className="cf-it-name">Simkl</div>
+              <span className="cf-pill" style={{ marginTop: 5 }}>
+                Coming soon
+              </span>
+            </div>
+          </div>
+          <div className="cf-it-desc">
+            An alternative scrobble target alongside Trakt.
+          </div>
+          <div className="cf-it-foot">
+            <button className="cf-btn cf-sm" disabled>
+              Connect
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── not-configured guidance (owner action) ───────────────────── */}
+      {status && !configured && (
+        <div className="cf-banner cf-info">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v.5M12 11v5" />
+          </svg>
+          <div>
             The server owner needs to register a Trakt OAuth app at{" "}
             <a
               href="https://trakt.tv/oauth/applications"
               target="_blank"
               rel="noreferrer"
-              className="underline"
             >
               trakt.tv/oauth/applications
             </a>{" "}
-            (redirect URI <code>urn:ietf:wg:oauth:2.0:oob</code>) and
-            paste the JSON into the Trakt credential slot.
-          </p>
-        )}
+            (redirect URI <code>urn:ietf:wg:oauth:2.0:oob</code>) and paste the
+            JSON into the Trakt credential slot.
+          </div>
+        </div>
+      )}
 
-        {status?.linked && status.expired && (
-          <p className="mt-2 text-xs text-red-300">
-            Your Trakt access token has expired. The next sync will try
-            to refresh it; if that fails (the refresh token is also
-            expired after ~60 days of no use), unlink and re-link below.
-          </p>
-        )}
-
-        {status?.linked && !status.expired && status.expiring_soon && (
-          <p className="mt-2 text-xs text-amber-300">
-            Your Trakt access token expires soon. Run a sync to refresh
-            it, or it will silently stop working in the next few days.
-          </p>
-        )}
-
-        {status && status.app_configured && !status.linked && !pending && (
-          <button
-            onClick={startLink}
-            disabled={busy !== null}
-            className="mt-3 rounded bg-(--color-accent) px-3 py-1.5 text-xs font-semibold text-white transition disabled:opacity-50"
-          >
-            {busy === "link" ? "Starting…" : "Link Trakt account"}
-          </button>
-        )}
-
-        {pending && (
-          <div className="mt-3 rounded border border-accent/40 bg-accent/10 p-3">
-            <div className="text-xs text-white/65">
+      {/* ── pending device-code link ─────────────────────────────────── */}
+      {pending && (
+        <div className="cf-card">
+          <div className="cf-card-body cf-pad">
+            <div className="cf-muted" style={{ fontSize: 13 }}>
               Open Trakt in another tab and enter this code:
             </div>
-            <div className="mt-2 font-mono text-2xl tracking-[0.5em] text-white">
+            <div
+              className="cf-mono"
+              style={{
+                marginTop: 8,
+                fontSize: 28,
+                letterSpacing: "0.4em",
+                color: "#fff",
+              }}
+            >
               {pending.user_code}
             </div>
             <a
               href={pending.verification_url}
               target="_blank"
               rel="noreferrer"
-              className="mt-2 inline-block text-xs text-(--color-accent) underline"
+              className="cf-pill cf-accent"
+              style={{ marginTop: 10, display: "inline-flex" }}
             >
               {pending.verification_url}
             </a>
-            <div className="mt-2 text-xs text-white/45">
+            <div className="cf-faint" style={{ marginTop: 10, fontSize: 12 }}>
               Waiting for approval… (this card updates automatically)
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {status?.linked && (
-          <div className="mt-3 space-y-2">
-            <div className="text-xs text-white/60">
-              Linked since{" "}
-              {status.linked_at ? formatDateTime(status.linked_at) : "—"}
-              {status.last_synced_at && (
-                <>
-                  {" · "}last sync {formatDateTime(status.last_synced_at)}
-                </>
-              )}
+      {/* ── connected detail ─────────────────────────────────────────── */}
+      {linked && (
+        <>
+          <div className="cf-section-title" id="trakt">
+            Trakt.tv — connected
+          </div>
+
+          {status?.expired ? (
+            <div className="cf-banner cf-err">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 3l9 16H3z" />
+                <path d="M12 10v4M12 17v.5" />
+              </svg>
+              <div>
+                Your Trakt access token has <b>expired</b>. The next sync will try
+                to refresh it; if that fails (the refresh token also expires after
+                ~60 days of no use), unlink and re-link.
+              </div>
             </div>
-            <div className="flex gap-2">
-              <button
-                onClick={syncNow}
-                disabled={busy !== null}
-                className="rounded bg-white/10 px-3 py-1.5 text-xs font-medium hover:bg-white/15 disabled:opacity-50"
-              >
-                {busy === "sync" ? "Syncing…" : "Sync now"}
-              </button>
-              <button
-                onClick={() => setAskUnlink(true)}
-                disabled={busy !== null}
-                className="rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50"
-              >
-                {busy === "unlink" ? "Unlinking…" : "Unlink"}
-              </button>
+          ) : (
+            status?.expiring_soon && (
+              <div className="cf-banner cf-warn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 3l9 16H3z" />
+                  <path d="M12 10v4M12 17v.5" />
+                </svg>
+                <div>
+                  Your access token <b>expires soon</b>. Running a sync refreshes it
+                  automatically — or it&rsquo;ll quietly stop working.
+                </div>
+              </div>
+            )
+          )}
+
+          <div className="cf-card">
+            <div className="cf-card-head">
+              <div className="cf-flex cf-gap12">
+                <div
+                  className="cf-it-logo"
+                  style={{ background: "#ed1c24", color: "#fff" }}
+                >
+                  T
+                </div>
+                <div>
+                  <div className="cf-ttl">Trakt account</div>
+                  <div className="cf-sub">
+                    Every play scrobbles to your history; an hourly job pulls
+                    history &amp; resume points back. Ratings sync both directions.
+                  </div>
+                </div>
+              </div>
+              <div className="cf-head-aside">
+                <button
+                  className="cf-btn cf-sm"
+                  onClick={syncNow}
+                  disabled={busy !== null}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M4 10a8 8 0 0 1 14-4l2 2M20 14a8 8 0 0 1-14 4l-2-2" />
+                    <path d="M18 4v4h-4M6 20v-4h4" />
+                  </svg>
+                  {busy === "sync" ? "Syncing…" : "Sync now"}
+                </button>
+                <button
+                  className="cf-btn cf-danger cf-sm"
+                  onClick={() => setAskUnlink(true)}
+                  disabled={busy !== null}
+                >
+                  {busy === "unlink" ? "Unlinking…" : "Unlink"}
+                </button>
+              </div>
             </div>
-            {lastSync && (
-              <div className="text-xs text-emerald-300">
+            <div className="cf-card-body">
+              <div className="cf-row">
+                <div className="cf-row-main">
+                  <div className="cf-row-label">Linked since</div>
+                </div>
+                <div className="cf-row-control cf-faint">
+                  {status?.linked_at ? formatDateTime(status.linked_at) : "—"}
+                </div>
+              </div>
+              <div className="cf-row">
+                <div className="cf-row-main">
+                  <div className="cf-row-label">Last sync</div>
+                </div>
+                <div className="cf-row-control">
+                  {status?.last_synced_at ? (
+                    <span className="cf-pill cf-ok">
+                      <span className="cf-dot" />
+                      {formatDateTime(status.last_synced_at)}
+                    </span>
+                  ) : (
+                    <span className="cf-faint">Never</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {lastSync && (
+            <div className="cf-banner cf-ok">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M20 6L9 17l-5-5" />
+              </svg>
+              <div>
                 {lastSync.queued
                   ? "Sync started — running in the background. Watched status and watchlist update as it completes."
                   : "A sync is already running in the background. Watched status and watchlist update as it completes."}
               </div>
-            )}
-            {stats && (
-              <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 rounded border border-white/10 bg-white/3 p-3 text-xs text-white/70 sm:grid-cols-4">
-                <StatTile
-                  label="Movies"
-                  value={stats.movies.watched.toLocaleString()}
-                  hint={`${formatMinutes(stats.movies.minutes)} watched`}
-                />
-                <StatTile
-                  label="Shows"
-                  value={stats.shows.watched.toLocaleString()}
-                  hint={`${stats.episodes.watched.toLocaleString()} eps`}
-                />
-                <StatTile
-                  label="Episodes"
-                  value={stats.episodes.plays.toLocaleString()}
-                  hint={`${formatMinutes(stats.episodes.minutes)} watched`}
-                />
-                <StatTile
-                  label="Ratings"
-                  value={stats.ratings.total.toLocaleString()}
-                  hint="given"
-                />
-              </div>
-            )}
-          </div>
-        )}
+            </div>
+          )}
 
-        {error && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="mt-3 text-xs text-red-300"
-          >
-            {error}
-          </div>
-        )}
-      </div>
+          {stats && (
+            <div className="cf-grid cf-c4">
+              <StatTile
+                tone="cf-tone-red"
+                label="Movies"
+                value={stats.movies.watched.toLocaleString()}
+                meta={`${formatMinutes(stats.movies.minutes)} watched`}
+                icon={<rect x="3" y="4" width="18" height="16" rx="2" />}
+              />
+              <StatTile
+                tone="cf-tone-blue"
+                label="Shows"
+                value={stats.shows.watched.toLocaleString()}
+                meta={`${stats.episodes.watched.toLocaleString()} episodes`}
+                icon={
+                  <>
+                    <rect x="3" y="4" width="18" height="14" rx="2" />
+                    <path d="M8 20h8" />
+                  </>
+                }
+              />
+              <StatTile
+                tone="cf-tone-violet"
+                label="Episodes"
+                value={stats.episodes.plays.toLocaleString()}
+                meta={`${formatMinutes(stats.episodes.minutes)} watched`}
+                icon={<path d="M3 12h4l3 8 4-16 3 8h4" />}
+              />
+              <StatTile
+                tone="cf-tone-amber"
+                label="Ratings"
+                value={stats.ratings.total.toLocaleString()}
+                meta="given"
+                icon={
+                  <path d="M12 4l2.5 5 5.5.7-4 3.9 1 5.4-5-2.8-5 2.8 1-5.4-4-3.9 5.5-.7z" />
+                }
+              />
+            </div>
+          )}
+        </>
+      )}
+
+      {error && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="cf-banner cf-err"
+          style={{ marginTop: 16 }}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
+
       {askUnlink && (
         <ConfirmDialog
           title="Unlink Trakt?"
@@ -325,24 +684,50 @@ export function SettingsIntegrationsClient() {
   );
 }
 
+/// One `.cf-stat` tile. `icon` is the inner SVG path(s); the wrapping
+/// <svg> + tone styling come from the console design system.
 function StatTile({
+  tone,
   label,
   value,
-  hint,
+  meta,
+  icon,
 }: {
+  tone: string;
   label: string;
   value: string;
-  hint?: string;
+  meta?: string;
+  icon: React.ReactNode;
 }) {
   return (
-    <div>
-      <div className="text-[10px] uppercase tracking-wide text-white/40">
+    <div className={`cf-stat ${tone}`}>
+      <div className="cf-stat-top">
+        <span className="cf-stat-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            {icon}
+          </svg>
+        </span>
         {label}
       </div>
-      <div className="text-sm font-semibold text-white">{value}</div>
-      {hint && <div className="text-[10px] text-white/40">{hint}</div>}
+      <div className="cf-stat-val">{value}</div>
+      {meta && <div className="cf-stat-meta">{meta}</div>}
     </div>
   );
+}
+
+/// Mask a Discord webhook URL for display — show the host + the truncated
+/// webhook id, hide the secret token entirely. A Discord webhook looks like
+/// `https://discord.com/api/webhooks/<id>/<token>`; we never re-show the
+/// token (the server doesn't hand it back either, but the saved value lives
+/// in this component briefly after a Save).
+function maskDiscordUrl(url: string): string {
+  const marker = "/api/webhooks/";
+  const idx = url.indexOf(marker);
+  if (idx === -1) return "Connected";
+  const rest = url.slice(idx + marker.length);
+  const id = rest.split("/")[0] ?? "";
+  const shortId = id.length > 8 ? `${id.slice(0, 8)}…` : id;
+  return `…/api/webhooks/${shortId}/••••••`;
 }
 
 function formatMinutes(minutes: number): string {

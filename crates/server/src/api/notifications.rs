@@ -107,3 +107,19 @@ pub async fn mark_all_read(
         .map_err(ApiError::Internal)?;
     Ok(Json(MarkAllResponse { marked }))
 }
+
+#[derive(Debug, Serialize)]
+pub struct ClearResponse {
+    pub cleared: u64,
+}
+
+/// Delete all of the caller's notifications (the bell's "Clear all").
+pub async fn clear_all(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<ClearResponse>, ApiError> {
+    let cleared = queries::clear_notifications(&state.pool, user.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(ClearResponse { cleared }))
+}

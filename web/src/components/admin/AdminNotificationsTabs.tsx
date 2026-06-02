@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, type ComponentProps } from "react";
-import { Tabs } from "@/components/admin/ui";
 import { AdminEmailClient } from "./AdminEmailClient";
 import { AdminWebhooksClient } from "./AdminWebhooksClient";
 
@@ -18,28 +17,38 @@ export function AdminNotificationsTabs({
   email: ComponentProps<typeof AdminEmailClient>["initial"];
   webhooks: ComponentProps<typeof AdminWebhooksClient>["initial"];
 }) {
-  const [tab, setTab] = useState<string>(initialTab);
-  const select = (id: string) => {
+  const [tab, setTab] = useState<"email" | "webhooks">(initialTab);
+  const select = (id: "email" | "webhooks") => {
     setTab(id);
     if (typeof window !== "undefined")
       window.history.replaceState(null, "", `?tab=${id}`);
   };
   return (
-    <>
-      <Tabs
-        tabs={[
-          { id: "email", label: "Email" },
-          { id: "webhooks", label: "Webhooks" },
-        ]}
-        active={tab}
-        onSelect={select}
-      />
+    <div>
+      <div className="cf-tabs">
+        <button
+          type="button"
+          className={"cf-tab" + (tab === "email" ? " cf-on" : "")}
+          aria-current={tab === "email" ? "page" : undefined}
+          onClick={() => select("email")}
+        >
+          Email
+        </button>
+        <button
+          type="button"
+          className={"cf-tab" + (tab === "webhooks" ? " cf-on" : "")}
+          aria-current={tab === "webhooks" ? "page" : undefined}
+          onClick={() => select("webhooks")}
+        >
+          Webhooks
+        </button>
+      </div>
       <div className={tab === "email" ? "" : "hidden"}>
         <AdminEmailClient initial={email} />
       </div>
       <div className={tab === "webhooks" ? "" : "hidden"}>
         <AdminWebhooksClient initial={webhooks} />
       </div>
-    </>
+    </div>
   );
 }

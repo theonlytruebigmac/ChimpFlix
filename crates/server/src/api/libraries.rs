@@ -96,6 +96,24 @@ pub async fn trigger_scan(
         .await?
         .ok_or(ApiError::NotFound)?;
 
+    let job = spawn_library_scan(&state, library_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+/// Acquire the per-library scan lock, create a `scan_jobs` row, and
+/// spawn the scanner task (with the same exclusivity-gate + pipeline
+/// emitter wiring as the on-demand scan button). Returns the queued
+/// `ScanJob` once the task is spawned.
+///
+/// Shared by [`trigger_scan`] and the whole-library bulk Re-scan
+/// action so both paths get identical coordination (409 if a scan is
+/// already running, worker-pool pause for the scan's duration, webhook
+/// fan-out on completion). Callers are responsible for any auth gate
+/// and for having validated that the library exists.
+pub async fn spawn_library_scan(
+    state: &AppState,
+    library_id: i64,
+) -> Result<ScanJob, ApiError> {
     // Coordinate with the scheduled scan and file watcher via the
     // shared per-library lock. Operator hitting the scan button twice
     // (or hitting it while a scheduled scan is running) used to
@@ -203,7 +221,7 @@ pub async fn trigger_scan(
         state_for_release.release_library_scan(library_id).await;
     });
 
-    Ok((StatusCode::ACCEPTED, Json(job)))
+    Ok(job)
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +237,9 @@ pub struct LibraryStatsResponse {
     pub total_bytes: i64,
     pub orphan_files: i64,
     pub last_scanned_at: Option<i64>,
+    pub total_runtime_ms: i64,
+    pub items_with_poster: i64,
+    pub items_missing_ids: i64,
 }
 
 /// At-a-glance numbers for one library — items, episodes, files,
@@ -245,6 +266,9 @@ pub async fn library_stats(
         total_bytes: s.total_bytes,
         orphan_files: s.orphan_files,
         last_scanned_at: s.last_scanned_at,
+        total_runtime_ms: s.total_runtime_ms,
+        items_with_poster: s.items_with_poster,
+        items_missing_ids: s.items_missing_ids,
     }))
 }
 

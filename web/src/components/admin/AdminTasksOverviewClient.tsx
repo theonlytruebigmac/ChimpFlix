@@ -7,6 +7,13 @@
 /// the sole tasks-list surface — the legacy per-row Advanced
 /// editor was folded into the detail page in the 2026-05-20
 /// consolidation.
+///
+/// Styled with the console design system (`cf-*`) to match the
+/// redesign mockup: a 5-stat job-queue hero, a registry-driven
+/// scheduled-tasks table with a per-kind Enabled toggle + next-run,
+/// and the maintenance-window setting card. Production's richer
+/// per-kind health (status pill + in-flight/queued) is kept in the
+/// table cells.
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
@@ -14,22 +21,22 @@ import Link from "next/link";
 import {
   admin as adminApi,
   friendlyErrorMessage,
+  type JobSummary,
   type OverviewKindCard,
   type OverviewKindGroup,
   type ServerSettings,
-  type TaskMode,
   type TasksOverviewResponse,
-  type TasksSummaryResponse,
 } from "@/lib/chimpflix-api";
 import {
   formatRelativeAgo,
   formatRelativeFuture,
 } from "@/lib/relative-time";
-import { ErrorBanner, HeroCard, Pill, type PillTone } from "./ui";
 
 interface Props {
   initialOverview: TasksOverviewResponse;
-  initialSummary: TasksSummaryResponse;
+  /// Durable job-queue counters (queued/running/succeeded/failed/dead).
+  /// Drives the 5-stat hero. Polled on the same cadence as the rest.
+  initialJobsSummary: JobSummary;
   initialSettings: ServerSettings;
   /// `Date.now()` snapshot from the server fetch. Threaded into
   /// every relative-time formatter so SSR HTML and the first
@@ -44,27 +51,29 @@ const REFRESH_MS = 5_000;
 
 export function AdminTasksOverviewClient({
   initialOverview,
-  initialSummary,
+  initialJobsSummary,
   initialSettings,
   initialNowMs,
 }: Props) {
   const [overview, setOverview] = useState(initialOverview);
-  const [summary, setSummary] = useState(initialSummary);
+  const [jobsSummary, setJobsSummary] = useState(initialJobsSummary);
   const [settings, setSettings] = useState(initialSettings);
   const [nowMs, setNowMs] = useState(initialNowMs);
   const [busyKinds, setBusyKinds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
-  /// Refresh both endpoints. Errors are surfaced inline (banner)
-  /// rather than thrown so the existing render stays usable.
+  /// Refresh all three endpoints. Errors are surfaced inline (banner)
+  /// rather than thrown so the existing render stays usable. `jobs.summary`
+  /// is the same endpoint the Queue tab polls — reused here for the hero,
+  /// no new backend.
   const refresh = useCallback(async () => {
     try {
-      const [o, s] = await Promise.all([
+      const [o, j] = await Promise.all([
         adminApi.tasks.overview(),
-        adminApi.tasks.summary(),
+        adminApi.jobs.summary(),
       ]);
       setOverview(o);
-      setSummary(s);
+      setJobsSummary(j);
       setNowMs(Date.now());
       setError(null);
     } catch (e) {
@@ -104,11 +113,41 @@ export function AdminTasksOverviewClient({
   );
 
   return (
-    <div className="space-y-6">
-      <ErrorBanner error={error} />
+    <div>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
 
-      <HeroStrip summary={summary} nowMs={nowMs} />
+      {/* ── 5-stat job-queue hero ─────────────────────────────────── */}
+      <div
+        className="cf-grid"
+        style={{ gridTemplateColumns: "repeat(5, 1fr)", marginBottom: 18 }}
+      >
+        <StatTile tone="cf-tone-blue" label="Queued" value={jobsSummary.queued} />
+        <StatTile tone="cf-tone-violet" label="Running" value={jobsSummary.running} />
+        <StatTile tone="cf-tone-green" label="Succeeded" value={jobsSummary.succeeded} />
+        <StatTile tone="cf-tone-amber" label="Failed" value={jobsSummary.failed} />
+        <StatTile tone="cf-tone-red" label="Dead" value={jobsSummary.dead} />
+      </div>
 
+      {/* ── scheduled tasks (registry-driven) ─────────────────────── */}
+      {overview.groups.map((group) => (
+        <KindGroupCard
+          key={group.id}
+          group={group}
+          busyKinds={busyKinds}
+          nowMs={nowMs}
+          onToggleGate={toggleGate}
+        />
+      ))}
+
+      {/* ── maintenance window ────────────────────────────────────── */}
       <MaintenanceWindowCard
         settings={settings}
         onSaved={(next) => {
@@ -117,97 +156,42 @@ export function AdminTasksOverviewClient({
         }}
         onError={setError}
       />
-
-      <div className="flex items-center justify-end gap-2 text-xs text-white/60">
-        <Link
-          href="/settings/admin/tasks?tab=flow"
-          className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
-        >
-          Pipeline flow
-        </Link>
-        <Link
-          href="/settings/admin/tasks?tab=queue"
-          className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
-        >
-          Job queue
-        </Link>
-        <Link
-          href="/settings/admin/tasks?tab=activity"
-          className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
-        >
-          Activity →
-        </Link>
-      </div>
-
-      {overview.groups.map((group) => (
-        <KindGroupSection
-          key={group.id}
-          group={group}
-          busyKinds={busyKinds}
-          nowMs={nowMs}
-          onToggleGate={toggleGate}
-        />
-      ))}
     </div>
   );
 }
 
-// ─── Hero strip ────────────────────────────────────────────────────────
+// ─── Hero stat tile ────────────────────────────────────────────────────
 
-function HeroStrip({
-  summary,
-  nowMs,
+function StatTile({
+  tone,
+  label,
+  value,
 }: {
-  summary: TasksSummaryResponse;
-  nowMs: number;
+  tone: string;
+  label: string;
+  value: number;
 }) {
-  const windowMeta = summary.next_maintenance_window_ms
-    ? `opens ${formatRelativeFuture(summary.next_maintenance_window_ms, nowMs)}`
-    : "currently open";
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-      <HeroCard
-        tone="info"
-        label="Running"
-        value={summary.running.toString()}
-        meta={`${summary.queued} pending`}
-      />
-      <HeroCard
-        tone="ok"
-        label="Last 24h"
-        value={summary.succeeded_24h.toLocaleString()}
-        meta={passRateMeta(summary.succeeded_24h, summary.failed_24h)}
-      />
-      <HeroCard
-        tone={summary.failed_24h > 0 ? "warn" : "muted"}
-        label="Failures last 24h"
-        value={summary.failed_24h.toString()}
-        meta={
-          summary.failed_24h === 0
-            ? "all clear"
-            : "review the activity log"
-        }
-      />
-      <HeroCard
-        tone="muted"
-        label="Maintenance window"
-        value={windowMeta}
-        meta="snaps heavy tasks to the configured slot"
-      />
+    <div className={`cf-stat ${tone}`} style={{ padding: 14 }}>
+      <div className="cf-stat-top">{label}</div>
+      <div className="cf-stat-val" style={{ fontSize: 24 }}>
+        {compactNumber(value)}
+      </div>
     </div>
   );
 }
 
-function passRateMeta(succeeded: number, failed: number): string {
-  const total = succeeded + failed;
-  if (total === 0) return "no runs yet";
-  const pct = (succeeded / total) * 100;
-  return `${pct.toFixed(1)}% pass rate`;
+/// Compact-format large counts ("12.4k") the way the mockup does;
+/// small counts render verbatim.
+function compactNumber(n: number): string {
+  if (n < 10_000) return n.toLocaleString();
+  if (n < 1_000_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
 }
 
-// ─── Group + section + row ─────────────────────────────────────────────
+// ─── Group → scheduled-tasks card/table ────────────────────────────────
 
-function KindGroupSection({
+function KindGroupCard({
   group,
   busyKinds,
   nowMs,
@@ -218,45 +202,44 @@ function KindGroupSection({
   nowMs: number;
   onToggleGate: (kind: string, next: boolean) => Promise<void>;
 }) {
-  // Hide a group entirely when it has no rows after dropping empty
-  // sections (legacy housekeeping group is empty on a fresh install).
-  const visibleSections = group.sections.filter((s) => s.kinds.length > 0);
-  if (visibleSections.length === 0) return null;
+  // Flatten the group's sections into a single row list — the table
+  // is the unit the mockup shows. Drop empty sections (the legacy
+  // housekeeping group is empty on a fresh install).
+  const kinds = group.sections.flatMap((s) => s.kinds);
+  if (kinds.length === 0) return null;
   return (
-    <section>
-      <div className="mb-2 flex items-baseline justify-between gap-3 px-1">
-        <h2 className="text-xs font-semibold uppercase tracking-[0.08em] text-white/65">
-          {group.name}
-        </h2>
-      </div>
-      {visibleSections.map((s, i) => (
-        <div key={s.id} className={i > 0 ? "mt-3" : undefined}>
-          <SubgroupDivider label={s.label} count={s.kinds.length} />
-          <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-            {s.kinds.map((k) => (
-              <KindRow
-                key={k.name}
-                card={k}
-                busy={busyKinds.has(k.name)}
-                nowMs={nowMs}
-                onToggleGate={onToggleGate}
-              />
-            ))}
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">{group.name}</div>
+          <div className="cf-sub">
+            Registry-driven — new kinds appear here automatically.
           </div>
         </div>
-      ))}
-    </section>
-  );
-}
-
-function SubgroupDivider({ label, count }: { label: string; count: number }) {
-  // The single "All" subgroup is just visual noise — skip it.
-  if (label === "All") return null;
-  return (
-    <div className="mb-2 flex items-center gap-2 px-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-white/40">
-      <span>{label}</span>
-      <span className="text-white/30">·</span>
-      <span className="text-white/40">{count}</span>
+      </div>
+      <table className="cf-table">
+        <thead>
+          <tr>
+            <th>Task</th>
+            <th>Status</th>
+            <th>In flight</th>
+            <th>Next run</th>
+            <th>Enabled</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {kinds.map((k) => (
+            <KindRow
+              key={k.name}
+              card={k}
+              busy={busyKinds.has(k.name)}
+              nowMs={nowMs}
+              onToggleGate={onToggleGate}
+            />
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -273,47 +256,76 @@ function KindRow({
   onToggleGate: (kind: string, next: boolean) => Promise<void>;
 }) {
   const detailHref = `/settings/admin/tasks/kind/${encodeURIComponent(card.name)}`;
-  // One <Link> per row instead of four. The gate toggle is a
-  // sibling `<button>` outside the link, so the toggle click
-  // doesn't bubble into the link navigation. Screen readers
-  // announce one "open detail for X" link per row instead of
-  // four — much less noise.
-  //
-  // Click-target geometry: the Link is the topmost interactive
-  // layer (`z-10`) covering the entire row, so a click anywhere
-  // on the row — name, schedule, status, chevron — navigates to
-  // the detail page. The gate toggle is bumped to `z-20` to
-  // stay above the Link; its click stays local. Content cells
-  // are marked `pointer-events-none` so they don't block the
-  // Link from receiving clicks (otherwise siblings declared
-  // after the absolutely-positioned Link would sit on top in
-  // DOM order and steal the click).
   return (
-    <div className="group relative grid grid-cols-[44px_1fr_auto] items-center gap-3 border-b border-white/8 px-3 py-3 last:border-b-0 transition-colors hover:bg-white/3 md:grid-cols-[44px_1.4fr_200px_220px_24px]">
-      <Link
-        href={detailHref}
-        aria-label={`Open detail for ${card.display_name}`}
-        className="absolute inset-0 z-10"
-      />
-      <div className="relative z-20 flex items-center justify-center">
+    <tr>
+      <td>
+        <b>{card.display_name}</b>
+        <div className="cf-faint" style={{ fontSize: 11 }}>
+          {card.name}
+          {card.gate.setting_key ? ` · gate ${card.gate.setting_key}` : null}
+        </div>
+      </td>
+      <td>
+        <StatusPill card={card} />
+      </td>
+      <td className="cf-num cf-mono">
+        {card.live.queued} queued ·{" "}
+        {card.live.in_flight > 0 ? (
+          <b style={{ color: "#fff" }}>{card.live.in_flight} running</b>
+        ) : (
+          "0 running"
+        )}
+      </td>
+      <td className="cf-faint">{scheduleLabel(card, nowMs)}</td>
+      <td>
         <GateToggle card={card} busy={busy} onToggleGate={onToggleGate} />
-      </div>
-      <div className="pointer-events-none relative z-0 min-w-0">
-        <KindNameCell card={card} />
-      </div>
-      <div className="pointer-events-none relative z-0">
-        <ScheduleCell card={card} nowMs={nowMs} />
-      </div>
-      <div className="pointer-events-none relative z-0">
-        <StatusCell card={card} nowMs={nowMs} />
-      </div>
-      <div className="pointer-events-none relative z-0">
-        <ChevronCell />
-      </div>
-    </div>
+      </td>
+      <td className="cf-num">
+        <Link className="cf-btn cf-ghost cf-tiny" href={detailHref}>
+          Open
+        </Link>
+      </td>
+    </tr>
   );
 }
 
+/// Health verdict pill (idle / running / failing) — derived from the
+/// schedule row's last_status plus live activity.
+function StatusPill({ card }: { card: OverviewKindCard }) {
+  if (card.schedule?.last_status === "bad") {
+    return (
+      <span className="cf-pill cf-err">
+        <span className="cf-dot" />
+        Failing
+      </span>
+    );
+  }
+  if (card.schedule?.last_status === "warn") {
+    return (
+      <span className="cf-pill cf-warn">
+        <span className="cf-dot" />
+        Warnings
+      </span>
+    );
+  }
+  if (card.live.in_flight > 0) {
+    return (
+      <span className="cf-pill cf-info">
+        <span className="cf-dot" />
+        Running
+      </span>
+    );
+  }
+  return (
+    <span className="cf-pill">
+      <span className="cf-dot" style={{ background: "var(--ghost)" }} />
+      Idle
+    </span>
+  );
+}
+
+/// Per-kind toggle. Automatic ("locked") kinds render a small dot
+/// instead of a switch — the backend rejects PATCH against them.
 function GateToggle({
   card,
   busy,
@@ -323,16 +335,15 @@ function GateToggle({
   busy: boolean;
   onToggleGate: (kind: string, next: boolean) => Promise<void>;
 }) {
-  // Always-on rows render a small ✓ rather than a toggle. The
-  // backend rejects PATCH attempts against Automatic kinds; we
-  // avoid even surfacing the action.
   if (card.gate.locked) {
     return (
       <span
         title="Always on"
-        className="inline-flex h-4.5 w-4.5 items-center justify-center rounded-full bg-emerald-500/15 text-[10px] text-emerald-300 ring-1 ring-emerald-500/30"
+        className="cf-pill cf-ok"
+        style={{ padding: "1px 7px" }}
       >
-        ●
+        <span className="cf-dot" />
+        Auto
       </span>
     );
   }
@@ -342,189 +353,25 @@ function GateToggle({
       type="button"
       role="switch"
       aria-checked={enabled}
+      aria-label={`Enable ${card.display_name}`}
       disabled={busy}
       onClick={() => onToggleGate(card.name, !enabled)}
-      className={`relative inline-flex h-4.5 w-8 cursor-pointer items-center rounded-full border transition-colors disabled:cursor-wait ${
-        enabled
-          ? "border-emerald-500/70 bg-emerald-500"
-          : "border-white/20 bg-white/12"
-      }`}
-    >
-      <span
-        className={`block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform ${
-          enabled ? "translate-x-3.5" : "translate-x-0.5"
-        }`}
-      />
-    </button>
+      className={`cf-switch${enabled ? " cf-on" : ""}`}
+      style={{ verticalAlign: "middle" }}
+    />
   );
 }
 
-function KindNameCell({ card }: { card: OverviewKindCard }) {
-  return (
-    <div className="min-w-0">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[13.5px] font-semibold text-white/95">
-          {card.display_name}
-        </span>
-        <span className="rounded bg-white/8 px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide text-white/55">
-          {card.scope.replace("_", " ")}
-        </span>
-        {modeBadge(card.mode)}
-      </div>
-      <div className="mt-0.5 truncate font-mono text-[11.5px] text-white/45">
-        {card.name}
-        {card.gate.setting_key ? ` · gate ${card.gate.setting_key}` : null}
-      </div>
-    </div>
-  );
-}
-
-function modeBadge(mode: TaskMode) {
-  if (mode === "automatic") {
-    return (
-      <Pill tone="info" dot>
-        Auto
-      </Pill>
-    );
-  }
-  if (mode === "gated") {
-    return (
-      <Pill tone="warn" dot>
-        Gated
-      </Pill>
-    );
-  }
-  return (
-    <Pill tone="muted" dot>
-      Periodic
-    </Pill>
-  );
-}
-
-function ScheduleCell({
-  card,
-  nowMs,
-}: {
-  card: OverviewKindCard;
-  nowMs: number;
-}) {
+function scheduleLabel(card: OverviewKindCard, nowMs: number): string {
   const sched = card.schedule;
-  if (!sched) {
-    return (
-      <div className="flex flex-col gap-0.5 text-[12.5px]">
-        <span className="text-white/85">On-add only</span>
-        <span className="text-[11.5px] text-white/45">
-          no sweep scheduled
-        </span>
-      </div>
-    );
-  }
-  const primary = sched.enabled
-    ? `${prettyFrequency(sched.frequency)}`
-    : "Sweep disabled";
-  // Guard `next_at === 0` (epoch 1970 — appears for sweeps that
-  // have never been ticked yet); rendering "in 56y" looks like a
-  // bug.
-  const hasNext = sched.enabled && sched.next_at > 0;
-  const sub = hasNext
-    ? `Next ${formatRelativeFuture(sched.next_at, nowMs)}`
-    : sched.last_at
-      ? `Last ran ${formatRelativeAgo(sched.last_at, nowMs)}`
-      : sched.enabled
-        ? "Awaiting first run"
-        : "Never run";
-  return (
-    <div className="flex flex-col gap-0.5 text-[12.5px]">
-      <span className="text-white/85">{primary}</span>
-      <span className="text-[11.5px] text-white/45">{sub}</span>
-    </div>
-  );
-}
-
-function prettyFrequency(f: string): string {
-  switch (f) {
-    case "manual":
-      return "Manual only";
-    case "hourly":
-      return "Every hour";
-    case "every_3_hours":
-      return "Every 3 hours";
-    case "every_6_hours":
-      return "Every 6 hours";
-    case "every_12_hours":
-      return "Every 12 hours";
-    case "daily":
-      return "Daily";
-    case "every_3_days":
-      return "Every 3 days";
-    case "weekly":
-      return "Weekly";
-    case "monthly":
-      return "Monthly";
-    case "on_change":
-      return "On change";
-    case "custom":
-      return "Custom cron";
-    default:
-      return f;
-  }
-}
-
-function StatusCell({
-  card,
-  nowMs,
-}: {
-  card: OverviewKindCard;
-  nowMs: number;
-}) {
-  // Health pill: derived from the schedule row's last_status if
-  // present. In-flight count is shown as a separate info pill
-  // alongside; queued count likewise. (The aggregate pill is the
-  // *health verdict*, not the *current activity*.)
-  const tone: PillTone =
-    card.schedule?.last_status === "bad"
-      ? "bad"
-      : card.schedule?.last_status === "warn"
-        ? "warn"
-        : "ok";
-  const label =
-    card.schedule?.last_status === "bad"
-      ? "Failing"
-      : card.schedule?.last_status === "warn"
-        ? "Warnings"
-        : "Healthy";
-  return (
-    <div className="flex flex-col gap-1 text-[12.5px]">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Pill tone={tone} dot>
-          {label}
-        </Pill>
-        {card.live.in_flight > 0 && (
-          <Pill tone="info" dot>
-            {card.live.in_flight} running
-          </Pill>
-        )}
-        {card.live.queued > 0 && (
-          <Pill tone="muted">{card.live.queued} queued</Pill>
-        )}
-      </div>
-      <span className="text-[11.5px] text-white/45">
-        {card.live.last_success_at_ms
-          ? `Last ok ${formatRelativeAgo(card.live.last_success_at_ms, nowMs)}`
-          : card.schedule?.last_at
-            ? `Last run ${formatRelativeAgo(card.schedule.last_at, nowMs)}`
-            : "No runs yet"}
-      </span>
-    </div>
-  );
-}
-
-function ChevronCell() {
-  return (
-    <span aria-hidden className="hidden text-white/30 md:inline">
-      ›
-    </span>
-  );
+  if (!sched) return "on-add only";
+  if (!sched.enabled) return "sweep disabled";
+  // Guard `next_at === 0` (epoch 1970 — appears for sweeps that have
+  // never been ticked yet); rendering "in 56y" looks like a bug.
+  if (sched.next_at > 0) return formatRelativeFuture(sched.next_at, nowMs);
+  if (sched.last_at)
+    return `last ran ${formatRelativeAgo(sched.last_at, nowMs)}`;
+  return "awaiting first run";
 }
 
 // ─── Maintenance window card ───────────────────────────────────────────
@@ -533,9 +380,7 @@ function ChevronCell() {
 /// `_end` (HH:MM). Tasks whose schedule has
 /// `requires_maintenance_window = true` get their `next_run_at`
 /// snapped forward into this window so heavy sweeps don't compete
-/// with playback prime time. Lived on the legacy Advanced editor
-/// before the consolidation — folded into the new overview so
-/// there's a single place to tune scheduled tasks.
+/// with playback prime time.
 function MaintenanceWindowCard({
   settings,
   onSaved,
@@ -545,12 +390,9 @@ function MaintenanceWindowCard({
   onSaved: (next: ServerSettings) => void;
   onError: (msg: string) => void;
 }) {
-  // Remount the editor whenever the parent's settings change so
-  // the form picks up the new baseline without a useEffect-syncing
-  // anti-pattern. In practice this only happens after Save (the
-  // parent updates its state from the PATCH response) or if
-  // someone reloads the page; either way an in-progress edit
-  // surviving is not a goal here.
+  // Remount the editor whenever the parent's settings change so the
+  // form picks up the new baseline without a useEffect-syncing
+  // anti-pattern.
   const key = `${settings.maintenance_window_start}|${settings.maintenance_window_end}`;
   return (
     <MaintenanceWindowEditor
@@ -600,59 +442,65 @@ function MaintenanceWindowEditor({
   }
 
   return (
-    <div className="rounded-lg border border-white/10 bg-white/2">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-white/8 px-4 py-3">
+    <div className="cf-card" style={{ marginBottom: 0 }}>
+      <div className="cf-card-head">
         <div>
-          <div className="text-[13.5px] font-semibold text-white/95">
-            Maintenance window
-          </div>
-          <div className="text-xs text-white/55">
-            Heavy sweeps (full scans, metadata refresh, backups) snap into
-            this window so they don&rsquo;t compete with playback. Server-local
-            time. End earlier than start to wrap midnight.
+          <div className="cf-ttl">Maintenance window</div>
+          <div className="cf-sub">
+            Heavy sweeps (full scans, metadata refresh, backups) snap into this
+            window so they don&rsquo;t compete with playback. Server-local time.
+            End earlier than start to wrap midnight.
           </div>
         </div>
-        {isActive ? (
-          <Pill tone="ok" dot>
-            Active now
-          </Pill>
-        ) : (
-          <Pill tone="muted">
-            Next opening {describeNextWindow(start, end)}
-          </Pill>
-        )}
+        <div className="cf-head-aside">
+          {isActive ? (
+            <span className="cf-pill cf-ok">
+              <span className="cf-dot" />
+              Active now
+            </span>
+          ) : (
+            <span className="cf-pill">
+              Next opening {describeNextWindow(start, end)}
+            </span>
+          )}
+        </div>
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-3 text-[12.5px]">
-          <label className="flex items-center gap-2">
-            <span className="text-white/55">From</span>
+      <div className="cf-card-body">
+        <div className="cf-row">
+          <div className="cf-row-main">
+            <div className="cf-row-label">Window</div>
+            <div className="cf-row-help">
+              Tasks scheduled outside the window wait until it opens.
+            </div>
+          </div>
+          <div className="cf-row-control">
             <input
               type="time"
+              className="cf-input cf-w-auto"
+              style={{ minWidth: 110 }}
               value={start}
               onChange={(e) => setStart(e.target.value)}
               disabled={saving}
-              className="rounded border border-white/15 bg-black/30 px-2 py-1 tabular-nums text-white/90 focus:border-white/30 focus:outline-none"
             />
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="text-white/55">to</span>
+            <span className="cf-faint">to</span>
             <input
               type="time"
+              className="cf-input cf-w-auto"
+              style={{ minWidth: 110 }}
               value={end}
               onChange={(e) => setEnd(e.target.value)}
               disabled={saving}
-              className="rounded border border-white/15 bg-black/30 px-2 py-1 tabular-nums text-white/90 focus:border-white/30 focus:outline-none"
             />
-          </label>
+            <button
+              type="button"
+              className="cf-btn cf-primary cf-sm"
+              onClick={save}
+              disabled={!dirty || saving}
+            >
+              {saving ? "Saving…" : "Save window"}
+            </button>
+          </div>
         </div>
-        <button
-          type="button"
-          onClick={save}
-          disabled={!dirty || saving}
-          className="rounded bg-white/85 px-3 py-1.5 text-xs font-medium text-black transition-colors hover:bg-white disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/55"
-        >
-          {saving ? "Saving…" : "Save window"}
-        </button>
       </div>
     </div>
   );
@@ -703,4 +551,3 @@ function withGateFlipped(
     })),
   };
 }
-

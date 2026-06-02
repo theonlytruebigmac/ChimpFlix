@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
-import { Tabs } from "@/components/admin/ui";
 
 /// Consolidated Libraries page. Folds the old library subtree — per-library
 /// CRUD, collections, the metadata-agent catalogue, optimized versions, and
@@ -12,6 +11,7 @@ import { Tabs } from "@/components/admin/ui";
 /// and half-edited forms survive a tab switch.
 export function AdminLibrariesTabs({
   initialTab,
+  libraryCount,
   libraries,
   collections,
   agents,
@@ -19,6 +19,7 @@ export function AdminLibrariesTabs({
   defaults,
 }: {
   initialTab: string;
+  libraryCount: number;
   libraries: ReactNode;
   collections: ReactNode;
   agents: ReactNode;
@@ -31,19 +32,34 @@ export function AdminLibrariesTabs({
     if (typeof window !== "undefined")
       window.history.replaceState(null, "", `?tab=${id}`);
   };
+
+  const TABS: { id: string; label: string; count?: number }[] = [
+    { id: "libraries", label: "Libraries", count: libraryCount },
+    { id: "collections", label: "Collections" },
+    { id: "agents", label: "Metadata agents" },
+    { id: "optimized", label: "Optimized versions" },
+    { id: "defaults", label: "Defaults" },
+  ];
+
   return (
     <>
-      <Tabs
-        tabs={[
-          { id: "libraries", label: "Libraries" },
-          { id: "collections", label: "Collections" },
-          { id: "agents", label: "Agents" },
-          { id: "optimized", label: "Optimized" },
-          { id: "defaults", label: "Defaults" },
-        ]}
-        active={tab}
-        onSelect={select}
-      />
+      <div className="cf-tabs" role="tablist">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
+            className={`cf-tab${tab === t.id ? " cf-on" : ""}`}
+            onClick={() => select(t.id)}
+          >
+            {t.label}
+            {t.count != null && (
+              <span className="cf-pillcount">{t.count}</span>
+            )}
+          </button>
+        ))}
+      </div>
       <div className={tab === "libraries" ? "" : "hidden"}>{libraries}</div>
       <div className={tab === "collections" ? "" : "hidden"}>{collections}</div>
       <div className={tab === "agents" ? "" : "hidden"}>{agents}</div>

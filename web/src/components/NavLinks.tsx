@@ -127,6 +127,11 @@ function navItems(
       match: (p) => p === "/new-popular" || p.startsWith("/new-popular/"),
     },
     {
+      href: "/calendar",
+      label: "Calendar",
+      match: (p) => p === "/calendar" || p.startsWith("/calendar/"),
+    },
+    {
       href: "/my-list",
       label: "My List",
       match: (p) => p === "/my-list" || p.startsWith("/my-list/"),

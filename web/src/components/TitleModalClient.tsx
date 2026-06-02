@@ -610,6 +610,7 @@ function TitleModalView({
           targetEpisodeKey={initialEpisodeKey}
           onWatchStatsChange={refreshDetail}
           bulkWatchVersion={bulkWatchVersion}
+          showPoster={item.thumb}
         />
       )}
 
@@ -1058,7 +1059,7 @@ function CollectionCard({
           View all {data.item_count}
         </Link>
       </div>
-      <div className="-mx-2 flex gap-3 overflow-x-auto px-2 pb-2">
+      <div className="-mx-2 flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x px-2 pb-2">
         {siblings.slice(0, 8).map((it) => (
           <CollectionMemberTile key={it.id} item={it} />
         ))}
@@ -2268,7 +2269,7 @@ function CastAndCrew({ credits }: { credits: Credit[] }) {
   return (
     <section className="border-t border-white/10 px-10 py-8">
       <h2 className="mb-6 text-2xl font-medium">Cast &amp; Crew</h2>
-      <div className="-mx-2 flex gap-2 overflow-x-auto px-2 pb-2">
+      <div className="-mx-2 flex gap-2 overflow-x-auto overscroll-x-contain touch-pan-x px-2 pb-2">
         {cast.map((c) => (
           <CastTile key={c.id} credit={c} />
         ))}
@@ -2333,7 +2334,7 @@ function ExtrasRail({ extras }: { extras: Extra[] }) {
   return (
     <section className="border-t border-white/10 px-10 py-8">
       <h2 className="mb-6 text-2xl font-medium">Extras</h2>
-      <div className="-mx-2 flex gap-3 overflow-x-auto px-2 pb-2">
+      <div className="-mx-2 flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x px-2 pb-2">
         {extras.map((e) => (
           <ExtraTile key={e.id} extra={e} />
         ))}

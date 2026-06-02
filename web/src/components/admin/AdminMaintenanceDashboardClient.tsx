@@ -8,7 +8,6 @@ import {
   type VacuumResult,
   type VerifyAllResult,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 
 /// Instance-wide maintenance dashboard. Each card maps 1:1 to a
@@ -20,9 +19,12 @@ import { ConfirmDialog } from "../ConfirmDialog";
 ///   2. Purge orphans       — hard-delete soft-deleted rows
 ///   3. Vacuum database     — defragment SQLite, reclaim space
 ///   4. Clear transcode     — wipe stale segment dirs from disk
+///
+/// Restyled to the console `cf-*` design system (card + card-head +
+/// card-body) per docs/redesign/admin-maintenance.html.
 export function AdminMaintenanceDashboardClient() {
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+    <div className="cf-grid cf-c2">
       <VerifyAllCard />
       <PurgeAllCard />
       <VacuumCard />
@@ -52,9 +54,7 @@ function VerifyAllCard() {
     <Card
       title="Verify all libraries"
       description="Stat every media file across every library. Files whose disk path is gone get soft-deleted (the row stays for 7 days so watch history and markers survive a temporary unmount). Same as the weekly scheduled task — run on demand when you've moved files around."
-      action={
-        <ActionButton onClick={run} busy={busy} label="Verify all" />
-      }
+      action={<ActionButton onClick={run} busy={busy} label="Verify all" />}
       error={error}
     >
       {result && (
@@ -109,16 +109,31 @@ function PurgeAllCard() {
         title="Purge orphan files"
         description="Hard-delete media_file rows whose grace window has expired (default 7 days). Cascade-sweeps orphan episodes (no files), seasons (no episodes), and items (no files or seasons). Use 'now' to bypass the grace window — only after you've verified the files are gone for good."
         action={
-          <div className="flex flex-wrap gap-2">
-            <ActionButton onClick={() => run(false)} busy={busy} label="Purge expired" />
+          <>
+            <ActionButton
+              onClick={() => run(false)}
+              busy={busy}
+              label="Purge expired"
+            />
             <button
+              type="button"
               onClick={() => setAskImmediate(true)}
               disabled={busy}
-              className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-500/20 disabled:opacity-50"
+              className="cf-btn cf-danger cf-sm"
             >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" />
+              </svg>
               Purge all now
             </button>
-          </div>
+          </>
         }
         error={error}
       >
@@ -169,8 +184,22 @@ function VacuumCard() {
     <>
       <Card
         title="Vacuum database"
-        description="Rebuild the SQLite file from scratch, defragmenting pages and shrinking the on-disk size. Reclaims space after big deletions (purges, library removals). Blocks other queries while it runs — usually a few seconds at our scale."
-        action={<ActionButton onClick={() => setAskVacuum(true)} busy={busy} label="Vacuum" />}
+        description={
+          <>
+            Rebuild the SQLite file from scratch with{" "}
+            <span className="cf-mono">VACUUM</span>, defragmenting pages and
+            shrinking the on-disk size. Reclaims space after big deletions
+            (purges, library removals). Blocks other queries while it runs —
+            usually a few seconds at our scale.
+          </>
+        }
+        action={
+          <ActionButton
+            onClick={() => setAskVacuum(true)}
+            busy={busy}
+            label="Vacuum"
+          />
+        }
         error={error}
       >
         {result && (
@@ -224,9 +253,21 @@ function ClearTranscodeCacheCard() {
     <>
       <Card
         title="Clear transcoder cache"
-        description="Wipe orphan session directories from /data/cache/sessions/. Active sessions skip — only directories left behind by previous crashes or unclean shutdowns get reaped. Useful when the cache disk is filling up and you've confirmed no one is mid-playback."
+        description={
+          <>
+            Wipe orphan session directories from{" "}
+            <span className="cf-mono">/data/cache/sessions/</span>. Active
+            sessions skip — only directories left behind by previous crashes or
+            unclean shutdowns get reaped. Useful when the cache disk is filling
+            up and you&apos;ve confirmed no one is mid-playback.
+          </>
+        }
         action={
-          <ActionButton onClick={() => setAskClear(true)} busy={busy} label="Clear cache" />
+          <ActionButton
+            onClick={() => setAskClear(true)}
+            busy={busy}
+            label="Clear cache"
+          />
         }
         error={error}
       >
@@ -268,19 +309,38 @@ function Card({
   children,
 }: {
   title: string;
-  description: string;
+  description: React.ReactNode;
   action: React.ReactNode;
   error: string | null;
   children?: React.ReactNode;
 }) {
   return (
-    <section className="rounded-lg border border-white/10 bg-white/2 p-5">
-      <h2 className="mb-1 text-base font-semibold">{title}</h2>
-      <p className="mb-4 text-xs text-white/55">{description}</p>
-      <div className="mb-3">{action}</div>
-      <ErrorBanner error={error} className="mb-3" />
-      {children}
-    </section>
+    <div className="cf-card" style={{ marginBottom: 0 }}>
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">{title}</div>
+          <div className="cf-sub">{description}</div>
+        </div>
+      </div>
+      <div className="cf-card-body cf-pad">
+        <div className="cf-flex cf-wrap cf-gap12">{action}</div>
+        {error && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="cf-banner cf-err"
+            style={{ marginTop: 12, marginBottom: 0 }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 8v4M12 16v.5" />
+            </svg>
+            <div>{error}</div>
+          </div>
+        )}
+        {children}
+      </div>
+    </div>
   );
 }
 
@@ -295,9 +355,10 @@ function ActionButton({
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       disabled={busy}
-      className="rounded-md bg-red-500 px-4 py-1.5 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
+      className="cf-btn cf-primary"
     >
       {busy ? "Running…" : label}
     </button>
@@ -309,7 +370,8 @@ function StatGrid({ children }: { children: React.ReactNode }) {
     <div
       role="status"
       aria-live="polite"
-      className="grid grid-cols-2 gap-2 md:grid-cols-4"
+      className="cf-grid cf-c4"
+      style={{ marginTop: 16, gap: 10 }}
     >
       {children}
     </div>
@@ -332,12 +394,31 @@ function Stat({
   else if (format === "ms") rendered = `${value.toLocaleString()} ms`;
   else rendered = value.toLocaleString();
   return (
-    <div className="rounded border border-white/5 bg-black/20 px-2.5 py-1.5">
-      <div className="text-[10px] uppercase tracking-wider text-white/40">
+    <div
+      style={{
+        borderRadius: 8,
+        border: "1px solid var(--line-faint)",
+        background: "rgba(0,0,0,0.2)",
+        padding: "8px 10px",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 10,
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+          color: "var(--faint)",
+        }}
+      >
         {label}
       </div>
       <div
-        className={`tabular-nums ${emphasis ? "text-amber-300" : "text-white/85"}`}
+        className="cf-mono"
+        style={{
+          fontVariantNumeric: "tabular-nums",
+          color: emphasis ? "var(--warn)" : "var(--fg)",
+          marginTop: 2,
+        }}
       >
         {rendered}
       </div>

@@ -50,7 +50,7 @@ fn is_remote_request(ip: IpAddr, lan_raw: &str) -> bool {
 // Stream-side library access enforcement lives in [`crate::api::access`].
 // Re-export under the local name so existing callsites don't need to
 // chase a different module path.
-use crate::api::access::ensure_file_accessible;
+use crate::api::access::ensure_file_playable;
 
 // ---------------------------------------------------------------------------
 // Direct play (HTTP Range)
@@ -62,7 +62,9 @@ pub async fn direct(
     Path(file_id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    ensure_file_accessible(&state, &user, file_id).await?;
+    // PLAYBACK gate (phase 107): direct play requires `full`. A `view`-only
+    // user is 403'd here even though they can browse the item.
+    ensure_file_playable(&state, &user, file_id).await?;
     let locator = queries::get_media_file_locator(&state.pool, file_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -417,7 +419,10 @@ async fn create_session_impl(
             .saturating_add(settings.subtitle_default_offset_ms)
             .clamp(-60_000, 60_000);
     }
-    ensure_file_accessible(state, user, req.media_file_id).await?;
+    // PLAYBACK gate (phase 107): starting a transcode/HLS session requires
+    // `full`. Covers prewarm_session too, which funnels through here. A
+    // `view`-only user gets 403; no-access gets 404.
+    ensure_file_playable(state, user, req.media_file_id).await?;
     let locator = queries::get_media_file_locator(&state.pool, req.media_file_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -805,9 +810,14 @@ async fn create_session_impl(
             // a restart. Auto / unknown / unavailable all fall back to
             // libx264 inside HwAccel::resolve.
             let settings_snapshot = state.settings.read().await.clone();
+            // Lock-free snapshot of the (possibly re-probed) hardware
+            // capabilities. Loaded once here so every capability-driven
+            // decision in this session-create path sees a single
+            // consistent view even if an admin re-probe lands mid-flight.
+            let caps_snapshot = state.transcoder_caps.load();
             let hwaccel = chimpflix_transcoder::HwAccel::resolve(
                 &settings_snapshot.transcoder_hw_accel,
-                &state.transcoder_caps,
+                &caps_snapshot,
             );
             // Per-encoder-type cap: software encodes (libx264 / libx265)
             // peg N CPU cores each. The overall `transcoder_max_concurrent`
@@ -855,7 +865,7 @@ async fn create_session_impl(
             if matches!(strictness, "require_hw" | "prefer_hw") {
                 let breakdown = assess_hw_coverage(
                     hwaccel,
-                    &state.transcoder_caps,
+                    &caps_snapshot,
                     source_video_codec.as_deref(),
                     video_treatment,
                     req.subtitle_index.is_some(),
@@ -1049,13 +1059,18 @@ async fn create_session_impl(
                         &state.transcoder.capabilities(),
                     ),
                     settings_snapshot.transcoder_gpu_device.as_str(),
-                    // Two-pass loudnorm when the analyze_loudness
-                    // task has stored measurements; falls back to
-                    // single-pass when absent. Always looked up
-                    // (even when normalize is off) because the call
-                    // is cheap (1 row) and centralising the decision
-                    // here keeps Session::start dumb.
-                    if req.audio_normalize {
+                    // Two-pass loudnorm — only when the operator opted
+                    // in AND the analyze_loudness task stored
+                    // measurements. Passing a `LoudnessTarget` flips
+                    // the loudnorm filter to `linear=true` measure-then-
+                    // apply mode; `None` keeps the single-pass
+                    // streaming-window estimate. With the toggle off
+                    // (default) we never look up measurements, so the
+                    // command stays byte-identical to the single-pass
+                    // path. The lookup is gated by `audio_normalize`
+                    // too because loudnorm isn't applied at all when
+                    // normalization is disabled.
+                    if req.audio_normalize && settings_snapshot.transcoder_two_pass_loudnorm {
                         queries::get_loudness_measurement(&state.pool, req.media_file_id)
                             .await
                             .ok()
@@ -1069,6 +1084,10 @@ async fn create_session_impl(
                     } else {
                         None
                     },
+                    // Burn text subtitles into the video instead of the
+                    // default WebVTT-sidecar overlay. Off by default —
+                    // text subs stay on the sidecar fast-path.
+                    settings_snapshot.transcoder_burn_ass_subtitles,
                 )
                 .await
                 .map_err(ApiError::Internal)?;

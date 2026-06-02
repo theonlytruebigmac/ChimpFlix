@@ -50,6 +50,14 @@ pub struct AuthUser {
     /// and by session-rotation paths that want to spare the current
     /// session.
     pub session_id: i64,
+    /// The user's `kids_safe` preference, copied from the user row the
+    /// extractor already loaded (no extra DB read). When true, listing
+    /// handlers restrict results to kid-safe-certified titles. Defaults
+    /// to `false` for the network-bypass owner + cast-token paths where
+    /// preserving the historical (unfiltered) behaviour is correct — a
+    /// LAN automation token or Cast session shouldn't inherit a viewer's
+    /// kid-safe filter. The cookie auth path carries the real value.
+    pub kids_safe: bool,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -99,6 +107,9 @@ impl FromRequestParts<AppState> for AuthUser {
                             username: owner.username,
                             role: owner.role,
                             session_id: BYPASS_SESSION_ID,
+                            // Network-bypass automation runs unfiltered —
+                            // it stands in for the owner's full visibility.
+                            kids_safe: false,
                         });
                     }
                     // No owner user on this deployment — fall through
@@ -162,6 +173,8 @@ impl FromRequestParts<AppState> for AuthUser {
             username: user.username,
             role: user.role,
             session_id: session.id,
+            // Free read — `user` was already fetched above for auth.
+            kids_safe: user.kids_safe,
         })
     }
 }
@@ -254,6 +267,9 @@ impl FromRequestParts<AppState> for StreamAuthUser {
                         // a real session" if they care, while keeping
                         // the field typed as `i64`.
                         session_id: 0,
+                        // Streaming/cast playback isn't a listing surface;
+                        // the kid-safe filter only gates browse/home lists.
+                        kids_safe: false,
                     }));
                 }
                 // Token present but invalid — fall through to cookie

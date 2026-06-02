@@ -19,11 +19,62 @@
 
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tracing::{debug, warn};
 
 use crate::FfmpegConfig;
+
+/// Refreshable holder for the detected hardware capabilities.
+///
+/// Capabilities are probed once at boot, but a driver swap or GPU
+/// hot-add can change what the host can do without the process
+/// restarting. This wrapper lets the admin "re-probe" endpoint swap in
+/// a fresh [`TranscoderCapabilities`] atomically while live readers
+/// (the stream session path, the admin GET) keep seeing a consistent
+/// snapshot.
+///
+/// Readers call [`SharedCapabilities::load`], which clones the inner
+/// `Arc` under a very short read lock and hands it back — identical in
+/// shape to the previous `Arc<TranscoderCapabilities>` the code held
+/// directly, so the hot path keeps a lock-free snapshot for the rest of
+/// its work. Writers call [`SharedCapabilities::store`] to publish a new
+/// snapshot; in-flight readers that already loaded the old `Arc` keep
+/// using it until they drop it, exactly like `ArcSwap` semantics but
+/// with no extra dependency.
+#[derive(Debug)]
+pub struct SharedCapabilities {
+    inner: RwLock<Arc<TranscoderCapabilities>>,
+}
+
+impl SharedCapabilities {
+    /// Wrap an initial (boot-time) capability snapshot.
+    pub fn new(caps: TranscoderCapabilities) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(Arc::new(caps)),
+        })
+    }
+
+    /// Current snapshot. Clones the inner `Arc` under a short read lock
+    /// and releases the lock before returning, so callers never hold
+    /// the lock across `.await`.
+    pub fn load(&self) -> Arc<TranscoderCapabilities> {
+        // A poisoned lock here just means a writer panicked mid-swap;
+        // the held data is still a valid snapshot, so recover it rather
+        // than propagate the panic into the playback path.
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Publish a fresh snapshot (used by the re-probe endpoint).
+    pub fn store(&self, caps: TranscoderCapabilities) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Arc::new(caps);
+    }
+}
 
 /// Per-encoder time budget for the startup smoke test. Working
 /// encoders complete in under 300 ms on every box we've tested;

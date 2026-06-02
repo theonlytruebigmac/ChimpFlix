@@ -5,7 +5,6 @@ import {
   ChimpFlixApiError,
   type KindDetailResponse,
 } from "@/lib/chimpflix-api";
-import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 import { AdminTaskDetailClient } from "@/components/admin/AdminTaskDetailClient";
 
 /// Per-kind drill-in. Renders the schedule + gate config, live counters, and
@@ -31,12 +30,7 @@ export default async function AdminTaskDetailPage({
   // eslint-disable-next-line react-hooks/purity
   const initialNowMs = Date.now();
   return (
-    <div>
-      <AdminPageHeader
-        eyebrow="Tasks · Detail"
-        title={initial.display_name}
-        description="Schedule, gate, live counters, and 30-day history for one task kind."
-      />
+    <div className="cf-content-inner cf-wide">
       <AdminTaskDetailClient initial={initial} initialNowMs={initialNowMs} />
     </div>
   );

@@ -120,6 +120,8 @@ pub fn wrap_emitter_for_pipeline(
             // (no API calls) — this is how a freshly added library picks up
             // watch history that was pulled before it existed.
             ScanEvent::Completed {
+                job_id,
+                library_id,
                 files_added,
                 files_updated,
                 ..
@@ -128,6 +130,38 @@ pub fn wrap_emitter_for_pipeline(
                     let st = reconcile_state.clone();
                     tokio::spawn(async move {
                         crate::trakt_sync::reconcile_all_linked_users(&st).await;
+                    });
+                }
+                // New-content notifications: only when the scan actually
+                // ADDED files (re-scans that merely update don't announce).
+                // The enqueue is a single cheap `enqueue_job_unique` — but
+                // we still `tokio::spawn` it so the emitter callback (which
+                // the scanner invokes inline) NEVER awaits a DB write. The
+                // job handler does all audience-resolution + fan-out off the
+                // scan path, and dedupes against the `notified_content`
+                // ledger so a re-persist of an existing title never repeats.
+                if files_added > 0 {
+                    let st = reconcile_state.clone();
+                    tokio::spawn(async move {
+                        match handlers::notify_new_content::enqueue_for_scan(
+                            &st.pool, library_id, job_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                // A fan-out job for this library was already
+                                // queued (dedup) — fine, it'll resolve the
+                                // full unannounced set when it runs.
+                            }
+                            Err(e) => warn!(
+                                library_id,
+                                scan_job_id = job_id,
+                                error = %format!("{e:#}"),
+                                "enqueue notify_new_content failed; new content will be \
+                                 announced on the next scan that adds files"
+                            ),
+                        }
                     });
                 }
             }

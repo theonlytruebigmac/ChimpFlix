@@ -101,6 +101,21 @@ pub static REGISTRY: LazyLock<Vec<KindMetadata>> = LazyLock::new(|| {
             // at a time so two seasons don't dogpile CPU + disk.
             concurrency: 1,
         },
+        // ─── Content notifications (scan-completion triggered) ────
+        KindMetadata {
+            job_kind: "notify_new_content",
+            // Triggered by ScanEvent::Completed (see jobs::pipeline),
+            // not a cron sweep — no sweep_kind, like bootstrap_season_refs.
+            sweep_kind: None,
+            display_name: "New-content notifications",
+            mode: TaskMode::Automatic,
+            scope: TaskScope::Global,
+            gate_setting_key: None,
+            // Network-touching fan-out (bell rows + SMTP + Discord) but one
+            // job per scan, low volume. 2 lets a manual + scheduled scan of
+            // two libraries announce in parallel without dogpiling SMTP.
+            concurrency: 2,
+        },
         // ─── Periodic system tasks (registry surface only — no job_queue rows) ───
         KindMetadata {
             // Periodic kinds have no job_kind in the queue; they

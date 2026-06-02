@@ -10,6 +10,7 @@ import { formatRuntime, type MediaItem } from "@/lib/chimpflix-types";
 import { plexImage } from "@/lib/image";
 import { TOAST_DISMISS_MS } from "@/lib/toast";
 import { usePlayedThresholdPct } from "@/lib/server-config";
+import { upcomingAirLabel } from "@/lib/relative-time";
 import { MarkerEditor } from "./MarkerEditor";
 
 export function SeasonEpisodes({
@@ -20,6 +21,7 @@ export function SeasonEpisodes({
   targetEpisodeKey,
   onWatchStatsChange,
   bulkWatchVersion = 0,
+  showPoster,
 }: {
   seasons: MediaItem[];
   initialEpisodes: MediaItem[];
@@ -45,6 +47,14 @@ export function SeasonEpisodes({
   /// state) reflects the post-bulk watched flags instead of the
   /// stale pre-bulk array.
   bulkWatchVersion?: number;
+  /// The show's poster (TMDB-relative path). Used as the thumbnail for
+  /// PLACEHOLDER episodes (no downloaded file → no episode still) on the
+  /// client refetch path, where the season list response carries only a
+  /// null `thumb_path` and not the show's artwork. SSR rows already get
+  /// this via `adaptEpisode`'s poster fallback; this keeps the two paths
+  /// consistent so a placeholder shows the poster (Trakt-style) rather
+  /// than an empty black box after the user switches seasons.
+  showPoster?: string;
 }) {
   const [selectedKey, setSelectedKey] = useState(initialSeasonKey);
   const [episodes, setEpisodes] = useState(initialEpisodes);
@@ -82,6 +92,18 @@ export function SeasonEpisodes({
     };
   }, []);
 
+  // "Now" reference for the relative air-date labels ("Tomorrow", "In 2
+  // weeks"). Snapshotted post-mount rather than read inline during render:
+  // an inline Date.now() differs between the SSR pass and the client's
+  // first paint, which would flag a hydration mismatch on any upcoming-
+  // episode badge. Until this fills (first paint), nowMs is null and the
+  // air-label is simply not rendered — the row shows its normal runtime,
+  // exactly matching what the server emitted.
+  const [nowMs, setNowMs] = useState<number | null>(null);
+  useEffect(() => {
+    setNowMs(Date.now());
+  }, []);
+
   const changeSeason = useCallback(async function changeSeason(
     seasonKey: string,
   ) {
@@ -105,8 +127,13 @@ export function SeasonEpisodes({
           episode_number: number;
           title: string;
           summary: string | null;
+          air_date: number | null;
           duration_ms: number | null;
           thumb_path: string | null;
+          // False = placeholder (no downloaded file). Optional/defaults
+          // true so a season fetched before the backend grew the flag
+          // never strips affordances off a real episode.
+          has_file?: boolean;
           play_state: {
             position_ms: number;
             max_position_ms: number;
@@ -116,28 +143,39 @@ export function SeasonEpisodes({
       };
       if (!aliveRef.current || requestIdRef.current !== myRequestId) return;
       setEpisodes(
-        data.episodes.map((e) => ({
-          ratingKey: `e${e.id}`,
-          key: `/episodes/${e.id}`,
-          type: "episode",
-          title: e.title,
-          summary: e.summary ?? undefined,
-          thumb: e.thumb_path ?? undefined,
-          duration: e.duration_ms ?? undefined,
-          // Furthest-watched drives the bar + "X min left" (resume still
-          // uses position_ms server-side), so skipping around no longer
-          // makes a finished episode look un-watched.
-          viewOffset: e.play_state?.max_position_ms ?? undefined,
-          watched: e.play_state?.watched ?? false,
-          index: e.episode_number,
-        })),
+        data.episodes.map((e) => {
+          // Placeholder = no downloaded file. It has no episode still, so
+          // fall back to the show poster (Trakt-style), matching the SSR
+          // adapter's behaviour. Real episodes keep their own still.
+          const hasFile = e.has_file !== false;
+          const thumb = hasFile
+            ? (e.thumb_path ?? showPoster ?? undefined)
+            : (showPoster ?? undefined);
+          return {
+            ratingKey: `e${e.id}`,
+            key: `/episodes/${e.id}`,
+            type: "episode",
+            title: e.title,
+            summary: e.summary ?? undefined,
+            thumb,
+            duration: e.duration_ms ?? undefined,
+            airDate: e.air_date ?? undefined,
+            // Furthest-watched drives the bar + "X min left" (resume still
+            // uses position_ms server-side), so skipping around no longer
+            // makes a finished episode look un-watched.
+            viewOffset: e.play_state?.max_position_ms ?? undefined,
+            watched: e.play_state?.watched ?? false,
+            index: e.episode_number,
+            hasFile,
+          };
+        }),
       );
     } finally {
       if (aliveRef.current && requestIdRef.current === myRequestId) {
         setLoading(false);
       }
     }
-  }, []);
+  }, [showPoster]);
 
   // Refetch the currently selected season after a show-level bulk
   // watched toggle (Mark all as watched / unwatched). Skips the
@@ -216,14 +254,34 @@ export function SeasonEpisodes({
     if (dur <= 0 || pos <= 0) return false;
     return (pos / dur) * 100 >= thresholdPct;
   };
+  // Placeholder episodes (no downloaded file) are never an "Up Next"
+  // candidate — there's nothing to play. `playable()` gates the
+  // in-progress / first-unwatched scans below so playback never resumes on
+  // a file-less future episode.
+  const playable = (ep: MediaItem): boolean => ep.hasFile !== false;
   const upNextIdx = (() => {
     const inProgress = episodes.findIndex(
-      (ep) => !isEffectivelyWatched(ep) && (ep.viewOffset ?? 0) > 0,
+      (ep) =>
+        playable(ep) && !isEffectivelyWatched(ep) && (ep.viewOffset ?? 0) > 0,
     );
     if (inProgress !== -1) return inProgress;
-    const firstUnwatched = episodes.findIndex((ep) => !isEffectivelyWatched(ep));
+    const firstUnwatched = episodes.findIndex(
+      (ep) => playable(ep) && !isEffectivelyWatched(ep),
+    );
     return firstUnwatched === -1 ? null : firstUnwatched;
   })();
+
+  // Highest episode_number in the loaded season — the season finale.
+  // Derived from the season's own episode list (which SeasonEpisodes
+  // already holds) rather than any per-row flag, so it stays correct as
+  // the user switches seasons. `ep.index` carries episode_number (set in
+  // both the SSR adapter and the changeSeason refetch). A single-episode
+  // season is both premiere and finale; we only label it "Finale" if it
+  // has more than one episode so a one-off special isn't mislabelled.
+  const maxEpisodeNumber = episodes.reduce(
+    (max, ep) => Math.max(max, ep.index ?? 0),
+    0,
+  );
 
   // Per-episode watched toggle. Optimistic — flips local state
   // first, then fires the server call; on failure we revert so the
@@ -273,15 +331,25 @@ export function SeasonEpisodes({
     return () => window.clearTimeout(t);
   }, [confirmation]);
   async function bulkToggleSeason() {
-    if (bulkBusy || episodes.length === 0) return;
-    const allWatched = episodes.every((ep) => ep.watched);
+    // Placeholder episodes (no file) can't be watched, so they're excluded
+    // from both the "are they all watched?" check and the set of ids we
+    // toggle. Without this, a season with any upcoming placeholder would
+    // never read as fully-watched and we'd POST set_watched for file-less
+    // rows the backend has no play-state for.
+    const downloaded = episodes.filter((ep) => ep.hasFile !== false);
+    if (bulkBusy || downloaded.length === 0) return;
+    const allWatched = downloaded.every((ep) => ep.watched);
     const target = !allWatched;
-    const ids = episodes
+    const ids = downloaded
       .map((ep) => ratingKeyToEpisodeId(ep.ratingKey))
       .filter((id): id is number => id != null);
     const snapshot = episodes;
     setBulkBusy(true);
-    setEpisodes((prev) => prev.map((ep) => ({ ...ep, watched: target })));
+    setEpisodes((prev) =>
+      prev.map((ep) =>
+        ep.hasFile !== false ? { ...ep, watched: target } : ep,
+      ),
+    );
     try {
       await Promise.all(
         ids.map((id) =>
@@ -335,14 +403,20 @@ export function SeasonEpisodes({
       <div className="mb-6 flex items-center justify-between gap-3">
         <h2 className="text-2xl font-medium">Episodes</h2>
         <div className="flex items-center gap-3">
-          {episodes.length > 0 && (
+          {/* Only shown when the season has at least one downloaded
+              episode — a season made up entirely of upcoming placeholders
+              has nothing to mark watched. The label reflects the
+              downloaded episodes' state, ignoring file-less placeholders. */}
+          {episodes.some((ep) => ep.hasFile !== false) && (
             <button
               type="button"
               onClick={() => void bulkToggleSeason()}
               disabled={bulkBusy}
               className="inline-flex items-center gap-1.5 rounded-md border border-white/20 px-3 py-2 text-sm text-white/80 transition-colors hover:border-white/40 hover:text-white disabled:opacity-50"
             >
-              {episodes.every((ep) => ep.watched)
+              {episodes
+                .filter((ep) => ep.hasFile !== false)
+                .every((ep) => ep.watched)
                 ? "Mark season as unwatched"
                 : "Mark season as watched"}
             </button>
@@ -399,18 +473,52 @@ export function SeasonEpisodes({
               ? ep.duration - ep.viewOffset
               : null;
           const isUpNext = idx === upNextIdx;
+          // PLACEHOLDER = an episode the metadata agent knows about but for
+          // which no file has been downloaded (in-progress / future season).
+          // These render Trakt-style: show poster, muted, no play / watched
+          // / marker affordances, and a "Not downloaded · Airs <date>" note.
+          // `hasFile` is undefined for non-episode/legacy sources → treated
+          // as a real downloaded episode (renders exactly as before).
+          const isPlaceholder = ep.hasFile === false;
+          // Relative air label ("Today" / "Tomorrow" / "In 2 weeks"),
+          // only for episodes that haven't aired yet. Null when the
+          // episode has no air date, has already aired, or before the
+          // post-mount nowMs snapshot lands — in which case the row keeps
+          // its normal runtime display untouched.
+          const airLabel =
+            ep.airDate != null && nowMs != null
+              ? upcomingAirLabel(ep.airDate, nowMs)
+              : null;
+          // Absolute air date ("Jun 5, 2026") for the placeholder
+          // "Not downloaded · Airs <date>" affordance. Gated on the
+          // post-mount nowMs snapshot so the locale/timezone-dependent
+          // toLocaleDateString output can't differ between the SSR pass and
+          // the client's first paint (which would flag a hydration mismatch).
+          const airDateStr =
+            isPlaceholder && ep.airDate != null && nowMs != null
+              ? new Date(ep.airDate).toLocaleDateString(undefined, {
+                  month: "short",
+                  day: "numeric",
+                  year: "numeric",
+                })
+              : null;
+          // Season premiere = episode 1 (series premiere too if it's
+          // also season 1; "Premiere" reads fine for both). Finale = the
+          // highest episode_number in the season, but only when the
+          // season has more than one episode so a lone special isn't
+          // tagged. episode_number lives in ep.index. NOTE: maxEpisodeNumber
+          // is computed over ALL episodes including placeholders, so an
+          // undownloaded finale (e.g. E12) is correctly badged the Finale
+          // even while only E1–E9 have files.
+          const epNum = ep.index ?? 0;
+          const isPremiere = epNum === 1;
+          const isFinale = epNum > 1 && epNum === maxEpisodeNumber;
 
-          return (
-            <li
-              key={ep.ratingKey}
-              ref={ep.ratingKey === targetEpisodeKey ? targetRowRef : undefined}
-            >
-              <Link
-                href={`/watch/${ep.ratingKey}`}
-                className={`group -mx-3 flex gap-4 rounded-md px-3 py-5 transition-colors hover:bg-white/5 ${
-                  isUpNext ? "bg-white/3" : ""
-                }`}
-              >
+          // Shared inner content (thumbnail + metadata). The wrapper differs:
+          // downloaded episodes are a <Link> to /watch; placeholders are a
+          // plain <div> (nothing to play) with no hover/play affordances.
+          const inner = (
+            <>
                 <div className="flex w-8 shrink-0 items-start pt-2 text-2xl font-medium text-white/60">
                   {idx + 1}
                 </div>
@@ -420,24 +528,32 @@ export function SeasonEpisodes({
                     <img
                       src={thumb}
                       alt=""
-                      className="h-full w-full object-cover transition-opacity group-hover:opacity-70"
+                      className={
+                        isPlaceholder
+                          ? "h-full w-full object-cover opacity-40"
+                          : "h-full w-full object-cover transition-opacity group-hover:opacity-70"
+                      }
                       loading="lazy"
                     />
                   )}
-                  <div className="absolute inset-0 flex items-center justify-center">
-                    <div className="flex h-11 w-11 items-center justify-center rounded-full border-2 border-white/80 bg-black/40 text-white opacity-90 backdrop-blur-sm transition-all group-hover:scale-110 group-hover:border-white group-hover:bg-white group-hover:text-black group-hover:opacity-100">
-                      <svg
-                        width="18"
-                        height="18"
-                        viewBox="0 0 24 24"
-                        fill="currentColor"
-                        aria-hidden
-                      >
-                        <path d="M7 4l13 8-13 8V4z" />
-                      </svg>
+                  {/* Play overlay + progress bar are playback affordances —
+                      suppressed for placeholders (no file to play). */}
+                  {!isPlaceholder && (
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <div className="flex h-11 w-11 items-center justify-center rounded-full border-2 border-white/80 bg-black/40 text-white opacity-90 backdrop-blur-sm transition-all group-hover:scale-110 group-hover:border-white group-hover:bg-white group-hover:text-black group-hover:opacity-100">
+                        <svg
+                          width="18"
+                          height="18"
+                          viewBox="0 0 24 24"
+                          fill="currentColor"
+                          aria-hidden
+                        >
+                          <path d="M7 4l13 8-13 8V4z" />
+                        </svg>
+                      </div>
                     </div>
-                  </div>
-                  {progress !== null && (
+                  )}
+                  {!isPlaceholder && progress !== null && (
                     <div className="absolute inset-x-2 bottom-1.5 h-0.75 rounded-full bg-white/25">
                       <div
                         className="h-full rounded-full bg-(--color-accent)"
@@ -445,12 +561,21 @@ export function SeasonEpisodes({
                       />
                     </div>
                   )}
+                  {airLabel && (
+                    <span className="absolute left-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white backdrop-blur-sm">
+                      {airLabel}
+                    </span>
+                  )}
                 </div>
                 <div className="flex-1">
                   <div className="mb-1 flex items-baseline justify-between gap-3">
-                    <h3 className="flex items-center gap-2 text-base font-medium">
+                    <h3
+                      className={`flex items-center gap-2 text-base font-medium ${
+                        isPlaceholder ? "text-white/55" : ""
+                      }`}
+                    >
                       {ep.title}
-                      {ep.watched && (
+                      {!isPlaceholder && ep.watched && (
                         <span
                           aria-label="Watched"
                           title="Watched"
@@ -476,6 +601,20 @@ export function SeasonEpisodes({
                           Up Next
                         </span>
                       )}
+                      {isPremiere && (
+                        <span className="rounded-sm border border-white/20 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-white/70">
+                          Premiere
+                        </span>
+                      )}
+                      {isFinale && (
+                        <span className="inline-flex items-center gap-1 rounded-sm border border-accent/40 bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-accent">
+                          <span
+                            className="inline-block h-1.5 w-1.5 rounded-full bg-(--color-accent)"
+                            aria-hidden
+                          />
+                          Finale
+                        </span>
+                      )}
                     </h3>
                     {ep.duration && (
                       <span className="shrink-0 text-sm text-white/60">
@@ -486,51 +625,106 @@ export function SeasonEpisodes({
                     )}
                   </div>
                   {ep.summary && (
-                    <p className="line-clamp-3 text-sm text-white/70">
+                    <p
+                      className={`line-clamp-3 text-sm ${
+                        isPlaceholder ? "text-white/45" : "text-white/70"
+                      }`}
+                    >
                       {ep.summary}
                     </p>
                   )}
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        // Stop the parent <Link> from intercepting
-                        // the click and navigating to /watch.
-                        e.preventDefault();
-                        e.stopPropagation();
-                        const id = ratingKeyToEpisodeId(ep.ratingKey);
-                        if (id != null) {
-                          void toggleEpisodeWatched(id, !ep.watched);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded border border-white/15 px-2 py-0.5 text-[11px] text-white/75 transition-colors hover:border-white/30 hover:text-white"
-                    >
-                      {ep.watched ? "Mark as unwatched" : "Mark as watched"}
-                    </button>
-                    {isOwner && (
+                  {isPlaceholder ? (
+                    // Placeholder affordance — no watched toggle / markers /
+                    // play (not downloaded). A muted "Not downloaded" pill
+                    // plus, when we know it, "Airs <date>", mirroring Trakt's
+                    // greyed upcoming rows.
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-white/45">
+                      <span className="inline-flex items-center gap-1.5 rounded border border-white/10 px-2 py-0.5">
+                        <svg
+                          width="11"
+                          height="11"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden
+                        >
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                          <polyline points="7 10 12 15 17 10" />
+                          <line x1="12" y1="15" x2="12" y2="3" />
+                        </svg>
+                        Not downloaded
+                      </span>
+                      {airDateStr && <span>Airs {airDateStr}</span>}
+                    </div>
+                  ) : (
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={(e) => {
+                          // Stop the parent <Link> from intercepting
+                          // the click and navigating to /watch.
                           e.preventDefault();
                           e.stopPropagation();
                           const id = ratingKeyToEpisodeId(ep.ratingKey);
                           if (id != null) {
-                            void openMarkerEditor(id, ep.title);
+                            void toggleEpisodeWatched(id, !ep.watched);
                           }
                         }}
-                        disabled={
-                          editLoadingId === ratingKeyToEpisodeId(ep.ratingKey)
-                        }
-                        className="inline-flex items-center gap-1.5 rounded border border-white/15 px-2 py-0.5 text-[11px] text-white/75 transition-colors hover:border-white/30 hover:text-white disabled:opacity-50"
+                        className="inline-flex items-center gap-1.5 rounded border border-white/15 px-2 py-0.5 text-[11px] text-white/75 transition-colors hover:border-white/30 hover:text-white"
                       >
-                        {editLoadingId === ratingKeyToEpisodeId(ep.ratingKey)
-                          ? "Loading…"
-                          : "Edit markers"}
+                        {ep.watched ? "Mark as unwatched" : "Mark as watched"}
                       </button>
-                    )}
-                  </div>
+                      {isOwner && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const id = ratingKeyToEpisodeId(ep.ratingKey);
+                            if (id != null) {
+                              void openMarkerEditor(id, ep.title);
+                            }
+                          }}
+                          disabled={
+                            editLoadingId === ratingKeyToEpisodeId(ep.ratingKey)
+                          }
+                          className="inline-flex items-center gap-1.5 rounded border border-white/15 px-2 py-0.5 text-[11px] text-white/75 transition-colors hover:border-white/30 hover:text-white disabled:opacity-50"
+                        >
+                          {editLoadingId === ratingKeyToEpisodeId(ep.ratingKey)
+                            ? "Loading…"
+                            : "Edit markers"}
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
-              </Link>
+            </>
+          );
+
+          return (
+            <li
+              key={ep.ratingKey}
+              ref={ep.ratingKey === targetEpisodeKey ? targetRowRef : undefined}
+            >
+              {isPlaceholder ? (
+                // Not a link — there's nothing to play. Plain row, no hover
+                // highlight, slightly muted.
+                <div className="-mx-3 flex gap-4 rounded-md px-3 py-5">
+                  {inner}
+                </div>
+              ) : (
+                <Link
+                  href={`/watch/${ep.ratingKey}`}
+                  className={`group -mx-3 flex gap-4 rounded-md px-3 py-5 transition-colors hover:bg-white/5 ${
+                    isUpNext ? "bg-white/3" : ""
+                  }`}
+                >
+                  {inner}
+                </Link>
+              )}
             </li>
           );
         })}

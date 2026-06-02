@@ -35,40 +35,53 @@ export default async function AdminLibrariesPage({
     ]);
 
   // The agent catalogue is read-only — render it as plain server markup and
-  // pass it in as a slot rather than spinning up a client component.
+  // pass it in as a slot rather than spinning up a client component. Styled
+  // with the cf-* console design system to match the redesign mockup.
   const agentsTable = (
     <div>
-      <p className="mb-4 text-[12.5px] text-white/55">
-        Available metadata providers. Set the priority order per library on the
-        Libraries tab.
-      </p>
-      <div className="overflow-hidden rounded-lg border border-white/10">
-        <table className="w-full text-sm">
-          <thead className="bg-white/5 text-left text-xs uppercase tracking-wider text-white/40">
+      <div className="cf-banner cf-info">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 8v.5M12 11v5" />
+        </svg>
+        <div>
+          This is the catalogue of providers and whether each has credentials.
+          Set the <b>priority order per library</b> on the Libraries tab.
+        </div>
+      </div>
+      <div className="cf-card" style={{ marginBottom: 0 }}>
+        <table className="cf-table">
+          <thead>
             <tr>
-              <th className="px-4 py-2">Agent</th>
-              <th className="px-4 py-2">Supports</th>
-              <th className="px-4 py-2">Status</th>
+              <th>Agent</th>
+              <th>Supports</th>
+              <th>Credentials</th>
+              <th>Status</th>
             </tr>
           </thead>
           <tbody>
             {agentsRes.agents.map((a) => (
-              <tr key={a.name} className="border-t border-white/5">
-                <td className="px-4 py-3">
-                  <div className="font-medium">{a.display_name}</div>
-                  <div className="font-mono text-xs text-white/40">{a.name}</div>
+              <tr key={a.name}>
+                <td>
+                  <b>{a.display_name}</b>
+                  <div className="cf-mono cf-faint" style={{ fontSize: 11 }}>
+                    {a.name}
+                  </div>
                 </td>
-                <td className="px-4 py-3 text-white/70">
-                  {a.supported_kinds.join(", ")}
+                <td className="cf-muted">{a.supported_kinds.join(" · ")}</td>
+                <td className={`cf-mono${a.configured ? "" : " cf-faint"}`}>
+                  {a.configured ? "configured" : "none"}
                 </td>
-                <td className="px-4 py-3">
+                <td>
                   {a.configured ? (
-                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">
-                      Configured
+                    <span className="cf-pill cf-ok">
+                      <span className="cf-dot" />
+                      Ready
                     </span>
                   ) : (
-                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
-                      Not configured
+                    <span className="cf-pill cf-warn">
+                      <span className="cf-dot" />
+                      Needs key
                     </span>
                   )}
                 </td>
@@ -83,6 +96,7 @@ export default async function AdminLibrariesPage({
   return (
     <AdminLibrariesTabs
       initialTab={initialTab}
+      libraryCount={libs.libraries.length}
       libraries={
         <AdminLibrariesClient
           initialLibraries={libs.libraries}

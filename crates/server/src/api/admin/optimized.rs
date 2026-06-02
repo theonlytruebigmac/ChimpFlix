@@ -82,6 +82,75 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(row)))
 }
 
+/// Cancel a queued or running optimized version.
+///
+/// * Queued → the DB row is flipped straight to `cancelled`; the
+///   worker's claim query only picks up `queued` rows, so it never
+///   touches this one.
+/// * Running → the row is flipped to `cancelled` AND the id is inserted
+///   into the in-memory cancel set the `optimize_versions` worker polls
+///   between ffmpeg progress reads. The worker then kills its ffmpeg
+///   child and removes the partial output file.
+/// * Terminal (`success` / `failed` / already `cancelled`) → no-op; the
+///   route still returns 200 so the UI's optimistic refresh is harmless.
+///
+/// Owner-gated (via `OwnerAuth`) and audited.
+pub async fn cancel(
+    State(state): State<AppState>,
+    OwnerAuth(actor): OwnerAuth,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<Json<OptimizedVersion>, ApiError> {
+    let outcome = queries::cancel_optimized_version(&state.pool, id)
+        .await
+        .map_err(ApiError::Internal)?;
+    let Some((prior_status, _output_path)) = outcome else {
+        return Err(ApiError::NotFoundResource("optimized version"));
+    };
+
+    // Tell the worker to kill its ffmpeg child for ANY non-terminal row —
+    // not just one we read as `running`. A row can flip queued→running in
+    // the window between cancel_optimized_version's status read and its
+    // guarded UPDATE; the UPDATE flips it either way, but only the
+    // cancel-set entry makes a just-started worker stop. A stale id for a
+    // row that never ran is harmless (ids are never reused; the worker
+    // clears ids it handles).
+    if prior_status == "queued" || prior_status == "running" {
+        state.request_optimize_cancel(id).await;
+    }
+
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "optimized.cancel".into(),
+            target_kind: Some("optimized_version".into()),
+            target_id: Some(id.to_string()),
+            payload_json: Some(
+                serde_json::json!({ "prior_status": prior_status }).to_string(),
+            ),
+            ip: None,
+            user_agent,
+        },
+    )
+    .await;
+
+    // Hand back the row's current state so the client can reconcile
+    // without a second round-trip.
+    let versions = queries::list_optimized_versions(&state.pool)
+        .await
+        .map_err(ApiError::Internal)?;
+    let row = versions
+        .into_iter()
+        .find(|v| v.id == id)
+        .ok_or(ApiError::NotFoundResource("optimized version"))?;
+    Ok(Json(row))
+}
+
 pub async fn delete(
     State(state): State<AppState>,
     OwnerAuth(actor): OwnerAuth,

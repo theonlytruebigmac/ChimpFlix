@@ -1131,10 +1131,16 @@ async fn find_local_episode(
     episode: i32,
 ) -> Option<i64> {
     sqlx::query_scalar::<_, i64>(
+        // Match only a DOWNLOADED episode. A Trakt resume position is
+        // meaningless on a placeholder (no media_files, materialized to
+        // complete a season) and would leak undownloaded content into
+        // play_state / continue-watching, so require a live file.
         "SELECT e.id FROM episodes e
          JOIN seasons s ON s.id = e.season_id
          JOIN items i ON i.id = s.show_id
          WHERE i.tmdb_id = ? AND s.season_number = ? AND e.episode_number = ?
+           AND EXISTS (SELECT 1 FROM media_files mf
+                       WHERE mf.episode_id = e.id AND mf.removed_at IS NULL)
          LIMIT 1",
     )
     .bind(show_tmdb_id)

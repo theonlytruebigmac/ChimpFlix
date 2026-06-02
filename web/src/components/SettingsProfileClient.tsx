@@ -1,16 +1,16 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Switch } from "@/components/admin/ui";
 import {
   auth as authApi,
   ChimpFlixApiError,
   type User,
 } from "@/lib/chimpflix-api";
-import { SettingsFeedback } from "./ui/SettingsFeedback";
 
 interface Props {
   initial: User;
+  /// Drives the "Owner" pill in the card head. Read-only context.
+  isOwner?: boolean;
 }
 
 const LANG_OPTIONS: ReadonlyArray<{ code: string; label: string }> = [
@@ -30,7 +30,7 @@ const LANG_OPTIONS: ReadonlyArray<{ code: string; label: string }> = [
   { code: "nld", label: "Dutch" },
 ];
 
-export function SettingsProfileClient({ initial }: Props) {
+export function SettingsProfileClient({ initial, isOwner = false }: Props) {
   const [user, setUser] = useState(initial);
   const [displayName, setDisplayName] = useState(initial.display_name ?? "");
   const [avatarUrl, setAvatarUrl] = useState(initial.avatar_url ?? "");
@@ -42,6 +42,9 @@ export function SettingsProfileClient({ initial }: Props) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Reset to true when the avatar URL changes so a freshly-typed, broken
+  // URL re-attempts a load instead of staying stuck on the monogram.
+  const [avatarFailed, setAvatarFailed] = useState(false);
 
   // Compare against the most-recent server state (`user`, not the
   // immutable `initial` prop) so the Save button correctly disables
@@ -65,6 +68,11 @@ export function SettingsProfileClient({ initial }: Props) {
       }
     };
   }, []);
+
+  const monogram = (displayName.trim() || user.username || "?")
+    .charAt(0)
+    .toUpperCase();
+  const showAvatarImg = avatarUrl.trim().length > 0 && !avatarFailed;
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
@@ -108,96 +116,233 @@ export function SettingsProfileClient({ initial }: Props) {
     }
   }
 
-  return (
-    <form onSubmit={save} className="space-y-4">
-      <div className="grid gap-4 sm:grid-cols-2">
-        <label className="block text-xs">
-          <span className="mb-1 block text-white/60">Display name</span>
-          <input
-            type="text"
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            placeholder={user.username}
-            maxLength={64}
-            className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-          />
-        </label>
-        <label className="block text-xs">
-          <span className="mb-1 block text-white/60">
-            Avatar URL <span className="text-white/40">(optional)</span>
-          </span>
-          <input
-            type="url"
-            value={avatarUrl}
-            onChange={(e) => setAvatarUrl(e.target.value)}
-            placeholder="https://…/me.jpg"
-            className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-          />
-        </label>
-      </div>
+  function discard() {
+    setDisplayName(user.display_name ?? "");
+    setAvatarUrl(user.avatar_url ?? "");
+    setAudioLang(user.default_audio_lang ?? "");
+    setSubtitleLang(user.default_subtitle_lang ?? "");
+    setNotifyEmail(user.notify_via_email);
+    setError(null);
+  }
 
-      <div className="border-t border-white/10 pt-4">
-        <h3 className="mb-3 text-sm font-semibold">Playback defaults</h3>
-        <p className="mb-3 text-xs text-white/55">
-          Auto-selects matching tracks on play. Picking a language that
-          isn&apos;t available on a title just falls back to the default.
-        </p>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <label className="block text-xs">
-            <span className="mb-1 block text-white/60">Default audio</span>
-            <select
-              value={audioLang}
-              onChange={(e) => setAudioLang(e.target.value)}
-              className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-            >
-              {LANG_OPTIONS.map((o) => (
-                <option key={o.code || "_none"} value={o.code}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="block text-xs">
-            <span className="mb-1 block text-white/60">Default subtitles</span>
-            <select
-              value={subtitleLang}
-              onChange={(e) => setSubtitleLang(e.target.value)}
-              className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-            >
-              {LANG_OPTIONS.map((o) => (
-                <option key={o.code || "_none"} value={o.code}>
-                  {o.label === "— No preference —" ? "— Off —" : o.label}
-                </option>
-              ))}
-            </select>
-          </label>
+  return (
+    <form onSubmit={save}>
+      {/* ── Profile card ──────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Profile</div>
+            <div className="cf-sub">How you appear across ChimpFlix.</div>
+          </div>
+          {isOwner && (
+            <div className="cf-head-aside">
+              <span className="cf-pill cf-ok">
+                <span className="cf-dot" />
+                Owner
+              </span>
+            </div>
+          )}
+        </div>
+        <div className="cf-card-body">
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Display name</div>
+              <div className="cf-row-help">
+                Shown on activity and in the admin console. Defaults to your
+                username.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <input
+                type="text"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder={user.username}
+                maxLength={64}
+                className={
+                  "cf-input cf-w-auto" +
+                  (displayName !== (user.display_name ?? "") ? " cf-changed" : "")
+                }
+                style={{ minWidth: 240 }}
+              />
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Avatar</div>
+              <div className="cf-row-help">
+                A direct image URL. Leave blank for the auto monogram.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              {showAvatarImg ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={avatarUrl}
+                  alt="Avatar preview"
+                  width={38}
+                  height={38}
+                  onError={() => setAvatarFailed(true)}
+                  style={{
+                    width: 38,
+                    height: 38,
+                    borderRadius: "50%",
+                    objectFit: "cover",
+                    flex: "none",
+                  }}
+                />
+              ) : (
+                <span
+                  className="cf-avatar cf-a1"
+                  style={{ width: 38, height: 38 }}
+                  aria-hidden
+                >
+                  {monogram}
+                </span>
+              )}
+              <input
+                type="url"
+                value={avatarUrl}
+                onChange={(e) => {
+                  setAvatarUrl(e.target.value);
+                  setAvatarFailed(false);
+                }}
+                placeholder="https://…/me.jpg"
+                className={
+                  "cf-input cf-w-auto" +
+                  (avatarUrl !== (user.avatar_url ?? "") ? " cf-changed" : "")
+                }
+                style={{ minWidth: 240 }}
+              />
+            </div>
+          </div>
         </div>
       </div>
 
-      <div className="border-t border-white/10 pt-4">
-        <h3 className="mb-3 text-sm font-semibold">Notifications</h3>
-        <label className="flex items-start gap-3 text-xs">
-          <Switch checked={notifyEmail} onChange={setNotifyEmail} disabled={!user.email} />
+      {/* ── Playback defaults card ────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
           <div>
-            <div className="text-white">Email me when I get a notification</div>
-            <div className="mt-0.5 text-white/50">
-              Mirrors the in-app bell to your email. Requires an email on
-              your profile and SMTP configured by the admin.
+            <div className="cf-ttl">Playback defaults</div>
+            <div className="cf-sub">
+              Auto-selected when a title has matching tracks; falls back
+              gracefully otherwise.
             </div>
           </div>
-        </label>
+        </div>
+        <div className="cf-card-body">
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Default audio language</div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                value={audioLang}
+                onChange={(e) => setAudioLang(e.target.value)}
+                className={
+                  "cf-select cf-w-auto" +
+                  (audioLang !== (user.default_audio_lang ?? "")
+                    ? " cf-changed"
+                    : "")
+                }
+              >
+                {LANG_OPTIONS.map((o) => (
+                  <option key={o.code || "_none"} value={o.code}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Default subtitles</div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                value={subtitleLang}
+                onChange={(e) => setSubtitleLang(e.target.value)}
+                className={
+                  "cf-select cf-w-auto" +
+                  (subtitleLang !== (user.default_subtitle_lang ?? "")
+                    ? " cf-changed"
+                    : "")
+                }
+              >
+                {LANG_OPTIONS.map((o) => (
+                  <option key={o.code || "_none"} value={o.code}>
+                    {o.label === "— No preference —" ? "— Off —" : o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">
+                Email me when I get a notification
+              </div>
+              <div className="cf-row-help">
+                Mirrors the in-app bell to your email. Needs an email on file and
+                SMTP configured by the admin.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={notifyEmail}
+                aria-label="Email me when I get a notification"
+                disabled={!user.email}
+                className={"cf-switch" + (notifyEmail ? " cf-on" : "")}
+                onClick={() => setNotifyEmail((v) => !v)}
+              />
+            </div>
+          </div>
+        </div>
       </div>
 
-      <div className="flex items-center gap-3 pt-1">
-        <button
-          type="submit"
-          disabled={busy || !hasChanges}
-          className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs transition disabled:opacity-50"
-        >
-          {busy ? "Saving…" : "Save changes"}
-        </button>
-        <SettingsFeedback message={message} error={error} />
-      </div>
+      {/* ── sticky save bar — only while there are unsaved changes ── */}
+      {(hasChanges || error || message) && (
+        <div className="cf-savebar">
+          <div className="cf-sb-status">
+            {error ? (
+              <>
+                <span className="cf-dot" style={{ background: "var(--err)" }} />
+                <b style={{ color: "#fff" }}>{error}</b>
+              </>
+            ) : hasChanges ? (
+              <>
+                <span className="cf-dot" style={{ background: "var(--warn)" }} />
+                <b style={{ color: "#fff" }}>Unsaved changes</b>
+              </>
+            ) : (
+              <>
+                <span className="cf-dot" style={{ background: "var(--ok)" }} />
+                {message}
+              </>
+            )}
+          </div>
+          <div className="cf-sb-actions">
+            <button
+              type="button"
+              className="cf-btn cf-ghost cf-sm"
+              onClick={discard}
+              disabled={busy || !hasChanges}
+            >
+              Discard
+            </button>
+            <button
+              type="submit"
+              className="cf-btn cf-primary cf-sm"
+              disabled={busy || !hasChanges}
+            >
+              {busy ? "Saving…" : "Save changes"}
+            </button>
+          </div>
+        </div>
+      )}
     </form>
   );
 }

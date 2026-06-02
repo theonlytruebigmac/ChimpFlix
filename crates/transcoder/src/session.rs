@@ -783,13 +783,15 @@ pub struct TranscodeManager {
 struct Inner {
     cache_root: PathBuf,
     ffmpeg: FfmpegConfig,
-    /// Capabilities probed once at server startup (encoder list,
-    /// per-hwaccel decoder list). Used by [`Self::start`] to decide
-    /// whether to emit a `-hwaccel <name>` hint for the source
-    /// codec — only do so if the runtime probe confirmed this card
-    /// can actually decode the codec, otherwise software-decode and
-    /// just use the GPU for the encode side.
-    capabilities: Arc<crate::TranscoderCapabilities>,
+    /// Capabilities probed at server startup (encoder list, per-hwaccel
+    /// decoder list), refreshable at runtime via the admin "re-probe"
+    /// endpoint. Used by [`Self::start`] to decide whether to emit a
+    /// `-hwaccel <name>` hint for the source codec — only do so if the
+    /// probe confirmed this card can actually decode the codec,
+    /// otherwise software-decode and just use the GPU for the encode
+    /// side. Shared (same `Arc<SharedCapabilities>`) with
+    /// `AppState.transcoder_caps` so a re-probe updates both at once.
+    capabilities: Arc<crate::SharedCapabilities>,
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     /// Serialises the "check the operator's concurrent-session cap
     /// then start a new session" path so two requests racing under
@@ -805,7 +807,7 @@ impl TranscodeManager {
     pub fn new(
         cache_root: PathBuf,
         ffmpeg: FfmpegConfig,
-        capabilities: Arc<crate::TranscoderCapabilities>,
+        capabilities: Arc<crate::SharedCapabilities>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("create transcode cache dir {}", cache_root.display()))?;
@@ -832,9 +834,10 @@ impl TranscodeManager {
 
     /// Read accessor for the capability probe — callers (the session
     /// API in particular) need to know which encoders are actually
-    /// available before deciding whether to request HEVC.
+    /// available before deciding whether to request HEVC. Returns the
+    /// current snapshot, picking up any runtime re-probe.
     pub fn capabilities(&self) -> Arc<crate::TranscoderCapabilities> {
-        self.inner.capabilities.clone()
+        self.inner.capabilities.load()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -870,6 +873,13 @@ impl TranscodeManager {
         target_video_codec: VideoCodec,
         gpu_device: &str,
         loudness_target: Option<LoudnessTarget>,
+        // When true the operator has opted into burning text subtitles
+        // (SRT / ASS / SSA / mov_text) into the video instead of the
+        // default WebVTT-sidecar overlay. Picture subs (PGS / VobSub /
+        // DVB) always burn regardless — they never get a sidecar — so
+        // this flag only governs the text path. Default false keeps the
+        // sidecar fast-path (player overlays client-side).
+        burn_text_subtitles: bool,
     ) -> Result<Arc<Session>> {
         let id = generate_id();
         let session_dir = self.inner.cache_root.join(&id);
@@ -895,8 +905,13 @@ impl TranscodeManager {
         // sessions can't ABR because there's no encoder to retarget.
         // Fallback also has to be strictly smaller than the primary or
         // it adds no value.
+        //
+        // A text sub is a burn (not a sidecar) only when the operator
+        // opted into burn-in — otherwise it stays on the ABR-safe
+        // sidecar path. Picture subs are always a burn.
+        let subtitle_is_text = subtitle_codec.is_some_and(is_text_subtitle_codec);
         let subtitle_is_burn =
-            subtitle_index.is_some() && !subtitle_codec.is_some_and(is_text_subtitle_codec);
+            subtitle_index.is_some() && (!subtitle_is_text || burn_text_subtitles);
         let abr_eligible = matches!(video_treatment, VideoTreatment::Reencode) && !subtitle_is_burn;
         let resolved_fallback = if abr_eligible {
             fallback_variant.and_then(|(fh, fbps)| {
@@ -973,10 +988,15 @@ impl TranscodeManager {
         // light up NVDEC for it; a GTX 1050's probe won't list
         // `av1` and we silently fall back to software decode for
         // the same source. No card-model database needed.
+        //
+        // Snapshot the (possibly re-probed) capabilities once for the
+        // duration of this start so the decode-hint decision is made
+        // against a single consistent view.
+        let caps = self.inner.capabilities.load();
         let use_hwaccel_decode = match hwaccel.paired_decoder() {
             Some(name) => source_video_codec
                 .map(normalize_codec_for_decoder)
-                .is_some_and(|c| self.inner.capabilities.decoders.supports(name, &c)),
+                .is_some_and(|c| caps.decoders.supports(name, &c)),
             None => false,
         };
 
@@ -1025,7 +1045,12 @@ impl TranscodeManager {
         // tracks, so they still take the burn path.
         let start_seconds = (start_position_ms.max(0) as f64) / 1000.0;
         let webvtt_sidecar: Option<WebVttSidecar> = if let Some(si) = subtitle_index {
-            if matches!(subtitle_kind(subtitle_codec), SubtitleKind::Text) {
+            // When the operator opted into subtitle burn-in, text subs
+            // skip the sidecar entirely and fall through to the
+            // `subtitles=` burn path in `spawn_ffmpeg` (which keys off
+            // `using_sidecar_subtitle == false`). Default (flag off)
+            // keeps the sidecar so the player overlays client-side.
+            if matches!(subtitle_kind(subtitle_codec), SubtitleKind::Text) && !burn_text_subtitles {
                 let language = subtitle_language
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "und".to_string());

@@ -35,13 +35,8 @@ export default async function AdminMaintenancePage({
       cleanup={<AdminMaintenanceDashboardClient />}
       health={<AdminLibraryHealthClient report={report} />}
       backups={
-        <div className="space-y-6">
-          <section className="rounded-lg border border-white/10 bg-white/2 p-6">
-            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-white/40">
-              One-shot download
-            </h2>
-            <SettingsBackupClient />
-          </section>
+        <div>
+          <SettingsBackupClient />
           <AdminBackupRestoreClient />
         </div>
       }

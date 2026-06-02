@@ -6,6 +6,9 @@ import { downloadBackup } from "@/lib/chimpflix-api";
 // Owner-only "Download backup" button. Hits POST /admin/backups which
 // runs VACUUM INTO server-side and streams back the resulting .db file.
 // The browser handles the save dialog via a Blob download.
+//
+// Rendered as the "On-demand" card in the Maintenance → Backups tab,
+// styled with the console `cf-*` design system.
 export function SettingsBackupClient() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -26,49 +29,98 @@ export function SettingsBackupClient() {
   }
 
   return (
-    <div className="space-y-3">
-      <p className="text-xs text-white/55">
-        Atomic SQLite snapshot covering users, library metadata, play state,
-        and reviews. Doesn&apos;t include the media files themselves — keep
-        those backed up separately.
-      </p>
-      <div className="flex items-center gap-3">
-        <button
-          type="button"
-          onClick={run}
-          disabled={busy}
-          className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs transition disabled:opacity-50"
-        >
-          {busy ? "Preparing…" : "Download backup"}
-        </button>
-        {lastDownload && !busy && (
-          <span className="text-xs text-white/55">
-            Downloaded at {lastDownload.toLocaleTimeString()}
-          </span>
-        )}
-      </div>
-      {error && (
-        <p className="text-xs text-(--color-accent)">{error}</p>
-      )}
-      <details className="text-xs text-white/55">
-        <summary className="cursor-pointer text-white/70 transition-colors hover:text-white">
-          Restore instructions
-        </summary>
-        <div className="mt-2 space-y-2 rounded border border-white/10 bg-white/5 p-3">
-          <p>To restore from a snapshot:</p>
-          <ol className="ml-5 list-decimal space-y-1">
-            <li>Stop the server: <code className="rounded bg-black/40 px-1 py-0.5">docker compose stop server</code></li>
-            <li>Replace <code className="rounded bg-black/40 px-1 py-0.5">/data/chimpflix.db</code> with the downloaded file</li>
-            <li>Delete <code className="rounded bg-black/40 px-1 py-0.5">/data/chimpflix.db-shm</code> and <code className="rounded bg-black/40 px-1 py-0.5">-wal</code> if present</li>
-            <li>Restart: <code className="rounded bg-black/40 px-1 py-0.5">docker compose up -d server</code></li>
-          </ol>
-          <p className="text-white/45">
-            Restore is intentionally not a one-click action — replacing the
-            DB is destructive and you should confirm the snapshot before
-            swapping it in.
-          </p>
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">On-demand</div>
+          <div className="cf-sub">
+            Writes a consistent copy with{" "}
+            <span className="cf-mono">VACUUM INTO</span> — safe while the server
+            is running. Atomic SQLite snapshot covering users, library metadata,
+            play state, and reviews. Doesn&apos;t include the media files
+            themselves — keep those backed up separately.
+          </div>
         </div>
-      </details>
+      </div>
+      <div className="cf-card-body cf-pad">
+        <div className="cf-flex cf-wrap cf-gap12">
+          <button
+            type="button"
+            onClick={run}
+            disabled={busy}
+            className="cf-btn cf-primary"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 4v11M8 11l4 4 4-4" />
+              <path d="M4 19h16" />
+            </svg>
+            {busy ? "Preparing…" : "Download backup now"}
+          </button>
+          {lastDownload && !busy && (
+            <span className="cf-faint" style={{ fontSize: 12.5 }}>
+              Downloaded at {lastDownload.toLocaleTimeString()}
+            </span>
+          )}
+        </div>
+        {error && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="cf-banner cf-err"
+            style={{ marginTop: 12, marginBottom: 0 }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 8v4M12 16v.5" />
+            </svg>
+            <div>{error}</div>
+          </div>
+        )}
+        <details className="cf-muted" style={{ fontSize: 12.5, marginTop: 14 }}>
+          <summary style={{ cursor: "pointer" }}>Restore instructions</summary>
+          <div
+            style={{
+              marginTop: 8,
+              borderRadius: 8,
+              border: "1px solid var(--line)",
+              background: "rgba(255,255,255,0.04)",
+              padding: 12,
+            }}
+          >
+            <p>To restore from a snapshot:</p>
+            <ol style={{ marginLeft: 20, listStyle: "decimal", marginTop: 6 }}>
+              <li>
+                Stop the server:{" "}
+                <code className="cf-mono">docker compose stop server</code>
+              </li>
+              <li>
+                Replace <code className="cf-mono">/data/chimpflix.db</code> with
+                the downloaded file
+              </li>
+              <li>
+                Delete <code className="cf-mono">/data/chimpflix.db-shm</code> and{" "}
+                <code className="cf-mono">-wal</code> if present
+              </li>
+              <li>
+                Restart:{" "}
+                <code className="cf-mono">docker compose up -d server</code>
+              </li>
+            </ol>
+            <p className="cf-faint" style={{ marginTop: 8 }}>
+              Restore is intentionally not a one-click action — replacing the DB
+              is destructive and you should confirm the snapshot before swapping
+              it in.
+            </p>
+          </div>
+        </details>
+      </div>
     </div>
   );
 }

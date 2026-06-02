@@ -166,6 +166,13 @@ export type EpisodeSibling = {
   viewOffset?: number;
   index?: number;
   parentTitle?: string;
+  /// False marks a PLACEHOLDER episode — a metadata-agent row with no
+  /// downloaded file behind it. The picker renders these non-playable
+  /// (muted, no Link, no navigation) so the viewer can see the full
+  /// season but can't jump to an episode that can't be streamed.
+  /// Optional + defaulted-playable (a missing flag is treated as a real
+  /// file) so a downloaded episode is never wrongly muted.
+  hasFile?: boolean;
 };
 
 interface Props {
@@ -902,13 +909,32 @@ export function ChimpFlixPlayer({
     // arriving (loadedmetadata supplies videoWidth/Height), the
     // player element resizing (fullscreen toggle, window
     // resize, sidebar collapse).
-    const onAddTrack = () => applyAll();
     const onCueChange = () => applyAll();
+    // `cuechange` is the signal that a track's cues are populated and
+    // active, so it must be attached to EVERY track — including the one
+    // HLS.js (or a late external `<track>` append) adds AFTER this effect
+    // first runs. The old code only wired the tracks present at mount and
+    // had `addtrack` re-run `applyAll()` (which no-ops while the new
+    // track's cues are still empty) WITHOUT wiring `cuechange` to it. So a
+    // stream's subtitles never picked up the saved bottom-inset until the
+    // user nudged the slider — which re-ran this effect once the track
+    // already existed. That was the "position doesn't persist on load"
+    // regression. We now track wired tracks so cleanup stays exact and
+    // attach `cuechange` to any track added later.
+    const wired = new Set<TextTrack>();
+    const wireTrack = (track: TextTrack) => {
+      if (wired.has(track)) return;
+      wired.add(track);
+      track.addEventListener("cuechange", onCueChange);
+    };
+    for (let i = 0; i < v.textTracks.length; i++) wireTrack(v.textTracks[i]);
+    const onAddTrack = (e: Event) => {
+      const track = (e as TrackEvent).track;
+      if (track) wireTrack(track);
+      applyAll();
+    };
     const onMeta = () => applyAll();
     v.textTracks.addEventListener("addtrack", onAddTrack);
-    for (let i = 0; i < v.textTracks.length; i++) {
-      v.textTracks[i].addEventListener("cuechange", onCueChange);
-    }
     v.addEventListener("loadedmetadata", onMeta);
     v.addEventListener("resize", onMeta);
     const ro = new ResizeObserver(() => applyAll());
@@ -917,9 +943,7 @@ export function ChimpFlixPlayer({
     document.addEventListener("fullscreenchange", fsHandler);
     return () => {
       v.textTracks.removeEventListener("addtrack", onAddTrack);
-      for (let i = 0; i < v.textTracks.length; i++) {
-        v.textTracks[i].removeEventListener("cuechange", onCueChange);
-      }
+      wired.forEach((t) => t.removeEventListener("cuechange", onCueChange));
       v.removeEventListener("loadedmetadata", onMeta);
       v.removeEventListener("resize", onMeta);
       ro.disconnect();
@@ -3562,6 +3586,7 @@ export function ChimpFlixPlayer({
               <CastButton
                 videoRef={videoRef}
                 resolveMedia={resolveCastMedia}
+                onNotice={showNotice}
               />
             </div>
           </div>
@@ -4776,6 +4801,9 @@ function EpisodesControl({
         viewOffset: e.play_state?.max_position_ms,
         index: e.episode_number,
         parentTitle: `Season ${e.season_number}`,
+        // Placeholder (undownloaded) rows render non-playable in the
+        // picker — backend `has_file` defaults true when absent.
+        hasFile: e.has_file !== false,
       }));
       setOverride({
         seasonId,
@@ -4963,6 +4991,35 @@ function EpisodeRow({
     episode.viewOffset && episode.duration
       ? Math.min(100, (episode.viewOffset / episode.duration) * 100)
       : null;
+
+  // A PLACEHOLDER episode (metadata-agent row with no downloaded file)
+  // can't be streamed, so it renders as a muted, non-navigable strip —
+  // no Link, no onClose, no play affordance. The viewer still sees the
+  // full season for context (Netflix-style "coming up") but can't jump
+  // to an episode that has no file behind it. `hasFile` defaults to a
+  // real file when absent, so downloaded episodes are never muted.
+  if (episode.hasFile === false) {
+    return (
+      <li>
+        <div
+          aria-disabled="true"
+          className="flex cursor-default items-center gap-3 border-b border-white/5 px-4 py-2.5 opacity-45 last:border-b-0"
+        >
+          {episode.index !== undefined && (
+            <span className="w-6 shrink-0 text-sm font-semibold tabular-nums text-white/50">
+              {episode.index}
+            </span>
+          )}
+          <span className="line-clamp-1 flex-1 text-sm text-white/60">
+            {episode.title}
+          </span>
+          <span className="shrink-0 text-[0.65rem] font-medium uppercase tracking-wide text-white/40">
+            Not downloaded
+          </span>
+        </div>
+      </li>
+    );
+  }
 
   // Netflix's pattern: the row the viewer is *on* gets the rich
   // thumbnail-plus-synopsis treatment; every other row is a compact

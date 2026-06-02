@@ -271,6 +271,15 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
   };
 }
 
+/// A PLACEHOLDER episode (metadata-agent row with no downloaded file) can
+/// never be played, so it must never become the "Next" target or the first
+/// episode of a show. The backend's `has_file` defaults to true when absent
+/// (older responses / movies), so a missing flag is treated as playable —
+/// a missing flag never strips a real, downloaded episode from navigation.
+function episodeHasFile(e: { has_file?: boolean }): boolean {
+  return e.has_file !== false;
+}
+
 async function resolveEpisode(
   episode: EpisodeDetail,
   show: { title: string; seasons?: SeasonSummary[] },
@@ -300,6 +309,8 @@ async function resolveEpisode(
       viewOffset: e.play_state?.max_position_ms,
       index: e.episode_number,
       parentTitle: `Season ${e.season_number}`,
+      // Placeholder (undownloaded) rows render non-playable in the picker.
+      hasFile: episodeHasFile(e),
     }),
   );
   const external = await externalSubtitlesApi
@@ -344,20 +355,30 @@ async function findNextEpisode(
   try {
     if (seasonEpisodes) {
       const idx = seasonEpisodes.findIndex((e) => e.id === current.id);
-      if (idx >= 0 && idx + 1 < seasonEpisodes.length) {
-        const ep = seasonEpisodes[idx + 1];
-        return {
-          id: ep.id,
-          title: ep.title,
-          thumb: plexImage(ep.thumb_path ?? undefined, 480, 270) ?? undefined,
-        };
+      if (idx >= 0) {
+        // Skip placeholder (undownloaded) episodes — Next must target a
+        // playable file, not a row materialized only for the calendar /
+        // finale flag.
+        const ep = seasonEpisodes
+          .slice(idx + 1)
+          .find((e) => episodeHasFile(e));
+        if (ep) {
+          return {
+            id: ep.id,
+            title: ep.title,
+            thumb:
+              plexImage(ep.thumb_path ?? undefined, 480, 270) ?? undefined,
+          };
+        }
       }
     }
     const show = await itemsApi.get(current.show_id);
     const sIdx = show.seasons.findIndex((s) => s.id === current.season_id);
     if (sIdx >= 0 && sIdx + 1 < show.seasons.length) {
       const nextSeason = await seasonsApi.get(show.seasons[sIdx + 1].id);
-      const first = nextSeason.episodes[0];
+      // First DOWNLOADED episode of the next season — an undownloaded
+      // premiere placeholder must not become the Next target.
+      const first = nextSeason.episodes.find((e) => episodeHasFile(e));
       if (first) {
         return {
           id: first.id,
@@ -379,7 +400,9 @@ async function resolveShowFirstEpisode(
   const firstSeason = detail.seasons[0];
   if (!firstSeason) return null;
   const seasonDetail = await seasonsApi.get(firstSeason.id);
-  const firstEpisode = seasonDetail.episodes[0];
+  // First DOWNLOADED episode — never open the player on a placeholder
+  // (undownloaded) first episode, which has no file to stream.
+  const firstEpisode = seasonDetail.episodes.find((e) => episodeHasFile(e));
   if (!firstEpisode) return null;
   const episodeDetail = await episodesApi.get(firstEpisode.id);
   return resolveEpisode(episodeDetail, detail);

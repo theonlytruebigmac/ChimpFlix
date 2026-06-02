@@ -89,7 +89,7 @@ export async function ComingSoonRail({
       <h2 className="mb-3 text-lg font-semibold tracking-tight sm:text-xl md:text-[1.4rem]">
         {title}
       </h2>
-      <div className="flex gap-3 overflow-x-auto pb-2 sm:gap-4">
+      <div className="flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x pb-2 sm:gap-4">
         {tiles.map(({ entry, show }) => {
           if (!show) return null;
           const thumbPath =
@@ -99,7 +99,7 @@ export async function ComingSoonRail({
           return (
             <Link
               key={`${entry.show_item_id}-${entry.season}-${entry.episode}`}
-              href={`/show/${entry.show_item_id}`}
+              href={`/watch/${entry.show_item_id}`}
               className="group relative flex-none overflow-hidden rounded-md bg-neutral-900 transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus:ring-2 focus:ring-white"
               style={{ width: 320 }}
             >
@@ -171,7 +171,7 @@ export async function UpcomingMoviesRail({
       <h2 className="mb-3 text-lg font-semibold tracking-tight sm:text-xl md:text-[1.4rem]">
         Upcoming Movies
       </h2>
-      <div className="flex gap-3 overflow-x-auto pb-2 sm:gap-4">
+      <div className="flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x pb-2 sm:gap-4">
         {tiles.map(({ entry, movie }) => {
           if (!movie) return null;
           const thumbPath =
@@ -184,7 +184,7 @@ export async function UpcomingMoviesRail({
           return (
             <Link
               key={`${entry.movie_item_id}-${entry.released}`}
-              href={`/movie/${entry.movie_item_id}`}
+              href={`/watch/${entry.movie_item_id}`}
               className="group relative flex-none overflow-hidden rounded-md bg-neutral-900 transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus:ring-2 focus:ring-white"
               style={{ width: 320 }}
             >

@@ -8,6 +8,7 @@ pub mod detect_markers_file;
 pub mod extract_embedded_subs;
 pub mod fetch_external_ratings;
 pub mod fetch_subtitles_item;
+pub mod notify_new_content;
 pub mod refresh_logos_item;
 pub mod trakt_pull_user;
 pub mod trakt_push_user_history;

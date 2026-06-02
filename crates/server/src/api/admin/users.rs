@@ -9,7 +9,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::header::USER_AGENT;
 use axum::http::{HeaderMap, StatusCode};
-use chimpflix_library::{AccessMatrixEntry, NewAuditEntry, SessionSummary, queries};
+use chimpflix_library::{AccessLevel, AccessMatrixEntry, NewAuditEntry, SessionSummary, queries};
 
 use crate::client_ip::EffectiveClientIp;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use sha2::Digest as _;
 
 use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
-use crate::auth::{AdminAuth, OwnerAuth, can_act_on};
+use crate::auth::{AdminAuth, AuthUser, OwnerAuth, can_act_on};
 use crate::mail_template;
 use crate::mailer::{Mailer, OutgoingMessage};
 use crate::state::AppState;
@@ -409,6 +409,83 @@ pub async fn send_password_reset(
     Ok(Json(response))
 }
 
+// ─── Account lock / unlock ─────────────────────────────────────────────────
+//
+// Disables (or re-enables) a user account. A locked account fails the
+// /auth/login gate AFTER the password check — see api/auth.rs::login.
+// Owners are never lockable: the hierarchy guard below refuses an
+// admin acting on an owner, and `set_user_locked` itself rejects a lock
+// on an owner regardless of actor. You also can't lock your own account
+// (which would lock you out of the very surface you're using).
+
+#[derive(Debug, Serialize)]
+pub struct LockResponse {
+    pub user: chimpflix_library::User,
+}
+
+pub async fn lock_user(
+    State(state): State<AppState>,
+    AdminAuth(actor): AdminAuth,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> Result<Json<LockResponse>, ApiError> {
+    set_locked(&state, &actor, &headers, user_id, true).await
+}
+
+pub async fn unlock_user(
+    State(state): State<AppState>,
+    AdminAuth(actor): AdminAuth,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> Result<Json<LockResponse>, ApiError> {
+    set_locked(&state, &actor, &headers, user_id, false).await
+}
+
+async fn set_locked(
+    state: &AppState,
+    actor: &AuthUser,
+    headers: &HeaderMap,
+    user_id: i64,
+    locked: bool,
+) -> Result<Json<LockResponse>, ApiError> {
+    if user_id == actor.id {
+        return Err(ApiError::validation("cannot lock your own account"));
+    }
+    // Hierarchy guard — admins can't touch owners. require_target loads
+    // the target and enforces can_act_on; the owner can never be locked.
+    let target = require_target(state, actor.role, user_id).await?;
+    if locked && matches!(target.role, chimpflix_library::UserRole::Owner) {
+        return Err(ApiError::validation("owners cannot be locked"));
+    }
+    let user = queries::set_user_locked(&state.pool, user_id, locked)
+        .await
+        .map_err(|e| ApiError::validation(format!("{e:#}")))?
+        .ok_or(ApiError::NotFound)?;
+    let action = if locked {
+        "user.lock"
+    } else {
+        "user.unlock"
+    };
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    audit_log(
+        state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: action.into(),
+            target_kind: Some("user".into()),
+            target_id: Some(user_id.to_string()),
+            payload_json: None,
+            ip: None,
+            user_agent,
+        },
+    )
+    .await;
+    Ok(Json(LockResponse { user }))
+}
+
 #[derive(Debug, Serialize)]
 pub struct AccessMatrixResponse {
     pub entries: Vec<AccessMatrixEntry>,
@@ -426,15 +503,35 @@ pub async fn get_access_matrix(
 
 #[derive(Debug, Deserialize)]
 pub struct AccessUpdate {
-    /// Bulk-replace shape: per library, the full list of allowed users.
-    /// Omitted libraries are left as-is.
+    /// Bulk-replace shape: per library, the desired grants. Omitted
+    /// libraries are left as-is.
     pub libraries: Vec<LibraryAccessAssignment>,
 }
 
+/// Per-library grant set sent by the access matrix.
+///
+/// Phase 107 tri-state: when `grants` is present, each entry's `level`
+/// (`view`/`full`; `none` revokes) is written verbatim via
+/// `set_library_access_levels`. When only the legacy `user_ids` list is
+/// sent (older clients), every listed user gets a `full` grant — preserving
+/// the prior binary behaviour with no regression.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LibraryAccessAssignment {
     pub library_id: i64,
+    /// Legacy binary shape — every listed user is granted `full`. Used when
+    /// `grants` is omitted.
+    #[serde(default)]
     pub user_ids: Vec<i64>,
+    /// Tri-state shape — explicit per-user level. Takes precedence over
+    /// `user_ids` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<UserAccessGrant>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UserAccessGrant {
+    pub user_id: i64,
+    pub level: AccessLevel,
 }
 
 pub async fn put_access_matrix(
@@ -444,9 +541,25 @@ pub async fn put_access_matrix(
     Json(input): Json<AccessUpdate>,
 ) -> Result<Json<AccessMatrixResponse>, ApiError> {
     for assignment in &input.libraries {
-        queries::set_library_user_ids(&state.pool, assignment.library_id, &assignment.user_ids)
-            .await
-            .map_err(ApiError::Internal)?;
+        match &assignment.grants {
+            Some(grants) => {
+                let levels: Vec<(i64, AccessLevel)> =
+                    grants.iter().map(|g| (g.user_id, g.level)).collect();
+                queries::set_library_access_levels(&state.pool, assignment.library_id, &levels)
+                    .await
+                    .map_err(ApiError::Internal)?;
+            }
+            None => {
+                // Legacy clients: binary list → full grants.
+                queries::set_library_user_ids(
+                    &state.pool,
+                    assignment.library_id,
+                    &assignment.user_ids,
+                )
+                .await
+                .map_err(ApiError::Internal)?;
+            }
+        }
     }
     audit(
         &state,

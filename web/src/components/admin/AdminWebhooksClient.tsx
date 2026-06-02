@@ -5,18 +5,26 @@ import {
   admin as adminApi,
   type Webhook,
   type WebhookDelivery,
+  type WebhookLastDelivery,
   type WebhooksListResponse,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner, Pill } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
-import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 import { formatDateTime } from "@/lib/format";
+import { formatRelativeAgo } from "@/lib/relative-time";
 
 export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse }) {
   const [webhooks, setWebhooks] = useState(initial.webhooks);
   const [events] = useState(initial.events);
   const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Snapshot "now" once after mount so the relative "Last delivery"
+  // timestamps share one reference instant and stay hydration-safe
+  // (server's now differs from the client's first paint). 0 until the
+  // effect runs; the LastDeliveryPill renders an absolute fallback then.
+  const [nowMs, setNowMs] = useState(0);
+  useEffect(() => {
+    setNowMs(Date.now());
+  }, [webhooks]);
 
   async function refresh() {
     try {
@@ -28,18 +36,36 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
   }
 
   return (
-    <div className="space-y-6">
-      <ErrorBanner error={error} />
+    <div>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
 
-      <div className="flex items-center justify-between">
-        <span className="text-sm text-white/60">
-          {webhooks.length} webhook{webhooks.length === 1 ? "" : "s"}
-        </span>
+      <div className="cf-flex cf-between" style={{ marginBottom: 14 }}>
+        <div className="cf-muted" style={{ fontSize: 13 }}>
+          {webhooks.length} endpoint{webhooks.length === 1 ? "" : "s"}
+        </div>
         <button
+          type="button"
+          className="cf-btn cf-primary cf-sm"
           onClick={() => setShowAdd((v) => !v)}
-          className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover"
         >
-          {showAdd ? "Cancel" : "+ New webhook"}
+          {showAdd ? (
+            "Cancel"
+          ) : (
+            <>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+              New webhook
+            </>
+          )}
         </button>
       </div>
 
@@ -54,34 +80,123 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
         />
       )}
 
-      <div className="space-y-3">
-        {webhooks.length === 0 && !showAdd && (
-          <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-8 text-center text-sm text-white/50">
-            No webhooks configured.
+      {webhooks.length === 0 && !showAdd ? (
+        <div className="cf-card">
+          <div className="cf-card-body cf-pad">
+            <span className="cf-faint" style={{ fontSize: 13 }}>
+              No webhooks configured.
+            </span>
           </div>
-        )}
-        {webhooks.map((w) => (
-          <WebhookRow
-            key={w.id}
-            webhook={w}
-            events={events}
-            onChanged={refresh}
-            onError={setError}
-          />
-        ))}
+        </div>
+      ) : (
+        webhooks.length > 0 && (
+          <div className="cf-card">
+            <table className="cf-table">
+              <thead>
+                <tr>
+                  <th>URL</th>
+                  <th>Events</th>
+                  <th>Last delivery</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {webhooks.map((w) => (
+                  <WebhookRow
+                    key={w.id}
+                    webhook={w}
+                    events={events}
+                    nowMs={nowMs}
+                    onChanged={refresh}
+                    onError={setError}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+
+      {/* ── available events ─────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Available events</div>
+            <div className="cf-sub">
+              Fire a POST with a JSON payload when any of these occur.
+            </div>
+          </div>
+        </div>
+        <div className="cf-card-body cf-pad">
+          <div className="cf-flex cf-wrap cf-gap8">
+            {events.map((evt) => (
+              <span key={evt} className="cf-tag">
+                {evt}
+              </span>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * At-a-glance status pill for a webhook's most recent delivery. 2xx →
+ * cf-ok, any other status / transport error → cf-err, never delivered →
+ * a muted "Never". Relative timestamp shares the page-wide nowMs
+ * snapshot; before that snapshot exists (nowMs === 0) it falls back to an
+ * absolute date so SSR/first-paint stay stable.
+ */
+function LastDeliveryPill({
+  last,
+  nowMs,
+}: {
+  last?: WebhookLastDelivery;
+  nowMs: number;
+}) {
+  if (!last) {
+    return (
+      <span className="cf-faint" style={{ fontSize: 12 }}>
+        Never
+      </span>
+    );
+  }
+  const code = last.status_code;
+  // A delivery row is INSERTed at enqueue time (status_code + delivered
+  // null) before the first HTTP attempt. Treat that as "Pending" (muted),
+  // not a hard "Failed" — only a delivered non-2xx (or a recorded error)
+  // is a real failure.
+  const pending = !last.delivered && code == null;
+  const ok = last.delivered && code != null && code >= 200 && code < 300;
+  const tone = pending ? "" : ok ? "cf-ok" : "cf-err";
+  const when =
+    nowMs > 0
+      ? formatRelativeAgo(last.created_at, nowMs)
+      : formatDateTime(last.created_at);
+  return (
+    <span className="cf-flex cf-gap8" style={{ alignItems: "center" }}>
+      <span className={"cf-pill " + tone}>
+        <span className="cf-dot" />
+        {code != null ? code : pending ? "Pending" : ok ? "Delivered" : "Failed"}
+      </span>
+      <span className="cf-faint" style={{ fontSize: 11.5 }} title={formatDateTime(last.created_at)}>
+        {when}
+      </span>
+    </span>
   );
 }
 
 function WebhookRow({
   webhook,
   events,
+  nowMs,
   onChanged,
   onError,
 }: {
   webhook: Webhook;
   events: string[];
+  nowMs: number;
   onChanged: () => Promise<void>;
   onError: (msg: string | null) => void;
 }) {
@@ -203,175 +318,253 @@ function WebhookRow({
   }
 
   return (
-    <div className="rounded-lg border border-white/10 bg-white/2">
-      <div className="flex items-center gap-3 p-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="font-medium">{webhook.name}</span>
-            <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-white/60">
-              {initialMask.length} event{initialMask.length === 1 ? "" : "s"}
-            </span>
-          </div>
-          <div className="mt-0.5 truncate font-mono text-xs text-white/40">
-            {webhook.url}
-          </div>
-        </div>
-        <button
-          disabled={busy}
-          onClick={test}
-          className="rounded border border-white/15 px-2 py-1 text-xs text-white/80 hover:bg-white/5"
-        >
-          Test
-        </button>
-        <button
-          disabled={busy}
-          onClick={toggleEnabled}
-          className={`rounded border px-2 py-1 text-xs ${webhook.enabled ? "border-emerald-500/40 text-emerald-300" : "border-white/15 text-white/50"}`}
-        >
-          {webhook.enabled ? "Enabled" : "Disabled"}
-        </button>
-        <button
-          onClick={() => {
-            setExpanded((v) => !v);
-            if (!expanded) loadDeliveries();
-          }}
-          className="rounded border border-white/15 px-2 py-1 text-xs text-white/80 hover:bg-white/5"
-        >
-          {expanded ? "Collapse" : "Edit ▾"}
-        </button>
-      </div>
-      {expanded && (
-        <div className="space-y-4 border-t border-white/10 p-4">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <Field label="Name">
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-              />
-            </Field>
-            <Field label="URL">
-              <input
-                type="url"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-              />
-            </Field>
-            <Field
-              label="Secret"
-              hint="Used to sign payloads with HMAC-SHA256 (header X-ChimpFlix-Signature)."
-            >
-              <input
-                type="text"
-                value={secret}
-                placeholder="(none)"
-                onChange={(e) => setSecret(e.target.value)}
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
-              />
-            </Field>
-            <Field label="Subscribed events">
-              <div className="flex flex-wrap gap-1">
-                {events.map((evt) => {
-                  const on = mask.includes(evt);
-                  return (
-                    <button
-                      key={evt}
-                      type="button"
-                      onClick={() => toggleMaskEntry(evt)}
-                      className={`rounded border px-2 py-0.5 font-mono text-[11px] ${on ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200" : "border-white/15 text-white/50"}`}
-                    >
-                      {evt}
-                    </button>
-                  );
-                })}
-              </div>
-            </Field>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              disabled={!dirty || busy}
-              onClick={save}
-              className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-            >
-              Save
-            </button>
-            <button
-              disabled={busy}
-              onClick={() => setAskDelete(true)}
-              className="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-50"
-            >
-              Delete
-            </button>
-          </div>
-
-          <div>
-            <div className="mb-2 text-xs uppercase tracking-wider text-white/40">
-              Recent deliveries
-            </div>
-            {deliveries == null ? (
-              <LoadingPlaceholder />
-            ) : deliveries.length === 0 ? (
-              <div className="text-sm text-white/40">No deliveries yet.</div>
+    <>
+      <tr>
+        <td className="cf-mono">{webhook.url}</td>
+        <td>
+          <span className="cf-flex cf-wrap cf-gap8">
+            {initialMask.length === 0 ? (
+              <span className="cf-faint" style={{ fontSize: 12 }}>
+                No events
+              </span>
             ) : (
-              <div className="overflow-hidden rounded border border-white/10">
-                <table className="w-full text-xs">
-                  <thead className="bg-white/5 text-left text-white/40">
-                    <tr>
-                      <th className="px-3 py-1.5">When</th>
-                      <th className="px-3 py-1.5">Event</th>
-                      <th className="px-3 py-1.5">Status</th>
-                      <th className="px-3 py-1.5">Attempts</th>
-                      <th className="px-3 py-1.5">Response / error</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {deliveries.map((d) => {
-                      const ok = d.delivered_at != null;
-                      const code = d.status_code;
-                      return (
-                        <tr key={d.id} className="border-t border-white/5">
-                          <td className="px-3 py-1.5 text-white/60">
-                            {formatDateTime(d.created_at)}
-                          </td>
-                          <td className="px-3 py-1.5 font-mono text-white/70">
-                            {d.event}
-                          </td>
-                          <td className="px-3 py-1.5">
-                            {ok ? (
-                              <Pill tone="ok">
-                                Delivered{code != null ? ` ${code}` : ""}
-                              </Pill>
-                            ) : d.attempts >= 3 ? (
-                              <Pill tone="bad">
-                                Failed{code != null ? ` ${code}` : ""}
-                              </Pill>
-                            ) : (
-                              <Pill tone="warn">Pending</Pill>
-                            )}
-                          </td>
-                          <td className="px-3 py-1.5 tabular-nums text-white/60">
-                            {d.attempts}
-                          </td>
-                          <td className="px-3 py-1.5 text-white/60">
-                            {d.error ? (
-                              <span className="text-red-300">{d.error}</span>
-                            ) : (
-                              <code className="line-clamp-1 font-mono">
-                                {d.response_body ?? ""}
-                              </code>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              initialMask.map((evt) => (
+                <span key={evt} className="cf-pill">
+                  <span className="cf-dot" />
+                  {evt}
+                </span>
+              ))
             )}
-          </div>
-        </div>
+          </span>
+        </td>
+        <td>
+          <LastDeliveryPill last={webhook.last_delivery} nowMs={nowMs} />
+        </td>
+        <td className="cf-num">
+          <button
+            type="button"
+            className="cf-btn cf-ghost cf-tiny"
+            onClick={() => {
+              setExpanded((v) => !v);
+              if (!expanded) loadDeliveries();
+            }}
+          >
+            {expanded ? "Close" : "Edit"}
+          </button>
+          <button
+            type="button"
+            className="cf-btn cf-ghost cf-tiny"
+            disabled={busy}
+            onClick={test}
+          >
+            Test
+          </button>
+          <button
+            type="button"
+            className="cf-btn cf-ghost cf-tiny cf-danger"
+            disabled={busy}
+            onClick={() => setAskDelete(true)}
+          >
+            Delete
+          </button>
+        </td>
+      </tr>
+      {expanded && (
+        <tr>
+          <td colSpan={4} style={{ background: "rgba(255,255,255,0.02)" }}>
+            <div style={{ padding: "4px 0 8px" }}>
+              <div className="cf-flex cf-between" style={{ marginBottom: 14 }}>
+                <span className="cf-section-title" style={{ margin: 0 }}>
+                  Edit endpoint
+                </span>
+                <button
+                  type="button"
+                  className="cf-switch-wrap cf-flex cf-gap8"
+                  style={{
+                    border: 0,
+                    background: "transparent",
+                    cursor: "pointer",
+                    alignItems: "center",
+                  }}
+                  onClick={toggleEnabled}
+                  disabled={busy}
+                  aria-label={webhook.enabled ? "Disable webhook" : "Enable webhook"}
+                >
+                  <span className="cf-faint" style={{ fontSize: 12 }}>
+                    {webhook.enabled ? "Enabled" : "Disabled"}
+                  </span>
+                  <span
+                    role="switch"
+                    aria-checked={webhook.enabled}
+                    className={"cf-switch" + (webhook.enabled ? " cf-on" : "")}
+                  />
+                </button>
+              </div>
+
+              <div className="cf-grid cf-c2">
+                <div className="cf-field">
+                  <label className="cf-field-label">Name</label>
+                  <input
+                    className="cf-input"
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                  />
+                </div>
+                <div className="cf-field">
+                  <label className="cf-field-label">URL</label>
+                  <input
+                    className="cf-input"
+                    type="url"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="cf-field">
+                <label className="cf-field-label">Signing secret</label>
+                <input
+                  className="cf-input cf-mono"
+                  type="text"
+                  value={secret}
+                  placeholder="(none)"
+                  onChange={(e) => setSecret(e.target.value)}
+                />
+                <p className="cf-faint" style={{ marginTop: 6, fontSize: 11.5 }}>
+                  Signs payloads with HMAC-SHA256 (header{" "}
+                  <span className="cf-mono">X-ChimpFlix-Signature</span>).
+                </p>
+              </div>
+
+              <div className="cf-field">
+                <label className="cf-field-label">Subscribed events</label>
+                <div className="cf-flex cf-wrap cf-gap8">
+                  {events.map((evt) => {
+                    const on = mask.includes(evt);
+                    return (
+                      <button
+                        key={evt}
+                        type="button"
+                        onClick={() => toggleMaskEntry(evt)}
+                        className={"cf-tag" + (on ? " cf-on" : "")}
+                        style={
+                          on
+                            ? {
+                                color: "#ff7a82",
+                                borderColor: "var(--accent-line)",
+                                background: "var(--accent-soft)",
+                              }
+                            : undefined
+                        }
+                      >
+                        {evt}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="cf-flex cf-gap8" style={{ marginTop: 4 }}>
+                <button
+                  type="button"
+                  className="cf-btn cf-primary cf-sm"
+                  disabled={!dirty || busy}
+                  onClick={save}
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="cf-btn cf-sm"
+                  disabled={busy}
+                  onClick={test}
+                >
+                  Test
+                </button>
+                <button
+                  type="button"
+                  className="cf-btn cf-danger cf-sm"
+                  disabled={busy}
+                  onClick={() => setAskDelete(true)}
+                >
+                  Delete
+                </button>
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                <div className="cf-section-title" style={{ marginTop: 0 }}>
+                  Recent deliveries
+                </div>
+                {deliveries == null ? (
+                  <span className="cf-faint" style={{ fontSize: 13 }}>
+                    Loading…
+                  </span>
+                ) : deliveries.length === 0 ? (
+                  <span className="cf-faint" style={{ fontSize: 13 }}>
+                    No deliveries yet.
+                  </span>
+                ) : (
+                  <table className="cf-table">
+                    <thead>
+                      <tr>
+                        <th>When</th>
+                        <th>Event</th>
+                        <th>Status</th>
+                        <th>Attempts</th>
+                        <th>Response / error</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {deliveries.map((d) => {
+                        const ok = d.delivered_at != null;
+                        const code = d.status_code;
+                        return (
+                          <tr key={d.id}>
+                            <td className="cf-faint">
+                              {formatDateTime(d.created_at)}
+                            </td>
+                            <td className="cf-mono">{d.event}</td>
+                            <td>
+                              {ok ? (
+                                <span className="cf-pill cf-ok">
+                                  <span className="cf-dot" />
+                                  {code != null ? code : "Delivered"}
+                                </span>
+                              ) : d.attempts >= 3 ? (
+                                <span className="cf-pill cf-err">
+                                  <span className="cf-dot" />
+                                  {code != null ? code : "Failed"}
+                                </span>
+                              ) : (
+                                <span className="cf-pill cf-warn">
+                                  <span className="cf-dot" />
+                                  Pending
+                                </span>
+                              )}
+                            </td>
+                            <td className="cf-num">{d.attempts}</td>
+                            <td>
+                              {d.error ? (
+                                <span style={{ color: "var(--err)" }}>
+                                  {d.error}
+                                </span>
+                              ) : (
+                                <span className="cf-mono">
+                                  {d.response_body ?? ""}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </td>
+        </tr>
       )}
       {askDelete && (
         <ConfirmDialog
@@ -384,7 +577,7 @@ function WebhookRow({
           onCancel={() => setAskDelete(false)}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -423,35 +616,55 @@ function NewWebhookForm({
   }
 
   return (
-    <div className="space-y-4 rounded-lg border border-white/10 bg-white/2 p-4">
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        <Field label="Name">
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">New webhook</div>
+          <div className="cf-sub">
+            POST a JSON payload to an endpoint when subscribed events fire.
+          </div>
+        </div>
+      </div>
+      <div className="cf-card-body cf-pad">
+        <div className="cf-grid cf-c2">
+          <div className="cf-field">
+            <label className="cf-field-label">Name</label>
+            <input
+              className="cf-input"
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+          <div className="cf-field">
+            <label className="cf-field-label">URL</label>
+            <input
+              className="cf-input"
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://example.com/hook"
+            />
+          </div>
+        </div>
+
+        <div className="cf-field">
+          <label className="cf-field-label">Signing secret (optional)</label>
           <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-          />
-        </Field>
-        <Field label="URL">
-          <input
-            type="url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://example.com/hook"
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-          />
-        </Field>
-        <Field label="Secret (optional)">
-          <input
+            className="cf-input cf-mono"
             type="text"
             value={secret}
             onChange={(e) => setSecret(e.target.value)}
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm outline-none focus:border-white/30"
           />
-        </Field>
-        <Field label="Events">
-          <div className="flex flex-wrap gap-1">
+          <p className="cf-faint" style={{ marginTop: 6, fontSize: 11.5 }}>
+            Signs payloads with HMAC-SHA256 (header{" "}
+            <span className="cf-mono">X-ChimpFlix-Signature</span>).
+          </p>
+        </div>
+
+        <div className="cf-field">
+          <label className="cf-field-label">Events</label>
+          <div className="cf-flex cf-wrap cf-gap8">
             {events.map((evt) => {
               const on = mask.includes(evt);
               return (
@@ -463,42 +676,35 @@ function NewWebhookForm({
                       m.includes(evt) ? m.filter((x) => x !== evt) : [...m, evt],
                     )
                   }
-                  className={`rounded border px-2 py-0.5 font-mono text-[11px] ${on ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200" : "border-white/15 text-white/50"}`}
+                  className={"cf-tag" + (on ? " cf-on" : "")}
+                  style={
+                    on
+                      ? {
+                          color: "#ff7a82",
+                          borderColor: "var(--accent-line)",
+                          background: "var(--accent-soft)",
+                        }
+                      : undefined
+                  }
                 >
                   {evt}
                 </button>
               );
             })}
           </div>
-        </Field>
-      </div>
-      <button
-        disabled={busy || mask.length === 0 || !name.trim() || !url.trim()}
-        onClick={submit}
-        className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover disabled:opacity-50"
-      >
-        {busy ? "Creating…" : "Create"}
-      </button>
-    </div>
-  );
-}
+        </div>
 
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-white/50">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="mt-1 text-xs text-white/50">{hint}</p>}
+        <div className="cf-flex cf-gap8" style={{ marginTop: 4 }}>
+          <button
+            type="button"
+            className="cf-btn cf-primary cf-sm"
+            disabled={busy || mask.length === 0 || !name.trim() || !url.trim()}
+            onClick={submit}
+          >
+            {busy ? "Creating…" : "Create"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

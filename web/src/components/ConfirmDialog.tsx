@@ -36,6 +36,7 @@ export function ConfirmDialog({
   cancelLabel = "Cancel",
   destructive = false,
   busy = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -54,6 +55,11 @@ export function ConfirmDialog({
   /// (Cancel still works). Hand back to the parent so it can wire the
   /// disabled state to a long-running promise.
   busy?: boolean;
+  /// Disable the confirm button WITHOUT showing the busy spinner — for
+  /// gating on a pre-action precondition (e.g. a typed-name match)
+  /// rather than an in-flight request. Cancel stays enabled. `busy`
+  /// still takes precedence for the spinner/label.
+  confirmDisabled?: boolean;
   /// Called when the user clicks the confirm button. Parent is
   /// responsible for closing the dialog after the async action.
   onConfirm: () => void | Promise<void>;
@@ -116,7 +122,7 @@ export function ConfirmDialog({
             ref={confirmRef}
             type="button"
             onClick={() => void onConfirm()}
-            disabled={busy}
+            disabled={busy || confirmDisabled}
             className={
               destructive
                 ? "inline-flex items-center gap-2 rounded-md border border-red-500/40 bg-red-500/15 px-4 py-2 text-sm font-semibold text-red-200 transition-colors hover:border-red-500/65 hover:bg-red-500/25 disabled:opacity-50"

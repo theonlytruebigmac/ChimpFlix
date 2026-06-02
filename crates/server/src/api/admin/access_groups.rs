@@ -16,7 +16,8 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::header::USER_AGENT;
 use chimpflix_library::{
-    AccessGroup, AccessGroupDetail, AccessGroupUpdate, NewAccessGroup, NewAuditEntry, queries,
+    AccessGroup, AccessGroupDetail, AccessGroupUpdate, AccessLevel, GroupLibraryGrant,
+    NewAccessGroup, NewAuditEntry, queries,
 };
 use serde::{Deserialize, Serialize};
 
@@ -149,9 +150,19 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Request for replacing a group's bound libraries.
+///
+/// Phase 107 tri-state: when `grants` is present, each entry's `level`
+/// (`view`/`full`; `none` drops the binding) is stored on the group-library
+/// row. When only the legacy `library_ids` list is sent (older clients),
+/// every listed library is bound at `full` — preserving the prior binary
+/// behaviour with no regression.
 #[derive(Debug, Deserialize)]
 pub struct SetLibrariesRequest {
+    #[serde(default)]
     pub library_ids: Vec<i64>,
+    #[serde(default)]
+    pub grants: Option<Vec<GroupLibraryGrant>>,
 }
 
 pub async fn set_libraries(
@@ -161,7 +172,20 @@ pub async fn set_libraries(
     Path(id): Path<i64>,
     Json(input): Json<SetLibrariesRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if input.library_ids.len() > MAX_GROUP_LIBRARIES {
+    // Resolve to a single (library_id, level) list. `grants` wins; the
+    // legacy `library_ids` shape maps every entry to `full`.
+    let grants: Vec<GroupLibraryGrant> = match input.grants {
+        Some(g) => g,
+        None => input
+            .library_ids
+            .iter()
+            .map(|&library_id| GroupLibraryGrant {
+                library_id,
+                level: AccessLevel::Full,
+            })
+            .collect(),
+    };
+    if grants.len() > MAX_GROUP_LIBRARIES {
         return Err(ApiError::validation(format!(
             "a group can bind at most {MAX_GROUP_LIBRARIES} libraries"
         )));
@@ -175,7 +199,11 @@ pub async fn set_libraries(
     {
         return Err(ApiError::NotFound);
     }
-    queries::set_access_group_libraries(&state.pool, id, &input.library_ids)
+    let count = grants
+        .iter()
+        .filter(|g| !matches!(g.level, AccessLevel::None))
+        .count();
+    queries::set_access_group_libraries(&state.pool, id, &grants)
         .await
         .map_err(ApiError::Internal)?;
     audit_change(
@@ -183,7 +211,7 @@ pub async fn set_libraries(
         actor.id,
         "access_group.libraries.update",
         id,
-        Some(format!(r#"{{"count":{}}}"#, input.library_ids.len())),
+        Some(format!(r#"{{"count":{count}}}"#)),
         &headers,
     )
     .await;

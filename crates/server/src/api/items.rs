@@ -78,6 +78,19 @@ pub async fn list(
     }
     let acc = access(&state, &user).await?;
     let effective = restrict_access(acc, filter.library_ids.take());
+    // Apply the user's kid-safe preference server-side. `ItemFilter::kids_safe`
+    // is `#[serde(skip)]`, so it's always `false` off the wire and a client
+    // can't set it by hand — the toggle is authoritative from the stored
+    // preference. When false (the default) `list_items` adds no clause and
+    // the query is unchanged.
+    //
+    // EXCEPTION: the `count_only` existence probe (used by the home page to
+    // decide whether the server has been scanned at all) bypasses kids_safe so
+    // a kids_safe profile on a library with zero rated items doesn't see a
+    // false "scan in progress" screen. This is safe because `count_only`
+    // returns ZERO items (only `total`) — a viewer can never extract a
+    // non-kid-safe title through it, just an unfiltered content count.
+    filter.kids_safe = user.kids_safe && !filter.count_only;
     let page = queries::list_items(&state.pool, filter, user.id, effective.as_deref()).await?;
     Ok(Json(page))
 }
@@ -125,9 +138,17 @@ pub async fn trending(
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     let acc = access(&state, &user).await?;
     let effective = restrict_access(acc, q.library_ids);
-    let rows =
-        queries::list_trending_in_library(&state.pool, kind, user.id, limit, effective.as_deref())
-            .await?;
+    let rows = queries::list_trending_in_library(
+        &state.pool,
+        kind,
+        user.id,
+        limit,
+        effective.as_deref(),
+        // Top-10 rails honor the same per-user kid-safe toggle as plain
+        // browse; authoritative from the stored preference.
+        user.kids_safe,
+    )
+    .await?;
     let items = rows
         .into_iter()
         .map(|(rank, item)| TrendingItem { rank, item })
@@ -183,6 +204,83 @@ pub async fn library_top(
         .map(|(rank, item)| TrendingItem { rank, item })
         .collect();
     Ok(Json(TrendingResponse { items }))
+}
+
+/// Query for `GET /api/v1/calendar`. Two ways to express the window:
+///   * `?days=N` — a window of N days *ahead* of now, plus a fixed look-back
+///     so "this week" (episodes that aired in the last few days) still shows.
+///   * `?from=<ms>&to=<ms>` — an explicit epoch-millisecond window; takes
+///     precedence over `days` when both bounds are supplied.
+/// `library_ids` carries the same hidden-libraries preference as the rest of
+/// browse (the client passes its visible-library set), intersected with the
+/// user's access grants server-side.
+#[derive(Debug, Deserialize)]
+pub struct CalendarQuery {
+    /// Window size in days ahead of now. Defaults to 35 (~5 weeks).
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// Explicit window start, epoch milliseconds.
+    #[serde(default)]
+    pub from: Option<i64>,
+    /// Explicit window end, epoch milliseconds.
+    #[serde(default)]
+    pub to: Option<i64>,
+    /// Cap on returned rows. Defaults to 200; clamped server-side.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Visible-library filter, same shape as `ItemFilter::library_ids`.
+    #[serde(default, deserialize_with = "chimpflix_library::deserialize_csv_i64s")]
+    pub library_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CalendarResponse {
+    pub episodes: Vec<queries::UpcomingEpisode>,
+}
+
+const DAY_MS: i64 = 86_400_000;
+const CALENDAR_DEFAULT_DAYS_AHEAD: i64 = 35;
+
+/// `GET /api/v1/calendar` — locally-known episodes whose air date falls in
+/// the requested window, honoring the same per-library visibility +
+/// kids-safe rules as every other browse surface. The LOCAL-data complement
+/// to the Trakt-driven coming-soon rail. The frontend groups by `airDate`.
+pub async fn calendar(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<CalendarQuery>,
+) -> Result<Json<CalendarResponse>, ApiError> {
+    let now = chimpflix_common::now_ms();
+    // Default window: from the START OF TODAY (UTC) through `days_ahead` —
+    // NO look-back, so both the "Coming Up" rail and the calendar page show
+    // today + upcoming only (no already-aired episodes). `air_date` is stored
+    // as midnight-UTC of the air day, so flooring `from` to the current UTC
+    // day still includes anything airing today. Explicit ?from/?to overrides
+    // (e.g. a future "scroll back through the week" view).
+    let (from_ms, to_ms) = match (q.from, q.to) {
+        (Some(from), Some(to)) if to >= from => (from, to),
+        _ => {
+            let days_ahead = q.days.unwrap_or(CALENDAR_DEFAULT_DAYS_AHEAD).clamp(1, 365);
+            let day_start = now - now.rem_euclid(DAY_MS);
+            (day_start, day_start + days_ahead * DAY_MS)
+        }
+    };
+    let limit = q.limit.unwrap_or(200).clamp(1, 500);
+    let acc = access(&state, &user).await?;
+    let effective = restrict_access(acc, q.library_ids);
+    let episodes = queries::list_upcoming_episodes(
+        &state.pool,
+        user.id,
+        effective.as_deref(),
+        from_ms,
+        to_ms,
+        limit,
+        // Honor the per-user kid-safe toggle, authoritative from the stored
+        // preference — same as trending/browse.
+        user.kids_safe,
+    )
+    .await?;
+    Ok(Json(CalendarResponse { episodes }))
 }
 
 pub async fn get_one(

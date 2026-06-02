@@ -1,9 +1,10 @@
 //! Transcoder admin surface: capability report + preset CRUD.
 //!
-//! Capabilities are read from the static `AppState.transcoder_caps` populated
-//! at startup. Presets are persisted in SQLite and managed through this
-//! module's CRUD endpoints; the player picker reads them via the same
-//! endpoint to offer matching qualities.
+//! Capabilities are read from `AppState.transcoder_caps` (a refreshable
+//! `SharedCapabilities` holder) populated at startup and re-runnable at
+//! runtime via the re-probe endpoint. Presets are persisted in SQLite
+//! and managed through this module's CRUD endpoints; the player picker
+//! reads them via the same endpoint to offer matching qualities.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -47,7 +48,56 @@ pub async fn capabilities(
     _owner: OwnerAuth,
 ) -> Result<Json<CapabilitiesResponse>, ApiError> {
     Ok(Json(CapabilitiesResponse {
-        capabilities: (*state.transcoder_caps).clone(),
+        capabilities: (*state.transcoder_caps.load()).clone(),
+        cache_root: state.transcoder.cache_root().display().to_string(),
+    }))
+}
+
+/// Re-run hardware capability detection without a server restart.
+///
+/// The boot-time probe runs `ffmpeg -hwaccels`/`-encoders` + per-encoder
+/// and per-decoder one-frame smoke tests, then caches the result. After
+/// a driver upgrade or a GPU hot-add/-remove that cache is stale until a
+/// restart. This endpoint re-runs the *same* `detect_capabilities` used
+/// at boot and atomically swaps the fresh result into the shared
+/// `SharedCapabilities` holder, so subsequent GETs *and* live encoder
+/// selection (the manager shares the same handle) immediately see it.
+///
+/// Owner-only and audited. The probe shells out to ffmpeg up to a dozen
+/// times (bounded by the per-test SMOKE_TIMEOUT), so it can take a few
+/// seconds on a cold box; the swap itself is instantaneous.
+pub async fn reprobe_capabilities(
+    State(state): State<AppState>,
+    OwnerAuth(actor): OwnerAuth,
+    headers: HeaderMap,
+) -> Result<Json<CapabilitiesResponse>, ApiError> {
+    // Same detection routine used at boot, against the configured
+    // ffmpeg binary. `detect_capabilities` invokes ffmpeg directly
+    // (not the background-nice wrapper), so any scanner nice level on
+    // `state.ffmpeg` is irrelevant here — identical detection to boot.
+    let fresh = chimpflix_transcoder::detect_capabilities(&state.ffmpeg).await;
+    // Publish atomically. Both `AppState.transcoder_caps` and the
+    // transcode manager hold this same handle, so both observe the swap.
+    state.transcoder_caps.store(fresh.clone());
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "transcoder.capabilities.reprobe".to_string(),
+            target_kind: Some("transcoder".into()),
+            target_id: None,
+            payload_json: None,
+            ip: None,
+            user_agent,
+        },
+    )
+    .await;
+    Ok(Json(CapabilitiesResponse {
+        capabilities: fresh,
         cache_root: state.transcoder.cache_root().display().to_string(),
     }))
 }

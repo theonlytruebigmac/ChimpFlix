@@ -34,6 +34,92 @@ export function formatRelativeFuture(targetMs: number, nowMs: number): string {
   return formatDelta(delta, "future");
 }
 
+/// Relative *calendar-day* label for an air date — "Today" / "Tomorrow" /
+/// "Yesterday", a bare weekday inside the next week ("Saturday"), or a
+/// "Weekday, Mon D" form further out ("Saturday, Jun 6"). Used by the local
+/// calendar surfaces (the home "Coming up" rail + /calendar page).
+///
+/// Both arguments are epoch milliseconds. The day comparison is done in the
+/// caller's LOCAL timezone (the calendar groups by the browser's local day),
+/// so `targetMs` — which the backend stores at midnight UTC — is bucketed by
+/// the local date it falls on, same as the grouping logic. `nowMs` is passed
+/// explicitly for the same purity/consistency reasons as the formatters
+/// above (snapshot once at fetch time, thread through props).
+export function relativeDayLabel(targetMs: number, nowMs: number): string {
+  const dayDelta = localDayDelta(targetMs, nowMs);
+  if (dayDelta === 0) return "Today";
+  if (dayDelta === 1) return "Tomorrow";
+  if (dayDelta === -1) return "Yesterday";
+  const d = new Date(targetMs);
+  // Inside the next week, the weekday alone is unambiguous ("Saturday").
+  if (dayDelta > 1 && dayDelta < 7) {
+    return d.toLocaleDateString(undefined, { weekday: "long" });
+  }
+  // Otherwise (further out, or in the past) qualify with the date.
+  return d.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/// Relative air-date label for an *upcoming* episode, in the bucketed
+/// "Today / Tomorrow / In N days / Next week / In N weeks" phrasing Trakt
+/// uses on its upcoming-episode surfaces. Returns `null` when the episode
+/// has already aired (or airs today-or-earlier by less than a day) — callers
+/// fall back to their normal display (e.g. the runtime chip) in that case.
+///
+/// Buckets, by LOCAL calendar-day delta (so "Tomorrow" is correct across a
+/// midnight boundary regardless of the wall-clock time-of-day):
+///
+///   * 0 days   → "Today"
+///   * 1 day    → "Tomorrow"
+///   * 2-6      → "In N days"
+///   * 7-13     → "Next week"
+///   * 14-20    → "In 2 weeks"
+///   * 21-27    → "In 3 weeks"
+///   * 28+      → "In N weeks"  (floor(delta / 7))
+///
+/// Both args are epoch milliseconds; `nowMs` is threaded explicitly for the
+/// same purity/consistency reasons as the other helpers in this module.
+export function upcomingAirLabel(
+  targetMs: number,
+  nowMs: number,
+): string | null {
+  const dayDelta = localDayDelta(targetMs, nowMs);
+  if (dayDelta < 0) return null; // already aired
+  if (dayDelta === 0) return "Today";
+  if (dayDelta === 1) return "Tomorrow";
+  if (dayDelta < 7) return `In ${dayDelta} days`;
+  if (dayDelta < 14) return "Next week";
+  if (dayDelta < 21) return "In 2 weeks";
+  if (dayDelta < 28) return "In 3 weeks";
+  return `In ${Math.floor(dayDelta / 7)} weeks`;
+}
+
+/// Whole-day difference between two instants in the LOCAL timezone, i.e.
+/// `localMidnight(target) - localMidnight(now)` measured in days. Anchoring
+/// each instant to its local midnight before subtracting means DST shifts and
+/// the wall-clock time-of-day never bleed into the day count.
+function localDayDelta(targetMs: number, nowMs: number): number {
+  const t = new Date(targetMs);
+  const n = new Date(nowMs);
+  const tMid = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
+  const nMid = new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime();
+  return Math.round((tMid - nMid) / 86_400_000);
+}
+
+/// Local-day bucket key for grouping episodes by calendar day — a stable
+/// "YYYY-MM-DD" string in the browser's local timezone. Two instants on the
+/// same local day produce the same key regardless of time-of-day.
+export function localDayKey(targetMs: number): string {
+  const d = new Date(targetMs);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 /// Format a duration in milliseconds. Independent of nowMs.
 export function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`;

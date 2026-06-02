@@ -39,11 +39,14 @@ function csp(): string {
     "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com",
     "style-src 'self' 'unsafe-inline'",
     // Posters / backdrops served from same origin; trailer thumbnails
-    // come from i.ytimg.com. The metadata enrichment pipeline can also
-    // hit TVMaze (fallback show provider), TheTVDB (anime / fallback),
-    // and AniList (anime primary) — their image CDNs need to be in
-    // img-src or browsers block the poster/backdrop loads.
-    "img-src 'self' data: blob: https://i.ytimg.com https://image.tmdb.org https://static.tvmaze.com https://artworks.thetvdb.com https://s4.anilist.co",
+    // come from i.ytimg.com; metadata-CDN hosts (TMDB, TVMaze, TheTVDB,
+    // AniList) supply enrichment art. `https:` is included so user-set
+    // **avatar URLs** (Account → Profile accepts "a direct image URL")
+    // and any other external image load instead of being CSP-blocked —
+    // a deliberate relaxation for a self-hosted app where users supply
+    // their own URLs. (Note: some hosts like LinkedIn hotlink-protect and
+    // may still 403 regardless of CSP; a direct image host works best.)
+    "img-src 'self' data: blob: https:",
     "font-src 'self' data:",
     // Plex's CDN for show theme songs played on the title modal.
     // Same source the official Plex web app uses; first-party MP3.

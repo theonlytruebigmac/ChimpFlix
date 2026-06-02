@@ -22,10 +22,9 @@ export default async function AdminTasksPage({
     ? (sp.tab as string)
     : "overview";
 
-  const [overview, summary, settingsRes, activity, jobsSummary, jobsList] =
+  const [overview, settingsRes, activity, jobsSummary, jobsList] =
     await Promise.all([
       adminApi.tasks.overview(),
-      adminApi.tasks.summary(),
       adminApi.settings.get(),
       adminApi.tasks.activity(),
       adminApi.jobs
@@ -41,10 +40,13 @@ export default async function AdminTasksPage({
   return (
     <AdminTasksTabs
       initialTab={initialTab}
+      initialQueueCount={
+        jobsSummary.queued + jobsSummary.running + jobsSummary.failed + jobsSummary.dead
+      }
       overview={
         <AdminTasksOverviewClient
           initialOverview={overview}
-          initialSummary={summary}
+          initialJobsSummary={jobsSummary}
           initialSettings={settingsRes.settings}
           initialNowMs={initialNowMs}
         />
@@ -58,7 +60,6 @@ export default async function AdminTasksPage({
       activity={
         <AdminTasksActivityClient
           initialActivity={activity}
-          initialSummary={summary}
           initialNowMs={initialNowMs}
           initialKindConcurrency={settingsRes.settings.job_kind_concurrency}
         />

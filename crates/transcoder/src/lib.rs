@@ -24,7 +24,7 @@ pub fn safe_ffmpeg_input(path: &std::path::Path) -> String {
     format!("file:{}", path.display())
 }
 
-pub use capabilities::{TranscoderCapabilities, detect_capabilities};
+pub use capabilities::{SharedCapabilities, TranscoderCapabilities, detect_capabilities};
 pub use hwaccel::{EncoderPreset, HwAccel, VideoCodec};
 pub use probe::{
     Chapter, GopProbe, ProbeResult, ProbeStream, StreamKind, probe, probe_chapters, probe_gop,

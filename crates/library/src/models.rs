@@ -418,8 +418,13 @@ pub struct OptimizedVersion {
     pub output_path: String,
     pub output_size_bytes: Option<i64>,
     pub duration_ms: Option<i64>,
-    /// queued | running | success | failed
+    /// queued | running | success | failed | cancelled
     pub status: String,
+    /// Re-encode progress in tenths of a percent (0..=1000). `None`
+    /// while queued and on any row whose worker hasn't stamped a
+    /// measurement yet — the admin UI renders an indeterminate
+    /// "running" bar in that case and a determinate bar once present.
+    pub progress_permille: Option<i64>,
     pub error: Option<String>,
     pub created_at: i64,
     pub completed_at: Option<i64>,
@@ -438,6 +443,10 @@ impl OptimizedVersion {
                 .flatten(),
             duration_ms: row.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
             status: row.try_get("status")?,
+            progress_permille: row
+                .try_get::<Option<i64>, _>("progress_permille")
+                .ok()
+                .flatten(),
             error: row.try_get::<Option<String>, _>("error").ok().flatten(),
             created_at: row.try_get("created_at")?,
             completed_at: row.try_get::<Option<i64>, _>("completed_at").ok().flatten(),
@@ -482,6 +491,27 @@ pub struct Webhook {
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// At-a-glance summary of the most recent delivery attempt for this
+    /// webhook, so the admin list view can show a status pill without
+    /// expanding the per-hook delivery history. `None` when the hook has
+    /// never been delivered to. Only populated by `list_webhooks`; the
+    /// single-row `get_webhook` path leaves it `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_delivery: Option<WebhookLastDelivery>,
+}
+
+/// The latest `webhook_deliveries` row for a webhook, reduced to what the
+/// list-view status pill needs: HTTP status code (if the request reached
+/// the endpoint), whether it ultimately succeeded, and when it happened.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookLastDelivery {
+    /// HTTP status code from the last attempt, or `None` if the request
+    /// never produced a response (DNS/connect/timeout error).
+    pub status_code: Option<i64>,
+    /// True when the delivery was acknowledged (`delivered_at` set).
+    pub delivered: bool,
+    /// `created_at` of the latest delivery row (ms epoch).
+    pub created_at: i64,
 }
 
 impl Webhook {
@@ -527,6 +557,7 @@ impl Webhook {
             enabled: row.try_get::<i64, _>("enabled")? != 0,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            last_delivery: None,
         })
     }
 }
@@ -1005,6 +1036,27 @@ pub struct ItemFilter {
     /// codec. Requires a JOIN to media_streams.
     #[serde(default, deserialize_with = "deserialize_csv_strings")]
     pub codecs: Option<Vec<String>>,
+    /// Server-side only: set from the authenticated user's `kids_safe`
+    /// preference by the `/items` list handler. NEVER deserialized from the
+    /// query string (`#[serde(skip)]`) so a client can't toggle the filter
+    /// by hand — the filter is authoritative and lives behind the user's
+    /// stored preference. When true, [`crate::queries::list_items`] hides
+    /// titles whose `rating_age` is an explicit non-kid-safe rating (see
+    /// [`KIDS_SAFE_CERTS`]); unrated / NULL titles are SHOWN (fail open), so
+    /// the filter is a no-op until ratings are populated.
+    /// Default false ⇒ no clause added ⇒ the query is byte-for-byte unchanged.
+    #[serde(skip)]
+    pub kids_safe: bool,
+    /// Existence/count probe. Wire-readable (`?count_only=true`) and used by the
+    /// home page's "is the server scanned at all?" check. When true,
+    /// [`crate::queries::list_items`] still computes `total` but returns ZERO
+    /// items. Because it never returns a single row, it can never leak a
+    /// non-kid-safe title to a viewer even when the `/items` handler pairs it
+    /// with a kids_safe bypass (see the handler) — the only thing it exposes is
+    /// an unfiltered content count, which is not content. Default false ⇒
+    /// normal behavior, items returned as before.
+    #[serde(default)]
+    pub count_only: bool,
 }
 
 /// Serde deserializer for `?key=1,2,3` query-string fields. Empty string
@@ -1280,6 +1332,16 @@ pub struct Episode {
     pub air_date: Option<i64>,
     pub duration_ms: Option<i64>,
     pub thumb_path: Option<String>,
+    /// True when this episode has at least one live (non-removed)
+    /// `media_files` row — i.e. it is downloaded and playable. False marks
+    /// a PLACEHOLDER episode: a row the metadata agent materialized for an
+    /// in-progress / future season so the season is complete (correct
+    /// finale flag, calendar coverage) but which has no file behind it.
+    /// Lets `SeasonEpisodes` / the calendar render a placeholder
+    /// distinctly (show poster, no play affordance) without inferring it
+    /// from an empty `files` array. Computed in `from_row`; serialized as
+    /// `has_file`. Frontend treats an absent flag as true (downloaded).
+    pub has_file: bool,
     pub added_at: i64,
     pub updated_at: i64,
 }
@@ -1513,6 +1575,164 @@ impl UserRole {
     }
 }
 
+/// A user's effective access to a single library — the tri-state grant
+/// model introduced in phase 107.
+///
+///   * `None` — no grant: the library + its items are HIDDEN. There is no
+///     stored 'none' level; it's the *absence* of any grant row.
+///   * `View` — can browse/see the library + item metadata, but CANNOT
+///     start playback (direct play, transcode, HLS).
+///   * `Full` — can browse AND play (the prior binary "allowed" behaviour;
+///     also the level every pre-phase-107 grant migrates to).
+///
+/// `Ord` is derived so `None < View < Full` — the resolver picks the
+/// HIGHEST level across a user's direct + group-derived grants by taking
+/// the max. Owners always implicitly resolve to `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLevel {
+    None,
+    View,
+    Full,
+}
+
+impl AccessLevel {
+    /// Wire/DB string. NOTE: `None` has no stored representation — it's the
+    /// absence of a grant row — so this is only meaningful for `View`/`Full`
+    /// when persisting a grant.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::View => "view",
+            Self::Full => "full",
+        }
+    }
+
+    /// Parse a stored grant level. Unknown / NULL values fail SAFE to
+    /// `None` so a malformed row can never silently grant access. The DB
+    /// `CHECK` constraint only admits 'view' / 'full', so this is belt-and-
+    /// suspenders for a row written before the constraint or by a future
+    /// level we don't yet understand.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "full" => Self::Full,
+            "view" => Self::View,
+            _ => Self::None,
+        }
+    }
+
+    /// True when the level permits starting playback (the THE-key gate).
+    pub fn can_play(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// True when the level permits browsing/seeing the library + items.
+    pub fn can_browse(&self) -> bool {
+        matches!(self, Self::View | Self::Full)
+    }
+}
+
+impl Default for AccessLevel {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// One entry in the home-rail catalogue: a stable id plus a human label.
+/// The id is the wire/storage key used in `users.home_rails_json`; the
+/// label is what the customization UI shows.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct HomeRailCatalogueEntry {
+    pub rail_id: &'static str,
+    pub label: &'static str,
+}
+
+/// The stable catalogue of home-page rails that exist today, in their
+/// default top-to-bottom order. Derived from the rails actually assembled
+/// in `web/src/app/page.tsx` (one entry per logical rail; the multi-rail
+/// blocks — per-library "New in …", per-genre, Trakt lists — collapse to a
+/// single toggleable group id because they're generated dynamically).
+///
+/// `users.home_rails_json` is a SPARSE overlay over this list: any rail id
+/// absent from the user's config keeps its default position + enabled
+/// state, so the default experience is preserved unless the user opts in.
+/// The frontend (Feature 3) is the source of truth for merging the overlay;
+/// this constant exists so backend validation + the prefs API can advertise
+/// the canonical id set.
+pub const HOME_RAIL_CATALOGUE: &[HomeRailCatalogueEntry] = &[
+    HomeRailCatalogueEntry { rail_id: "continue_watching", label: "Continue Watching" },
+    HomeRailCatalogueEntry { rail_id: "recently_added", label: "Recently Added" },
+    HomeRailCatalogueEntry { rail_id: "coming_soon", label: "Coming Soon" },
+    HomeRailCatalogueEntry { rail_id: "season_premieres", label: "New Seasons" },
+    HomeRailCatalogueEntry { rail_id: "calendar", label: "Coming Up · Calendar" },
+    HomeRailCatalogueEntry { rail_id: "upcoming_movies", label: "Upcoming Movies" },
+    HomeRailCatalogueEntry { rail_id: "trakt_recs_movies", label: "Recommended for You · Movies" },
+    HomeRailCatalogueEntry { rail_id: "trakt_recs_shows", label: "Recommended for You · Shows" },
+    HomeRailCatalogueEntry { rail_id: "trakt_favorites", label: "Your Trakt Favorites" },
+    HomeRailCatalogueEntry { rail_id: "trakt_lists", label: "Your Trakt Lists" },
+    HomeRailCatalogueEntry { rail_id: "top10_movies", label: "Top 10 Movies This Week" },
+    HomeRailCatalogueEntry { rail_id: "top10_shows", label: "Top 10 Shows This Week" },
+    HomeRailCatalogueEntry { rail_id: "collections", label: "Collections" },
+    HomeRailCatalogueEntry { rail_id: "library_sections", label: "New in Your Libraries" },
+    HomeRailCatalogueEntry { rail_id: "movie_genres", label: "Movie Genre Rails" },
+    HomeRailCatalogueEntry { rail_id: "show_genres", label: "Show Genre Rails" },
+];
+
+/// Returns true if `rail_id` is a known entry in `HOME_RAIL_CATALOGUE`.
+/// Used by /auth/me to reject unknown rail ids in a `home_rails_json` patch.
+pub fn is_known_home_rail(rail_id: &str) -> bool {
+    HOME_RAIL_CATALOGUE.iter().any(|e| e.rail_id == rail_id)
+}
+
+/// Certification values (`items.rating_age`) considered explicitly kid-safe by
+/// the `kids_safe` per-user toggle. Matched case-insensitively after trimming.
+///
+/// FAIL-OPEN semantics (changed from the original fail-closed design): unrated
+/// content (NULL / empty `rating_age`) is SHOWN, not hidden — see
+/// [`cert_is_kids_safe`]. This set is therefore only consulted to decide
+/// whether an *explicitly-rated* title passes; an explicit rating NOT in this
+/// set is the only thing the filter hides. Rationale: `rating_age` is sparsely
+/// populated (manual edits / a handful of agents), so a fail-closed allow-set
+/// would hide an entire library the moment a viewer flips kids_safe on. With
+/// fail-open, kids_safe is a no-op until ratings exist, then it hides only the
+/// titles a curator has explicitly marked mature. Populate `rating_age` across
+/// the library for full coverage.
+///
+/// Allow-set is deliberately limited to UNAMBIGUOUS kid-safe labels. Bare
+/// single-digit numeric tokens (`0`/`6`/`7`/`9`) were removed because they
+/// collide across rating systems (FSK 0/6, Kijkwijzer 6/9, etc.) and would
+/// over-match values from other rating schemes; the suffixed `6+`/`7+`/`9+`
+/// forms are unambiguous and kept.
+pub const KIDS_SAFE_CERTS: &[&str] = &[
+    // US film
+    "G", "PG",
+    // US TV
+    "TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G", "TV-PG",
+    // unambiguous international kid ratings
+    "U", "UC", "AL", "6+", "7+", "9+",
+];
+
+/// Returns true if `cert` (a raw `items.rating_age` value) is permitted under
+/// the `kids_safe` filter.
+///
+/// FAIL-OPEN: `None` / empty are permitted (shown) — unrated content is not
+/// hidden. Only an explicit, non-empty rating that is NOT in [`KIDS_SAFE_CERTS`]
+/// is rejected. This mirrors [`crate::queries::kids_safe_clause`] exactly.
+pub fn cert_is_kids_safe(cert: Option<&str>) -> bool {
+    match cert {
+        // Unrated / NULL → allowed (fail open).
+        None => true,
+        Some(c) => {
+            let c = c.trim();
+            // Empty after trim → allowed (fail open).
+            c.is_empty()
+                || KIDS_SAFE_CERTS
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(c))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
     pub id: i64,
@@ -1541,6 +1761,35 @@ pub struct User {
     /// object = all defaults. Security kinds (`user.2fa.*`) ignore this
     /// and always notify. Parsed lazily by the notifier.
     pub notification_prefs_json: String,
+    /// Personal Discord webhook URL. `None` = not configured (no Discord
+    /// delivery). When set, notifications that reach the user are mirrored
+    /// to this webhook as an embed (treated like the email channel for
+    /// per-kind prefs + quiet hours). Validated at /auth/me.
+    pub discord_webhook_url: Option<String>,
+    /// IANA timezone name (e.g. `America/New_York`). Defaults to `UTC`.
+    /// Used by the notifier to interpret the user's quiet-hours window in
+    /// their local wall-clock time. An unparseable value falls back to UTC
+    /// at read time. Tolerant read so pre-phase-104 rows load as `UTC`.
+    pub timezone: String,
+    /// Per-user home-page rail layout overlay, a JSON array of
+    /// `{"rail_id": "<id>", "enabled": <bool>}` entries. Sparse/overlay
+    /// semantics: any rail absent from the array keeps its default position
+    /// + enabled state, so `"[]"` = stock home. The array order is the
+    /// user's desired rail order; the frontend merges it over the default
+    /// catalogue (`HOME_RAIL_CATALOGUE`). Validated as parseable JSON at
+    /// /auth/me. Tolerant read so pre-phase-106 rows load as `"[]"`.
+    pub home_rails_json: String,
+    /// When true, additionally suppress fully-watched titles from the
+    /// Continue Watching rail (on-deck already excludes watched + >=90%).
+    /// Default false. Tolerant read so pre-phase-106 rows load as false.
+    pub hide_watched_cw: bool,
+    /// When true, hide titles from home + main browse whose certification
+    /// (`items.rating_age`) is an explicit non-kid-safe rating (see
+    /// `KIDS_SAFE_CERTS`). FAIL-OPEN: unrated / NULL-rated titles are SHOWN, so
+    /// the filter is a no-op until `rating_age` is populated, then it hides only
+    /// explicitly-mature titles. Default false. Tolerant read so pre-phase-106
+    /// rows load as false.
+    pub kids_safe: bool,
     /// Most-recent successful login. `None` if the user has never
     /// logged in (e.g. just-registered).
     pub last_login_at: Option<i64>,
@@ -1549,6 +1798,12 @@ pub struct User {
     /// post-login screen as a cheap anomaly check.
     pub previous_login_at: Option<i64>,
     pub previous_login_ip: Option<String>,
+    /// When true the account is disabled — the login handler rejects it
+    /// (after the password check, to avoid pre-credential enumeration).
+    /// Owners are never lockable; the admin lock route + login gate both
+    /// guard against locking / blocking an owner. Tolerant read so
+    /// pre-phase-100 rows load as active.
+    pub locked: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1606,6 +1861,28 @@ impl User {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "{}".to_string()),
+            discord_webhook_url: row
+                .try_get::<Option<String>, _>("discord_webhook_url")
+                .ok()
+                .flatten(),
+            timezone: row
+                .try_get::<String, _>("timezone")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "UTC".to_string()),
+            home_rails_json: row
+                .try_get::<String, _>("home_rails_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "[]".to_string()),
+            hide_watched_cw: row
+                .try_get::<i64, _>("hide_watched_cw")
+                .map(|v| v != 0)
+                .unwrap_or(false),
+            kids_safe: row
+                .try_get::<i64, _>("kids_safe")
+                .map(|v| v != 0)
+                .unwrap_or(false),
             last_login_at: row
                 .try_get::<Option<i64>, _>("last_login_at")
                 .ok()
@@ -1622,6 +1899,10 @@ impl User {
                 .try_get::<Option<String>, _>("previous_login_ip")
                 .ok()
                 .flatten(),
+            locked: row
+                .try_get::<i64, _>("locked")
+                .map(|v| v != 0)
+                .unwrap_or(false),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -1646,6 +1927,15 @@ pub struct AccessGroup {
     pub library_count: i64,
 }
 
+/// One library bound to an access group, with the level the group grants.
+/// Phase 107: groups grant a per-library level (`view`/`full`) rather than
+/// a bare membership.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupLibraryGrant {
+    pub library_id: i64,
+    pub level: AccessLevel,
+}
+
 /// Eager-loaded variant with the joined member + library lists.
 /// Used by the group editor.
 #[derive(Debug, Clone, Serialize)]
@@ -1653,7 +1943,11 @@ pub struct AccessGroupDetail {
     #[serde(flatten)]
     pub group: AccessGroup,
     pub member_ids: Vec<i64>,
+    /// Bare library ids this group grants (any level). Kept for any caller
+    /// that only cares about membership; `library_grants` carries the level.
     pub library_ids: Vec<i64>,
+    /// Per-library grant level for the group (phase 107).
+    pub library_grants: Vec<GroupLibraryGrant>,
 }
 
 impl AccessGroup {
@@ -1883,6 +2177,12 @@ pub struct ServerSettings {
     /// One of: "required" | "preferred" | "disabled".
     pub secure_connections: String,
     pub telemetry_opt_in: bool,
+    /// Master switch for open self-registration. When true (the
+    /// default), `/auth/register` provisions an account even with no
+    /// invite code. When false the server is invite-only: a codeless
+    /// self-signup is rejected, but invite-bearing registration still
+    /// works.
+    pub allow_signups: bool,
     /// True once the operator has finished (or explicitly skipped)
     /// the first-run onboarding wizard at `/onboarding`. The login
     /// flow auto-redirects owners to the wizard when this is false;
@@ -1940,6 +2240,22 @@ pub struct ServerSettings {
     /// linear. Default `hable` is the previously hard-coded value
     /// and a reasonable middle ground.
     pub transcoder_hdr_tonemap_algo: String,
+    // ---- Subtitle burn-in + loudnorm toggles (phase 102) ---------------
+    /// Master gate for burning text subtitles (SRT / ASS / SSA /
+    /// mov_text) into the video via the `subtitles=` filter. When
+    /// false (default), a selected text subtitle takes the WebVTT
+    /// sidecar path (player overlays it client-side) instead of being
+    /// baked into the pixels. Picture-format subs (PGS / VobSub / DVB)
+    /// always overlay regardless of this flag because browsers can't
+    /// render bitmaps as a separate text track.
+    pub transcoder_burn_ass_subtitles: bool,
+    /// When true, EBU R 128 volume leveling uses the precise per-file
+    /// measurements stamped by the `analyze_loudness` task (loudnorm
+    /// `linear=true`, measure-then-apply) instead of the single-pass
+    /// streaming-window estimate. Only consulted when normalization is
+    /// engaged. Default false keeps the cheap single-pass path that
+    /// needs no analysis run.
+    pub transcoder_two_pass_loudnorm: bool,
     // ---- SMTP / email (phase 21) ---------------------------------------
     /// SMTP server hostname (e.g. "smtp.example.com"). When None, the
     /// Mailer treats email as disabled and feature code calling
@@ -2143,6 +2459,14 @@ pub struct ServerSettings {
     /// fill the partition over time). See BLOCK #4 in
     /// `docs/PUBLIC_RELEASE_HARDENING.md`.
     pub backup_retention_count: i64,
+    /// Persisted result of the most recent network reachability check, as
+    /// a JSON object, or None when no check has ever run. Written by the
+    /// `/admin/network/test-reachability` endpoint each time it runs so the
+    /// Network admin page can render a standing "Reachable · checked Xm
+    /// ago" banner across reloads. Shape (owned by the server):
+    /// `{ ok, public_url, status_code, latency_ms, error, checked_at }`.
+    /// The DB / this struct treat it as opaque text.
+    pub network_last_reachability: Option<String>,
     /// JSON-encoded escape-hatch storage for fields added by later phases
     /// without their own migration.
     pub extras_json: String,
@@ -2161,6 +2485,14 @@ impl ServerSettings {
             cors_origins: row.try_get("cors_origins")?,
             secure_connections: row.try_get("secure_connections")?,
             telemetry_opt_in: row.try_get::<i64, _>("telemetry_opt_in")? != 0,
+            allow_signups: row
+                .try_get::<Option<i64>, _>("allow_signups")
+                .ok()
+                .flatten()
+                // Tolerant of pre-migration rows: defaults to open
+                // registration, matching the column's DEFAULT 1.
+                .unwrap_or(1)
+                != 0,
             setup_completed: row
                 .try_get::<i64, _>("setup_completed")
                 .map(|v| v != 0)
@@ -2207,6 +2539,24 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "hable".to_string()),
+            transcoder_burn_ass_subtitles: row
+                .try_get::<Option<i64>, _>("transcoder_burn_ass_subtitles")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0,
+            // Defaults ON: pre-migration, two-pass loudnorm was used
+            // automatically whenever per-file measurements existed and
+            // normalization was engaged. Defaulting the gate ON preserves
+            // that behavior on upgrade (fresh installs have no measurements,
+            // so this still falls back to single-pass); the toggle lets an
+            // operator turn two-pass OFF.
+            transcoder_two_pass_loudnorm: row
+                .try_get::<Option<i64>, _>("transcoder_two_pass_loudnorm")
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+                != 0,
             email_smtp_host: row
                 .try_get::<Option<String>, _>("email_smtp_host")
                 .ok()
@@ -2423,6 +2773,12 @@ impl ServerSettings {
                 .ok()
                 .flatten()
                 .unwrap_or(14),
+            // Tolerant of pre-migration rows: a missing column reads as
+            // None ("no check has run yet") rather than failing the row.
+            network_last_reachability: row
+                .try_get::<Option<String>, _>("network_last_reachability")
+                .ok()
+                .flatten(),
             extras_json: row.try_get("extras_json")?,
             updated_at: row.try_get("updated_at")?,
             updated_by: row.try_get::<Option<i64>, _>("updated_by").ok().flatten(),
@@ -2449,6 +2805,8 @@ pub struct ServerSettingsUpdate {
     pub secure_connections: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_opt_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_signups: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_completed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2477,6 +2835,10 @@ pub struct ServerSettingsUpdate {
     pub transcoder_hdr_tonemap_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoder_hdr_tonemap_algo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_burn_ass_subtitles: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcoder_two_pass_loudnorm: Option<bool>,
     // Email / SMTP — every nullable field uses double-Option so the admin
     // UI can both clear and unset values without ambiguity.
     #[serde(

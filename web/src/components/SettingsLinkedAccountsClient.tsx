@@ -4,11 +4,11 @@ import { useEffect, useState } from "react";
 import { plex, type PlexLinkSummary } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PlexSignInButton } from "./PlexSignInButton";
-import { SettingsFeedback } from "./ui/SettingsFeedback";
 import { formatDate } from "@/lib/format";
 
-/// Per-user "Linked accounts" card. Today this is Plex-only; when we
-/// add Google OAuth the same surface will list both providers.
+/// Per-user "Linked accounts" surface. Today this is Plex-only; when we
+/// add Google OAuth the same surface will list both providers. Rendered
+/// as a console setting-row to match the redesign mockup.
 export function SettingsLinkedAccountsClient() {
   const [links, setLinks] = useState<PlexLinkSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -54,44 +54,41 @@ export function SettingsLinkedAccountsClient() {
   }
 
   return (
-    <div className="space-y-3 text-sm">
-      <div>
-        <div className="flex items-baseline justify-between gap-3">
-          <div>
-            <div className="text-white">Plex.tv</div>
-            {plexLink ? (
-              <div className="mt-0.5 text-xs text-white/55">
-                Linked to{" "}
-                <span className="text-white">
-                  {plexLink.external_username ?? "your Plex account"}
-                </span>
-                {plexLink.external_email && (
-                  <span className="text-white/40">
-                    {" "}
-                    ({plexLink.external_email})
-                  </span>
-                )}
-                {" · "}since {formatDate(plexLink.linked_at)}
-              </div>
-            ) : (
-              <div className="mt-0.5 text-xs text-white/55">
-                Sign in with your Plex account instead of a password.
-              </div>
+    <div>
+      <div className="cf-row" style={{ paddingTop: 0 }}>
+        <div className="cf-row-main">
+          <div className="cf-row-label">
+            <span style={{ color: "#e5a00d", fontWeight: 800 }}>Plex</span>.tv
+            {plexLink && (
+              <span className="cf-pill cf-ok" style={{ marginLeft: 6 }}>
+                <span className="cf-dot" />
+                Connected
+              </span>
             )}
           </div>
-          {plexLink && (
+          {plexLink ? (
+            <div className="cf-row-help">
+              Linked {formatDate(plexLink.linked_at)} as{" "}
+              <b>{plexLink.external_username ?? "your Plex account"}</b>
+              {plexLink.external_email ? ` · ${plexLink.external_email}` : ""}
+            </div>
+          ) : (
+            <div className="cf-row-help">
+              Sign in with your Plex account instead of a password.
+            </div>
+          )}
+        </div>
+        <div className="cf-row-control">
+          {plexLink ? (
             <button
               type="button"
               onClick={() => setAskUnlink(true)}
               disabled={busy}
-              className="rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50"
+              className="cf-btn cf-danger cf-sm"
             >
               {busy ? "Unlinking…" : "Unlink"}
             </button>
-          )}
-        </div>
-        {!plexLink && (
-          <div className="mt-3">
+          ) : (
             <PlexSignInButton
               intent={{ intent: "link" }}
               onLinked={async () => {
@@ -100,11 +97,27 @@ export function SettingsLinkedAccountsClient() {
               }}
               onError={(msg) => setError(msg)}
             />
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
-      <SettingsFeedback variant="block" message={notice} error={error} />
+      {notice && (
+        <div className="cf-banner cf-ok" style={{ marginTop: 14, marginBottom: 0 }}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+          <div>{notice}</div>
+        </div>
+      )}
+      {error && (
+        <div className="cf-banner cf-err" style={{ marginTop: 14, marginBottom: 0 }}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
       {askUnlink && (
         <ConfirmDialog
           title="Unlink Plex?"

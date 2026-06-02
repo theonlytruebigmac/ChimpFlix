@@ -3,6 +3,7 @@
 import Link from "next/link";
 import type { MediaItem } from "@/lib/chimpflix-types";
 import { Card } from "./Card";
+import { RailScroller } from "./RailScroller";
 
 /// Netflix-style "Top 10" rail: each entry is a portrait poster with a
 /// giant outlined rank glyph sitting behind it. The number uses CSS
@@ -59,7 +60,7 @@ export function Top10Rail({
           Top 10
         </span>
       </h2>
-      <ul className="-mx-1 flex snap-x snap-mandatory gap-1.5 overflow-x-auto px-1 pb-12 pt-2 scrollbar-none md:snap-none [&::-webkit-scrollbar]:hidden">
+      <RailScroller className="-mx-1 flex snap-x snap-mandatory touch-pan-x gap-1.5 overflow-x-auto overscroll-x-contain px-1 pb-12 pt-2 scrollbar-none md:snap-none [&::-webkit-scrollbar]:hidden">
         {items.map(({ rank, item }) => (
           <li
             key={item.ratingKey}
@@ -68,7 +69,7 @@ export function Top10Rail({
             <Top10Entry rank={rank} item={item} />
           </li>
         ))}
-      </ul>
+      </RailScroller>
     </section>
   );
 }

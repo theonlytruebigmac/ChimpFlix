@@ -6,10 +6,10 @@ import {
   ChimpFlixApiError,
   type AccessGroup,
   type AccessGroupDetail,
+  type AccessLevel,
   type Library,
   type User,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
@@ -30,6 +30,7 @@ export function AdminAccessGroupsClient({
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
+  const [showNew, setShowNew] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [askDelete, setAskDelete] = useState<{ id: number; name: string } | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -65,6 +66,7 @@ export function AdminAccessGroupsClient({
     try {
       const group = await adminApi.accessGroups.create({ name });
       setNewName("");
+      setShowNew(false);
       await refreshList();
       void loadDetail(group.id);
     } catch (e) {
@@ -97,92 +99,137 @@ export function AdminAccessGroupsClient({
   }
 
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[18rem_1fr]">
-      <aside className="space-y-3">
-        <div className="space-y-2 rounded-lg border border-white/10 bg-white/2 p-3">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-white/55">
-            New group
-          </h3>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="e.g. Family"
-              maxLength={64}
-              className="flex-1 rounded bg-white/10 px-2 py-1.5 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-            />
-            <button
-              type="button"
-              onClick={create}
-              disabled={creating || !newName.trim()}
-              className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
-            >
-              {creating ? "…" : "Add"}
-            </button>
-          </div>
+    <div>
+      <div
+        className="cf-flex cf-between cf-wrap cf-gap12"
+        style={{ marginBottom: 14 }}
+      >
+        <div className="cf-muted" style={{ fontSize: 13 }}>
+          Apply access to several users at once.
         </div>
+        <button
+          type="button"
+          className="cf-btn cf-primary cf-sm"
+          onClick={() => setShowNew((v) => !v)}
+        >
+          New group
+        </button>
+      </div>
 
-        <ErrorBanner error={error} />
-
-        <ul className="divide-y divide-white/5 overflow-hidden rounded-lg border border-white/10 bg-white/2">
-          {groups.length === 0 && (
-            <li className="px-3 py-4 text-center text-xs text-white/45">
-              No groups yet.
-            </li>
-          )}
-          {groups.map((g) => {
-            const active = activeId === g.id;
-            return (
-              <li key={g.id}>
+      {showNew && (
+        <div className="cf-card">
+          <div className="cf-card-body cf-pad">
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Group name</label>
+              <div className="cf-flex cf-gap8">
+                <input
+                  type="text"
+                  className="cf-input"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  placeholder="e.g. Family"
+                  maxLength={64}
+                />
                 <button
                   type="button"
-                  onClick={() => loadDetail(g.id)}
-                  className={`block w-full px-3 py-2 text-left transition-colors ${
-                    active ? "bg-white/10" : "hover:bg-white/5"
-                  }`}
+                  className="cf-btn cf-primary cf-sm"
+                  onClick={create}
+                  disabled={creating || !newName.trim()}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className={`text-sm ${active ? "text-white" : "text-white/85"}`}>
-                      {g.name}
-                    </span>
-                    <span className="text-[10px] uppercase tracking-wider text-white/40">
-                      {g.member_count} · {g.library_count} libs
-                    </span>
-                  </div>
-                  {g.description && (
-                    <div className="mt-0.5 truncate text-[11px] text-white/45">
-                      {g.description}
-                    </div>
-                  )}
+                  {creating ? "…" : "Create"}
                 </button>
-              </li>
-            );
-          })}
-        </ul>
-      </aside>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-5">
-        {!activeId && (
-          <p className="text-sm text-white/55">
-            Select a group on the left, or create a new one to get started.
-          </p>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
+
+      <div className="cf-card" style={{ marginBottom: 0 }}>
+        {groups.length === 0 ? (
+          <div
+            className="cf-card-body cf-pad cf-center cf-muted"
+            style={{ fontSize: 13 }}
+          >
+            No groups yet. Create one above.
+          </div>
+        ) : (
+          <table className="cf-table">
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Members</th>
+                <th>Libraries</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map((g) => (
+                <tr key={g.id}>
+                  <td>
+                    <b>{g.name}</b>
+                    {g.description && (
+                      <div className="cf-faint" style={{ fontSize: 11.5, marginTop: 2 }}>
+                        {g.description}
+                      </div>
+                    )}
+                  </td>
+                  <td className="cf-muted">
+                    {g.member_count} member{g.member_count === 1 ? "" : "s"}
+                  </td>
+                  <td className="cf-muted">
+                    {g.library_count} librar{g.library_count === 1 ? "y" : "ies"}
+                  </td>
+                  <td className="cf-num">
+                    <button
+                      type="button"
+                      className="cf-btn cf-ghost cf-tiny"
+                      onClick={() => loadDetail(g.id)}
+                    >
+                      Edit
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
-        {activeId && loadingDetail && <LoadingPlaceholder />}
-        {detail && (
-          <GroupEditor
-            detail={detail}
-            users={users}
-            libraries={libraries}
-            onChanged={async () => {
-              await refreshList();
-              await loadDetail(detail.id);
-            }}
-            onDeleted={() => deleteGroup(detail.id, detail.name)}
-            onError={(e) => setError(e)}
-          />
-        )}
-      </section>
+      </div>
+
+      {activeId && (
+        <div className="cf-card" style={{ marginTop: 18, marginBottom: 0 }}>
+          <div className="cf-card-body cf-pad">
+            {loadingDetail && <LoadingPlaceholder />}
+            {detail && (
+              <GroupEditor
+                detail={detail}
+                users={users}
+                libraries={libraries}
+                onClose={() => {
+                  setActiveId(null);
+                  setDetail(null);
+                }}
+                onChanged={async () => {
+                  await refreshList();
+                  await loadDetail(detail.id);
+                }}
+                onDeleted={() => deleteGroup(detail.id, detail.name)}
+                onError={(e) => setError(e)}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
       {askDelete && (
         <ConfirmDialog
           title={`Delete group "${askDelete.name}"?`}
@@ -202,6 +249,7 @@ function GroupEditor({
   detail,
   users,
   libraries,
+  onClose,
   onChanged,
   onDeleted,
   onError,
@@ -209,13 +257,17 @@ function GroupEditor({
   detail: AccessGroupDetail;
   users: User[];
   libraries: Library[];
+  onClose: () => void;
   onChanged: () => Promise<void> | void;
   onDeleted: () => void;
   onError: (msg: string) => void;
 }) {
   const [name, setName] = useState(detail.name);
   const [description, setDescription] = useState(detail.description ?? "");
-  const [libs, setLibs] = useState<Set<number>>(new Set(detail.library_ids));
+  // Per-library level map. Libraries absent from the map are unbound ("none").
+  const [libLevels, setLibLevels] = useState<Map<number, AccessLevel>>(
+    () => initialLibLevels(detail),
+  );
   const [members, setMembers] = useState<Set<number>>(new Set(detail.member_ids));
   const [savingMeta, setSavingMeta] = useState(false);
   const [savingLibs, setSavingLibs] = useState(false);
@@ -224,8 +276,9 @@ function GroupEditor({
 
   const metaDirty =
     name !== detail.name || (description || null) !== (detail.description ?? null);
-  const libsDirty = !setsEqual(libs, new Set(detail.library_ids));
+  const libsDirty = !levelMapsEqual(libLevels, initialLibLevels(detail));
   const membersDirty = !setsEqual(members, new Set(detail.member_ids));
+  const boundCount = Array.from(libLevels.values()).filter((v) => v !== "none").length;
 
   async function saveMeta() {
     setSavingMeta(true);
@@ -248,7 +301,11 @@ function GroupEditor({
     setSavingLibs(true);
     setNotice(null);
     try {
-      await adminApi.accessGroups.setLibraries(detail.id, Array.from(libs));
+      const grants = Array.from(libLevels, ([library_id, level]) => ({
+        library_id,
+        level,
+      })).filter((g) => g.level !== "none");
+      await adminApi.accessGroups.setLibraries(detail.id, grants);
       await onChanged();
       setNotice("Libraries updated.");
     } catch (e) {
@@ -272,11 +329,15 @@ function GroupEditor({
     }
   }
 
-  function toggleLib(id: number) {
-    setLibs((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+  // Cycle a library's level: none → view → full → none.
+  function cycleLib(id: number) {
+    setLibLevels((prev) => {
+      const next = new Map(prev);
+      const cur = next.get(id) ?? "none";
+      const order: AccessLevel[] = ["none", "view", "full"];
+      const nextLevel = order[(order.indexOf(cur) + 1) % order.length];
+      if (nextLevel === "none") next.delete(id);
+      else next.set(id, nextLevel);
       return next;
     });
   }
@@ -290,152 +351,189 @@ function GroupEditor({
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-3">
-        <h2 className="text-lg font-semibold">{detail.name}</h2>
-        <button
-          type="button"
-          onClick={onDeleted}
-          className="rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/20"
-        >
-          Delete group
-        </button>
+    <div>
+      <div className="cf-flex cf-between" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 16, fontWeight: 700 }}>{detail.name}</div>
+        <div className="cf-flex cf-gap8">
+          <button type="button" className="cf-btn cf-ghost cf-sm" onClick={onClose}>
+            Close
+          </button>
+          <button type="button" className="cf-btn cf-danger cf-sm" onClick={onDeleted}>
+            Delete group
+          </button>
+        </div>
       </div>
+
       {notice && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200"
-        >
-          {notice}
+        <div role="status" aria-live="polite" className="cf-banner cf-ok">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+          <div>{notice}</div>
         </div>
       )}
 
       {/* Name + description */}
-      <section className="space-y-3">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-white/55">
-          Details
-        </h3>
-        <div className="grid gap-3 md:grid-cols-2">
-          <label className="block text-xs">
-            <span className="mb-1 block text-white/70">Name</span>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={64}
-              className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-            />
-          </label>
-          <label className="block text-xs">
-            <span className="mb-1 block text-white/70">
-              Description <span className="text-white/40">(optional)</span>
-            </span>
-            <input
-              type="text"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="e.g. Movies + TV for the family"
-              maxLength={280}
-              className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-            />
-          </label>
+      <div className="cf-section-title">Details</div>
+      <div className="cf-grid cf-c2">
+        <div className="cf-field" style={{ marginBottom: 0 }}>
+          <label className="cf-field-label">Name</label>
+          <input
+            type="text"
+            className="cf-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={64}
+          />
         </div>
+        <div className="cf-field" style={{ marginBottom: 0 }}>
+          <label className="cf-field-label">
+            Description <span className="cf-faint">(optional)</span>
+          </label>
+          <input
+            type="text"
+            className="cf-input"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="e.g. Movies + TV for the family"
+            maxLength={280}
+          />
+        </div>
+      </div>
+      <div style={{ marginTop: 12 }}>
         <button
           type="button"
+          className="cf-btn cf-primary cf-sm"
           onClick={saveMeta}
           disabled={!metaDirty || savingMeta}
-          className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingMeta ? "…" : "Save details"}
         </button>
-      </section>
+      </div>
 
       {/* Libraries */}
-      <section className="space-y-3">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-white/55">
-          Libraries ({libs.size})
-        </h3>
-        {libraries.length === 0 ? (
-          <p className="text-xs text-white/45">No libraries to bind yet.</p>
-        ) : (
-          <div className="flex flex-wrap gap-2">
-            {libraries.map((l) => {
-              const active = libs.has(l.id);
-              return (
-                <button
-                  key={l.id}
-                  type="button"
-                  onClick={() => toggleLib(l.id)}
-                  className={
-                    "rounded-full border px-3 py-1 text-xs transition-colors " +
-                    (active
-                      ? "border-accent bg-accent/20 text-white"
-                      : "border-white/15 text-white/70 hover:border-white/30")
-                  }
-                >
-                  {l.name}
-                </button>
-              );
-            })}
-          </div>
-        )}
+      <div className="cf-section-title">Libraries ({boundCount})</div>
+      <p className="cf-faint" style={{ fontSize: 12, marginTop: 0 }}>
+        Click a library to cycle the level it grants members: unbound →{" "}
+        <b>View</b> (browse only) → <b>Full</b> (browse + play).
+      </p>
+      <AccessLevelLegend />
+      {libraries.length === 0 ? (
+        <p className="cf-faint" style={{ fontSize: 12 }}>No libraries to bind yet.</p>
+      ) : (
+        <div className="cf-flex cf-wrap cf-gap8">
+          {libraries.map((l) => {
+            const level = libLevels.get(l.id) ?? "none";
+            // Canonical tri-state palette (matches the access matrix):
+            // View = amber (cf-warn), Full = green (cf-ok), unbound = muted.
+            const cls =
+              level === "full" ? " cf-ok" : level === "view" ? " cf-warn" : "";
+            const suffix =
+              level === "full" ? " · Full" : level === "view" ? " · View" : "";
+            return (
+              <button
+                key={l.id}
+                type="button"
+                onClick={() => cycleLib(l.id)}
+                className={`cf-pill${cls}`}
+                style={{ cursor: "pointer", padding: "5px 12px" }}
+                title={`Level: ${level}`}
+              >
+                {l.name}
+                {suffix}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ marginTop: 12 }}>
         <button
           type="button"
+          className="cf-btn cf-primary cf-sm"
           onClick={saveLibs}
           disabled={!libsDirty || savingLibs}
-          className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingLibs ? "…" : "Save libraries"}
         </button>
-      </section>
+      </div>
 
       {/* Members */}
-      <section className="space-y-3">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-white/55">
-          Members ({members.size})
-        </h3>
-        {users.length === 0 ? (
-          <p className="text-xs text-white/45">No users to add yet.</p>
-        ) : (
-          <ul className="divide-y divide-white/5 overflow-hidden rounded-md border border-white/10">
-            {users.map((u) => {
-              const active = members.has(u.id);
-              return (
-                <li key={u.id} className="flex items-center justify-between gap-3 px-3 py-2">
-                  <div>
-                    <div className="text-sm text-white/90">
-                      {u.display_name ?? u.username}
-                    </div>
-                    <div className="text-[11px] text-white/50">
-                      @{u.username}
-                      {u.role === "owner" && (
-                        <span className="ml-1 text-accent">· owner</span>
-                      )}
-                    </div>
-                  </div>
-                  <label className="flex cursor-pointer items-center gap-2 text-xs text-white/75">
-                    <input
-                      type="checkbox"
-                      checked={active}
-                      onChange={() => toggleMember(u.id)}
-                    />
-                    {active ? "Member" : "Add"}
-                  </label>
-                </li>
-              );
-            })}
-          </ul>
-        )}
+      <div className="cf-section-title">Members ({members.size})</div>
+      {users.length === 0 ? (
+        <p className="cf-faint" style={{ fontSize: 12 }}>No users to add yet.</p>
+      ) : (
+        <div className="cf-card" style={{ marginBottom: 0 }}>
+          <table className="cf-table">
+            <tbody>
+              {users.map((u) => {
+                const active = members.has(u.id);
+                return (
+                  <tr key={u.id}>
+                    <td>
+                      <div style={{ fontWeight: 600 }}>
+                        {u.display_name ?? u.username}
+                      </div>
+                      <div className="cf-faint" style={{ fontSize: 11.5 }}>
+                        @{u.username}
+                        {u.role === "owner" && (
+                          <span style={{ color: "var(--accent)" }}> · owner</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="cf-num">
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={active}
+                        aria-label={`${active ? "Remove" : "Add"} ${u.display_name ?? u.username}`}
+                        className={"cf-switch" + (active ? " cf-on" : "")}
+                        onClick={() => toggleMember(u.id)}
+                      />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{ marginTop: 12 }}>
         <button
           type="button"
+          className="cf-btn cf-primary cf-sm"
           onClick={saveMembers}
           disabled={!membersDirty || savingMembers}
-          className="rounded bg-accent px-3 py-2 text-sm font-semibold sm:py-1.5 sm:text-xs text-white disabled:opacity-50"
         >
           {savingMembers ? "…" : "Save members"}
         </button>
-      </section>
+      </div>
+    </div>
+  );
+}
+
+// Three-tier legend, shared visual language with the access matrix.
+// Unbound = muted, View = amber (cf-warn), Full = green (cf-ok).
+function AccessLevelLegend() {
+  return (
+    <div
+      className="cf-flex cf-wrap cf-gap8"
+      style={{ margin: "2px 0 10px", alignItems: "center" }}
+    >
+      <span className="cf-pill" style={{ padding: "1px 8px", fontSize: 10.5 }}>
+        Unbound · hidden
+      </span>
+      <span
+        className="cf-pill cf-warn"
+        style={{ padding: "1px 8px", fontSize: 10.5 }}
+      >
+        View · browse only
+      </span>
+      <span
+        className="cf-pill cf-ok"
+        style={{ padding: "1px 8px", fontSize: 10.5 }}
+      >
+        Full · browse + play
+      </span>
     </div>
   );
 }
@@ -443,6 +541,28 @@ function GroupEditor({
 function setsEqual(a: Set<number>, b: Set<number>): boolean {
   if (a.size !== b.size) return false;
   for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+// Build the per-library level map from a group detail. Prefers the
+// `library_grants` (level-aware) list; falls back to treating bare
+// `library_ids` as "full" for any older response shape.
+function initialLibLevels(detail: AccessGroupDetail): Map<number, AccessLevel> {
+  const m = new Map<number, AccessLevel>();
+  if (detail.library_grants && detail.library_grants.length > 0) {
+    for (const g of detail.library_grants) m.set(g.library_id, g.level);
+  } else {
+    for (const id of detail.library_ids) m.set(id, "full");
+  }
+  return m;
+}
+
+function levelMapsEqual(
+  a: Map<number, AccessLevel>,
+  b: Map<number, AccessLevel>,
+): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) if (b.get(k) !== v) return false;
   return true;
 }
 

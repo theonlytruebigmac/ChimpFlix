@@ -97,12 +97,18 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
             }
         }
     } else {
-        // show — walk episodes
+        // show — walk episodes. Only DOWNLOADED episodes: a placeholder
+        // row (no media_files, materialized to complete a season for the
+        // finale flag / calendar) has no file for subtitles to attach to,
+        // so fetching for it would burn OpenSubtitles API calls / rate
+        // limit for nothing.
         let eps = sqlx::query(
             "SELECT e.id AS id, s.season_number AS season, e.episode_number AS episode
              FROM episodes e
              JOIN seasons s ON s.id = e.season_id
-             WHERE s.show_id = ?",
+             WHERE s.show_id = ?
+               AND EXISTS (SELECT 1 FROM media_files mf
+                           WHERE mf.episode_id = e.id AND mf.removed_at IS NULL)",
         )
         .bind(item_id)
         .fetch_all(&state.pool)

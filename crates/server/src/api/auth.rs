@@ -265,6 +265,30 @@ pub async fn login(
     let user = user_opt.expect("ok=true requires a user");
     state.login_attempts.record_success(&attempt_key).await;
 
+    // Account-lock gate. Checked AFTER the password verify (above) so a
+    // locked username can't be enumerated by the pre-credential path —
+    // an attacker who hasn't proven the password gets the same generic
+    // invalid-credentials error as any wrong password. Owners are never
+    // lockable, so this check can never block an owner (the lock route
+    // refuses to set the flag on an owner, and we belt-and-braces skip
+    // the check here too).
+    if user.locked && user.role != chimpflix_library::UserRole::Owner {
+        warn!(user_id = user.id, "login blocked: account is locked");
+        audit_auth(
+            &state,
+            "auth.login.blocked_account_locked",
+            Some(user.id),
+            Some(user.id),
+            None,
+            &headers,
+            Some(ip),
+        )
+        .await;
+        return Err(ApiError::validation(
+            "this account is locked — contact your ChimpFlix administrator",
+        ));
+    }
+
     // Transparent rehash-on-login: if the stored hash uses weaker
     // Argon2 parameters than today's target (e.g. an account created
     // under the OWASP-floor default before Phase 52), recompute and
@@ -608,6 +632,34 @@ pub struct UpdateMeInput {
     /// Per-kind notification preferences, a JSON object. Validated as
     /// parseable JSON here; semantics enforced by the notifier.
     pub notification_prefs_json: Option<String>,
+    /// Personal Discord webhook URL. Empty string clears it; a non-empty
+    /// value must look like a Discord webhook URL (validated below); omit
+    /// to leave unchanged.
+    pub discord_webhook_url: Option<String>,
+    /// IANA timezone name (e.g. `America/New_York`). Empty string resets to
+    /// `UTC`; a non-empty value must parse as a known IANA zone (validated
+    /// below); omit to leave unchanged. Drives quiet-hours interpretation.
+    pub timezone: Option<String>,
+    /// Home-page rail layout overlay: a JSON array of
+    /// `{"rail_id": "<id>", "enabled": <bool>}` entries. Empty string resets
+    /// to `"[]"` (stock home); a non-empty value must be a JSON array of
+    /// known-rail entries (validated below); omit to leave unchanged.
+    pub home_rails_json: Option<String>,
+    /// Hide fully-watched titles from Continue Watching. Present → set the
+    /// boolean. Omit to leave as-is.
+    pub hide_watched_cw: Option<bool>,
+    /// Restrict home + main browse to kid-safe-certified titles. Present →
+    /// set the boolean. Omit to leave as-is.
+    pub kids_safe: Option<bool>,
+}
+
+/// One entry in a `home_rails_json` patch. The id must be a known member of
+/// `chimpflix_library::HOME_RAIL_CATALOGUE`; `enabled` toggles the rail's
+/// visibility, and the array order is the user's desired rail order.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HomeRailPref {
+    pub rail_id: String,
+    pub enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -1008,6 +1060,68 @@ pub async fn update_me(
         serde_json::from_str::<serde_json::Value>(raw)
             .map_err(|_| ApiError::validation("notification_prefs_json must be valid JSON"))?;
     }
+    // Discord webhook: empty string clears (Some(None)); a non-empty value
+    // must look like a Discord webhook URL before we trust it as a POST
+    // target; an absent key leaves it unchanged (None).
+    let discord_normalized = normalize(input.discord_webhook_url);
+    if let Some(Some(ref url)) = discord_normalized {
+        validate_discord_webhook_url(url)?;
+    }
+    // Timezone: an empty/whitespace value resets to "UTC"; a non-empty
+    // value must parse as a known IANA zone before we trust it (the
+    // notifier feeds it to chrono-tz at read time). The column is
+    // NOT NULL, so there's no "clear" — we collapse to "UTC" instead.
+    let timezone_patch = match input.timezone {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Some("UTC".to_string())
+            } else {
+                if trimmed.parse::<chrono_tz::Tz>().is_err() {
+                    return Err(ApiError::validation(
+                        "timezone must be a valid IANA timezone name (e.g. America/New_York)",
+                    ));
+                }
+                Some(trimmed.to_string())
+            }
+        }
+    };
+    // Home-rail layout overlay: an empty/whitespace value resets to "[]"
+    // (stock home); a non-empty value must be a JSON array whose entries are
+    // `{"rail_id": "<known id>", "enabled": <bool>}`. We validate shape +
+    // rail-id membership here so the frontend can trust the stored blob and
+    // never has to defend against junk. Overlay/sparse semantics mean a
+    // partial list is fine — absent rails keep their defaults.
+    let home_rails_patch = match input.home_rails_json {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Some("[]".to_string())
+            } else {
+                let parsed: Vec<HomeRailPref> = serde_json::from_str(trimmed).map_err(|_| {
+                    ApiError::validation(
+                        "home_rails_json must be a JSON array of {rail_id, enabled} entries",
+                    )
+                })?;
+                for entry in &parsed {
+                    if !chimpflix_library::is_known_home_rail(&entry.rail_id) {
+                        return Err(ApiError::validation(format!(
+                            "home_rails_json contains unknown rail_id '{}'",
+                            entry.rail_id
+                        )));
+                    }
+                }
+                // Re-serialize from the validated, typed form so we store a
+                // canonical {rail_id, enabled} array (drops any extra keys
+                // the client may have sent).
+                let canonical = serde_json::to_string(&parsed)
+                    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+                Some(canonical)
+            }
+        }
+    };
 
     let patch = queries::UserSelfUpdate {
         display_name: normalize(input.display_name),
@@ -1023,6 +1137,11 @@ pub async fn update_me(
         subtitle_bottom_inset_pct: input.subtitle_bottom_inset_pct.map(Some),
         notify_via_email: input.notify_via_email,
         notification_prefs_json: input.notification_prefs_json,
+        discord_webhook_url: discord_normalized,
+        timezone: timezone_patch,
+        home_rails_json: home_rails_patch,
+        hide_watched_cw: input.hide_watched_cw,
+        kids_safe: input.kids_safe,
     };
     let updated = queries::update_user_self(&state.pool, user.id, patch)
         .await
@@ -1049,34 +1168,51 @@ pub async fn register(
     Json(input): Json<RegisterInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     let raw_code = input.code.trim();
-    if raw_code.is_empty() {
-        return Err(ApiError::validation("invite code is required"));
-    }
     if raw_code.len() > 256 {
         return Err(ApiError::validation("invite code is invalid"));
     }
     validate_username(&input.username)?;
     validate_password(&input.password)?;
 
-    let code_hash = hash_invite_code(raw_code);
-    let invite = queries::find_invite_by_code_hash(&state.pool, &code_hash)
-        .await
-        .map_err(ApiError::Internal)?
-        .ok_or_else(|| ApiError::validation("invite code is invalid"))?;
-    if invite.consumed_by.is_some() {
-        return Err(ApiError::validation("invite code has already been used"));
-    }
-    if let Some(exp) = invite.expires_at {
-        if exp < now_ms() {
-            return Err(ApiError::validation("invite code has expired"));
+    // Two registration paths share this handler:
+    //   * invite-accept — a non-empty code; ALWAYS permitted, even when
+    //     open signups are disabled, because the operator explicitly
+    //     issued the invite.
+    //   * self-registration — no code; only permitted when the
+    //     `allow_signups` server setting is on. When off the server is
+    //     invite-only and we reject with a clear error.
+    let invite = if raw_code.is_empty() {
+        // SELF-REGISTRATION PATH — gated by allow_signups.
+        if !state.settings.read().await.allow_signups {
+            return Err(ApiError::validation(
+                "sign-ups are disabled on this server; an invite is required to register",
+            ));
         }
-    }
+        None
+    } else {
+        // INVITE-ACCEPT PATH — validate the invite; bypasses the gate.
+        let code_hash = hash_invite_code(raw_code);
+        let invite = queries::find_invite_by_code_hash(&state.pool, &code_hash)
+            .await
+            .map_err(ApiError::Internal)?
+            .ok_or_else(|| ApiError::validation("invite code is invalid"))?;
+        if invite.consumed_by.is_some() {
+            return Err(ApiError::validation("invite code has already been used"));
+        }
+        if let Some(exp) = invite.expires_at {
+            if exp < now_ms() {
+                return Err(ApiError::validation("invite code has expired"));
+            }
+        }
+        Some((code_hash, invite))
+    };
 
     let hash = password::hash(&input.password).map_err(ApiError::Internal)?;
     // Pre-bind the user's email from the invite. If the invite was issued
-    // without an email, the user is created without one and can set it
-    // themselves later via PATCH /auth/me.
-    let invite_email = invite.email.as_deref();
+    // without an email — or this is a codeless self-signup — the user is
+    // created without one and can set it themselves later via PATCH
+    // /auth/me.
+    let invite_email = invite.as_ref().and_then(|(_, inv)| inv.email.as_deref());
     let user = queries::create_user(
         &state.pool,
         input.username.trim(),
@@ -1096,9 +1232,11 @@ pub async fn register(
         }
     })?;
 
-    queries::consume_invite(&state.pool, &code_hash, user.id)
-        .await
-        .map_err(ApiError::Internal)?;
+    if let Some((code_hash, _)) = invite.as_ref() {
+        queries::consume_invite(&state.pool, code_hash, user.id)
+            .await
+            .map_err(ApiError::Internal)?;
+    }
 
     // Fan out a notification to every owner. Fire-and-forget — won't
     // fail the registration if SMTP is down or all admins have email
@@ -2188,6 +2326,35 @@ fn validate_avatar_url(url: &str) -> Result<(), ApiError> {
     if url.chars().any(|c| c.is_control() || c == ' ') {
         return Err(ApiError::validation(
             "avatar_url contains illegal whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a personal Discord webhook URL before we trust it as a POST
+/// target. Discord webhooks always live under one of the official
+/// `/api/webhooks/` paths; restricting to the known hosts keeps this from
+/// becoming an arbitrary-URL SSRF surface (the notifier POSTs server-side).
+fn validate_discord_webhook_url(url: &str) -> Result<(), ApiError> {
+    const PREFIXES: [&str; 3] = [
+        "https://discord.com/api/webhooks/",
+        "https://discordapp.com/api/webhooks/",
+        "https://canary.discord.com/api/webhooks/",
+    ];
+    if url.len() > 2048 {
+        return Err(ApiError::validation(
+            "discord_webhook_url must be at most 2048 characters",
+        ));
+    }
+    if url.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(ApiError::validation(
+            "discord_webhook_url contains illegal whitespace or control characters",
+        ));
+    }
+    if !PREFIXES.iter().any(|p| url.starts_with(p)) {
+        return Err(ApiError::validation(
+            "discord_webhook_url must be a Discord webhook URL \
+             (https://discord.com/api/webhooks/…)",
         ));
     }
     Ok(())

@@ -5,25 +5,13 @@ import {
   admin as adminApi,
   auth as authApi,
   ChimpFlixApiError,
+  type AccessLevel,
   type AccessMatrixEntry,
   type AdminSessionSummary,
   type AuditLogEntry,
   type User,
   type UserRole,
 } from "@/lib/chimpflix-api";
-import {
-  Drawer,
-  DrawerBody,
-  DrawerHeader,
-  DrawerKV,
-  DrawerSection,
-  DrawerTabs,
-  ErrorBanner,
-  FilterChip,
-  Pill,
-  type DrawerTab,
-  type PillTone,
-} from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 import { formatDate, formatDateTime } from "@/lib/format";
@@ -35,10 +23,10 @@ interface Props {
 
 type FilterId = "all" | "owners" | "admins" | "online" | "locked";
 
-const ROLE_TONE: Record<UserRole, PillTone> = {
-  owner: "bad",
-  admin: "info",
-  user: "muted",
+const ROLE_PILL: Record<UserRole, string> = {
+  owner: "cf-pill cf-accent",
+  admin: "cf-pill cf-info",
+  user: "cf-pill",
 };
 const ROLE_LABEL: Record<UserRole, string> = {
   owner: "Owner",
@@ -57,10 +45,9 @@ function tier(role: UserRole): number {
   }
 }
 
-/// Mock 3 — one Users page that holds the table + a sticky tabbed
-/// drawer (Profile / Access / Devices / Audit). Replaces the previous
-/// SettingsUsersClient long-row layout and folds in what used to live
-/// at /users/devices and /users/access for individual users.
+/// One Users master-detail: the user list on the left, a sticky tabbed
+/// drawer (Profile / Access / Devices / Audit) on the right. Folds in
+/// what used to live at /users/devices and /users/access per user.
 export function AdminUsersUnifiedClient({
   currentUserId,
   currentUserRole,
@@ -143,10 +130,7 @@ export function AdminUsersUnifiedClient({
     const online =
       users?.filter((u) => (sessionsByUser.get(u.id)?.length ?? 0) > 0)
         .length ?? 0;
-    // "Locked" is a placeholder until we surface lockout status —
-    // counted as 0 today but kept so the filter chip is visible and
-    // can light up once the backend exposes the field.
-    const locked = 0;
+    const locked = users?.filter((u) => u.locked).length ?? 0;
     return { all, owners, admins, online, locked };
   }, [users, sessionsByUser]);
 
@@ -157,7 +141,7 @@ export function AdminUsersUnifiedClient({
     else if (filter === "admins") list = list.filter((u) => u.role === "admin");
     else if (filter === "online") {
       list = list.filter((u) => (sessionsByUser.get(u.id)?.length ?? 0) > 0);
-    }
+    } else if (filter === "locked") list = list.filter((u) => u.locked);
     if (query.trim()) {
       const q = query.trim().toLowerCase();
       list = list.filter(
@@ -184,98 +168,12 @@ export function AdminUsersUnifiedClient({
   }
   if (users.length === 0) {
     return (
-      <p className="text-sm text-white/60">{message ?? "No users yet."}</p>
+      <p className="cf-muted" style={{ fontSize: 13 }}>
+        {message ?? "No users yet."}
+      </p>
     );
   }
 
-  // Only reserve the drawer slot when something is actually selected
-  // — otherwise the table column gets squeezed (clipping the Status
-  // column at typical viewport widths) and the filter chips wrap to a
-  // second row. Drawer width 380px so the table has at least ~520px
-  // even on 1280-wide laptops after the page chrome eats its share.
-  const gridClass = selected
-    ? "grid grid-cols-1 gap-4 lg:grid-cols-[1fr_380px]"
-    : "grid grid-cols-1 gap-4";
-
-  return (
-    <div className={gridClass}>
-      <div className="min-w-0">
-        <FilterBar
-          filter={filter}
-          counts={counts}
-          query={query}
-          onFilter={setFilter}
-          onQuery={setQuery}
-        />
-        <div className="overflow-hidden rounded-b-lg border border-t-0 border-white/10 bg-white/2">
-          <table className="w-full table-fixed text-sm">
-            <thead className="bg-white/4 text-left text-[11.5px] uppercase tracking-wider text-white/45">
-              <tr>
-                <th className="px-3 py-2 font-semibold">User</th>
-                <th className="w-24 px-3 py-2 font-semibold whitespace-nowrap">Role</th>
-                <th className="w-28 px-3 py-2 font-semibold whitespace-nowrap">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((u) => (
-                <UserRow
-                  key={u.id}
-                  user={u}
-                  selected={selectedId === u.id}
-                  currentUserId={currentUserId}
-                  liveSessions={sessionsByUser.get(u.id) ?? []}
-                  accessCount={accessByUser.get(u.id)?.filter((e) => e.allowed).length ?? 0}
-                  nowMs={nowMs}
-                  onSelect={() => setSelectedId(u.id)}
-                />
-              ))}
-            </tbody>
-          </table>
-          {filtered.length === 0 && (
-            <div className="px-4 py-8 text-center text-sm text-white/45">
-              No users match this filter.
-            </div>
-          )}
-        </div>
-        {message && <p className="mt-3 text-xs text-white/70">{message}</p>}
-      </div>
-
-      {selected && (
-        <UserDrawer
-          key={selected.id}
-          user={selected}
-          currentUserId={currentUserId}
-          currentUserRole={currentUserRole}
-          sessions={sessionsByUser.get(selected.id) ?? []}
-          access={accessByUser.get(selected.id) ?? []}
-          onClose={() => setSelectedId(null)}
-          onChanged={bumpRefresh}
-          onDeleted={() => {
-            setSelectedId(null);
-            bumpRefresh();
-          }}
-          onMessage={setMessage}
-        />
-      )}
-    </div>
-  );
-}
-
-// ─── Filter bar + table row ─────────────────────────────────────────
-
-function FilterBar({
-  filter,
-  counts,
-  query,
-  onFilter,
-  onQuery,
-}: {
-  filter: FilterId;
-  counts: Record<FilterId, number>;
-  query: string;
-  onFilter: (f: FilterId) => void;
-  onQuery: (q: string) => void;
-}) {
   const chips: Array<{ id: FilterId; label: string }> = [
     { id: "all", label: "All" },
     { id: "owners", label: "Owners" },
@@ -283,121 +181,180 @@ function FilterBar({
     { id: "online", label: "Online" },
     { id: "locked", label: "Locked" },
   ];
+
+  // Only render the 1fr + 440px master-detail grid when a row is
+  // selected; otherwise let the list span the full width.
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-white/10 bg-white/2 p-3">
-      <input
-        value={query}
-        onChange={(e) => onQuery(e.target.value)}
-        placeholder="Search by name or email…"
-        className="h-8 max-w-70 flex-1 rounded-md border border-white/10 bg-black/30 px-3 text-[13px] outline-none focus:border-white/30"
-      />
-      {chips.map((c) => (
-        <FilterChip
-          key={c.id}
-          active={filter === c.id}
-          count={counts[c.id]}
-          onClick={() => onFilter(c.id)}
-        >
-          {c.label}
-        </FilterChip>
-      ))}
+    <div>
+      <div
+        className="cf-flex cf-between cf-wrap cf-gap12"
+        style={{ marginBottom: 14 }}
+      >
+        <div className="cf-seg cf-accent" role="tablist" aria-label="Filter users">
+          {chips.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              role="tab"
+              aria-selected={filter === c.id}
+              className={filter === c.id ? "cf-on" : ""}
+              onClick={() => setFilter(c.id)}
+            >
+              {c.label}
+              {counts[c.id] > 0 && (
+                <span style={{ marginLeft: 6, opacity: 0.6 }}>
+                  {counts[c.id]}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+        <input
+          className="cf-input cf-w-auto"
+          style={{ minWidth: 220 }}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search name or email…"
+        />
+      </div>
+
+      <div className={selected ? "cf-md" : undefined}>
+        <div className="cf-md-list">
+          {filtered.map((u) => (
+            <UserRow
+              key={u.id}
+              user={u}
+              selected={selectedId === u.id}
+              currentUserId={currentUserId}
+              liveSessions={sessionsByUser.get(u.id) ?? []}
+              onSelect={() => setSelectedId(u.id)}
+            />
+          ))}
+          {filtered.length === 0 && (
+            <div
+              className="cf-card"
+              style={{ marginBottom: 0 }}
+            >
+              <div className="cf-card-body cf-pad cf-center cf-muted" style={{ fontSize: 13 }}>
+                No users match this filter.
+              </div>
+            </div>
+          )}
+        </div>
+
+        {selected && (
+          <UserDrawer
+            key={selected.id}
+            user={selected}
+            currentUserId={currentUserId}
+            currentUserRole={currentUserRole}
+            sessions={sessionsByUser.get(selected.id) ?? []}
+            access={accessByUser.get(selected.id) ?? []}
+            fullMatrix={matrix}
+            nowMs={nowMs}
+            onClose={() => setSelectedId(null)}
+            onChanged={bumpRefresh}
+            onDeleted={() => {
+              setSelectedId(null);
+              bumpRefresh();
+            }}
+            onMessage={setMessage}
+          />
+        )}
+      </div>
+      {message && (
+        <p className="cf-muted" style={{ marginTop: 12, fontSize: 12.5 }}>
+          {message}
+        </p>
+      )}
     </div>
   );
 }
+
+// ─── Table row ──────────────────────────────────────────────────────
 
 function UserRow({
   user,
   selected,
   currentUserId,
   liveSessions,
-  accessCount,
-  nowMs,
   onSelect,
 }: {
   user: User;
   selected: boolean;
   currentUserId: number;
   liveSessions: AdminSessionSummary[];
-  accessCount: number;
-  nowMs: number;
   onSelect: () => void;
 }) {
   const online = liveSessions.length > 0;
-  const lastSeen = online
-    ? "now"
-    : user.last_login_at && nowMs > 0
-      ? formatRelative(nowMs - user.last_login_at)
-      : user.last_login_at
-        ? formatDate(user.last_login_at)
-        : "never";
-  const subtitleBits: string[] = [];
-  if (user.email) subtitleBits.push(user.email);
-  subtitleBits.push(
-    `${accessCount} ${accessCount === 1 ? "library" : "libraries"}`,
-  );
-  subtitleBits.push(`last ${lastSeen}`);
+  const name = user.display_name ?? user.username;
   return (
-    <tr
+    <button
+      type="button"
       onClick={onSelect}
-      className={`cursor-pointer border-t border-white/6 ${selected ? "bg-accent/6" : "hover:bg-white/2.5"}`}
+      className={`cf-md-item${selected ? " cf-active" : ""}`}
     >
-      <td className="px-3 py-3">
-        <div className="flex items-center gap-3">
-          <Avatar name={user.display_name ?? user.username} />
-          <div className="min-w-0">
-            <div className="truncate text-[13.5px] font-medium">
-              {user.display_name ?? user.username}
-              {user.id === currentUserId && (
-                <span className="ml-1.5 text-[11px] text-white/40">(you)</span>
-              )}
-            </div>
-            <div className="truncate text-[11.5px] text-white/55">
-              @{user.username} · {subtitleBits.join(" · ")}
-            </div>
-          </div>
+      <Avatar name={name} />
+      <div className="min-w-0">
+        <div className="cf-md-name">
+          {name}
+          {user.id === currentUserId && (
+            <span className="cf-faint" style={{ marginLeft: 6, fontWeight: 400 }}>
+              (you)
+            </span>
+          )}
         </div>
-      </td>
-      <td className="whitespace-nowrap px-3 py-3">
-        <Pill tone={ROLE_TONE[user.role]}>{ROLE_LABEL[user.role]}</Pill>
-      </td>
-      <td className="whitespace-nowrap px-3 py-3">
-        {online ? (
-          <Pill tone="ok" dot>
-            online
-          </Pill>
-        ) : (
-          <Pill tone="muted" dot>
-            offline
-          </Pill>
+        <div className="cf-md-sub">{user.email ?? `@${user.username}`}</div>
+      </div>
+      <div className="cf-md-trail">
+        <span className={ROLE_PILL[user.role]} style={{ padding: "2px 8px" }}>
+          {ROLE_LABEL[user.role]}
+        </span>
+        {user.locked && (
+          <span className="cf-pill cf-err" style={{ padding: "1px 7px" }}>
+            Locked
+          </span>
         )}
-      </td>
-    </tr>
+        {online ? (
+          <span className="cf-pill cf-ok" style={{ padding: "1px 7px" }}>
+            <span className="cf-dot" />
+            Online
+          </span>
+        ) : (
+          <span className="cf-pill" style={{ padding: "1px 7px" }}>
+            <span className="cf-dot" style={{ background: "var(--ghost)" }} />
+            Offline
+          </span>
+        )}
+      </div>
+    </button>
   );
 }
 
-function Avatar({ name }: { name: string }) {
+// ─── Avatar ─────────────────────────────────────────────────────────
+
+/// Five-tone console avatar keyed by name so the same user always gets
+/// the same color across the list and drawer header.
+function Avatar({
+  name,
+  size,
+}: {
+  name: string;
+  size?: number;
+}) {
   const initials = name
     .split(/\s+/)
     .map((s) => s[0]?.toUpperCase() ?? "")
     .join("")
     .slice(0, 2);
-  // Six-tone palette keyed by name so the same user always gets the
-  // same color across the table and drawer header. Hash is the sum of
-  // char codes mod 6 — fine for visual variety, not security.
   let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h + name.charCodeAt(i)) % 6;
-  const palette = [
-    "from-indigo-500 to-fuchsia-500",
-    "from-amber-500 to-red-500",
-    "from-emerald-500 to-cyan-500",
-    "from-pink-500 to-rose-500",
-    "from-violet-500 to-pink-500",
-    "from-cyan-500 to-indigo-500",
-  ];
+  for (let i = 0; i < name.length; i++) h = (h + name.charCodeAt(i)) % 5;
+  const tone = `cf-a${h + 1}`;
+  const style = size
+    ? { width: size, height: size, fontSize: Math.round(size * 0.38) }
+    : undefined;
   return (
-    <span
-      className={`grid h-8 w-8 shrink-0 place-items-center rounded-full bg-linear-to-br ${palette[h]} text-[11px] font-bold text-white`}
-    >
+    <span className={`cf-avatar ${tone}`} style={style}>
       {initials || "?"}
     </span>
   );
@@ -405,12 +362,12 @@ function Avatar({ name }: { name: string }) {
 
 // ─── Drawer ─────────────────────────────────────────────────────────
 
-const DRAWER_TABS: DrawerTab[] = [
+const DRAWER_TABS = [
   { id: "profile", label: "Profile" },
   { id: "access", label: "Access" },
   { id: "devices", label: "Devices" },
   { id: "audit", label: "Audit" },
-];
+] as const;
 
 function UserDrawer({
   user,
@@ -418,6 +375,8 @@ function UserDrawer({
   currentUserRole,
   sessions,
   access,
+  fullMatrix,
+  nowMs,
   onClose,
   onChanged,
   onDeleted,
@@ -428,12 +387,14 @@ function UserDrawer({
   currentUserRole: UserRole;
   sessions: AdminSessionSummary[];
   access: AccessMatrixEntry[];
+  fullMatrix: AccessMatrixEntry[];
+  nowMs: number;
   onClose: () => void;
   onChanged: () => void;
   onDeleted: () => void;
   onMessage: (msg: string | null) => void;
 }) {
-  const [tab, setTab] = useState("profile");
+  const [tab, setTab] = useState<string>("profile");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Confirmation gating — boolean per action since each fires against
@@ -443,20 +404,10 @@ function UserDrawer({
   const [askKickSessions, setAskKickSessions] = useState(false);
   const [askDeleteUser, setAskDeleteUser] = useState(false);
   const sessionCount = sessions.length;
+  const online = sessionCount > 0;
   const canActOnTarget =
     user.id !== currentUserId && tier(currentUserRole) >= tier(user.role);
-
-  // Drawer tabs with live counts so the Devices tab shows "Devices 3"
-  // when the user has 3 active sessions, etc.
-  const tabsWithCounts: DrawerTab[] = DRAWER_TABS.map((t) => {
-    if (t.id === "devices" && sessionCount > 0) {
-      return { ...t, count: sessionCount };
-    }
-    if (t.id === "access" && access.length > 0) {
-      return { ...t, count: access.filter((e) => e.allowed).length };
-    }
-    return t;
-  });
+  const name = user.display_name ?? user.username;
 
   async function withBusy<T>(label: string, fn: () => Promise<T>) {
     setBusy(label);
@@ -476,6 +427,16 @@ function UserDrawer({
   async function setRole(role: UserRole) {
     try {
       await withBusy("role", () => authApi.setUserRole(user.id, role));
+      onChanged();
+    } catch {
+      /* error surfaced */
+    }
+  }
+  async function setLocked(locked: boolean) {
+    try {
+      await withBusy("lock", () =>
+        locked ? adminApi.lockUser(user.id) : adminApi.unlockUser(user.id),
+      );
       onChanged();
     } catch {
       /* error surfaced */
@@ -539,70 +500,117 @@ function UserDrawer({
     setAskDeleteUser(false);
     try {
       await withBusy("delete", () => authApi.deleteUser(user.id));
-      onMessage(`Removed "${user.display_name ?? user.username}".`);
+      onMessage(`Removed "${name}".`);
       onDeleted();
     } catch {
       /* error surfaced */
     }
   }
 
+  const accessCount = access.filter((e) => e.allowed).length;
+
   return (
-    <Drawer>
-      <DrawerHeader onClose={onClose}>
-        <div className="mb-2 flex items-center gap-3">
-          <Avatar name={user.display_name ?? user.username} />
-          <div className="min-w-0">
-            <div className="truncate text-base font-bold tracking-tight">
-              {user.display_name ?? user.username}
-            </div>
-            <div className="truncate text-[11.5px] text-white/55">
-              {user.email ?? `@${user.username}`}
-            </div>
+    <div className="cf-drawer">
+      <div className="cf-drawer-head">
+        <Avatar name={name} size={42} />
+        <div className="min-w-0" style={{ flex: 1 }}>
+          <div
+            style={{ fontSize: 16, fontWeight: 700 }}
+            className="truncate"
+          >
+            {name}
+          </div>
+          <div className="cf-sub">
+            {(user.email ?? `@${user.username}`)} ·{" "}
+            {online ? "Online now" : "Offline"}
           </div>
         </div>
-        <div className="flex flex-wrap gap-1.5">
-          <Pill tone={ROLE_TONE[user.role]}>{ROLE_LABEL[user.role]}</Pill>
-          {sessionCount > 0 ? (
-            <Pill tone="ok" dot>
-              online
-            </Pill>
-          ) : (
-            <Pill tone="muted" dot>
-              offline
-            </Pill>
-          )}
-          {user.id === currentUserId && (
-            <Pill tone="muted">it&apos;s you</Pill>
-          )}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="cf-btn cf-ghost cf-tiny"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+
+      <div className="cf-drawer-body">
+        <div className="cf-mtabs" role="tablist">
+          {DRAWER_TABS.map((t) => {
+            const count =
+              t.id === "devices" && sessionCount > 0
+                ? sessionCount
+                : t.id === "access" && accessCount > 0
+                  ? accessCount
+                  : undefined;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={tab === t.id}
+                className={`cf-mtab${tab === t.id ? " cf-on" : ""}`}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+                {count !== undefined && (
+                  <span style={{ marginLeft: 5, opacity: 0.6 }}>{count}</span>
+                )}
+              </button>
+            );
+          })}
         </div>
-      </DrawerHeader>
 
-      <DrawerTabs tabs={tabsWithCounts} activeId={tab} onSelect={setTab} />
-
-      <DrawerBody>
-        <ErrorBanner error={error} className="mb-3" />
+        {error && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="cf-banner cf-err"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 8v4M12 16v.5" />
+            </svg>
+            <div>{error}</div>
+          </div>
+        )}
 
         {tab === "profile" && (
           <ProfileTab
             user={user}
             sessionCount={sessionCount}
             canActOnTarget={canActOnTarget}
+            isSelf={user.id === currentUserId}
             currentUserRole={currentUserRole}
             busy={busy}
             onSetRole={setRole}
+            onSetLocked={setLocked}
             onSendReset={sendPasswordReset}
             onReset2FA={resetTwoFactor}
             onKickSessions={kickSessions}
-            onDelete={deleteUser}
           />
         )}
 
-        {tab === "access" && <AccessTab entries={access} />}
+        {tab === "access" && (
+          <AccessTab
+            userId={user.id}
+            isOwner={user.role === "owner"}
+            entries={access}
+            fullMatrix={fullMatrix}
+            onChanged={onChanged}
+            onError={setError}
+          />
+        )}
 
         {tab === "devices" && (
           <DevicesTab
             sessions={sessions}
             busy={busy}
+            nowMs={nowMs}
             onRevoke={revokeSession}
           />
         )}
@@ -610,10 +618,25 @@ function UserDrawer({
         {tab === "audit" && (
           <AuditTab userId={user.id} username={user.username} />
         )}
-      </DrawerBody>
+      </div>
+
+      <div className="cf-drawer-foot">
+        {canActOnTarget && (
+          <button
+            type="button"
+            onClick={deleteUser}
+            disabled={busy === "delete"}
+            className="cf-btn cf-danger cf-sm"
+            style={{ marginLeft: "auto" }}
+          >
+            {busy === "delete" ? "Deleting…" : "Delete user"}
+          </button>
+        )}
+      </div>
+
       {askSendReset && (
         <ConfirmDialog
-          title={`Send password reset to "${user.display_name ?? user.username}"?`}
+          title={`Send password reset to "${name}"?`}
           body="A reset link is emailed to the address on file. The link expires in 1 hour and can only be used once."
           confirmLabel="Send"
           busy={busy === "reset"}
@@ -623,7 +646,7 @@ function UserDrawer({
       )}
       {askResetTwoFactor && (
         <ConfirmDialog
-          title={`Reset 2FA for "${user.display_name ?? user.username}"?`}
+          title={`Reset 2FA for "${name}"?`}
           body="They'll log in with just their password until they re-enroll. Existing recovery codes are invalidated."
           confirmLabel="Reset 2FA"
           destructive
@@ -635,7 +658,7 @@ function UserDrawer({
       {askKickSessions && (
         <ConfirmDialog
           title={`Revoke all ${sessionCount} active session${sessionCount === 1 ? "" : "s"}?`}
-          body={`"${user.display_name ?? user.username}" will be signed out of every device. Anything currently playing stops at the next heartbeat.`}
+          body={`"${name}" will be signed out of every device. Anything currently playing stops at the next heartbeat.`}
           confirmLabel="Revoke sessions"
           destructive
           busy={busy === "kick"}
@@ -645,7 +668,7 @@ function UserDrawer({
       )}
       {askDeleteUser && (
         <ConfirmDialog
-          title={`Delete user "${user.display_name ?? user.username}"?`}
+          title={`Delete user "${name}"?`}
           body="Their sessions, watch state, and personal lists will be removed. Library files on disk are untouched."
           confirmLabel="Delete user"
           destructive
@@ -654,7 +677,7 @@ function UserDrawer({
           onCancel={() => setAskDeleteUser(false)}
         />
       )}
-    </Drawer>
+    </div>
   );
 }
 
@@ -664,221 +687,505 @@ function ProfileTab({
   user,
   sessionCount,
   canActOnTarget,
+  isSelf,
   currentUserRole,
   busy,
   onSetRole,
+  onSetLocked,
   onSendReset,
   onReset2FA,
   onKickSessions,
-  onDelete,
 }: {
   user: User;
   sessionCount: number;
   canActOnTarget: boolean;
+  isSelf: boolean;
   currentUserRole: UserRole;
   busy: string | null;
   onSetRole: (role: UserRole) => void;
+  onSetLocked: (locked: boolean) => void;
   onSendReset: () => void;
   onReset2FA: () => void;
   onKickSessions: () => void;
-  onDelete: () => void;
 }) {
   const lastLogin = user.last_login_at
     ? `${formatDateTime(user.last_login_at)}${user.last_login_ip ? ` · ${user.last_login_ip}` : ""}`
     : "never";
-  const previousLogin = user.previous_login_at
-    ? `${formatDateTime(user.previous_login_at)}${user.previous_login_ip ? ` · ${user.previous_login_ip}` : ""}`
-    : "—";
 
   return (
     <>
-      <DrawerKV
-        rows={[
-          { label: "Display name", value: user.display_name ?? "—" },
-          { label: "Email", value: user.email ?? "—" },
-          {
-            label: "Joined",
-            value: formatDate(user.created_at),
-          },
-          { label: "Last login", value: lastLogin },
-          { label: "Previous login", value: previousLogin },
-          {
-            label: "Active sessions",
-            value:
-              sessionCount === 0
-                ? "0"
-                : `${sessionCount} (see Devices tab)`,
-          },
-          {
-            label: "Email-mirror",
-            value: user.notify_via_email ? "on" : "off",
-          },
-        ]}
-      />
+      {/* Role — editable in-place when the actor outranks the target. */}
+      <div className="cf-field">
+        <label className="cf-field-label">Role</label>
+        {canActOnTarget ? (
+          <select
+            className="cf-select"
+            value={user.role}
+            disabled={busy === "role"}
+            onChange={(e) => {
+              const next = e.target.value as UserRole;
+              if (next !== user.role) onSetRole(next);
+            }}
+          >
+            <option value="owner">Owner</option>
+            <option value="admin">Admin</option>
+            <option value="user">User</option>
+          </select>
+        ) : (
+          <div className="cf-muted" style={{ fontSize: 13 }}>
+            {user.role === "owner"
+              ? "Owner"
+              : user.role === "admin"
+                ? "Admin"
+                : "User"}
+          </div>
+        )}
+      </div>
+
+      <div className="cf-grid cf-c2">
+        <div className="cf-field" style={{ marginBottom: 0 }}>
+          <label className="cf-field-label">Created</label>
+          <div style={{ fontSize: 13 }}>{formatDate(user.created_at)}</div>
+        </div>
+        <div className="cf-field" style={{ marginBottom: 0 }}>
+          <label className="cf-field-label">Last login</label>
+          <div style={{ fontSize: 13 }}>{lastLogin}</div>
+        </div>
+      </div>
+
+      <div className="cf-row" style={{ padding: "13px 0" }}>
+        <div className="cf-row-main">
+          <div className="cf-row-label" style={{ fontSize: 13 }}>
+            Active sessions
+          </div>
+          <div className="cf-row-help">
+            {sessionCount === 0
+              ? "No devices currently signed in."
+              : `${sessionCount} device${sessionCount === 1 ? "" : "s"} signed in — see the Devices tab.`}
+          </div>
+        </div>
+        <div className="cf-row-control">
+          <span className="cf-num-badge">{sessionCount}</span>
+        </div>
+      </div>
+
+      <div className="cf-row" style={{ padding: "13px 0" }}>
+        <div className="cf-row-main">
+          <div className="cf-row-label" style={{ fontSize: 13 }}>
+            Email mirror
+          </div>
+          <div className="cf-row-help">
+            Mirrors in-app notifications to {user.email ?? "the account email"}.
+          </div>
+        </div>
+        <div className="cf-row-control">
+          <span className={`cf-pill${user.notify_via_email ? " cf-ok" : ""}`}>
+            {user.notify_via_email ? "On" : "Off"}
+          </span>
+        </div>
+      </div>
 
       {canActOnTarget && (
-        <DrawerSection title="Quick actions">
-          <div className="grid grid-cols-2 gap-2">
-            <DrawerAction
-              label="Send reset"
-              busy={busy === "reset"}
-              onClick={onSendReset}
-            />
-            <DrawerAction
-              label="Reset 2FA"
-              busy={busy === "2fa"}
-              onClick={onReset2FA}
-            />
-            <DrawerAction
-              label="Kick sessions"
-              busy={busy === "kick"}
-              disabled={sessionCount === 0}
-              onClick={onKickSessions}
-            />
-            <DrawerAction
-              label="Change role…"
-              busy={busy === "role"}
-              onClick={() => {
-                // No menu primitive yet — surface via window.prompt
-                // until we build a dropdown. Backend rejects invalid
-                // transitions, so a typo just shows an error.
-                const next = window.prompt(
-                  `New role for "${user.display_name ?? user.username}" (owner / admin / user):`,
-                  user.role,
-                );
-                if (next && (next === "owner" || next === "admin" || next === "user")) {
-                  if (next !== user.role) onSetRole(next);
-                }
-              }}
-            />
+        <>
+          {/* Lock account — owners are never lockable, and you can't
+              lock yourself, so the switch is hidden in those cases. */}
+          {user.role !== "owner" && !isSelf && (
+            <div className="cf-row" style={{ padding: "13px 0" }}>
+              <div className="cf-row-main">
+                <div className="cf-row-label" style={{ fontSize: 13 }}>
+                  Lock account
+                </div>
+                <div className="cf-row-help">
+                  {user.locked
+                    ? "This account is disabled — sign-in is blocked until you unlock it."
+                    : "Disable sign-in for this account without deleting it."}
+                </div>
+              </div>
+              <div className="cf-row-control">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={user.locked}
+                  aria-label="Lock account"
+                  disabled={busy === "lock"}
+                  className={"cf-switch" + (user.locked ? " cf-on" : "")}
+                  onClick={() => onSetLocked(!user.locked)}
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="cf-row" style={{ padding: "13px 0" }}>
+            <div className="cf-row-main">
+              <div className="cf-row-label" style={{ fontSize: 13 }}>
+                Reset password
+              </div>
+              <div className="cf-row-help">Emails a one-time reset link.</div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                className="cf-btn cf-sm"
+                onClick={onSendReset}
+                disabled={busy === "reset"}
+              >
+                {busy === "reset" ? "…" : "Send link"}
+              </button>
+            </div>
           </div>
-          <p className="mt-2 text-[11px] text-white/45">
+
+          <div className="cf-row" style={{ padding: "13px 0" }}>
+            <div className="cf-row-main">
+              <div className="cf-row-label" style={{ fontSize: 13 }}>
+                Reset two-factor
+              </div>
+              <div className="cf-row-help">
+                Clears their authenticator + recovery codes.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                className="cf-btn cf-sm"
+                onClick={onReset2FA}
+                disabled={busy === "2fa"}
+              >
+                {busy === "2fa" ? "…" : "Reset 2FA"}
+              </button>
+            </div>
+          </div>
+
+          <div className="cf-row" style={{ padding: "13px 0" }}>
+            <div className="cf-row-main">
+              <div className="cf-row-label" style={{ fontSize: 13 }}>
+                Sign out everywhere
+              </div>
+              <div className="cf-row-help">
+                Revokes every active session for this user.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                className="cf-btn cf-sm"
+                onClick={onKickSessions}
+                disabled={busy === "kick" || sessionCount === 0}
+              >
+                {busy === "kick" ? "…" : "Kick sessions"}
+              </button>
+            </div>
+          </div>
+
+          <p className="cf-faint" style={{ marginTop: 10, fontSize: 11.5 }}>
             Role hierarchy:{" "}
-            <code className="font-mono">
+            <span className="cf-mono">
               {currentUserRole === "owner"
                 ? "owner can manage anyone"
                 : "admin can manage user + admin (not owners)"}
-            </code>
+            </span>
           </p>
-        </DrawerSection>
-      )}
-
-      {canActOnTarget && (
-        <DrawerSection title="Danger zone">
-          <button
-            type="button"
-            onClick={onDelete}
-            disabled={busy === "delete"}
-            className="w-full rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[12px] font-medium text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-          >
-            {busy === "delete" ? "Deleting…" : "Delete user…"}
-          </button>
-        </DrawerSection>
+        </>
       )}
     </>
   );
 }
 
-function AccessTab({ entries }: { entries: AccessMatrixEntry[] }) {
-  const allowed = entries.filter((e) => e.allowed || e.via_groups.length > 0);
-  if (allowed.length === 0) {
+// Per-library tri-state access control for one user (phase 107). Each
+// library gets a None / View / Full segmented control that edits the
+// DIRECT `library_access` grant level; group-derived access (`via_groups`)
+// is shown as informational pills and isn't editable here (it lives under
+// Users → Groups). Persists the whole set in one bulk PUT to the same
+// /admin/access-matrix endpoint the matrix uses, scoped to this user.
+const ACCESS_LEVELS: { id: AccessLevel; label: string }[] = [
+  { id: "none", label: "None" },
+  { id: "view", label: "View" },
+  { id: "full", label: "Full" },
+];
+
+function AccessTab({
+  userId,
+  isOwner,
+  entries,
+  fullMatrix,
+  onChanged,
+  onError,
+}: {
+  userId: number;
+  isOwner: boolean;
+  entries: AccessMatrixEntry[];
+  // The whole user × library matrix. The save path is a per-library
+  // full-replace on the backend, so we must resend EVERY user's current
+  // direct level for each touched library — otherwise other users' grants
+  // would be wiped. We pull those siblings out of the full matrix.
+  fullMatrix: AccessMatrixEntry[];
+  onChanged: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  // Libraries this user could be granted, with their current direct level.
+  // Sorted by name so the list is stable across refreshes.
+  const libs = useMemo(
+    () =>
+      [...entries]
+        .sort((a, b) => a.library_name.localeCompare(b.library_name))
+        .map((e) => ({
+          library_id: e.library_id,
+          library_name: e.library_name,
+          level: e.level,
+          via_groups: e.via_groups,
+        })),
+    [entries],
+  );
+
+  // Local edit state: library_id → desired direct level. Seeded from the
+  // server's direct-grant levels.
+  const [levels, setLevels] = useState<Map<number, AccessLevel>>(
+    () => new Map(libs.map((l) => [l.library_id, l.level])),
+  );
+  const [busy, setBusy] = useState(false);
+
+  // Re-seed when the user (and thus `entries`) changes. The drawer is keyed
+  // by user id so this remounts per user, but a post-save refresh swaps the
+  // `entries` prop in place — resync so the baseline tracks the saved state.
+  useEffect(() => {
+    setLevels(new Map(libs.map((l) => [l.library_id, l.level])));
+  }, [libs]);
+
+  if (isOwner) {
     return (
-      <p className="text-[12.5px] text-white/55">
-        No library access. Grant some by editing the access matrix at{" "}
-        <a
-          href="/settings/admin/users?tab=access"
-          className="text-white/80 underline hover:text-white"
-        >
-          Users → Access
-        </a>
-        .
+      <p className="cf-muted" style={{ fontSize: 12.5 }}>
+        Owners always have <b>Full</b> access to every library — there's
+        nothing to configure here.
       </p>
     );
   }
+
+  if (libs.length === 0) {
+    return (
+      <p className="cf-muted" style={{ fontSize: 12.5 }}>
+        No libraries exist yet. Create one under{" "}
+        <a href="/settings/admin/libraries">Libraries</a> to grant access.
+      </p>
+    );
+  }
+
+  const dirty = libs.some(
+    (l) => (levels.get(l.library_id) ?? "none") !== l.level,
+  );
+
+  function setLevel(libraryId: number, level: AccessLevel) {
+    setLevels((prev) => {
+      const next = new Map(prev);
+      next.set(libraryId, level);
+      return next;
+    });
+  }
+
+  async function save() {
+    setBusy(true);
+    onError(null);
+    try {
+      // The /admin/access-matrix PUT is a per-library FULL replace of every
+      // direct grant. So for each library this user's level changed, we
+      // resend the COMPLETE direct-grant set: every OTHER user's current
+      // direct level (from the full matrix) plus this user's new level.
+      // Owners are force-kept at full server-side regardless. Only touched
+      // libraries are included so we don't needlessly rewrite the rest.
+      const changed = libs.filter(
+        (l) => (levels.get(l.library_id) ?? "none") !== l.level,
+      );
+      const payload = changed.map((l) => {
+        const others = fullMatrix
+          .filter(
+            (e) =>
+              e.library_id === l.library_id &&
+              e.user_id !== userId &&
+              e.allowed,
+          )
+          .map((e) => ({ user_id: e.user_id, level: e.level }));
+        return {
+          library_id: l.library_id,
+          grants: [
+            ...others,
+            { user_id: userId, level: levels.get(l.library_id) ?? "none" },
+          ],
+        };
+      });
+      await adminApi.access.put(payload);
+      onChanged();
+    } catch (e) {
+      onError(friendlyError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function discard() {
+    setLevels(new Map(libs.map((l) => [l.library_id, l.level])));
+  }
+
   return (
     <>
-      <p className="mb-3 text-[11.5px] text-white/55">
-        Edit grants under{" "}
-        <a
-          href="/settings/admin/users?tab=access"
-          className="text-white/80 underline hover:text-white"
-        >
-          Users → Access
-        </a>
-        . This view is read-only.
+      <p className="cf-muted" style={{ marginTop: 0, fontSize: 12.5 }}>
+        Per-library access for this user. <b>None</b> hides the library,{" "}
+        <b>View</b> lets them browse it without playing, <b>Full</b> allows
+        browse + playback.
       </p>
-      <div className="rounded-md border border-white/10 bg-white/2">
-        {allowed.map((e, i) => {
-          const direct = e.allowed;
-          const groups = e.via_groups;
-          return (
-            <div
-              key={e.library_id}
-              className={`flex items-center justify-between gap-2 px-3 py-2 text-[12.5px] ${i === 0 ? "" : "border-t border-white/6"}`}
-            >
-              <span className="min-w-0 truncate">{e.library_name}</span>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {direct && <Pill>direct</Pill>}
-                {groups.map((g) => (
-                  <Pill key={g} tone="ok">
-                    via {g}
-                  </Pill>
+      <AccessLegend />
+      {libs.map((l) => {
+        const cur = levels.get(l.library_id) ?? "none";
+        return (
+          <div className="cf-row" key={l.library_id} style={{ padding: "11px 0" }}>
+            <div className="cf-row-main">
+              <div className="cf-row-label" style={{ fontSize: 13 }}>
+                {l.library_name}
+              </div>
+              {l.via_groups.length > 0 && (
+                <div
+                  className="cf-flex cf-wrap cf-gap8"
+                  style={{ marginTop: 4 }}
+                >
+                  {l.via_groups.map((g) => (
+                    <span
+                      key={g}
+                      className="cf-pill cf-info"
+                      style={{ padding: "1px 7px", fontSize: 10.5 }}
+                    >
+                      via {g}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="cf-row-control">
+              <div
+                className="cf-seg"
+                role="group"
+                aria-label={`Access level for ${l.library_name}`}
+              >
+                {ACCESS_LEVELS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    aria-pressed={cur === opt.id}
+                    className={cur === opt.id ? "cf-on" : ""}
+                    onClick={() => setLevel(l.library_id, opt.id)}
+                  >
+                    {opt.label}
+                  </button>
                 ))}
               </div>
             </div>
-          );
-        })}
-      </div>
+          </div>
+        );
+      })}
+      {dirty && (
+        <div className="cf-flex cf-gap8" style={{ marginTop: 14 }}>
+          <button
+            type="button"
+            className="cf-btn cf-ghost cf-sm"
+            onClick={discard}
+            disabled={busy}
+          >
+            Discard
+          </button>
+          <button
+            type="button"
+            className="cf-btn cf-primary cf-sm"
+            onClick={save}
+            disabled={busy}
+          >
+            {busy ? "Saving…" : "Save access"}
+          </button>
+        </div>
+      )}
     </>
+  );
+}
+
+// Three-tier legend shared by the drawer Access tab. Canonical cf-pill
+// tones (match the access matrix + groups): None = muted, View = amber
+// (cf-warn), Full = green (cf-ok). The blue "via {group}" pills above are
+// deliberately a different tone — they mark group-derived access, not a
+// level the admin sets here.
+function AccessLegend() {
+  return (
+    <div
+      className="cf-flex cf-wrap cf-gap8"
+      style={{ margin: "2px 0 12px", alignItems: "center" }}
+    >
+      <span className="cf-pill" style={{ padding: "1px 8px", fontSize: 10.5 }}>
+        None · hidden
+      </span>
+      <span
+        className="cf-pill cf-warn"
+        style={{ padding: "1px 8px", fontSize: 10.5 }}
+      >
+        View · browse only
+      </span>
+      <span
+        className="cf-pill cf-ok"
+        style={{ padding: "1px 8px", fontSize: 10.5 }}
+      >
+        Full · browse + play
+      </span>
+    </div>
   );
 }
 
 function DevicesTab({
   sessions,
   busy,
+  nowMs,
   onRevoke,
 }: {
   sessions: AdminSessionSummary[];
   busy: string | null;
+  nowMs: number;
   onRevoke: (id: number) => void;
 }) {
   if (sessions.length === 0) {
     return (
-      <p className="text-[12.5px] text-white/55">
+      <p className="cf-muted" style={{ fontSize: 12.5 }}>
         No active sessions for this user.
       </p>
     );
   }
   return (
-    <div className="space-y-2">
-      {sessions.map((s) => (
-        <div
-          key={s.id}
-          className="rounded-md border border-white/10 bg-white/2 p-3"
-        >
-          <div className="flex items-start justify-between gap-2">
+    <div className="cf-md-list" style={{ gap: 6 }}>
+      {sessions.map((s) => {
+        const last =
+          nowMs > 0
+            ? formatRelative(nowMs - s.last_seen_at)
+            : formatDateTime(s.last_seen_at);
+        return (
+          <div
+            key={s.id}
+            className="cf-flex cf-between"
+            style={{
+              padding: "11px 13px",
+              border: "1px solid var(--line)",
+              borderRadius: "var(--r)",
+            }}
+          >
             <div className="min-w-0">
-              <div className="truncate text-[12.5px] font-medium">
+              <div style={{ fontWeight: 600, fontSize: 13 }} className="truncate">
                 {summarizeUserAgent(s.user_agent)}
               </div>
-              <div className="mt-0.5 text-[11px] text-white/45">
-                {s.ip ?? "—"} · last seen {formatDateTime(s.last_seen_at)}
-              </div>
-              <div className="text-[11px] text-white/40">
-                expires {formatDate(s.expires_at)}
+              <div className="cf-faint cf-mono" style={{ fontSize: 11 }}>
+                {s.ip ?? "—"} · {last}
               </div>
             </div>
             <button
               type="button"
               onClick={() => onRevoke(s.id)}
               disabled={busy === `session-${s.id}`}
-              className="shrink-0 rounded border border-white/15 px-2 py-1 text-[11px] text-white/75 hover:border-red-500/50 hover:text-red-300 disabled:opacity-50"
+              className="cf-btn cf-ghost cf-tiny"
             >
-              Revoke
+              {busy === `session-${s.id}` ? "…" : "Revoke"}
             </button>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -894,6 +1201,11 @@ function AuditTab({
   const [total, setTotal] = useState(0);
   const [pageSize, setPageSize] = useState(20);
   const [error, setError] = useState<string | null>(null);
+  // Wall-clock captured at fetch time, used for relative "5m ago"
+  // labels. Stays 0 until after mount (set alongside the fetched
+  // data) so SSR/client output matches — same convention as the
+  // parent table's `nowMs`. Rows fall back to absolute time at 0.
+  const [nowMs, setNowMs] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -910,6 +1222,7 @@ function AuditTab({
         if (cancelled) return;
         setEntries(res.entries);
         setTotal(res.total);
+        setNowMs(Date.now());
       })
       .catch((e) => {
         if (cancelled) return;
@@ -926,46 +1239,44 @@ function AuditTab({
   }
   if (error) {
     return (
-      <p className="text-[12.5px] text-red-300">
+      <p style={{ fontSize: 12.5, color: "var(--err)" }}>
         Couldn&rsquo;t load audit entries: {error}
       </p>
     );
   }
   if (entries.length === 0) {
     return (
-      <p className="text-[12.5px] text-white/55">
+      <p className="cf-muted" style={{ fontSize: 12.5 }}>
         No admin actions recorded for{" "}
-        <code className="font-mono text-white/75">@{username}</code> yet.
+        <span className="cf-mono">@{username}</span> yet.
       </p>
     );
   }
 
   return (
-    <div className="space-y-2">
-      <div className="text-[11px] text-white/45">
+    <div>
+      <div className="cf-faint" style={{ fontSize: 11, marginBottom: 6 }}>
         {total === 1 ? "1 action" : `${total.toLocaleString()} actions`}
         {entries.length < total && ` — showing latest ${entries.length}`}
       </div>
-      <ol className="space-y-2">
+      <div style={{ borderTop: "1px solid var(--line-faint)" }}>
         {entries.map((e) => (
-          <AuditRow key={e.id} entry={e} />
+          <AuditRow key={e.id} entry={e} nowMs={nowMs} />
         ))}
-      </ol>
+      </div>
       {entries.length < total && (
         <button
           type="button"
           onClick={() => setPageSize((s) => s + 20)}
-          className="mt-2 w-full rounded border border-white/10 bg-white/2 px-2 py-1.5 text-[11.5px] text-white/65 hover:border-white/20 hover:text-white"
+          className="cf-btn cf-sm"
+          style={{ marginTop: 8, width: "100%", justifyContent: "center" }}
         >
           Load more
         </button>
       )}
-      <p className="pt-1 text-[11px] text-white/40">
+      <p className="cf-faint" style={{ paddingTop: 8, fontSize: 11 }}>
         Full server-wide log at{" "}
-        <a
-          href="/settings/admin/logs?tab=audit"
-          className="text-white/55 underline hover:text-white"
-        >
+        <a href="/settings/admin/logs?tab=audit">
           Maintenance → Logs → Audit trail
         </a>
         .
@@ -974,64 +1285,86 @@ function AuditTab({
   );
 }
 
-function AuditRow({ entry }: { entry: AuditLogEntry }) {
+function AuditRow({ entry, nowMs }: { entry: AuditLogEntry; nowMs: number }) {
   const when = new Date(entry.created_at);
-  return (
-    <li className="rounded-md border border-white/10 bg-white/2 p-2.5">
-      <div className="flex items-baseline justify-between gap-2">
-        <code className="truncate font-mono text-[11.5px] text-white/85">
-          {entry.action}
-        </code>
-        <time
-          className="shrink-0 text-[10.5px] text-white/45"
-          dateTime={when.toISOString()}
-          title={when.toLocaleString()}
-        >
-          {when.toLocaleString(undefined, {
-            month: "short",
-            day: "numeric",
-            hour: "2-digit",
-            minute: "2-digit",
-          })}
-        </time>
-      </div>
-      {(entry.target_kind || entry.target_id) && (
-        <div className="mt-0.5 text-[11px] text-white/55">
-          {entry.target_kind ?? "—"}
-          {entry.target_id != null && (
-            <span className="text-white/35"> #{entry.target_id}</span>
-          )}
-        </div>
-      )}
-      {entry.ip && (
-        <div className="mt-0.5 font-mono text-[10.5px] text-white/40">
-          {entry.ip}
-        </div>
-      )}
-    </li>
-  );
-}
+  const hasTarget = entry.target_kind != null || entry.target_id != null;
+  const target = hasTarget
+    ? `${entry.target_kind ?? "—"}${
+        entry.target_id != null ? ` #${entry.target_id}` : ""
+      }`
+    : null;
+  // Relative time once the post-mount clock is available; until then
+  // (and on the server) fall back to a compact absolute timestamp so
+  // SSR and the first client render agree.
+  const relTime =
+    nowMs > 0
+      ? formatRelative(nowMs - when.getTime())
+      : when.toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+  const absTime = when.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 
-function DrawerAction({
-  label,
-  busy,
-  disabled,
-  onClick,
-}: {
-  label: string;
-  busy?: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={busy || disabled}
-      className="rounded-md border border-white/15 bg-white/4 px-3 py-1.5 text-center text-[12px] font-medium text-white/85 hover:bg-white/8 disabled:cursor-not-allowed disabled:opacity-50"
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 3,
+        padding: "10px 0",
+        borderBottom: "1px solid var(--line-faint)",
+      }}
     >
-      {busy ? "…" : label}
-    </button>
+      {/* Line 1: action (truncates) + target tag — never collides with time */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          minWidth: 0,
+        }}
+      >
+        <span
+          className="cf-mono"
+          title={entry.action}
+          style={{
+            fontSize: 13,
+            fontWeight: 500,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            minWidth: 0,
+            flex: 1,
+          }}
+        >
+          {entry.action}
+        </span>
+        {target && (
+          <span className="cf-tag cf-mono" title={target}>
+            {target}
+          </span>
+        )}
+      </div>
+      {/* Line 2: faint meta — relative time · IP (IP omitted when absent) */}
+      <div className="cf-faint" style={{ fontSize: 11 }}>
+        <time dateTime={when.toISOString()} title={absTime}>
+          {relTime}
+        </time>
+        {entry.ip && (
+          <>
+            {" · "}
+            <span className="cf-mono">{entry.ip}</span>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1061,7 +1394,7 @@ function friendlyError(e: unknown): string {
 }
 
 function formatRelative(diffMs: number): string {
-  if (diffMs < 60_000) return "just now";
+  if (diffMs < 60_000) return "now";
   if (diffMs < 3_600_000) return `${Math.floor(diffMs / 60_000)}m ago`;
   if (diffMs < 86_400_000) return `${Math.floor(diffMs / 3_600_000)}h ago`;
   return `${Math.floor(diffMs / 86_400_000)}d ago`;
@@ -1089,7 +1422,7 @@ function summarizeUserAgent(ua: string | null): string {
           : /Android/.exec(ua)
             ? "Android"
             : null;
-  if (browser && os) return `${browser} on ${os}`;
+  if (browser && os) return `${browser} · ${os}`;
   if (browser) return browser;
   return ua.slice(0, 80);
 }

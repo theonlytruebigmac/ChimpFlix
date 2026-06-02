@@ -44,6 +44,27 @@ pub struct NetworkResponse {
     /// operator notices a misconfigured proxy before it silently
     /// collapses per-IP rate limits.
     pub proxy_diagnostic: ProxyDiagnostic,
+    /// The most recent persisted reachability check, or `None` when none
+    /// has ever run. Lets the page render a standing "Reachable · checked
+    /// Xm ago" banner across reloads without re-probing. Written each time
+    /// `test_reachability` runs (see `LastReachability`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reachability: Option<LastReachability>,
+}
+
+/// Persisted snapshot of the last reachability check. Serialized as the
+/// `network_last_reachability` JSON blob on the server_settings row and
+/// echoed back in the network GET so the Network page can render a
+/// standing banner. `checked_at` is epoch ms — the client renders the
+/// "checked Xm ago" relative label from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastReachability {
+    pub ok: bool,
+    pub public_url: Option<String>,
+    pub status_code: Option<u16>,
+    pub latency_ms: Option<i64>,
+    pub error: Option<String>,
+    pub checked_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +118,12 @@ fn response_from(
     proxy_diagnostic: ProxyDiagnostic,
 ) -> NetworkResponse {
     let cors_origins: Vec<String> = serde_json::from_str(&s.cors_origins).unwrap_or_default();
+    // Tolerant parse: a malformed / legacy blob just reads as "no check
+    // yet" rather than failing the whole GET.
+    let last_reachability = s
+        .network_last_reachability
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<LastReachability>(raw).ok());
     NetworkResponse {
         public_url: s.public_url,
         cors_origins,
@@ -107,6 +134,7 @@ fn response_from(
         auth_bypass_cidrs: s.auth_bypass_cidrs,
         bind_interface: s.bind_interface,
         proxy_diagnostic,
+        last_reachability,
     }
 }
 
@@ -229,6 +257,9 @@ pub async fn test_reachability(
 ) -> Result<Json<ReachabilityResponse>, ApiError> {
     let s = state.settings.read().await.clone();
     let Some(public_url) = s.public_url.clone() else {
+        // No probe ran — nothing meaningful to persist (a "checked Xm
+        // ago" banner with no target would only confuse). Return the
+        // guard result without touching the stored snapshot.
         return Ok(Json(ReachabilityResponse {
             ok: false,
             public_url: None,
@@ -243,54 +274,80 @@ pub async fn test_reachability(
     // internal URL and use the reachability test as a port-scan oracle
     // (200 vs connection-refused vs timeout reveals which internal
     // ports are open).
-    if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(&target).await {
-        return Ok(Json(ReachabilityResponse {
+    let result = if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(&target).await {
+        ReachabilityResponse {
             ok: false,
-            public_url: Some(public_url),
+            public_url: Some(public_url.clone()),
             status_code: None,
             latency_ms: None,
             error: Some(format!("blocked: {reason}")),
-        }));
-    }
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(false)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(Json(ReachabilityResponse {
+        }
+    } else {
+        match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .danger_accept_invalid_certs(false)
+            .build()
+        {
+            Ok(client) => {
+                let started = Instant::now();
+                match client.get(&target).send().await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let ok = status == 200;
+                        ReachabilityResponse {
+                            ok,
+                            public_url: Some(public_url.clone()),
+                            status_code: Some(status),
+                            latency_ms: Some(started.elapsed().as_millis() as i64),
+                            error: if ok {
+                                None
+                            } else {
+                                Some(format!("HTTP {status}"))
+                            },
+                        }
+                    }
+                    Err(e) => ReachabilityResponse {
+                        ok: false,
+                        public_url: Some(public_url.clone()),
+                        status_code: None,
+                        latency_ms: Some(started.elapsed().as_millis() as i64),
+                        error: Some(format!("{e}")),
+                    },
+                }
+            }
+            Err(e) => ReachabilityResponse {
                 ok: false,
-                public_url: Some(public_url),
+                public_url: Some(public_url.clone()),
                 status_code: None,
                 latency_ms: None,
                 error: Some(format!("client build failed: {e}")),
-            }));
+            },
         }
     };
-    let started = Instant::now();
-    match client.get(&target).send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let ok = status == 200;
-            Ok(Json(ReachabilityResponse {
-                ok,
-                public_url: Some(public_url),
-                status_code: Some(status),
-                latency_ms: Some(started.elapsed().as_millis() as i64),
-                error: if ok {
-                    None
-                } else {
-                    Some(format!("HTTP {status}"))
-                },
-            }))
+
+    // Persist the snapshot so the Network page can render a standing
+    // "checked Xm ago" banner. Best-effort: a write failure must not sink
+    // the operator's on-demand check, so we log-and-continue. On success
+    // we also refresh the in-memory settings cache the GET reads from.
+    let snapshot = LastReachability {
+        ok: result.ok,
+        public_url: result.public_url.clone(),
+        status_code: result.status_code,
+        latency_ms: result.latency_ms,
+        error: result.error.clone(),
+        checked_at: chimpflix_common::now_ms(),
+    };
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        match queries::set_network_last_reachability(&state.pool, &json).await {
+            Ok(updated) => {
+                let mut guard = state.settings.write().await;
+                *guard = updated;
+            }
+            Err(e) => {
+                tracing::warn!("failed to persist last reachability: {e}");
+            }
         }
-        Err(e) => Ok(Json(ReachabilityResponse {
-            ok: false,
-            public_url: Some(public_url),
-            status_code: None,
-            latency_ms: Some(started.elapsed().as_millis() as i64),
-            error: Some(format!("{e}")),
-        })),
     }
+
+    Ok(Json(result))
 }

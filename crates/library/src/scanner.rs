@@ -80,6 +80,17 @@ enum CachedSeason {
     Missing,
 }
 
+/// Per-scan set of show ids whose full episode list has already been
+/// materialized into placeholder rows this scan. The scanner walks files
+/// in parallel, so without this guard the first file of every episode of
+/// a show would each re-fetch the season list and re-run the placeholder
+/// upsert. We populate placeholders exactly once per show per scan: the
+/// first file of a show that resolves a usable external id wins; later
+/// files of the same show short-circuit on the `contains` check. Scoped
+/// to the scan (not persisted) so the next scan re-checks and picks up
+/// newly-announced episodes for ongoing shows.
+type PlaceholderShows = Mutex<std::collections::HashSet<i64>>;
+
 // AniList per-scan caches moved to `chimpflix_metadata::anilist_cache`
 // so `AniListAgent` can hold them directly. Type aliases below keep
 // the scanner's call sites readable.
@@ -390,6 +401,8 @@ async fn scan_inner(
     let anilist_cache: Arc<AniListCache> = Arc::new(Mutex::new(HashMap::new()));
     let anilist_episode_cache: Arc<AniListEpisodeCache> = Arc::new(Mutex::new(HashMap::new()));
     let anilist_season_id_cache: Arc<AniListSeasonIdCache> = Arc::new(Mutex::new(HashMap::new()));
+    let placeholder_shows: Arc<PlaceholderShows> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // Clone the network clients up front so each parallel worker owns
     // its own handle. reqwest::Client is internally Arc'd, so this is
@@ -418,6 +431,7 @@ async fn scan_inner(
             let anilist_cache = anilist_cache.clone();
             let anilist_episode_cache = anilist_episode_cache.clone();
             let anilist_season_id_cache = anilist_season_id_cache.clone();
+            let placeholder_shows = placeholder_shows.clone();
             async move {
                 let res = process_file(
                     &pool,
@@ -438,6 +452,7 @@ async fn scan_inner(
                     &anilist_cache,
                     &anilist_episode_cache,
                     &anilist_season_id_cache,
+                    &placeholder_shows,
                 )
                 .await;
                 (path, res)
@@ -676,6 +691,7 @@ async fn process_file(
     anilist_cache: &chimpflix_metadata::AniListShowCacheArc,
     anilist_episode_cache: &chimpflix_metadata::AniListEpisodeListCacheArc,
     anilist_season_id_cache: &chimpflix_metadata::AniListSeasonIdCacheArc,
+    placeholder_shows: &PlaceholderShows,
 ) -> Result<(queries::FileOutcome, Option<i64>)> {
     // Non-UTF8 paths used to fail silently up the error chain with
     // only the generic "non-UTF8 path" message in the scan job log.
@@ -1403,6 +1419,32 @@ async fn process_file(
                 }
             }
         }
+
+        // Placeholder population. The dispatch above only enriches the
+        // ONE episode this file backs; the scanner never creates rows
+        // for episodes that have no file. That leaves an in-progress
+        // season incomplete — the highest file-backed episode looks
+        // like the finale and freshly-announced episodes are missing
+        // from the calendar. Materialize a placeholder `episodes` row
+        // (no `media_files`) for every episode the chain's PRIMARY
+        // agent lists, so the season is complete. Runs once per show
+        // per scan (the `placeholder_shows` guard), reusing the episode
+        // list the per-file dispatch already fetched (TMDB `season_cache`
+        // / AniList episode cache) or one `fetch_episodes` per show for
+        // TVDB / TVMaze — never a per-file fetch storm.
+        populate_show_placeholders(
+            pool,
+            tmdb,
+            tvdb,
+            tvmaze,
+            agents,
+            library_kind,
+            hint.show_id,
+            &show_lookup,
+            season_cache,
+            placeholder_shows,
+        )
+        .await;
     }
 
     // Return the file_id so the caller can emit a FileAdded event
@@ -2172,6 +2214,38 @@ async fn refresh_show_through_chain(
         episodes = %ep_hits_str,
         "refresh: chain done"
     );
+
+    // Complete the season(s) with placeholder rows for every episode the
+    // primary agent knows about — the same step the scan path runs, so
+    // the Refresh button also picks up newly-announced episodes for
+    // ongoing shows (and fills in any season that only ever had
+    // file-backed rows). `show_lookup` now carries every id Pass 1
+    // resolved. Build the same kind of `AgentChain` the scan uses so the
+    // primary-agent selection matches. Fresh per-refresh caches: refresh
+    // is operator-driven and infrequent, so a cold `season_cache` is
+    // fine, and the single-element `placeholder_shows` just satisfies the
+    // helper's once-per-show contract.
+    let chain = AgentChain {
+        order: agents.iter().map(|a| a.agent_name.clone()).collect(),
+        language,
+    };
+    let season_cache: Arc<SeasonCache> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let placeholder_shows: Arc<PlaceholderShows> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    populate_show_placeholders(
+        pool,
+        tmdb,
+        tvdb,
+        tvmaze,
+        &chain,
+        library_kind,
+        show_id,
+        &show_lookup,
+        &season_cache,
+        &placeholder_shows,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -2540,6 +2614,277 @@ async fn tmdb_apply_episodes_for_show(
             "TMDB season fetch failed"
         ),
     }
+}
+
+/// Materialize placeholder `episodes` rows for every episode the
+/// chain's PRIMARY agent lists for `show_id`, so an in-progress or
+/// future season is COMPLETE in the DB even before the files arrive.
+///
+/// A placeholder is an `episodes` row with NO `media_files` row. It is
+/// informational only — excluded by construction from every
+/// "content you have" surface (those JOIN/EXISTS on `media_files`) — but
+/// it makes `MAX(episode_number)` reflect the true season length (so the
+/// finale flag is correct) and gives the local calendar its air dates.
+///
+/// Cost discipline (no per-file fetch storm):
+///   * Runs at most ONCE per show per scan, gated on `placeholder_shows`.
+///   * Reuses the same cached episode list the per-file dispatch already
+///     pulled: TMDB via `season_cache` (`fetch_season_cached`), so no new
+///     network call; TVDB / TVMaze do one `fetch_episodes` per show.
+///   * Only the PRIMARY agent is consulted — we don't fan out across the
+///     whole chain. The primary owns episode numbering for the library
+///     kind (anime → tvdb, shows → tvdb/tvmaze/tmdb, etc.).
+///
+/// Idempotent: [`queries::upsert_episode_placeholder`] keys on
+/// `(season_id, episode_number)` — the same key the file-backed
+/// [`queries::upsert_episode`] uses — so a placeholder reconciles in
+/// place when a file later arrives (no dupes, no clobbering).
+#[allow(clippy::too_many_arguments)]
+async fn populate_show_placeholders(
+    pool: &SqlitePool,
+    tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    tvmaze: Option<&TvMazeClient>,
+    agents: &AgentChain,
+    library_kind: LibraryKind,
+    show_id: i64,
+    show_lookup: &chimpflix_metadata::ShowLookup,
+    season_cache: &SeasonCache,
+    placeholder_shows: &PlaceholderShows,
+) {
+    // Once per show per scan. Insert-then-check so the first worker to
+    // reach a given show wins and every later file of that show bails.
+    {
+        let mut guard = placeholder_shows.lock().await;
+        if !guard.insert(show_id) {
+            return;
+        }
+    }
+
+    // External ids to address the show by. Prefer the ids the in-flight
+    // chain just resolved (`show_lookup`); fall back to whatever a prior
+    // scan persisted on the `items` row. The fallback matters on re-scans
+    // where the live title search hiccups but the id is already known —
+    // we still want to complete the season rather than skip the show.
+    let (mut tvdb_id, mut tmdb_id, mut tvmaze_id) =
+        (show_lookup.tvdb_id, show_lookup.tmdb_id, show_lookup.tvmaze_id);
+    if tvdb_id.is_none() || tmdb_id.is_none() || tvmaze_id.is_none() {
+        if let Ok(Some(row)) =
+            sqlx::query("SELECT tmdb_id, tvdb_id, tvmaze_id FROM items WHERE id = ?")
+                .bind(show_id)
+                .fetch_optional(pool)
+                .await
+        {
+            tvdb_id = tvdb_id.or_else(|| {
+                sqlx::Row::try_get::<Option<i64>, _>(&row, "tvdb_id")
+                    .ok()
+                    .flatten()
+            });
+            tmdb_id = tmdb_id.or_else(|| {
+                sqlx::Row::try_get::<Option<i64>, _>(&row, "tmdb_id")
+                    .ok()
+                    .flatten()
+            });
+            tvmaze_id = tvmaze_id.or_else(|| {
+                sqlx::Row::try_get::<Option<i64>, _>(&row, "tvmaze_id")
+                    .ok()
+                    .flatten()
+            });
+        }
+    }
+
+    // Walk the chain in priority order — `ordered()` puts the PRIMARY
+    // first, so the primary agent is consulted first and wins if it can
+    // supply a season-aware episode list. We fall through to the next
+    // capable agent only when an earlier one can't (e.g. the primary is
+    // `anilist`, which never drives placeholders — its `streamingEpisodes`
+    // listing has no per-season numbering or air dates — so an anime
+    // library still gets placeholders from `tvdb` further down the
+    // chain). AniList is also skipped on non-anime libraries to match
+    // the dispatch loops.
+    for agent_name in agents.ordered() {
+        if agent_name == "anilist" && !matches!(library_kind, LibraryKind::Anime) {
+            continue;
+        }
+        let upserted = match agent_name {
+            "tvdb" => {
+                let (Some(client), Some(id)) = (tvdb, tvdb_id) else {
+                    continue;
+                };
+                placeholders_from_tvdb(pool, client, show_id, id).await
+            }
+            "tvmaze" => {
+                let (Some(client), Some(id)) = (tvmaze, tvmaze_id) else {
+                    continue;
+                };
+                placeholders_from_tvmaze(pool, client, show_id, id).await
+            }
+            "tmdb" => {
+                let (Some(client), Some(id)) = (tmdb, tmdb_id) else {
+                    continue;
+                };
+                placeholders_from_tmdb(pool, client, season_cache, show_id, id).await
+            }
+            // anilist / omdb don't expose a season-aware episode list with
+            // air dates suitable for placeholders.
+            _ => continue,
+        };
+        match upserted {
+            // First agent that produced rows wins; stop walking the chain.
+            Ok(n) if n > 0 => {
+                debug!(show_id, agent = agent_name, count = n, "populated episode placeholders");
+                return;
+            }
+            Ok(_) => {
+                // Agent reachable but listed nothing new — still authoritative
+                // for placeholders; don't double-fetch from a lower-priority
+                // source.
+                return;
+            }
+            Err(e) => {
+                // Transient failure (network / rate limit / circuit breaker).
+                // Try the next capable agent in the chain. The show stays
+                // flagged for the REST OF THIS SCAN (so its other files
+                // don't re-storm the failing endpoint); the NEXT scan
+                // re-checks from a fresh `placeholder_shows` set and retries.
+                warn!(
+                    error = %format!("{e:#}"),
+                    show_id,
+                    agent = agent_name,
+                    "placeholder population failed; trying next agent"
+                );
+            }
+        }
+    }
+}
+
+/// TVDB placeholder source. One `fetch_episodes` returns every episode
+/// across every season (with season + episode numbers, air dates,
+/// absolute numbers, and the TVDB episode id), so a single call covers
+/// the whole show. `tvdb_id` here is the EPISODE's tvdb id, kept distinct
+/// from `tmdb_id` (TVDB doesn't surface TMDB ids).
+async fn placeholders_from_tvdb(
+    pool: &SqlitePool,
+    client: &TvdbClient,
+    show_id: i64,
+    tvdb_id: i64,
+) -> Result<usize> {
+    let episodes = client.fetch_episodes(tvdb_id).await?;
+    let mut count = 0usize;
+    for ep in &episodes {
+        // Skip TVDB "season 0" specials and any episode TVDB couldn't
+        // number — they don't belong on the main season timeline.
+        if ep.season_number <= 0 || ep.episode_number <= 0 {
+            continue;
+        }
+        let season_id = queries::upsert_season(pool, show_id, ep.season_number).await?;
+        queries::upsert_episode_placeholder(
+            pool,
+            season_id,
+            &queries::PlaceholderEpisode {
+                episode_number: ep.episode_number,
+                title: Some(ep.title.clone()).filter(|s| !s.trim().is_empty()),
+                summary: ep.summary.clone(),
+                air_date: ep.air_date.clone(),
+                tmdb_id: None,
+                tvdb_id: Some(ep.tvdb_id),
+                absolute_number: ep.absolute_number,
+            },
+        )
+        .await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// TVMaze placeholder source. Mirrors TVDB — one `fetch_episodes` lists
+/// every season. TVMaze carries no TMDB/TVDB episode ids.
+async fn placeholders_from_tvmaze(
+    pool: &SqlitePool,
+    client: &TvMazeClient,
+    show_id: i64,
+    tvmaze_id: i64,
+) -> Result<usize> {
+    let episodes = client.fetch_episodes(tvmaze_id).await?;
+    let mut count = 0usize;
+    for ep in &episodes {
+        if ep.season_number <= 0 || ep.episode_number <= 0 {
+            continue;
+        }
+        let season_id = queries::upsert_season(pool, show_id, ep.season_number).await?;
+        queries::upsert_episode_placeholder(
+            pool,
+            season_id,
+            &queries::PlaceholderEpisode {
+                episode_number: ep.episode_number,
+                title: Some(ep.title.clone()).filter(|s| !s.trim().is_empty()),
+                summary: ep.summary.clone(),
+                air_date: ep.air_date.clone(),
+                tmdb_id: None,
+                tvdb_id: None,
+                absolute_number: None,
+            },
+        )
+        .await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// TMDB placeholder source. TMDB groups episodes per season behind
+/// `/tv/{id}/season/{n}`, so we walk every season already present locally
+/// for this show (the per-file dispatch will have created at least the
+/// season the current file belongs to) and reuse the per-scan
+/// `season_cache` — a season the dispatch already fetched costs zero
+/// extra network calls here.
+async fn placeholders_from_tmdb(
+    pool: &SqlitePool,
+    client: &TmdbClient,
+    season_cache: &SeasonCache,
+    show_id: i64,
+    show_tmdb_id: i64,
+) -> Result<usize> {
+    let local_seasons: Vec<i32> = sqlx::query_scalar::<_, i32>(
+        "SELECT season_number FROM seasons WHERE show_id = ? AND season_number > 0 \
+         ORDER BY season_number",
+    )
+    .bind(show_id)
+    .fetch_all(pool)
+    .await?;
+    let mut count = 0usize;
+    for season_number in local_seasons {
+        let season = match fetch_season_cached(season_cache, client, show_tmdb_id, season_number)
+            .await
+        {
+            Ok(Some(s)) => s,
+            // Confirmed-missing season (cached 404) — common for
+            // split-cour anime; nothing to materialize.
+            Ok(None) => continue,
+            Err(e) => return Err(e),
+        };
+        let season_id = queries::upsert_season(pool, show_id, season_number).await?;
+        for ep in &season.episodes {
+            if ep.episode_number <= 0 {
+                continue;
+            }
+            queries::upsert_episode_placeholder(
+                pool,
+                season_id,
+                &queries::PlaceholderEpisode {
+                    episode_number: ep.episode_number,
+                    title: Some(ep.title.clone()).filter(|s| !s.trim().is_empty()),
+                    summary: ep.summary.clone(),
+                    air_date: ep.air_date.clone(),
+                    tmdb_id: Some(ep.tmdb_id),
+                    tvdb_id: None,
+                    absolute_number: None,
+                },
+            )
+            .await?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Memoised wrapper around `TmdbClient::fetch_season`. Same season

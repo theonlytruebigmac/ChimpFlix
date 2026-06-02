@@ -193,6 +193,7 @@ pub fn router(state: AppState) -> Router {
         // Items / seasons / episodes
         .route("/items", get(items::list))
         .route("/items/trending", get(items::trending))
+        .route("/calendar", get(items::calendar))
         .route("/items/{id}", get(items::get_one).patch(items::patch_item))
         .route(
             "/items/{id}/media",
@@ -380,6 +381,12 @@ pub fn router(state: AppState) -> Router {
             "/admin/items/bulk/detect-markers",
             post(admin::bulk::detect_markers),
         )
+        // Whole-library bulk operations (mark watched/unwatched for the
+        // acting operator, re-scan, destructive content delete).
+        .route(
+            "/admin/libraries/bulk",
+            post(admin::bulk::library_op),
+        )
         // Background job queue (Owner-only) — durable pipeline jobs
         // for marker detection, loudness analysis, subtitle fetch,
         // ratings, season fingerprint bootstrap. The list endpoint
@@ -411,6 +418,7 @@ pub fn router(state: AppState) -> Router {
             "/notifications/read-all",
             post(notifications::mark_all_read),
         )
+        .route("/notifications/clear", post(notifications::clear_all))
         // My List
         .route("/my-list", get(my_list::list))
         .route(
@@ -475,6 +483,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/settings/email/test", post(admin::email::test))
         .route("/admin/audit", get(admin::audit::list))
+        .route("/admin/audit/export", get(admin::audit::export))
         .route("/admin/library-health", get(admin::health::get))
         .route("/admin/library-health/items", get(admin::health::items))
         .route("/admin/agents", get(admin::agents::list_available))
@@ -524,6 +533,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/transcoder/capabilities",
             get(admin::transcoder::capabilities),
+        )
+        .route(
+            "/admin/transcoder/capabilities/reprobe",
+            post(admin::transcoder::reprobe_capabilities),
         )
         .route(
             "/admin/transcoder/presets",
@@ -579,6 +592,8 @@ pub fn router(state: AppState) -> Router {
             "/admin/users/{id}/unlock-attempts",
             post(admin::users::unlock_login_attempts),
         )
+        .route("/admin/users/{id}/lock", post(admin::users::lock_user))
+        .route("/admin/users/{id}/unlock", post(admin::users::unlock_user))
         .route(
             "/admin/access-matrix",
             get(admin::users::get_access_matrix).put(admin::users::put_access_matrix),
@@ -612,6 +627,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/versions/{id}",
             axum::routing::delete(admin::optimized::delete),
+        )
+        .route(
+            "/admin/versions/{id}/cancel",
+            post(admin::optimized::cancel),
         )
         .route("/admin/logs", get(admin::maintenance::logs))
         .route("/admin/alerts", get(admin::maintenance::alerts))

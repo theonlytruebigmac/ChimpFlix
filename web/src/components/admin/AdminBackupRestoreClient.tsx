@@ -8,7 +8,6 @@ import {
   type ListBackupsResponse,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "../ConfirmDialog";
-import { ErrorBanner } from "./ui";
 import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 
 /// Admin surface for the persisted auto-backup snapshots
@@ -16,6 +15,12 @@ import { LoadingPlaceholder } from "../ui/LoadingPlaceholder";
 /// age, exposes Download / Delete / Restore per row, and surfaces a
 /// big amber banner when a restore is staged so the operator
 /// remembers to restart.
+///
+/// Restyled to the console `cf-*` design system per
+/// docs/redesign/admin-maintenance.html (Backups tab). The mockup's
+/// "Automatic backups" card + snapshot table is the steady state; the
+/// staged-restore banner, vault-key warning, and retention control are
+/// the production superset kept on top.
 export function AdminBackupRestoreClient() {
   const [data, setData] = useState<ListBackupsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -204,84 +209,107 @@ export function AdminBackupRestoreClient() {
   }
 
   return (
-    <div className="space-y-4">
-      <ErrorBanner error={error} />
+    <div>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
       {toast && (
-        <div className="rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white/80">
-          {toast}
+        <div className="cf-banner cf-info">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v.5M12 11v5" />
+          </svg>
+          <div>{toast}</div>
         </div>
       )}
 
       {data?.pending_restore && (
-        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="text-sm text-amber-200">
-              <div className="font-semibold">Restore staged — restart required</div>
-              <p className="mt-1 text-xs text-amber-200/80">
-                A backup is queued as the next-boot database. Restart the
-                server to apply it. Your current database will be preserved
-                as <code className="font-mono">chimpflix.db.pre-restore-&lt;timestamp&gt;.db</code> in
-                the data directory.
-              </p>
-              <p
-                className="mt-2 text-xs text-amber-200/80"
-                role="status"
-                aria-live="polite"
+        <div className="cf-banner cf-warn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 3l9 16H3z" />
+            <path d="M12 10v4M12 17v.5" />
+          </svg>
+          <div style={{ flex: 1 }}>
+            <div className="cf-flex cf-between cf-gap12" style={{ alignItems: "flex-start" }}>
+              <div>
+                <b>Restore staged — restart required</b>
+                <p style={{ marginTop: 4 }}>
+                  A backup is queued as the next-boot database. Restart the
+                  server to apply it. Your current database will be preserved as{" "}
+                  <code className="cf-mono">
+                    chimpflix.db.pre-restore-&lt;timestamp&gt;.db
+                  </code>{" "}
+                  in the data directory.
+                </p>
+                <p style={{ marginTop: 8 }} role="status" aria-live="polite">
+                  {restartStatus === "down"
+                    ? "Server is offline — waiting for it to come back…"
+                    : restartStatus === "back"
+                      ? "Server is back online. Reload this page to confirm."
+                      : "Watching server uptime — we'll let you know the moment it restarts."}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={cancelRestore}
+                disabled={busy === "cancel"}
+                className="cf-btn cf-sm"
+                style={{ flex: "none" }}
               >
-                {restartStatus === "down"
-                  ? "Server is offline — waiting for it to come back…"
-                  : restartStatus === "back"
-                    ? "Server is back online. Reload this page to confirm."
-                    : "Watching server uptime — we'll let you know the moment it restarts."}
-              </p>
+                {busy === "cancel" ? "Cancelling…" : "Cancel restore"}
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={cancelRestore}
-              disabled={busy === "cancel"}
-              className="shrink-0 rounded border border-amber-500/40 px-3 py-1.5 text-xs text-amber-200 hover:bg-amber-500/10 disabled:opacity-50"
-            >
-              {busy === "cancel" ? "Cancelling…" : "Cancel restore"}
-            </button>
           </div>
         </div>
       )}
 
       {data?.vault_key_required && (
-        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">
-          <div className="font-semibold">Back up your vault key alongside these snapshots</div>
-          <p className="mt-1 text-xs text-amber-200/80">
-            This server has encrypted credentials at rest (SMTP password,
-            Trakt tokens, TOTP secrets, session HMAC). Backups are useless
-            without the matching{" "}
-            <code className="font-mono">CHIMPFLIX_SECRET_KEY</code>. Store the
-            current key off-box in a password manager — restoring a snapshot
-            against a different key bricks every encrypted credential.
-            {" "}
-            See <a
-              href="https://github.com/soybigmac/ChimpFlix/blob/main/docs/PUBLIC_RELEASE_HARDENING.md#1-backupvault-decoupling-silently-bricks-restores"
-              target="_blank"
-              rel="noreferrer"
-              className="underline hover:text-amber-100"
-            >
-              the hardening doc
-            </a> for the recovery procedure.
-          </p>
+        <div className="cf-banner cf-warn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 3l9 16H3z" />
+            <path d="M12 10v4M12 17v.5" />
+          </svg>
+          <div>
+            <b>Back up your vault key alongside these snapshots.</b>
+            <p style={{ marginTop: 4 }}>
+              This server has encrypted credentials at rest (SMTP password,
+              Trakt tokens, TOTP secrets, session HMAC). Backups are useless
+              without the matching{" "}
+              <code className="cf-mono">CHIMPFLIX_SECRET_KEY</code>. Store the
+              current key off-box in a password manager — restoring a snapshot
+              against a different key bricks every encrypted credential.{" "}
+              See{" "}
+              <a
+                href="https://github.com/soybigmac/ChimpFlix/blob/main/docs/PUBLIC_RELEASE_HARDENING.md#1-backupvault-decoupling-silently-bricks-restores"
+                target="_blank"
+                rel="noreferrer"
+              >
+                the hardening doc
+              </a>{" "}
+              for the recovery procedure.
+            </p>
+          </div>
         </div>
       )}
 
       {data && (
-        <section className="rounded-lg border border-white/10 bg-white/2 p-4">
-          <div className="flex items-center justify-between gap-3">
+        <div className="cf-card">
+          <div className="cf-card-head">
             <div>
-              <h3 className="text-sm font-semibold">Retention</h3>
-              <p className="mt-0.5 text-xs text-white/50">
-                Daily snapshots past this count get pruned after each
-                <code className="ml-1 font-mono text-white/65">backup_db</code> run.
-                Set to 0 to disable pruning entirely. Range 0&ndash;365.
-              </p>
+              <div className="cf-ttl">Retention</div>
+              <div className="cf-sub">
+                Daily snapshots past this count get pruned after each{" "}
+                <code className="cf-mono">backup_db</code> run. Set to 0 to
+                disable pruning entirely. Range 0&ndash;365.
+              </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="cf-head-aside">
               <input
                 type="number"
                 min={0}
@@ -290,7 +318,12 @@ export function AdminBackupRestoreClient() {
                 onChange={(e) =>
                   setRetentionDraft(Number.parseInt(e.target.value, 10) || 0)
                 }
-                className="w-20 rounded-md border border-white/15 bg-black/30 px-2 py-1 text-right text-sm tabular-nums outline-none focus:border-(--color-accent)"
+                className="cf-input"
+                style={{
+                  width: 80,
+                  textAlign: "right",
+                  fontVariantNumeric: "tabular-nums",
+                }}
               />
               <button
                 type="button"
@@ -315,109 +348,145 @@ export function AdminBackupRestoreClient() {
                     setRetentionSaving(false);
                   }
                 }}
-                className="rounded bg-(--color-accent) px-3 py-1 text-xs font-semibold text-white disabled:opacity-50"
+                className="cf-btn cf-primary cf-sm"
               >
                 {retentionSaving ? "Saving…" : "Save"}
               </button>
             </div>
           </div>
-        </section>
+        </div>
       )}
 
-      <section className="rounded-lg border border-white/10 bg-white/2">
-        <div className="flex items-baseline justify-between border-b border-white/10 px-4 py-3">
+      <div className="cf-card" style={{ marginBottom: 0 }}>
+        <div className="cf-card-head">
           <div>
-            <h3 className="text-sm font-semibold">Auto-backup snapshots</h3>
-            <p className="mt-0.5 text-xs text-white/50">
-              Persisted under <code className="font-mono text-white/65">&lt;data_dir&gt;/backups/auto/</code>.
-              Written by the <code className="font-mono text-white/65">backup_db</code> scheduled task.
-            </p>
+            <div className="cf-ttl">Automatic backups</div>
+            <div className="cf-sub">
+              Persisted under{" "}
+              <code className="cf-mono">&lt;data_dir&gt;/backups/auto/</code>.
+              Written by the <code className="cf-mono">backup_db</code> scheduled
+              task.
+            </div>
           </div>
-          {data && data.backups.length > 0 && (
-            (() => {
-              const pressure =
-                data.retention_count > 0
-                  ? data.backups.length / data.retention_count
-                  : 0;
-              const colour =
-                pressure >= 1
-                  ? "text-amber-300"
-                  : pressure >= 0.85
-                    ? "text-amber-200/80"
-                    : "text-white/55";
-              return (
-                <div className={`text-xs tabular-nums ${colour}`}>
-                  {data.retention_count > 0 ? (
-                    <>
-                      {data.backups.length} of {data.retention_count} retained
-                      {pressure >= 0.85 && (
-                        <span className="ml-1">(next run will prune)</span>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      {data.backups.length} file{data.backups.length === 1 ? "" : "s"} (retention disabled)
-                    </>
-                  )}
-                  {" · "}
-                  {formatBytes(data.total_bytes)}
-                </div>
-              );
-            })()
-          )}
+          <div className="cf-head-aside">
+            <span className="cf-pill cf-ok">
+              <span className="cf-dot" />
+              Scheduled
+            </span>
+          </div>
         </div>
 
+        {data && data.backups.length > 0 && (
+          (() => {
+            const pressure =
+              data.retention_count > 0
+                ? data.backups.length / data.retention_count
+                : 0;
+            const tone =
+              pressure >= 0.85 ? "var(--warn)" : "var(--faint)";
+            return (
+              <div
+                className="cf-card-body cf-pad cf-mono"
+                style={{
+                  paddingTop: 12,
+                  paddingBottom: 0,
+                  fontSize: 12,
+                  fontVariantNumeric: "tabular-nums",
+                  color: tone,
+                }}
+              >
+                {data.retention_count > 0 ? (
+                  <>
+                    {data.backups.length} of {data.retention_count} retained
+                    {pressure >= 0.85 && (
+                      <span style={{ marginLeft: 4 }}>(next run will prune)</span>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {data.backups.length} file
+                    {data.backups.length === 1 ? "" : "s"} (retention disabled)
+                  </>
+                )}
+                {" · "}
+                {formatBytes(data.total_bytes)}
+              </div>
+            );
+          })()
+        )}
+
         {loading ? (
-          <LoadingPlaceholder />
+          <div className="cf-card-body cf-pad">
+            <LoadingPlaceholder />
+          </div>
         ) : !data || data.backups.length === 0 ? (
-          <div className="px-4 py-6 text-center text-sm text-white/50">
-            No backups yet. The <code className="font-mono text-white/65">backup_db</code> scheduled task
-            writes one daily during the maintenance window.
+          <div className="cf-card-body cf-pad cf-faint cf-center" style={{ fontSize: 13 }}>
+            No backups yet. The <code className="cf-mono">backup_db</code>{" "}
+            scheduled task writes one daily during the maintenance window.
           </div>
         ) : (
-          <ul className="divide-y divide-white/5">
-            {data.backups.map((b) => (
-              <li
-                key={b.filename}
-                className="flex flex-wrap items-center gap-3 px-4 py-3 sm:flex-nowrap"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-mono text-sm">{b.filename}</div>
-                  <div className="mt-0.5 text-xs text-white/50">
-                    {formatBytes(b.size_bytes)}
-                    {" · "}
+          <table className="cf-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Size</th>
+                <th>Age</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {data.backups.map((b) => (
+                <tr key={b.filename}>
+                  <td>
+                    <div
+                      className="cf-mono"
+                      style={{
+                        maxWidth: 360,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {b.filename}
+                    </div>
+                  </td>
+                  <td className="cf-mono">{formatBytes(b.size_bytes)}</td>
+                  <td className="cf-faint">
                     {nowMs > 0 ? `${formatRelative(nowMs - b.modified_ms)} ago` : ""}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  disabled={busy === b.filename}
-                  onClick={() => downloadOne(b)}
-                  className="rounded border border-white/15 px-2 py-1 text-xs text-white/80 hover:bg-white/5 disabled:opacity-50"
-                >
-                  Download
-                </button>
-                <button
-                  type="button"
-                  disabled={busy === b.filename}
-                  onClick={() => setConfirmRestore(b)}
-                  className="rounded border border-amber-500/40 px-2 py-1 text-xs text-amber-300 hover:bg-amber-500/10 disabled:opacity-50"
-                >
-                  Restore…
-                </button>
-                <button
-                  type="button"
-                  disabled={busy === b.filename}
-                  onClick={() => deleteOne(b)}
-                  className="rounded border border-red-500/40 px-2 py-1 text-xs text-red-300 hover:bg-red-500/10 disabled:opacity-50"
-                >
-                  Delete
-                </button>
-              </li>
-            ))}
-          </ul>
+                  </td>
+                  <td className="cf-num">
+                    <button
+                      type="button"
+                      disabled={busy === b.filename}
+                      onClick={() => setConfirmRestore(b)}
+                      className="cf-btn cf-ghost cf-tiny"
+                    >
+                      Restore
+                    </button>{" "}
+                    <button
+                      type="button"
+                      disabled={busy === b.filename}
+                      onClick={() => downloadOne(b)}
+                      className="cf-btn cf-ghost cf-tiny"
+                    >
+                      Download
+                    </button>{" "}
+                    <button
+                      type="button"
+                      disabled={busy === b.filename}
+                      onClick={() => deleteOne(b)}
+                      className="cf-btn cf-ghost cf-tiny"
+                      style={{ color: "var(--err)" }}
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
-      </section>
+      </div>
 
       {confirmRestore && (
         <RestoreConfirmDialog

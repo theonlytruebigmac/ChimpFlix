@@ -47,6 +47,31 @@ export interface User {
    * discriminator (e.g. `{"job.failed":{"enabled":false}}`). Empty object
    * = all defaults. Security kinds (`user.2fa.*`) always notify. */
   notification_prefs_json: string;
+  /** Personal Discord webhook URL. null = not configured. When set,
+   * notifications that reach the user are mirrored to this webhook
+   * (treated like the email channel for per-kind prefs + quiet hours). */
+  discord_webhook_url: string | null;
+  /** IANA timezone name (e.g. `America/New_York`). Defaults to `UTC`.
+   * Used by the notifier to interpret the quiet-hours window in the
+   * user's local wall-clock time. */
+  timezone: string;
+  /** Per-user home-page rail layout overlay: a JSON array of
+   * `{"rail_id":"<id>","enabled":<bool>}` entries. SPARSE/overlay
+   * semantics — any rail absent from the array keeps its default position +
+   * enabled state, so `"[]"` (the default) = stock home. The array order is
+   * the user's desired rail order. Rail ids match the backend
+   * `HOME_RAIL_CATALOGUE` (see `web/src/app/page.tsx` for the id↔rail map). */
+  home_rails_json: string;
+  /** DEPRECATED / unused by the UI: was meant to hide fully-watched titles
+   * from Continue Watching, but on-deck already excludes finished titles so it
+   * was a no-op. The DB column remains; the settings UI no longer reads or
+   * writes it. Default false. */
+  hide_watched_cw: boolean;
+  /** When true, hide titles with an explicit mature rating from home + browse
+   * (enforced server-side at the items query layer). FAIL-OPEN: unrated /
+   * NULL-rated titles are still shown, so it's a no-op until `rating_age` is
+   * populated. Default false. */
+  kids_safe: boolean;
   /** Most-recent successful login. null on first login. */
   last_login_at: number | null;
   last_login_ip: string | null;
@@ -54,6 +79,9 @@ export interface User {
    * signed in 3h ago from X" so users can spot unexpected access. */
   previous_login_at: number | null;
   previous_login_ip: string | null;
+  /** When true the account is disabled — the login gate rejects it
+   * (after the password check). Owners are never lockable. */
+  locked: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -78,7 +106,73 @@ export interface UpdateMeInput {
   notify_via_email?: boolean;
   /** JSON object of per-kind notification prefs; validated server-side. */
   notification_prefs_json?: string;
+  /** Personal Discord webhook URL. Empty string clears it; a non-empty
+   * value must be a Discord webhook URL (validated server-side); omit to
+   * leave unchanged. */
+  discord_webhook_url?: string;
+  /** IANA timezone name (e.g. `America/New_York`). Empty string resets to
+   * `UTC`; a non-empty value must be a valid IANA name (validated
+   * server-side); omit to leave unchanged. */
+  timezone?: string;
+  /** Home-page rail layout overlay: a JSON array of
+   * `{"rail_id":"<id>","enabled":<bool>}` entries. Empty string resets to
+   * `"[]"` (stock home); a non-empty value must be a JSON array of known-rail
+   * entries (validated server-side); omit to leave unchanged. */
+  home_rails_json?: string;
+  /** DEPRECATED / unused by the UI (no-op against on-deck). Still accepted by
+   * the server for backward compat; the settings UI no longer sends it.
+   * Present sets the boolean; omit to leave unchanged. */
+  hide_watched_cw?: boolean;
+  /** Hide explicitly mature-rated titles from home + browse (fail-open: unrated
+   * titles still show). Present sets the boolean; omit to leave unchanged. */
+  kids_safe?: boolean;
 }
+
+/** One home-rail in the customization catalogue: the stable wire id stored
+ * in `User.home_rails_json` plus the human label shown in the Home &
+ * visibility settings. */
+export interface HomeRailCatalogueEntry {
+  rail_id: string;
+  label: string;
+}
+
+/** One entry in a `home_rails_json` overlay patch sent to PATCH /auth/me.
+ * `rail_id` must be a member of {@link HOME_RAIL_CATALOGUE}; `enabled`
+ * toggles whether the rail renders. The array order is the user's desired
+ * top-to-bottom rail order. */
+export interface HomeRailPref {
+  rail_id: string;
+  enabled: boolean;
+}
+
+/** The stable catalogue of home-page rails the customization UI can toggle +
+ * reorder, in their default top-to-bottom order.
+ *
+ * MUST stay in sync with the backend `HOME_RAIL_CATALOGUE`
+ * (crates/library/src/models.rs) — that constant is the source of truth the
+ * /auth/me prefs API validates `home_rails_json` against — AND with
+ * `HOME_RAIL_ORDER` in web/src/app/page.tsx, which maps each id to the
+ * rendered rail node. `User.home_rails_json` is a SPARSE overlay over this
+ * list: any rail absent from a user's overlay keeps its default position +
+ * enabled state, so an empty overlay = the stock home page. */
+export const HOME_RAIL_CATALOGUE: readonly HomeRailCatalogueEntry[] = [
+  { rail_id: "continue_watching", label: "Continue Watching" },
+  { rail_id: "recently_added", label: "Recently Added" },
+  { rail_id: "coming_soon", label: "Coming Soon" },
+  { rail_id: "season_premieres", label: "New Seasons" },
+  { rail_id: "calendar", label: "Coming Up · Calendar" },
+  { rail_id: "upcoming_movies", label: "Upcoming Movies" },
+  { rail_id: "trakt_recs_movies", label: "Recommended for You · Movies" },
+  { rail_id: "trakt_recs_shows", label: "Recommended for You · Shows" },
+  { rail_id: "trakt_favorites", label: "Your Trakt Favorites" },
+  { rail_id: "trakt_lists", label: "Your Trakt Lists" },
+  { rail_id: "top10_movies", label: "Top 10 Movies This Week" },
+  { rail_id: "top10_shows", label: "Top 10 Shows This Week" },
+  { rail_id: "collections", label: "Collections" },
+  { rail_id: "library_sections", label: "New in Your Libraries" },
+  { rail_id: "movie_genres", label: "Movie Genre Rails" },
+  { rail_id: "show_genres", label: "Show Genre Rails" },
+] as const;
 
 export interface Notification {
   id: number;
@@ -559,6 +653,22 @@ export interface NetworkSettings {
    *  request peer. Drives the "your proxy config is broken" banner
    *  on the admin home (see PUBLIC_RELEASE_HARDENING.md WEEK 1 #8). */
   proxy_diagnostic: ProxyDiagnostic;
+  /** The most recent persisted reachability check, or absent/undefined
+   *  when none has ever run. Lets the Network page show a standing
+   *  "Reachable · checked Xm ago" banner across reloads. */
+  last_reachability?: LastReachability;
+}
+
+/** Persisted snapshot of the last reachability check (mirrors the
+ *  server's `LastReachability`). `checked_at` is epoch ms — the client
+ *  renders the relative "checked Xm ago" label from it. */
+export interface LastReachability {
+  ok: boolean;
+  public_url: string | null;
+  status_code: number | null;
+  latency_ms: number | null;
+  error: string | null;
+  checked_at: number;
 }
 
 export interface ProxyDiagnostic {
@@ -596,6 +706,12 @@ export interface ReachabilityResult {
 
 // ─── Webhooks ──────────────────────────────────────────────────────────────
 
+export interface WebhookLastDelivery {
+  status_code: number | null;
+  delivered: boolean;
+  created_at: number; // ms epoch
+}
+
 export interface Webhook {
   id: number;
   name: string;
@@ -605,6 +721,8 @@ export interface Webhook {
   enabled: boolean;
   created_at: number;
   updated_at: number;
+  /** Summary of the most recent delivery; omitted if never delivered. */
+  last_delivery?: WebhookLastDelivery;
 }
 
 export interface NewWebhookInput {
@@ -655,14 +773,24 @@ export interface AdminSessionSummary {
   created_at: number;
 }
 
+/// Tri-state library access level (phase 107).
+///   - "none" — no grant: library + items HIDDEN.
+///   - "view" — can browse/see metadata, but CANNOT play.
+///   - "full" — can browse AND play (the prior binary "allowed").
+export type AccessLevel = "none" | "view" | "full";
+
 export interface AccessMatrixEntry {
   user_id: number;
   username: string;
   library_id: number;
   library_name: string;
-  /// Direct `library_access` row exists. This is the only field the
-  /// matrix checkbox edits.
+  /// A direct `library_access` row exists (any level). Kept for back-compat;
+  /// `level` carries the actual direct grant level.
   allowed: boolean;
+  /// Level of the DIRECT grant ("none" when no direct row exists). This is
+  /// what the matrix's per-cell selector edits. A user may still have
+  /// group-derived access — see `via_groups`.
+  level: AccessLevel;
   /// Access-group names that ALSO grant this user this library
   /// (`access_group_libraries` × `user_access_groups`). These grants
   /// aren't editable from the matrix — they're managed under Settings
@@ -672,9 +800,19 @@ export interface AccessMatrixEntry {
   via_groups: string[];
 }
 
+/// One user's desired level for a library, sent by the matrix.
+export interface UserAccessGrant {
+  user_id: number;
+  level: AccessLevel;
+}
+
 export interface LibraryAccessAssignment {
   library_id: number;
-  user_ids: number[];
+  /// Legacy binary shape (every listed user → "full"). Send `grants` for
+  /// tri-state.
+  user_ids?: number[];
+  /// Tri-state per-user levels. Takes precedence over `user_ids`.
+  grants?: UserAccessGrant[];
 }
 
 // ─── Optimized Versions ────────────────────────────────────────────────────
@@ -686,7 +824,14 @@ export interface OptimizedVersion {
   output_path: string;
   output_size_bytes: number | null;
   duration_ms: number | null;
-  status: "queued" | "running" | "success" | "failed";
+  status: "queued" | "running" | "success" | "failed" | "cancelled";
+  /**
+   * Re-encode progress in tenths of a percent (0..=1000), or null while
+   * queued / before the worker has stamped a measurement. The admin UI
+   * renders a determinate bar when present and an indeterminate
+   * "running" bar when null on a running row.
+   */
+  progress_permille: number | null;
   error: string | null;
   created_at: number;
   completed_at: number | null;
@@ -876,6 +1021,13 @@ export interface ItemFilter {
    *  `vp9` / `mpeg4` / `mpeg2video` / `other`. `other` matches any
    *  codec outside the known list. */
   codecs?: ReadonlyArray<string>;
+  /** Existence/count probe. When true the server returns `total` only
+   *  (zero `items`) AND bypasses the per-user kids_safe filter, so the
+   *  home page can ask "is the server scanned at all?" without a
+   *  kids_safe profile on an unrated library seeing a false empty-home
+   *  screen. Returns no titles, so it can't be used to bypass kids_safe
+   *  to view content. */
+  count_only?: boolean;
 }
 
 export interface MediaStreamSummary {
@@ -1119,6 +1271,13 @@ export interface Episode {
   air_date: number | null;
   duration_ms: number | null;
   thumb_path: string | null;
+  /// True when the episode has at least one downloaded (non-removed)
+  /// media file and is therefore playable. False marks a PLACEHOLDER
+  /// episode the metadata agent materialized for an in-progress / future
+  /// season (correct finale flag + calendar coverage) that has no file
+  /// behind it. Optional + defaulted-true on the client so responses that
+  /// predate the backend field never hide a real, downloaded episode.
+  has_file?: boolean;
   added_at: number;
   updated_at: number;
 }
@@ -1143,6 +1302,35 @@ export type OnDeckEntry =
 
 export interface OnDeckResponse {
   items: OnDeckEntry[];
+}
+
+/// One locally-known episode whose air date falls inside the calendar
+/// window — the LOCAL-data complement to the Trakt-driven coming-soon rail.
+/// Field names are camelCase (the backend `UpcomingEpisode` is
+/// `#[serde(rename_all = "camelCase")]`). `airDate` is epoch milliseconds,
+/// date-granular (midnight UTC). The frontend groups by `airDate`.
+export interface CalendarEpisode {
+  episodeId: number;
+  showId: number;
+  showTitle: string;
+  seasonNumber: number;
+  episodeNumber: number;
+  episodeTitle: string | null;
+  airDate: number;
+  durationMs: number | null;
+  /// Highest episode number in this episode's season (for finale flagging).
+  maxEpisodeNumber: number;
+  isFinale: boolean;
+  isPremiere: boolean;
+  /// Episode still, if scanned.
+  stillPath: string | null;
+  /// Parent show poster / backdrop.
+  posterPath: string | null;
+  backdropPath: string | null;
+}
+
+export interface CalendarResponse {
+  episodes: CalendarEpisode[];
 }
 
 export type ScanStatus =
@@ -1331,9 +1519,18 @@ export interface AccessGroup {
   library_count: number;
 }
 
+/// One library bound to a group, with the level the group grants (phase 107).
+export interface GroupLibraryGrant {
+  library_id: number;
+  level: AccessLevel;
+}
+
 export interface AccessGroupDetail extends AccessGroup {
   member_ids: number[];
+  /// Bare library ids the group grants (any level). `library_grants` carries
+  /// the per-library level.
   library_ids: number[];
+  library_grants: GroupLibraryGrant[];
 }
 
 export interface NewAccessGroupInput {
@@ -1385,6 +1582,11 @@ export interface ServerSettings {
   cors_origins: string;
   secure_connections: SecureConnectionsMode;
   telemetry_opt_in: boolean;
+  /** Master switch for open self-registration. When true (default),
+   *  `/auth/register` provisions an account even with no invite code.
+   *  When false the server is invite-only — codeless self-signup is
+   *  rejected, but invite-bearing registration still works. */
+  allow_signups: boolean;
   /** True once the first-run onboarding wizard has been completed
    *  or explicitly skipped. Drives the post-login redirect to
    *  `/onboarding` for owners on a fresh install. */
@@ -1408,6 +1610,16 @@ export interface ServerSettings {
   transcoder_hdr_tonemap_enabled: boolean;
   /** Algorithm passed to ffmpeg's tonemap filter. */
   transcoder_hdr_tonemap_algo: TonemapAlgorithm;
+  /** When true, text subtitles (SRT / ASS / SSA / mov_text) are burned
+   *  into the video via the `subtitles=` filter. Default false — text
+   *  subs take the WebVTT-sidecar overlay path instead. Picture subs
+   *  (PGS / VobSub / DVB) always burn regardless. */
+  transcoder_burn_ass_subtitles: boolean;
+  /** When true, EBU R 128 volume leveling uses precise per-file
+   *  measurements (loudnorm two-pass / `linear=true`) instead of the
+   *  single-pass estimate. Default false. Only takes effect when
+   *  normalization is engaged. */
+  transcoder_two_pass_loudnorm: boolean;
   /** HEVC output mode. `off` (default): always H.264.
    *  `when_client_supports`: HEVC for clients that report HEVC decode,
    *  H.264 otherwise. `always`: force HEVC every session (breaks
@@ -1520,6 +1732,17 @@ export interface ServerSettings {
   updated_by: number | null;
 }
 
+/** Envelope returned by GET/PATCH `/admin/settings`. `version` and
+ *  `data_dir` are read-only facts surfaced for display — PATCH ignores
+ *  them and they have no field on `ServerSettingsUpdate`. */
+export interface SettingsResponse {
+  settings: ServerSettings;
+  /** Server build version (the server crate's package version). */
+  version: string;
+  /** On-disk DATA_DIR path the server is running against. */
+  data_dir: string;
+}
+
 export type SmtpSecurity = "starttls" | "tls" | "none";
 
 /// Global 2FA policy. "disabled" blocks new enrollments; "optional" is
@@ -1534,6 +1757,7 @@ export interface ServerSettingsUpdate {
   cors_origins?: string;
   secure_connections?: SecureConnectionsMode;
   telemetry_opt_in?: boolean;
+  allow_signups?: boolean;
   setup_completed?: boolean;
   transcoder_max_concurrent?: number;
   transcoder_hw_accel?: TranscoderHwAccel;
@@ -1546,6 +1770,8 @@ export interface ServerSettingsUpdate {
   job_kind_concurrency?: string;
   transcoder_hdr_tonemap_enabled?: boolean;
   transcoder_hdr_tonemap_algo?: TonemapAlgorithm;
+  transcoder_burn_ass_subtitles?: boolean;
+  transcoder_two_pass_loudnorm?: boolean;
   transcoder_hevc_encoding_mode?: HevcMode;
   transcoder_gpu_device?: string;
   transcoder_max_cpu_concurrent?: number;
@@ -1653,6 +1879,13 @@ export interface AuditLogEntry {
   ip: string | null;
   user_agent: string | null;
   created_at: number;
+  /// Resolved display name for `actor_user_id` (display_name ??
+  /// username), stitched server-side via a batched lookup on the
+  /// `/admin/audit` list endpoint. Null when the actor id is null or no
+  /// longer resolves — fall back to "user #{actor_user_id}". Absent on
+  /// other surfaces that return raw `AuditLogEntry` (e.g. maintenance
+  /// dashboard), so it's optional on the shared type.
+  actor_name?: string | null;
 }
 
 export interface AuditListResponse {
@@ -1661,6 +1894,22 @@ export interface AuditListResponse {
   /** Total rows in audit_log — drives the paginated admin UI's
    *  "X–Y of Z" footer and jump-to-page buttons. */
   total: number;
+}
+
+/** Query params accepted by both `audit.list` and `audit.exportCsv`. */
+export interface AuditListParams {
+  before?: number;
+  limit?: number;
+  offset?: number;
+  /** Filter to entries authored by this user id. Drives the Audit tab in
+   *  the user-management drawer. */
+  actor_user_id?: number;
+  /** Substring match on the `action` column. */
+  action?: string;
+  /** Lower bound on the entry timestamp, epoch ms (inclusive). */
+  from?: number;
+  /** Upper bound on the entry timestamp, epoch ms (inclusive). */
+  to?: number;
 }
 
 // ─── External subtitles (Phase 12a — OpenSubtitles agent) ─────────────────
@@ -1730,6 +1979,63 @@ export const bulkItems = {
     apiFetch<BulkReport>("/admin/items/bulk/detect-markers", {
       method: "POST",
       body: { item_ids },
+    }),
+};
+
+/** Whole-library bulk operation selector. `mark_watched` /
+ *  `mark_unwatched` affect only the acting operator's play-state;
+ *  `rescan` queues a library scan; `delete` destroys all content. */
+export type LibraryBulkOp =
+  | "mark_watched"
+  | "mark_unwatched"
+  | "rescan"
+  | "delete";
+
+export interface LibraryBulkResponse {
+  library_id: number;
+  op: LibraryBulkOp;
+  /** Items/episodes whose play-state changed (mark watched/unwatched). */
+  affected?: number;
+  /** Top-level items deleted (delete op; children cascade). */
+  deleted_items?: number;
+  /** Queued scan job id (rescan op). */
+  scan_job_id?: number;
+  /** One-line human summary suitable for a banner. */
+  message: string;
+}
+
+export const bulkLibrary = {
+  markWatched: (library_id: number) =>
+    apiFetch<LibraryBulkResponse>("/admin/libraries/bulk", {
+      method: "POST",
+      body: { library_id, op: "mark_watched" satisfies LibraryBulkOp },
+    }),
+  markUnwatched: (library_id: number) =>
+    apiFetch<LibraryBulkResponse>("/admin/libraries/bulk", {
+      method: "POST",
+      body: { library_id, op: "mark_unwatched" satisfies LibraryBulkOp },
+    }),
+  rescan: (library_id: number) =>
+    apiFetch<LibraryBulkResponse>("/admin/libraries/bulk", {
+      method: "POST",
+      body: { library_id, op: "rescan" satisfies LibraryBulkOp },
+    }),
+  /** DESTRUCTIVE. The backend rejects unless `confirm_library_id`
+   *  echoes `library_id` AND `confirm_name` exactly matches the
+   *  library's name. */
+  deleteContent: (
+    library_id: number,
+    confirm_library_id: number,
+    confirm_name: string,
+  ) =>
+    apiFetch<LibraryBulkResponse>("/admin/libraries/bulk", {
+      method: "POST",
+      body: {
+        library_id,
+        op: "delete" satisfies LibraryBulkOp,
+        confirm_library_id,
+        confirm_name,
+      },
     }),
 };
 
@@ -2165,6 +2471,17 @@ export interface DashboardSession {
   /// Subtitle sidecar extraction state, when the session has a
   /// sidecar. Absent on burn-in / no-subtitle sessions.
   subtitle_health?: SubtitleHealth | null;
+  /// Resolved display name for `user_id` (display_name ?? username),
+  /// stitched server-side via a batched lookup. Null when the user no
+  /// longer resolves — fall back to "User #{user_id}".
+  username?: string | null;
+  /// Resolved human title for `media_file_id` — a movie title, or the
+  /// show name for an episode (with `subtitle` carrying "S1E4 — …").
+  /// Null when the file no longer resolves — fall back to "#{media_file_id}".
+  title?: string | null;
+  /// Episode descriptor ("S1E4 — Episode title") for TV sessions; null
+  /// for movie sessions.
+  subtitle?: string | null;
 }
 
 /// Mirrors `chimpflix_transcoder::TranscodeHealth`.
@@ -2202,6 +2519,11 @@ export interface DashboardDisk {
 export interface DashboardResponse {
   server: DashboardServerStatus;
   library_stats: DashboardLibraryStats[];
+  /** Global count of movie items across every library. Drives the
+   *  "N · M movies · K eps" Library hero tile. */
+  movie_count: number;
+  /** Global count of episodes across every library. */
+  episode_count: number;
   active_transcodes: DashboardSession[];
   recent_scans: DashboardScanJob[];
   disks: DashboardDisk[];
@@ -2587,6 +2909,10 @@ export const auth = {
       apiFetch<{ marked: number }>("/notifications/read-all", {
         method: "POST",
       }),
+    clearAll: () =>
+      apiFetch<{ cleared: number }>("/notifications/clear", {
+        method: "POST",
+      }),
   },
   setUserRole: (id: number, role: UserRole) =>
     apiFetch<{ user: User }>(`/admin/users/${id}`, {
@@ -2712,6 +3038,12 @@ export interface LibraryStatsResult {
   total_bytes: number;
   orphan_files: number;
   last_scanned_at: number | null;
+  /** Sum of every (non-removed) media file's duration in ms. */
+  total_runtime_ms: number;
+  /** Items that have at least one poster image. */
+  items_with_poster: number;
+  /** Items lacking every external id (tmdb / tvdb / imdb). */
+  items_missing_ids: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -2743,6 +3075,24 @@ export const items = {
       `/libraries/${libraryId}/top`,
       { query: { limit } },
     ),
+  /// Locally-known upcoming/recent episodes whose air date falls in the
+  /// requested window — the LOCAL-data complement to the Trakt coming-soon
+  /// rail. Honors the same per-library visibility + kids-safe rules as
+  /// browse. Either pass `days` (window ahead of now, with a small
+  /// look-back so "this week" shows) or an explicit `from`/`to` epoch-ms
+  /// window. Pass `library_ids` to honor the user's visibility prefs.
+  calendar: (
+    opts: {
+      days?: number;
+      from?: number;
+      to?: number;
+      limit?: number;
+      library_ids?: ReadonlyArray<number>;
+    } = {},
+  ) =>
+    apiFetch<CalendarResponse>("/calendar", {
+      query: opts as Record<string, QueryValue>,
+    }),
   get: (id: number) => apiFetch<ItemDetail>(`/items/${id}`),
   trailer: (id: number) =>
     apiFetch<{ video_id: string | null }>(`/items/${id}/trailer`),
@@ -3103,6 +3453,10 @@ export interface StatsOverview {
   direct_plays: number;
   transcoded_plays: number;
   unique_users: number;
+  /// Total watch time over the window, in milliseconds. Aggregated as
+  /// the sum of started-stream durations (see StatsOverview::watched_ms
+  /// on the backend). Rendered as minutes / "≈ N hours".
+  watched_ms: number;
 }
 
 export interface StatsActivityRow {
@@ -3128,6 +3482,9 @@ export interface StatsTopUserRow {
   play_count: number;
   completions: number;
   last_seen_at: number | null;
+  /// This user's watch time over the window, in milliseconds (sum of
+  /// started-stream durations). Surfaced as an hours figure on the row.
+  watched_ms: number;
 }
 
 export interface StatsTopItemRow {
@@ -3182,6 +3539,14 @@ export interface NowPlayingSession {
   bytes_served: number;
   transcode_health?: TranscodeHealth;
   subtitle_health?: SubtitleHealth | null;
+  /// Resolved display name for `user_id` (display_name ?? username).
+  /// Null when the user no longer resolves — fall back to "User #{user_id}".
+  username?: string | null;
+  /// Resolved human title for `media_file_id` — movie title or show
+  /// name. Null when unresolved — fall back to "#{media_file_id}".
+  title?: string | null;
+  /// Episode descriptor ("S1E4 — Episode title") for TV; null for movies.
+  subtitle?: string | null;
 }
 
 export interface StatsLibraryBucket {
@@ -3320,9 +3685,9 @@ export const admin = {
       apiFetch<{ sessions: NowPlayingSession[] }>("/admin/stats/now-playing"),
   },
   settings: {
-    get: () => apiFetch<{ settings: ServerSettings }>("/admin/settings"),
+    get: () => apiFetch<SettingsResponse>("/admin/settings"),
     patch: (patch: ServerSettingsUpdate) =>
-      apiFetch<{ settings: ServerSettings }>("/admin/settings", {
+      apiFetch<SettingsResponse>("/admin/settings", {
         method: "PATCH",
         body: patch,
       }),
@@ -3343,24 +3708,55 @@ export const admin = {
       }),
   },
   audit: {
-    list: (
-      params: {
-        before?: number;
-        limit?: number;
-        offset?: number;
-        /** Filter to entries authored by this user id. Drives the
-         *  Audit tab in the user-management drawer. */
-        actor_user_id?: number;
-      } = {},
-    ) =>
+    list: (params: AuditListParams = {}) =>
       apiFetch<AuditListResponse>("/admin/audit", {
         query: {
           before: params.before,
           limit: params.limit,
           offset: params.offset,
           actor_user_id: params.actor_user_id,
+          action: params.action,
+          from: params.from,
+          to: params.to,
         },
       }),
+    /** Download the filtered audit set as CSV. Same filters as `list`
+     *  (pagination ignored server-side); the backend streams a
+     *  `text/csv` attachment, which we wrap in a Blob + synthesized
+     *  click so the browser shows its native save dialog. */
+    exportCsv: async (
+      params: Pick<
+        AuditListParams,
+        "actor_user_id" | "action" | "from" | "to"
+      > = {},
+    ): Promise<void> => {
+      const qs = new URLSearchParams();
+      if (params.action) qs.set("action", params.action);
+      if (params.from != null) qs.set("from", String(params.from));
+      if (params.to != null) qs.set("to", String(params.to));
+      if (params.actor_user_id != null)
+        qs.set("actor_user_id", String(params.actor_user_id));
+      const suffix = qs.toString() ? `?${qs}` : "";
+      const res = await fetch(`/api/v1/admin/audit/export${suffix}`, {
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `audit export failed: ${res.status}`);
+      }
+      const disposition = res.headers.get("Content-Disposition") ?? "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match?.[1] ?? `chimpflix-audit-${Date.now()}.csv`;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    },
   },
   stopSession: (id: string) =>
     apiFetch<void>(`/stream/sessions/${encodeURIComponent(id)}`, {
@@ -3382,6 +3778,18 @@ export const admin = {
       `/admin/users/${userId}/password-reset`,
       { method: "POST" },
     ),
+  /// Admin: lock (disable) a user account. A locked account fails the
+  /// login gate after the password check. Owners can't be locked, and
+  /// you can't lock your own account. Returns the updated user row.
+  lockUser: (userId: number) =>
+    apiFetch<{ user: User }>(`/admin/users/${userId}/lock`, {
+      method: "POST",
+    }),
+  /// Admin: unlock (re-enable) a previously locked account.
+  unlockUser: (userId: number) =>
+    apiFetch<{ user: User }>(`/admin/users/${userId}/unlock`, {
+      method: "POST",
+    }),
   /// Named access groups — bulk-assignment of library permissions.
   /// User-side resolution unions direct library_access with group-derived.
   accessGroups: {
@@ -3401,11 +3809,19 @@ export const admin = {
       }),
     delete: (id: number) =>
       apiFetch<void>(`/admin/access-groups/${id}`, { method: "DELETE" }),
-    setLibraries: (id: number, libraryIds: number[]) =>
-      apiFetch<void>(`/admin/access-groups/${id}/libraries`, {
+    /// Replace the group's bound libraries. Pass `grants` for tri-state
+    /// per-library levels ("view"/"full"); pass a bare `number[]` to bind
+    /// every library at "full" (legacy binary shape).
+    setLibraries: (id: number, grants: number[] | GroupLibraryGrant[]) => {
+      const body =
+        grants.length > 0 && typeof grants[0] === "object"
+          ? { grants: grants as GroupLibraryGrant[] }
+          : { library_ids: grants as number[] };
+      return apiFetch<void>(`/admin/access-groups/${id}/libraries`, {
         method: "PUT",
-        body: { library_ids: libraryIds },
-      }),
+        body,
+      });
+    },
     setMembers: (id: number, userIds: number[]) =>
       apiFetch<void>(`/admin/access-groups/${id}/members`, {
         method: "PUT",
@@ -3494,6 +3910,16 @@ export const admin = {
       }),
     delete: (id: number) =>
       apiFetch<void>(`/admin/versions/${id}`, { method: "DELETE" }),
+    /**
+     * Cancel a queued or running optimized version. Queued rows are
+     * flipped straight to `cancelled`; running rows additionally have
+     * their ffmpeg child killed and partial output removed by the
+     * worker. Returns the row's reconciled state.
+     */
+    cancel: (id: number) =>
+      apiFetch<OptimizedVersion>(`/admin/versions/${id}/cancel`, {
+        method: "POST",
+      }),
   },
   sessions: {
     list: () =>
@@ -3560,6 +3986,14 @@ export const admin = {
     capabilities: () =>
       apiFetch<{ capabilities: TranscoderCapabilities; cache_root: string }>(
         "/admin/transcoder/capabilities",
+      ),
+    /** Re-run ffmpeg hardware detection without a server restart (after a
+     *  driver/GPU change). Returns the fresh capabilities, which are also
+     *  swapped into the live encoder-selection path server-side. */
+    reprobeCapabilities: () =>
+      apiFetch<{ capabilities: TranscoderCapabilities; cache_root: string }>(
+        "/admin/transcoder/capabilities/reprobe",
+        { method: "POST" },
       ),
     listPresets: () =>
       apiFetch<{ presets: TranscoderPreset[] }>("/admin/transcoder/presets"),

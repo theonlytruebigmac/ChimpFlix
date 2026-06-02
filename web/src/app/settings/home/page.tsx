@@ -1,25 +1,30 @@
 import { libraries as librariesApi } from "@/lib/chimpflix-api";
-import { SettingsHiddenLibrariesClient } from "@/components/SettingsHiddenLibrariesClient";
+import { requireUser } from "@/lib/chimpflix-server";
+import { SettingsHomeVisibilityClient } from "@/components/SettingsHomeVisibilityClient";
 
-/// Home & visibility — personal control over which libraries show up on your
-/// home page and browse rails. (The hidden-libraries half of the old
-/// /settings/libraries page; library management itself is owner-only under
-/// Server → Libraries.)
+/// Home & visibility — the personal "You" surface for controlling which
+/// libraries appear on your home page + browse rails, the order + on/off
+/// state of the home rails themselves, and two browse filters (hide watched
+/// from Continue Watching, kids-safe). Rendered in the console design
+/// language to match docs/redesign/home-visibility.html; the breadcrumb +
+/// active sidebar item identify the page, so there's no page-title header.
+///
+/// Server component: fetches the user (for the rail-layout overlay + filter
+/// prefs) and the library list (for the per-library show/hide switches). All
+/// state + persistence lives in the client; hidden libraries persist via the
+/// /auth/me/hidden-libraries prefs endpoint, while the rail layout + filters
+/// persist via PATCH /auth/me.
 export default async function HomeVisibilitySettingsPage() {
-  const libsResp = await librariesApi.list();
+  const [user, { libraries }] = await Promise.all([
+    requireUser("/settings/home"),
+    librariesApi.list(),
+  ]);
+  // Library-management visibility ("hidden" / "search_only") is the owner's
+  // server-level setting; libraries the owner fully hid from the home/search
+  // surface shouldn't appear as a personal show/hide toggle. Personal hiding
+  // layers on top of the home-and-search and search-only ones.
+  const personalLibs = libraries.filter((l) => l.visibility !== "hidden");
   return (
-    <div className="divide-y divide-white/10">
-      <section className="grid gap-4 py-6 md:grid-cols-[12rem_1fr] md:gap-12">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-white/50">
-          Home &amp; visibility
-        </h2>
-        <div className="space-y-3">
-          <p className="text-sm text-white/55">
-            Hidden libraries are excluded from your home page and browse rails.
-          </p>
-          <SettingsHiddenLibrariesClient libraries={libsResp.libraries} />
-        </div>
-      </section>
-    </div>
+    <SettingsHomeVisibilityClient user={user} libraries={personalLibs} />
   );
 }

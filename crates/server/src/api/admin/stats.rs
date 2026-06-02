@@ -14,9 +14,9 @@ use chimpflix_library::queries::{
     self, StatsActivityRow, StatsDailyBucket, StatsHourBucket, StatsLibraryBucket, StatsOverview,
     StatsPlatformBucket, StatsTopItemRow, StatsTopUserRow,
 };
-use chimpflix_transcoder::SessionSnapshot;
 use serde::{Deserialize, Serialize};
 
+use crate::api::admin::dashboard::{DashboardSession, enrich_sessions};
 use crate::api::error::ApiError;
 use crate::auth::AdminAuth;
 use crate::state::AppState;
@@ -250,14 +250,13 @@ pub async fn top_items(
 
 #[derive(Debug, Serialize)]
 pub struct NowPlayingResponse {
-    pub sessions: Vec<SessionSnapshot>,
+    pub sessions: Vec<DashboardSession>,
 }
 
 pub async fn now_playing(
     State(state): State<AppState>,
     _admin: AdminAuth,
 ) -> Result<Json<NowPlayingResponse>, ApiError> {
-    Ok(Json(NowPlayingResponse {
-        sessions: state.transcoder.list_sessions(),
-    }))
+    let sessions = enrich_sessions(&state, state.transcoder.list_sessions()).await;
+    Ok(Json(NowPlayingResponse { sessions }))
 }

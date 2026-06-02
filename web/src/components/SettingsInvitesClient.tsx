@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LoadingPlaceholder } from "./ui/LoadingPlaceholder";
-import { SettingsFeedback } from "./ui/SettingsFeedback";
 import { formatDate, formatDateTime } from "@/lib/format";
 import {
   admin as adminApi,
@@ -185,230 +184,254 @@ export function SettingsInvitesClient() {
   return (
     <div>
       {/* Issuance banner — shown once, then dismissable. */}
-      {issued && <IssuedBanner issued={issued} onCopyUrl={copyAcceptUrl} onCopyCode={copyCode} onDismiss={() => setIssued(null)} />}
+      {issued && (
+        <IssuedBanner
+          issued={issued}
+          onCopyUrl={copyAcceptUrl}
+          onCopyCode={copyCode}
+          onDismiss={() => setIssued(null)}
+        />
+      )}
 
-      <div className="mb-4 space-y-3 rounded-md border border-white/10 bg-white/3 p-4">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-white/50">
-          Create invite
-        </h3>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <label className="text-xs">
-            <span className="mb-1 block text-white/60">Recipient email (optional)</span>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="alice@example.com"
-              autoComplete="off"
-              spellCheck={false}
-              maxLength={320}
-              className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
-            />
-            <span className="mt-1 block text-[11px] text-white/40">
-              When set + SMTP is configured, the link is emailed automatically.
+      {/* ── invite someone ─────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Invite someone</div>
+            <div className="cf-sub">
+              Sends an email link, or generates a one-time signup URL.
+            </div>
+          </div>
+        </div>
+        <div className="cf-card-body cf-pad">
+          <div className="cf-grid cf-c2">
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Recipient email (optional)</label>
+              <input
+                type="email"
+                className="cf-input"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="alice@example.com"
+                autoComplete="off"
+                spellCheck={false}
+                maxLength={320}
+              />
+              <span className="cf-faint" style={{ display: "block", marginTop: 6, fontSize: 11.5 }}>
+                When set + SMTP is configured, the link is emailed automatically.
+              </span>
+            </div>
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Expires</label>
+              <select
+                className="cf-select"
+                value={expiry}
+                onChange={(e) => setExpiry(e.target.value as ExpiryChoice)}
+              >
+                {(Object.keys(EXPIRY_LABELS) as ExpiryChoice[]).map((k) => (
+                  <option key={k} value={k}>
+                    {EXPIRY_LABELS[k]}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="cf-field" style={{ marginTop: 16, marginBottom: 0 }}>
+            <label className="cf-field-label">Add to access groups (optional)</label>
+            {groups.length === 0 ? (
+              <p className="cf-faint" style={{ fontSize: 12 }}>
+                No groups yet. Create one under the Access groups tab.
+              </p>
+            ) : (
+              <div className="cf-flex cf-wrap cf-gap8">
+                {groups.map((g) => {
+                  const active = selectedGroupIds.has(g.id);
+                  return (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() => toggleGroup(g.id)}
+                      title={g.description ?? undefined}
+                      className={`cf-pill${active ? " cf-accent" : ""}`}
+                      style={{ cursor: "pointer", padding: "5px 12px" }}
+                    >
+                      {g.name}{" "}
+                      <span className="cf-faint">({g.library_count})</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <span className="cf-faint" style={{ display: "block", marginTop: 6, fontSize: 11.5 }}>
+              Group membership grants every library bound to the group.
             </span>
-          </label>
-          <label className="text-xs">
-            <span className="mb-1 block text-white/60">Expires</span>
-            <select
-              value={expiry}
-              onChange={(e) => setExpiry(e.target.value as ExpiryChoice)}
-              className="w-full rounded bg-white/10 px-3 py-2 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+          </div>
+
+          <div className="cf-field" style={{ marginTop: 16, marginBottom: 0 }}>
+            <label className="cf-field-label">Pre-grant direct library access (optional)</label>
+            {libraries.length === 0 ? (
+              <p className="cf-faint" style={{ fontSize: 12 }}>
+                No libraries to bind. Add libraries first.
+              </p>
+            ) : (
+              <div className="cf-flex cf-wrap cf-gap8">
+                {libraries.map((l) => {
+                  const active = selectedLibIds.has(l.id);
+                  return (
+                    <button
+                      key={l.id}
+                      type="button"
+                      onClick={() => toggleLib(l.id)}
+                      className={`cf-pill${active ? " cf-accent" : ""}`}
+                      style={{ cursor: "pointer", padding: "5px 12px" }}
+                    >
+                      {l.name}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <span className="cf-faint" style={{ display: "block", marginTop: 6, fontSize: 11.5 }}>
+              Direct grants add to anything the user inherits via groups. You can
+              also grant access after acceptance from the Access matrix tab.
+            </span>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <button
+              type="button"
+              className="cf-btn cf-primary"
+              onClick={create}
+              disabled={busy}
             >
-              {(Object.keys(EXPIRY_LABELS) as ExpiryChoice[]).map((k) => (
-                <option key={k} value={k}>
-                  {EXPIRY_LABELS[k]}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-
-        <div>
-          <span className="mb-1 block text-xs text-white/60">
-            Add to access groups (optional)
-          </span>
-          {groups.length === 0 ? (
-            <p className="text-xs text-white/40">
-              No groups yet. Create one under Users → Groups.
-            </p>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {groups.map((g) => {
-                const active = selectedGroupIds.has(g.id);
-                return (
-                  <button
-                    key={g.id}
-                    type="button"
-                    onClick={() => toggleGroup(g.id)}
-                    title={g.description ?? undefined}
-                    className={
-                      "rounded-full border px-3 py-1 text-xs transition-colors " +
-                      (active
-                        ? "border-(--color-accent) bg-accent/20 text-white"
-                        : "border-white/15 text-white/70 hover:border-white/30")
-                    }
-                  >
-                    {g.name}{" "}
-                    <span className="text-white/40">({g.library_count})</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          <span className="mt-1 block text-[11px] text-white/40">
-            Group membership grants every library bound to the group.
-          </span>
-        </div>
-
-        <div>
-          <span className="mb-1 block text-xs text-white/60">
-            Pre-grant direct library access (optional)
-          </span>
-          {libraries.length === 0 ? (
-            <p className="text-xs text-white/40">
-              No libraries to bind. Add libraries first.
-            </p>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {libraries.map((l) => {
-                const active = selectedLibIds.has(l.id);
-                return (
-                  <button
-                    key={l.id}
-                    type="button"
-                    onClick={() => toggleLib(l.id)}
-                    className={
-                      "rounded-full border px-3 py-1 text-xs transition-colors " +
-                      (active
-                        ? "border-(--color-accent) bg-accent/20 text-white"
-                        : "border-white/15 text-white/70 hover:border-white/30")
-                    }
-                  >
-                    {l.name}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          <span className="mt-1 block text-[11px] text-white/40">
-            Direct grants add to anything the user inherits via groups.
-            You can also grant access after acceptance from Users → Access.
-          </span>
-        </div>
-
-        <div>
-          <button
-            type="button"
-            onClick={create}
-            disabled={busy}
-            className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:py-2 sm:text-xs transition disabled:opacity-50"
-          >
-            {busy ? "Creating…" : "Create invite"}
-          </button>
+              {busy ? "Creating…" : "Send invite"}
+            </button>
+          </div>
         </div>
       </div>
 
-      <SettingsFeedback
-        variant="block"
-        message={message}
-        error={error}
-        className="mb-3"
-      />
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
+      {message && (
+        <div role="status" aria-live="polite" className="cf-muted" style={{ marginBottom: 16, fontSize: 13 }}>
+          {message}
+        </div>
+      )}
 
       {open.length === 0 && used.length === 0 && (
-        <p className="text-sm text-white/60">
+        <p className="cf-muted" style={{ fontSize: 13 }}>
           No invites yet. Create one above.
         </p>
       )}
 
       {open.length > 0 && (
-        <div className="mb-4">
-          <h3 className="mb-2 text-xs uppercase tracking-wide text-white/50">
-            Active
-          </h3>
-          <ul className="divide-y divide-white/5">
-            {open.map((inv) => (
-              <li
-                key={inv.id}
-                className="flex items-start justify-between gap-3 py-3 text-sm"
-              >
-                <div className="min-w-0 flex-1 space-y-0.5">
-                  <div className="text-white/90">
-                    {inv.email ?? <span className="text-white/50">No recipient</span>}
-                  </div>
-                  <div className="text-xs text-white/50">
-                    {inv.expires_at
-                      ? `Expires ${formatDateTime(inv.expires_at)}`
-                      : "Never expires"}
-                    {" · "}
-                    {inv.sent_at
-                      ? `Emailed ${formatDate(inv.sent_at)}`
-                      : inv.email
-                        ? "Email pending / failed"
-                        : "Link only"}
-                  </div>
-                  {(inv.library_ids.length > 0 || inv.group_ids.length > 0) && (
-                    <div className="flex flex-wrap gap-1 pt-1">
-                      {inv.group_ids.map((id) => (
-                        <span
-                          key={`g-${id}`}
-                          className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[10px] text-white/75"
-                        >
-                          group: {groupName(id)}
-                        </span>
-                      ))}
-                      {inv.library_ids.map((id) => (
-                        <span
-                          key={`l-${id}`}
-                          className="rounded-full border border-white/10 px-2 py-0.5 text-[10px] text-white/60"
-                        >
-                          {libraryName(id)}
-                        </span>
-                      ))}
+        <div className="cf-card" style={{ marginBottom: used.length > 0 ? 18 : 0 }}>
+          <div className="cf-card-head">
+            <div>
+              <div className="cf-ttl">Pending</div>
+            </div>
+          </div>
+          <table className="cf-table">
+            <tbody>
+              {open.map((inv) => (
+                <tr key={inv.id}>
+                  <td>
+                    <div className="cf-mono">
+                      {inv.email ?? (
+                        <span className="cf-faint">No recipient</span>
+                      )}
                     </div>
-                  )}
-                </div>
-                <div className="flex shrink-0 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => revoke(inv.id)}
-                    className="rounded bg-red-500/15 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/25"
-                  >
-                    Revoke
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
+                    <div className="cf-faint" style={{ fontSize: 11.5, marginTop: 2 }}>
+                      {inv.sent_at
+                        ? `Emailed ${formatDate(inv.sent_at)}`
+                        : inv.email
+                          ? "Email pending / failed"
+                          : "Link only"}
+                    </div>
+                    {(inv.library_ids.length > 0 || inv.group_ids.length > 0) && (
+                      <div
+                        className="cf-flex cf-wrap"
+                        style={{ gap: 4, marginTop: 6 }}
+                      >
+                        {inv.group_ids.map((id) => (
+                          <span
+                            key={`g-${id}`}
+                            className="cf-pill cf-accent"
+                            style={{ padding: "1px 7px", fontSize: 10 }}
+                          >
+                            group: {groupName(id)}
+                          </span>
+                        ))}
+                        {inv.library_ids.map((id) => (
+                          <span
+                            key={`l-${id}`}
+                            className="cf-pill"
+                            style={{ padding: "1px 7px", fontSize: 10 }}
+                          >
+                            {libraryName(id)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </td>
+                  <td className="cf-faint" style={{ whiteSpace: "nowrap" }}>
+                    {inv.expires_at
+                      ? `expires ${formatDateTime(inv.expires_at)}`
+                      : "never expires"}
+                  </td>
+                  <td className="cf-num">
+                    <button
+                      type="button"
+                      className="cf-btn cf-ghost cf-tiny"
+                      onClick={() => revoke(inv.id)}
+                    >
+                      Revoke
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 
       {used.length > 0 && (
-        <div>
-          <h3 className="mb-2 text-xs uppercase tracking-wide text-white/50">
-            Used
-          </h3>
-          <ul className="divide-y divide-white/5">
-            {used.map((inv) => (
-              <li
-                key={inv.id}
-                className="flex items-center justify-between gap-3 py-2 text-sm"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="text-white/70">
-                    {inv.email ?? <span className="text-white/40">No recipient</span>}
-                  </div>
-                  <div className="text-xs text-white/45">
-                    Used{" "}
-                    {inv.consumed_at ? formatDateTime(inv.consumed_at) : ""}
-                  </div>
-                </div>
-              </li>
-            ))}
-          </ul>
+        <div className="cf-card" style={{ marginBottom: 0 }}>
+          <div className="cf-card-head">
+            <div>
+              <div className="cf-ttl">Used</div>
+            </div>
+          </div>
+          <table className="cf-table">
+            <tbody>
+              {used.map((inv) => (
+                <tr key={inv.id}>
+                  <td>
+                    <div className="cf-mono cf-muted">
+                      {inv.email ?? (
+                        <span className="cf-faint">No recipient</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="cf-faint" style={{ whiteSpace: "nowrap" }}>
+                    Used {inv.consumed_at ? formatDateTime(inv.consumed_at) : ""}
+                  </td>
+                  <td className="cf-num"></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
+
       {askRevokeId != null && (
         <ConfirmDialog
           title="Revoke this invite?"
@@ -436,18 +459,14 @@ function IssuedBanner({
   onDismiss: () => void;
 }) {
   return (
-    <div className="mb-4 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-4 text-xs text-emerald-100">
-      <div className="mb-2 flex items-center justify-between">
-        <strong className="text-sm">Invite created</strong>
-        <button
-          type="button"
-          onClick={onDismiss}
-          className="text-emerald-200/70 hover:text-emerald-100"
-        >
+    <div className="cf-banner cf-ok" style={{ flexDirection: "column", alignItems: "stretch" }}>
+      <div className="cf-flex cf-between">
+        <b>Invite created</b>
+        <button type="button" className="cf-btn cf-ghost cf-tiny" onClick={onDismiss}>
           Dismiss
         </button>
       </div>
-      <p className="mb-3 text-emerald-200/80">
+      <p style={{ margin: "8px 0", fontSize: 12.5 }}>
         {issued.email_sent
           ? `Emailed to ${issued.invite.email}. The link below is your one-time backup — it will not be shown again.`
           : `Share this link with the recipient — it will not be shown again. ${
@@ -457,34 +476,50 @@ function IssuedBanner({
             }`}
       </p>
       {issued.accept_url ? (
-        <div className="space-y-2">
-          <code className="block break-all rounded bg-black/30 p-2 font-mono text-[11px] text-emerald-100">
+        <div className="cf-stack" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <code
+            className="cf-mono"
+            style={{
+              display: "block",
+              wordBreak: "break-all",
+              borderRadius: 6,
+              background: "rgba(0,0,0,.3)",
+              padding: 8,
+              fontSize: 11,
+            }}
+          >
             {issued.accept_url}
           </code>
-          <button
-            type="button"
-            onClick={onCopyUrl}
-            className="rounded bg-emerald-500/30 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-emerald-500/40"
-          >
-            Copy link
-          </button>
+          <div>
+            <button type="button" className="cf-btn cf-sm" onClick={onCopyUrl}>
+              Copy link
+            </button>
+          </div>
         </div>
       ) : (
-        <div className="space-y-2">
-          <p className="text-emerald-200/70">
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <p style={{ margin: 0, fontSize: 12.5 }}>
             Set Server → Network → Public URL to get a clickable accept link.
             Until then, share this code:
           </p>
-          <code className="block break-all rounded bg-black/30 p-2 font-mono text-[11px] text-emerald-100">
+          <code
+            className="cf-mono"
+            style={{
+              display: "block",
+              wordBreak: "break-all",
+              borderRadius: 6,
+              background: "rgba(0,0,0,.3)",
+              padding: 8,
+              fontSize: 11,
+            }}
+          >
             {issued.code}
           </code>
-          <button
-            type="button"
-            onClick={onCopyCode}
-            className="rounded bg-emerald-500/30 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-emerald-500/40"
-          >
-            Copy code
-          </button>
+          <div>
+            <button type="button" className="cf-btn cf-sm" onClick={onCopyCode}>
+              Copy code
+            </button>
+          </div>
         </div>
       )}
     </div>

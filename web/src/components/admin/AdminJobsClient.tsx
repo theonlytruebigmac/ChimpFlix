@@ -8,40 +8,36 @@ import {
   type JobStatusFilter,
   type JobSummary,
 } from "@/lib/chimpflix-api";
-import { DEFAULT_PAGE_SIZE, ErrorBanner, FilterChip, Pagination, Pill } from "./ui";
+import { DEFAULT_PAGE_SIZE, Pagination } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { formatTime } from "@/lib/format";
 
-/// Owner-only queue dashboard. Three sections:
+/// Owner-only queue dashboard, styled in the console design language
+/// (`cf-*`) to match the redesign mockup:
 ///
-///   1. Hero strip — counts by status (queued / running / failed /
-///      dead). Failed + dead are the actionable ones; queued and
-///      running are informational.
-///   2. Filter chip row — kind (all per-file kinds plus the legacy
-///      item-level one), status filter.
-///   3. Table — newest-first, last_error inline-wrapped for the dead
-///      rows so you can see the failure reason without clicking in.
+///   1. A status segmented control (All / Queued / Running / Failed /
+///      Dead) + the maintenance action buttons.
+///   2. A kind filter-pill row — "All kinds" plus the dynamic kind
+///      list, auto-extending as new kinds are registered.
+///   3. A `cf-table` — newest-first, last_error inline-wrapped for the
+///      dead rows so the failure reason is visible without clicking in.
 ///
-/// Refresh every 4s while the page is visible. Stops polling when
-/// the tab is hidden (no point burning CPU + API hits when nobody
-/// is looking).
+/// Refresh every 4s while the page is visible. Stops polling when the
+/// tab is hidden (no point burning CPU + API hits when nobody looks).
 const POLL_MS = 4_000;
 /// Permanent "All kinds" chip plus the dynamic kind list — the
 /// dynamic part is fetched from `/admin/tasks/activity` on mount so
-/// it auto-extends as new job kinds are registered. Used to be a
-/// hardcoded 4-item list that went stale as kinds were added
-/// (`bootstrap_season_refs`, `refresh_logos_item`, etc.), so jobs
-/// from new kinds were invisible to the filter.
+/// it auto-extends as new job kinds are registered.
 const ALL_KINDS_CHIP: { value: string; label: string } = {
   value: "",
   label: "All kinds",
 };
 const STATUSES: { value: "" | JobStatusFilter; label: string }[] = [
-  { value: "", label: "All statuses" },
+  { value: "", label: "All" },
   { value: "queued", label: "Queued" },
   { value: "running", label: "Running" },
-  { value: "failed", label: "Failed (retry pending)" },
-  { value: "dead", label: "Dead (manual retry)" },
+  { value: "failed", label: "Failed" },
+  { value: "dead", label: "Dead" },
   { value: "succeeded", label: "Succeeded" },
 ];
 
@@ -72,8 +68,7 @@ export function AdminJobsClient({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   /// Dynamic chip list — fetched from `/admin/tasks/activity` so it
-  /// auto-extends to whatever kinds the binary actually has. Starts
-  /// as just the "All kinds" chip; the effect below adds the rest.
+  /// auto-extends to whatever kinds the binary actually has.
   const [kinds, setKinds] = useState<{ value: string; label: string }[]>([
     ALL_KINDS_CHIP,
   ]);
@@ -83,15 +78,10 @@ export function AdminJobsClient({
   const [clearDeadBusy, setClearDeadBusy] = useState(false);
   const [sweepResult, setSweepResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Gating state for the three confirmation dialogs. Booleans because
-  // each action targets the whole current state (no per-row picking) —
-  // no need for an object payload.
+  // Gating state for the three confirmation dialogs.
   const [askProcessAll, setAskProcessAll] = useState(false);
   const [askWipe, setAskWipe] = useState(false);
   const [askClearDead, setAskClearDead] = useState(false);
-  // Keep the alive flag in a ref so the polling interval sees the
-  // latest value without re-creating the interval on every state
-  // change (which would reset the cadence).
   const aliveRef = useRef(true);
   useEffect(() => {
     aliveRef.current = true;
@@ -100,11 +90,7 @@ export function AdminJobsClient({
     };
   }, []);
 
-  // One-shot kind discovery. The activity endpoint already returns
-  // every kind the server knows about (registry + any kind that's
-  // ever shown up in the queue), each with a human display name —
-  // exactly the shape we want for the filter chips. Sorted by
-  // label so the chip order is stable across page loads.
+  // One-shot kind discovery from the activity endpoint.
   useEffect(() => {
     let cancelled = false;
     void adminApi.tasks
@@ -118,16 +104,15 @@ export function AdminJobsClient({
       })
       .catch(() => {
         // Activity endpoint failed (rare). Stay on the "All kinds"
-        // fallback — the filter is non-essential; the table still
-        // works without per-kind chips.
+        // fallback — the table still works without per-kind chips.
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Refetch on filter change + on the polling cadence. Both
-  // pathways funnel through one effect so they can't race.
+  // Refetch on filter change + on the polling cadence. Both pathways
+  // funnel through one effect so they can't race.
   useEffect(() => {
     let cancelled = false;
     async function refresh() {
@@ -138,7 +123,7 @@ export function AdminJobsClient({
             kind: kind || undefined,
             status: status || undefined,
             limit: pageSize,
-          offset: (page - 1) * pageSize,
+            offset: (page - 1) * pageSize,
           }),
         ]);
         if (cancelled || !aliveRef.current) return;
@@ -166,6 +151,26 @@ export function AdminJobsClient({
     };
   }, [kind, status, page, pageSize]);
 
+  async function reload() {
+    const [summary, list] = await Promise.all([
+      adminApi.jobs.summary(),
+      adminApi.jobs.list({
+        kind: kind || undefined,
+        status: status || undefined,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
+      }),
+    ]);
+    setState({
+      summary,
+      jobs: list.jobs,
+      total: list.total,
+      progress: list.progress,
+      // eslint-disable-next-line react-hooks/purity
+      nowMs: Date.now(),
+    });
+  }
+
   async function processAllPending() {
     setAskProcessAll(false);
     setSweepBusy(true);
@@ -179,24 +184,7 @@ export function AdminJobsClient({
           ? "All files already have every artifact — nothing to enqueue."
           : `Enqueued ${total.toLocaleString()} jobs: ${counts.markers} markers, ${counts.loudness} loudness.`,
       );
-      // Refresh now so the summary counters jump immediately rather
-      // than waiting for the next poll tick.
-      const [summary, list] = await Promise.all([
-        adminApi.jobs.summary(),
-        adminApi.jobs.list({
-          kind: kind || undefined,
-          status: status || undefined,
-          limit: pageSize,
-          offset: (page - 1) * pageSize,
-        }),
-      ]);
-      setState({
-        summary,
-        jobs: list.jobs,
-        total: list.total,
-        progress: list.progress,
-        nowMs: Date.now(),
-      });
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -215,22 +203,7 @@ export function AdminJobsClient({
       setSweepResult(
         `Wiped ${res.removed.toLocaleString()} queued job${res.removed === 1 ? "" : "s"}.`,
       );
-      const [summary, list] = await Promise.all([
-        adminApi.jobs.summary(),
-        adminApi.jobs.list({
-          kind: kind || undefined,
-          status: status || undefined,
-          limit: pageSize,
-          offset: (page - 1) * pageSize,
-        }),
-      ]);
-      setState({
-        summary,
-        jobs: list.jobs,
-        total: list.total,
-        progress: list.progress,
-        nowMs: Date.now(),
-      });
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -249,22 +222,7 @@ export function AdminJobsClient({
       setSweepResult(
         `Cleared ${res.removed.toLocaleString()} dead job${res.removed === 1 ? "" : "s"}.`,
       );
-      const [summary, list] = await Promise.all([
-        adminApi.jobs.summary(),
-        adminApi.jobs.list({
-          kind: kind || undefined,
-          status: status || undefined,
-          limit: pageSize,
-          offset: (page - 1) * pageSize,
-        }),
-      ]);
-      setState({
-        summary,
-        jobs: list.jobs,
-        total: list.total,
-        progress: list.progress,
-        nowMs: Date.now(),
-      });
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -277,23 +235,7 @@ export function AdminJobsClient({
     setError(null);
     try {
       await adminApi.jobs.requeue(jobId);
-      const [summary, list] = await Promise.all([
-        adminApi.jobs.summary(),
-        adminApi.jobs.list({
-          kind: kind || undefined,
-          status: status || undefined,
-          limit: pageSize,
-          offset: (page - 1) * pageSize,
-        }),
-      ]);
-      setState({
-        summary,
-        jobs: list.jobs,
-        total: list.total,
-        progress: list.progress,
-        // eslint-disable-next-line react-hooks/purity
-        nowMs: Date.now(),
-      });
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -304,230 +246,228 @@ export function AdminJobsClient({
   const { summary, jobs, nowMs, progress } = state;
 
   return (
-    <div className="space-y-5">
-      <ErrorBanner error={error} />
-
-      {sweepResult && (
-        <div className="rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-200">
-          {sweepResult}
+    <div>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
         </div>
       )}
 
-      {/* Hero counters */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <Counter label="Queued" value={summary.queued} tone="info" />
-        <Counter label="Running" value={summary.running} tone="accent" />
-        <Counter label="Failed" value={summary.failed} tone="warn" />
-        <Counter label="Dead" value={summary.dead} tone="bad" />
-        <Counter label="Succeeded" value={summary.succeeded} tone="ok" />
-      </div>
+      {sweepResult && (
+        <div className="cf-banner cf-info">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v.5M12 11v5" />
+          </svg>
+          <div>{sweepResult}</div>
+        </div>
+      )}
 
-      {/* Backfill action — operator-triggered sweep that catches up
-          files added before the discovery pipeline shipped, or any
-          file whose on-discovery job died past max_attempts. */}
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/10 bg-white/2 px-4 py-3">
-        <div>
-          <div className="text-sm font-medium">Backfill existing library</div>
-          <div className="text-xs text-white/55">
-            Runs the discovery pipeline against every file already in the
-            library that lacks an artifact. Use this once after upgrading;
-            new files trigger the pipeline automatically on scan.
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setAskClearDead(true)}
-            disabled={clearDeadBusy || summary.dead === 0}
-            className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-2 text-sm font-medium text-red-300 hover:border-red-500/55 hover:bg-red-500/10 disabled:opacity-50"
-          >
-            {clearDeadBusy ? "Clearing…" : `Clear dead (${summary.dead})`}
-          </button>
-          <button
-            type="button"
-            onClick={() => setAskWipe(true)}
-            disabled={wipeBusy || summary.queued === 0}
-            className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-2 text-sm font-medium text-red-300 hover:border-red-500/55 hover:bg-red-500/10 disabled:opacity-50"
-          >
-            {wipeBusy ? "Wiping…" : `Wipe queued (${summary.queued})`}
-          </button>
-          <button
-            type="button"
-            onClick={() => setAskProcessAll(true)}
-            disabled={sweepBusy}
-            className="rounded-md border border-white/25 bg-white/5 px-4 py-2 text-sm font-medium text-white hover:border-white/45 hover:bg-white/10 disabled:opacity-50"
-          >
-            {sweepBusy ? "Sweeping…" : "Process all pending"}
-          </button>
-        </div>
-        {askProcessAll && (
-          <ConfirmDialog
-            title="Process all pending?"
-            body={
-              <>
-                <p>
-                  Sweep every file lacking a pipeline artifact (markers,
-                  loudness) and enqueue jobs for them.
-                </p>
-                <p className="mt-2">
-                  This is idempotent — re-running while jobs are in flight is
-                  safe — but on a large library it can enqueue tens of
-                  thousands of rows.
-                </p>
-              </>
-            }
-            confirmLabel="Process all"
-            busy={sweepBusy}
-            onConfirm={() => void processAllPending()}
-            onCancel={() => setAskProcessAll(false)}
-          />
-        )}
-        {askWipe && (
-          <ConfirmDialog
-            title={`Wipe ${summary.queued.toLocaleString()} queued job${summary.queued === 1 ? "" : "s"}?`}
-            body={
-              <>
-                <p>
-                  Running jobs will finish their current file but no more
-                  queued rows will be picked up.
-                </p>
-                <p className="mt-2 text-white/55">
-                  This is the &ldquo;I clicked Process all pending by
-                  mistake&rdquo; escape hatch.
-                </p>
-              </>
-            }
-            confirmLabel="Wipe queued"
-            destructive
-            busy={wipeBusy}
-            onConfirm={() => void wipeQueued()}
-            onCancel={() => setAskWipe(false)}
-          />
-        )}
-        {askClearDead && (
-          <ConfirmDialog
-            title={`Clear ${summary.dead.toLocaleString()} dead job${summary.dead === 1 ? "" : "s"}?`}
-            body={
-              <p>
-                Dead rows have exhausted{" "}
-                <code className="font-mono text-white/85">max_attempts</code>{" "}
-                (or have no handler at all — e.g. left over from a renamed
-                kind). Use this when a Requeue won&rsquo;t help.
-              </p>
-            }
-            confirmLabel="Clear dead"
-            destructive
-            busy={clearDeadBusy}
-            onConfirm={() => void clearDead()}
-            onCancel={() => setAskClearDead(false)}
-          />
-        )}
-      </div>
-
-      {/* Filter chips */}
-      <div className="space-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs uppercase tracking-wider text-white/45">
-            Kind
-          </span>
-          {kinds.map((k) => (
-            <FilterChip
-              key={k.value || "all"}
-              active={kind === k.value}
-              onClick={() => {
-                setKind(k.value);
-                setPage(1);
-              }}
-            >
-              {k.label}
-            </FilterChip>
-          ))}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs uppercase tracking-wider text-white/45">
-            Status
-          </span>
+      {/* ── status segmented control + actions ────────────────────── */}
+      <div
+        className="cf-flex cf-between cf-wrap cf-gap8"
+        style={{ marginBottom: 14 }}
+      >
+        <div className="cf-seg">
           {STATUSES.map((s) => (
-            <FilterChip
+            <button
               key={s.value || "all"}
-              active={status === s.value}
+              type="button"
+              className={status === s.value ? "cf-on" : undefined}
               onClick={() => {
                 setStatus(s.value);
                 setPage(1);
               }}
             >
               {s.label}
-            </FilterChip>
+            </button>
           ))}
+        </div>
+        <div className="cf-flex cf-gap8">
+          <button
+            type="button"
+            className="cf-btn cf-sm"
+            onClick={() => setAskProcessAll(true)}
+            disabled={sweepBusy}
+          >
+            {sweepBusy ? "Sweeping…" : "Process all pending"}
+          </button>
+          <button
+            type="button"
+            className="cf-btn cf-danger cf-sm"
+            onClick={() => setAskWipe(true)}
+            disabled={wipeBusy || summary.queued === 0}
+          >
+            {wipeBusy ? "Wiping…" : `Wipe queued (${summary.queued})`}
+          </button>
+          <button
+            type="button"
+            className="cf-btn cf-danger cf-sm"
+            onClick={() => setAskClearDead(true)}
+            disabled={clearDeadBusy || summary.dead === 0}
+          >
+            {clearDeadBusy ? "Clearing…" : `Clear dead (${summary.dead})`}
+          </button>
         </div>
       </div>
 
-      {/* Table */}
+      {/* ── kind filter pills ─────────────────────────────────────── */}
+      <div className="cf-flex cf-wrap cf-gap8" style={{ marginBottom: 14 }}>
+        {kinds.map((k) => {
+          const active = kind === k.value;
+          return (
+            <button
+              key={k.value || "all"}
+              type="button"
+              className={`cf-pill${active ? " cf-accent" : ""}`}
+              style={{ cursor: "pointer" }}
+              onClick={() => {
+                setKind(k.value);
+                setPage(1);
+              }}
+            >
+              {k.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── confirmation dialogs ──────────────────────────────────── */}
+      {askProcessAll && (
+        <ConfirmDialog
+          title="Process all pending?"
+          body={
+            <>
+              <p>
+                Sweep every file lacking a pipeline artifact (markers,
+                loudness) and enqueue jobs for them.
+              </p>
+              <p className="mt-2">
+                This is idempotent — re-running while jobs are in flight is
+                safe — but on a large library it can enqueue tens of thousands
+                of rows.
+              </p>
+            </>
+          }
+          confirmLabel="Process all"
+          busy={sweepBusy}
+          onConfirm={() => void processAllPending()}
+          onCancel={() => setAskProcessAll(false)}
+        />
+      )}
+      {askWipe && (
+        <ConfirmDialog
+          title={`Wipe ${summary.queued.toLocaleString()} queued job${summary.queued === 1 ? "" : "s"}?`}
+          body={
+            <>
+              <p>
+                Running jobs will finish their current file but no more queued
+                rows will be picked up.
+              </p>
+              <p className="mt-2 text-white/55">
+                This is the &ldquo;I clicked Process all pending by
+                mistake&rdquo; escape hatch.
+              </p>
+            </>
+          }
+          confirmLabel="Wipe queued"
+          destructive
+          busy={wipeBusy}
+          onConfirm={() => void wipeQueued()}
+          onCancel={() => setAskWipe(false)}
+        />
+      )}
+      {askClearDead && (
+        <ConfirmDialog
+          title={`Clear ${summary.dead.toLocaleString()} dead job${summary.dead === 1 ? "" : "s"}?`}
+          body={
+            <p>
+              Dead rows have exhausted{" "}
+              <code className="font-mono text-white/85">max_attempts</code> (or
+              have no handler at all — e.g. left over from a renamed kind). Use
+              this when a Requeue won&rsquo;t help.
+            </p>
+          }
+          confirmLabel="Clear dead"
+          destructive
+          busy={clearDeadBusy}
+          onConfirm={() => void clearDead()}
+          onCancel={() => setAskClearDead(false)}
+        />
+      )}
+
+      {/* ── table ─────────────────────────────────────────────────── */}
       {jobs.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-8 text-center text-sm text-white/55">
-          No matching jobs.
+        <div className="cf-card" style={{ marginBottom: 0 }}>
+          <div className="cf-card-body cf-pad cf-center cf-faint">
+            No matching jobs.
+          </div>
         </div>
       ) : (
-        <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-          <table className="w-full text-sm">
-            <thead className="bg-white/4 text-left text-[11.5px] uppercase tracking-wider text-white/45">
+        <div className="cf-card" style={{ marginBottom: 0 }}>
+          <table className="cf-table">
+            <thead>
               <tr>
-                <th className="w-16 px-3 py-2 font-semibold">#</th>
-                <th className="px-3 py-2 font-semibold">Kind</th>
-                <th className="px-3 py-2 font-semibold">Payload</th>
-                <th className="w-24 px-3 py-2 font-semibold">Status</th>
-                <th className="w-20 px-3 py-2 font-semibold">Attempts</th>
-                <th className="w-32 px-3 py-2 font-semibold">Created</th>
-                <th className="w-24 px-3 py-2"></th>
+                <th>Job</th>
+                <th>Kind</th>
+                <th>Status</th>
+                <th>Attempts</th>
+                <th>Payload / last error</th>
+                <th>Created</th>
+                <th />
               </tr>
             </thead>
             <tbody>
               {jobs.map((j) => (
-                <tr key={j.id} className="border-t border-white/6 align-top">
-                  <td className="px-3 py-3 text-[12.5px] tabular-nums text-white/55">
-                    {j.id}
+                <tr key={j.id}>
+                  <td className="cf-mono">#{j.id}</td>
+                  <td className="cf-mono">{j.kind}</td>
+                  <td>
+                    <StatusPill status={j.status} />
                   </td>
-                  <td className="px-3 py-3 text-[12.5px]">
-                    <code className="font-mono text-[11.5px] text-white/80">
-                      {j.kind}
+                  <td className="cf-num cf-mono">
+                    {j.attempts} / {j.max_attempts}
+                  </td>
+                  <td>
+                    <code
+                      className="cf-mono"
+                      style={{ wordBreak: "break-all" }}
+                    >
+                      {j.payload}
                     </code>
-                  </td>
-                  <td className="px-3 py-3 text-[11.5px] text-white/55">
-                    <code className="font-mono break-all">{j.payload}</code>
-                    {/*
-                      Live progress for in-flight jobs and stage
-                      breakdown for completed ones. Both are
-                      operator-visibility nicety; never block
-                      anything — render only when data is present.
-                    */}
                     <LiveProgressLine progress={progress[String(j.id)]} />
                     <StageTimingsLine stageTimingsJson={j.stage_timings_json} />
                     {j.last_error && (
-                      <div className="mt-1 text-[11px] text-red-300/80">
+                      <div
+                        className="cf-mono"
+                        style={{
+                          marginTop: 4,
+                          fontSize: 11,
+                          color: "#fca5a5",
+                        }}
+                      >
                         {j.last_error}
                       </div>
                     )}
                   </td>
-                  <td className="px-3 py-3">
-                    <StatusPill status={j.status} />
-                  </td>
-                  <td className="px-3 py-3 text-[12.5px] tabular-nums text-white/65">
-                    {j.attempts} / {j.max_attempts}
-                  </td>
-                  <td className="px-3 py-3 text-[12px] text-white/55">
+                  <td className="cf-faint">
                     {nowMs > 0
                       ? relativeSince(j.created_at, nowMs)
                       : formatTime(j.created_at)}
                   </td>
-                  <td className="px-3 py-3 text-right">
+                  <td className="cf-num">
                     {(j.status === "dead" || j.status === "failed") && (
                       <button
                         type="button"
+                        className="cf-btn cf-ghost cf-tiny"
                         onClick={() => requeue(j.id)}
                         disabled={busyJobId === j.id}
-                        className="rounded border border-white/20 px-2 py-1 text-[11px] text-white/80 hover:border-white/40 hover:text-white disabled:opacity-50"
                       >
-                        {busyJobId === j.id ? "Requeuing…" : "Requeue"}
+                        {busyJobId === j.id ? "Requeuing…" : "Retry"}
                       </button>
                     )}
                   </td>
@@ -539,55 +479,27 @@ export function AdminJobsClient({
       )}
 
       {state.total > pageSize && (
-        <Pagination
-          page={page}
-          pageSize={pageSize}
-          total={state.total}
-          onPageChange={setPage}
-          onPageSizeChange={(s) => {
-            setPageSize(s);
-            setPage(1);
-          }}
-          noun="jobs"
-        />
+        <div style={{ marginTop: 16 }}>
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={state.total}
+            onPageChange={setPage}
+            onPageSizeChange={(s) => {
+              setPageSize(s);
+              setPage(1);
+            }}
+            noun="jobs"
+          />
+        </div>
       )}
 
-      <p className="text-xs text-white/45">
-        Refreshes every {POLL_MS / 1000}s while the tab is visible. Failed
-        rows are retry-pending — they re-claim automatically once their
-        backoff window expires. Dead rows have exhausted{" "}
-        <code className="font-mono">max_attempts</code> and need a manual
-        Requeue.
+      <p className="cf-faint" style={{ fontSize: 12, marginTop: 14 }}>
+        Refreshes every {POLL_MS / 1000}s while the tab is visible. Failed rows
+        are retry-pending — they re-claim automatically once their backoff
+        window expires. Dead rows have exhausted{" "}
+        <code className="cf-mono">max_attempts</code> and need a manual Retry.
       </p>
-    </div>
-  );
-}
-
-function Counter({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: number;
-  tone: "ok" | "warn" | "bad" | "info" | "accent" | "muted";
-}) {
-  const toneClass = {
-    ok: "text-emerald-300",
-    warn: "text-amber-300",
-    bad: "text-red-300",
-    info: "text-sky-300",
-    accent: "text-(--color-accent)",
-    muted: "text-white/70",
-  }[tone];
-  return (
-    <div className="rounded-lg border border-white/10 bg-white/2 px-4 py-3">
-      <div className="text-[11.5px] uppercase tracking-wider text-white/45">
-        {label}
-      </div>
-      <div className={`mt-1 text-2xl font-semibold tabular-nums ${toneClass}`}>
-        {value.toLocaleString()}
-      </div>
     </div>
   );
 }
@@ -595,17 +507,45 @@ function Counter({
 function StatusPill({ status }: { status: JobStatusFilter }) {
   switch (status) {
     case "queued":
-      return <Pill tone="info">queued</Pill>;
+      return (
+        <span className="cf-pill">
+          <span className="cf-dot" style={{ background: "var(--ghost)" }} />
+          Queued
+        </span>
+      );
     case "running":
-      return <Pill tone="accent">running</Pill>;
+      return (
+        <span className="cf-pill cf-info">
+          <span className="cf-dot" />
+          Running
+        </span>
+      );
     case "succeeded":
-      return <Pill tone="ok">succeeded</Pill>;
+      return (
+        <span className="cf-pill cf-ok">
+          <span className="cf-dot" />
+          Succeeded
+        </span>
+      );
     case "failed":
-      return <Pill tone="warn">failed</Pill>;
+      return (
+        <span className="cf-pill cf-err">
+          <span className="cf-dot" />
+          Failed
+        </span>
+      );
     case "dead":
-      return <Pill tone="bad">dead</Pill>;
+      return (
+        <span
+          className="cf-pill cf-err"
+          style={{ background: "rgba(248,113,113,.2)" }}
+        >
+          <span className="cf-dot" />
+          Dead
+        </span>
+      );
     default:
-      return <Pill tone="muted">{status}</Pill>;
+      return <span className="cf-pill">{status}</span>;
   }
 }
 
@@ -618,8 +558,7 @@ function relativeSince(epochMs: number, nowMs: number): string {
 }
 
 /// Inline live-progress pill for an in-flight job. Returns null when
-/// the job isn't currently executing — the parent row renders without
-/// any progress chrome.
+/// the job isn't currently executing.
 function LiveProgressLine({ progress }: { progress: JobProgress | undefined }) {
   if (!progress) return null;
   const pct =
@@ -627,8 +566,26 @@ function LiveProgressLine({ progress }: { progress: JobProgress | undefined }) {
       ? `${Math.round(progress.percent * 100)}%`
       : null;
   return (
-    <div className="mt-1 flex items-center gap-2 text-[11px] text-sky-300/85">
-      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+    <div
+      style={{
+        marginTop: 4,
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        fontSize: 11,
+        color: "#7dd3fc",
+      }}
+    >
+      <span
+        className="animate-pulse"
+        style={{
+          display: "inline-block",
+          height: 6,
+          width: 6,
+          borderRadius: "50%",
+          background: "#38bdf8",
+        }}
+      />
       <span>
         {progress.stage}
         {pct && ` · ${pct}`}
@@ -639,7 +596,6 @@ function LiveProgressLine({ progress }: { progress: JobProgress | undefined }) {
 
 /// Inline stage-breakdown for jobs with a persisted timing blob.
 /// Renders as "decode 3m 02s · fingerprint 1m 04s · loudness 67s".
-/// Falls back to null on parse failure (e.g. legacy blob shape).
 function StageTimingsLine({
   stageTimingsJson,
 }: {
@@ -652,8 +608,6 @@ function StageTimingsLine({
   } catch {
     return null;
   }
-  // Extract recognized fields; ignore unknown ones so the UI keeps
-  // working as tacet's API grows.
   const stages: Array<[string, number]> = [];
   for (const [label, key] of [
     ["markers", "markers_ms"],
@@ -668,10 +622,10 @@ function StageTimingsLine({
   }
   if (stages.length === 0) return null;
   return (
-    <div className="mt-1 text-[11px] text-white/40">
+    <div className="cf-faint" style={{ marginTop: 4, fontSize: 11 }}>
       {stages.map(([label, ms], i) => (
         <span key={label}>
-          {i > 0 && <span className="mx-1.5">·</span>}
+          {i > 0 && <span style={{ margin: "0 6px" }}>·</span>}
           {label} {formatShortDuration(ms)}
         </span>
       ))}

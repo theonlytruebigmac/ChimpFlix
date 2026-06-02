@@ -5,11 +5,17 @@ import { admin as adminApi, type LogLine } from "@/lib/chimpflix-api";
 
 const REFRESH_INTERVAL_MS = 3_000;
 
+const LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] as const;
+
 export function AdminLogsClient({ initial }: { initial: LogLine[] }) {
   const [lines, setLines] = useState(initial);
   const [level, setLevel] = useState<string>("INFO");
   const [paused, setPaused] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Client-side module/target filter. Logs are an in-memory ring on the
+  // server; filtering by `target` here avoids a backend round-trip and
+  // keeps the live tail responsive. Case-insensitive substring match.
+  const [moduleFilter, setModuleFilter] = useState("");
   // Mirror `paused` into a ref so the polling interval (which runs with
   // an empty dep array to avoid re-creating the timer every render) can
   // read the latest value. The ref writes have to live in an effect;
@@ -19,10 +25,10 @@ export function AdminLogsClient({ initial }: { initial: LogLine[] }) {
     pausedRef.current = paused;
   }, [paused]);
 
-  // Fetch immediately whenever `level` changes (the dropdown), and
-  // re-arm a polling tick that uses the same level. Without this the
-  // dropdown sat on stale results for up to one REFRESH_INTERVAL_MS
-  // tick — making it look like the filter wasn't doing anything.
+  // Fetch immediately whenever `level` changes (the seg), and re-arm a
+  // polling tick that uses the same level. Without this the seg sat on
+  // stale results for up to one REFRESH_INTERVAL_MS tick — making it
+  // look like the filter wasn't doing anything.
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -52,70 +58,208 @@ export function AdminLogsClient({ initial }: { initial: LogLine[] }) {
     };
   }, [level]);
 
+  // The "Auto-scroll" toggle drives the existing pause logic: on = live
+  // (following / polling), off = paused. Same single boolean, just
+  // surfaced as a switch to match the console design language.
+  const following = !paused;
+
+  // Apply the module filter to the already-fetched lines. Both the
+  // rendered list and the export operate on this filtered view so what
+  // you download matches what you see.
+  const filter = moduleFilter.trim().toLowerCase();
+  const shown = filter
+    ? lines.filter((l) => l.target.toLowerCase().includes(filter))
+    : lines;
+
+  // Export the currently-shown lines as a plain-text log file. No backend
+  // call — we serialize the in-memory `shown` array client-side and
+  // synthesize a download click.
+  function exportLog() {
+    const body = shown
+      .map(
+        (l) =>
+          `${new Date(l.timestamp_ms).toISOString()} ${l.level.toUpperCase().padEnd(5)} ${l.target}  ${l.message}`,
+      )
+      .join("\n");
+    const blob = new Blob([body + (body ? "\n" : "")], {
+      type: "text/plain;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `chimpflix-logs-${new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")}.log`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   return (
-    <div className="space-y-3">
-      <div className="flex items-center gap-3">
-        <label className="text-xs text-white/50">Min level</label>
-        <select
-          value={level}
-          onChange={(e) => setLevel(e.target.value)}
-          className="rounded-md border border-white/10 bg-black/30 px-3 py-1.5 text-sm outline-none focus:border-white/30"
-        >
-          <option value="TRACE">TRACE</option>
-          <option value="DEBUG">DEBUG</option>
-          <option value="INFO">INFO</option>
-          <option value="WARN">WARN</option>
-          <option value="ERROR">ERROR</option>
-        </select>
-        <button
-          onClick={() => setPaused((v) => !v)}
-          className={`rounded border px-3 py-1 text-xs ${paused ? "border-amber-500/40 text-amber-300" : "border-white/15 text-white/70"}`}
-        >
-          {paused ? "Resume" : "Pause"}
-        </button>
-        <span className="text-xs text-white/40">
-          {lines.length} line{lines.length === 1 ? "" : "s"}
-        </span>
-        {error && <span className="text-xs text-red-400">{error}</span>}
+    <div>
+      {/* ── controls: level seg (left) + auto-scroll toggle (right) ──── */}
+      <div
+        className="cf-flex cf-between cf-wrap cf-gap8"
+        style={{ marginBottom: 14 }}
+      >
+        <div className="cf-seg" role="group" aria-label="Minimum log level">
+          {LEVELS.map((lvl) => (
+            <button
+              key={lvl}
+              type="button"
+              aria-pressed={level === lvl}
+              onClick={() => setLevel(lvl)}
+              className={level === lvl ? "cf-on" : undefined}
+            >
+              {lvl}
+            </button>
+          ))}
+        </div>
+        <div className="cf-flex cf-gap8" style={{ alignItems: "center" }}>
+          <input
+            type="text"
+            className="cf-input"
+            placeholder="Filter by module…"
+            aria-label="Filter by module"
+            value={moduleFilter}
+            onChange={(e) => setModuleFilter(e.target.value)}
+            style={{ minWidth: 180 }}
+          />
+          <button
+            type="button"
+            className="cf-btn"
+            onClick={exportLog}
+            disabled={shown.length === 0}
+            title="Download the currently-shown log lines"
+          >
+            Export
+          </button>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={following}
+            aria-label="Auto-scroll"
+            onClick={() => setPaused((v) => !v)}
+            className={`cf-switch${following ? " cf-on" : ""}`}
+          />
+          <span
+            className="cf-faint"
+            style={{ fontSize: 12, whiteSpace: "nowrap" }}
+          >
+            Auto-scroll
+          </span>
+        </div>
       </div>
 
-      <div className="max-h-[70vh] overflow-y-auto rounded-lg border border-white/10 bg-black/40 p-3 font-mono text-xs">
-        {lines.length === 0 ? (
-          <div className="text-white/40">No log lines yet.</div>
-        ) : (
-          lines.map((l, i) => (
-            <div
-              key={`${l.timestamp_ms}-${i}`}
-              className="flex gap-2 whitespace-pre-wrap"
-            >
-              <span className="shrink-0 text-white/40">
-                {formatTime(l.timestamp_ms)}
-              </span>
-              <span className={`shrink-0 ${levelColor(l.level)}`}>
-                {l.level.padEnd(5)}
-              </span>
-              <span className="shrink-0 text-white/50">{l.target}</span>
-              <span className="text-white/80">{l.message}</span>
+      {/* ── live log card ─────────────────────────────────────────────── */}
+      <div className="cf-card" style={{ marginBottom: 0 }}>
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Live log</div>
+            <div className="cf-sub">
+              tail -f · {shown.length} line{shown.length === 1 ? "" : "s"}
+              {filter && lines.length !== shown.length
+                ? ` (filtered from ${lines.length})`
+                : ""}
             </div>
-          ))
-        )}
+          </div>
+          <div className="cf-head-aside">
+            {error && (
+              <span className="cf-pill cf-err">
+                <span className="cf-dot" />
+                {error}
+              </span>
+            )}
+            {following ? (
+              <span className="cf-pill cf-accent">
+                <span className="cf-dot" />
+                following
+              </span>
+            ) : (
+              <span className="cf-pill cf-warn">
+                <span className="cf-dot" />
+                paused
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="cf-card-body cf-pad">
+          <div
+            style={{
+              fontFamily: "ui-monospace, 'SFMono-Regular', Menlo, monospace",
+              fontSize: 12,
+              lineHeight: 1.7,
+              maxHeight: "70vh",
+              overflowY: "auto",
+            }}
+          >
+            {shown.length === 0 ? (
+              <div className="cf-faint">
+                {filter ? "No lines match that module." : "No log lines yet."}
+              </div>
+            ) : (
+              shown.map((l, i) => (
+                <div
+                  key={`${l.timestamp_ms}-${i}`}
+                  className="cf-flex cf-gap8"
+                  style={{ alignItems: "baseline", padding: "1px 0" }}
+                >
+                  <span className="cf-faint" style={{ flex: "none" }}>
+                    {formatTime(l.timestamp_ms)}
+                  </span>
+                  <span style={{ flex: "none" }}>
+                    <LevelPill level={l.level} />
+                  </span>
+                  <span
+                    style={{ flex: "none", color: "var(--violet)" }}
+                  >
+                    {l.target}
+                  </span>
+                  <span
+                    className="cf-muted"
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {l.message}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
-function levelColor(level: string): string {
+/// Log level rendered as a console `cf-pill` with the level-appropriate
+/// tone. Tightened padding so the inline tag sits cleanly in the line.
+function LevelPill({ level }: { level: string }) {
+  const tone = levelTone(level);
+  return (
+    <span className={`cf-pill${tone}`} style={{ padding: "1px 7px" }}>
+      {level.toUpperCase()}
+    </span>
+  );
+}
+
+function levelTone(level: string): string {
   switch (level.toUpperCase()) {
     case "ERROR":
-      return "text-red-400";
+      return " cf-err";
     case "WARN":
-      return "text-amber-300";
+      return " cf-warn";
     case "INFO":
-      return "text-emerald-300";
+      return " cf-info";
     case "DEBUG":
-      return "text-blue-300";
+      return " cf-info";
     default:
-      return "text-white/40";
+      return "";
   }
 }
 

@@ -7,7 +7,6 @@ import {
   type MySessionEntry,
 } from "@/lib/chimpflix-api";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { formatDate } from "@/lib/format";
 
 export function SettingsSessionsClient() {
   const [sessions, setSessions] = useState<MySessionEntry[] | null>(null);
@@ -78,81 +77,135 @@ export function SettingsSessionsClient() {
   }
 
   if (sessions === null) {
-    return <p className="text-xs text-white/55">Loading sessions…</p>;
+    return <p className="cf-faint" style={{ fontSize: 13 }}>Loading sessions…</p>;
   }
 
   const others = sessions.filter((s) => !s.current).length;
+  const countLabel =
+    sessions.length === 1
+      ? "One device currently signed in to your account."
+      : `${sessions.length} devices currently signed in to your account.`;
 
   return (
-    <div className="space-y-3">
-      <p className="text-xs text-white/55">
-        Sessions stay valid for 30 days. Revoke any you don&apos;t recognise.
-      </p>
-
-      <ul className="divide-y divide-white/5 overflow-hidden rounded-md border border-white/10 bg-black/20">
-        {sessions.length === 0 && (
-          <li className="px-3 py-4 text-center text-xs text-white/50">
-            No active sessions.
-          </li>
-        )}
-        {sessions.map((s) => (
-          <li
-            key={s.id}
-            className="flex items-start justify-between gap-3 px-3 py-2.5 text-xs"
-          >
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="font-medium text-white/90">
-                  {summarizeUserAgent(s.user_agent)}
-                </span>
-                {s.current && (
-                  <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-200">
-                    This device
-                  </span>
-                )}
-              </div>
-              <div className="mt-0.5 text-white/50">
-                {s.ip ?? "unknown IP"} · last seen {formatAge(s.last_seen_at)}
-              </div>
-              <div className="text-[10px] uppercase tracking-wider text-white/35">
-                Created {formatDate(s.created_at)} · expires{" "}
-                {formatDate(s.expires_at)}
-              </div>
+    <div>
+      {/* ── active sessions ──────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Active sessions</div>
+            <div className="cf-sub">{countLabel}</div>
+          </div>
+          {others > 0 && (
+            <div className="cf-head-aside">
+              <button
+                type="button"
+                className="cf-btn cf-danger cf-sm"
+                onClick={revokeOthers}
+                disabled={busy === "all"}
+              >
+                {busy === "all" ? "Signing out…" : "Sign out everywhere else"}
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() =>
-                revokeOne(
-                  s.id,
-                  s.current ? "this device" : summarizeUserAgent(s.user_agent),
-                )
-              }
-              disabled={busy === s.id}
-              className="rounded border border-white/15 px-2.5 py-1 text-[11px] font-medium text-white/80 hover:bg-white/5 disabled:opacity-50"
-            >
-              {busy === s.id ? "…" : "Sign out"}
-            </button>
-          </li>
-        ))}
-      </ul>
+          )}
+        </div>
 
-      {others > 0 && (
-        <button
-          type="button"
-          onClick={revokeOthers}
-          disabled={busy === "all"}
-          className="rounded border border-white/15 px-3 py-2 text-xs font-medium text-white/80 hover:bg-white/5 disabled:opacity-50"
-        >
-          {busy === "all" ? "Signing out…" : `Sign out of all ${others} other ${others === 1 ? "device" : "devices"}`}
-        </button>
-      )}
+        {sessions.length === 0 ? (
+          <div className="cf-card-body cf-pad">
+            <span className="cf-faint" style={{ fontSize: 13 }}>
+              No active sessions.
+            </span>
+          </div>
+        ) : (
+          <table className="cf-table">
+            <thead>
+              <tr>
+                <th>Device</th>
+                <th>IP address</th>
+                <th>Last seen</th>
+                <th>Expires</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {sessions.map((s) => {
+                const label = summarizeUserAgent(s.user_agent);
+                return (
+                  <tr key={s.id}>
+                    <td>
+                      <div className="cf-flex cf-gap8">
+                        <DeviceIcon ua={s.user_agent} />
+                        {s.current && (
+                          <span
+                            className="cf-pill cf-accent"
+                            style={{ padding: "2px 8px" }}
+                          >
+                            This device
+                          </span>
+                        )}
+                        <span>{label}</span>
+                      </div>
+                    </td>
+                    <td className="cf-mono">{s.ip ?? "unknown"}</td>
+                    <td>{formatAge(s.last_seen_at)}</td>
+                    <td className="cf-faint">{formatExpiresIn(s.expires_at)}</td>
+                    <td className="cf-num">
+                      <button
+                        type="button"
+                        className="cf-btn cf-ghost cf-tiny"
+                        onClick={() =>
+                          revokeOne(s.id, s.current ? "this device" : label)
+                        }
+                        disabled={busy === s.id}
+                      >
+                        {busy === s.id ? "…" : "Sign out"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* ── how "sign out everywhere else" behaves ───────────────────── */}
+      <div className="cf-banner cf-info" style={{ marginTop: 18 }}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 8v.5M12 11v5" />
+        </svg>
+        <div>
+          Sessions stay valid for 30 days. Signing out elsewhere ends every
+          other session but keeps <b>this device</b> signed in — you will not be
+          logged out here.
+        </div>
+      </div>
 
       {error && (
-        <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
+        <div
+          role="status"
+          aria-live="polite"
+          className="cf-banner cf-err"
+          style={{ marginTop: 14 }}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
         </div>
       )}
-      {message && <p className="text-xs text-white/70">{message}</p>}
+      {message && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="cf-muted"
+          style={{ marginTop: 14, fontSize: 13 }}
+        >
+          {message}
+        </div>
+      )}
+
       {askRevokeOne && (
         <ConfirmDialog
           title={`Sign out ${askRevokeOne.label}?`}
@@ -179,6 +232,82 @@ export function SettingsSessionsClient() {
   );
 }
 
+/// Device-type glyph derived purely from the UA string (no backend).
+/// Falls back to a generic laptop/monitor for desktop browsers.
+function DeviceIcon({ ua }: { ua: string | null }) {
+  const kind = deviceKind(ua);
+  const common = {
+    className: "cf-ico",
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    width: 16,
+    height: 16,
+    style: { flex: "none", opacity: 0.85 },
+  };
+  switch (kind) {
+    case "phone":
+      return (
+        <svg {...common} aria-hidden>
+          <rect x="6" y="3" width="12" height="18" rx="2" />
+          <path d="M11 18h2" />
+        </svg>
+      );
+    case "tablet":
+      return (
+        <svg {...common} aria-hidden>
+          <rect x="4" y="3" width="16" height="18" rx="2" />
+          <path d="M10 18h4" />
+        </svg>
+      );
+    case "tv":
+      return (
+        <svg {...common} aria-hidden>
+          <rect x="2" y="5" width="20" height="13" rx="2" />
+          <path d="M8 21h8M12 18v3" />
+        </svg>
+      );
+    default: // laptop / desktop
+      return (
+        <svg {...common} aria-hidden>
+          <rect x="3" y="4" width="18" height="12" rx="2" />
+          <path d="M8 20h8M12 16v4" />
+        </svg>
+      );
+  }
+}
+
+type DeviceKind = "phone" | "tablet" | "tv" | "laptop";
+
+function deviceKind(ua: string | null): DeviceKind {
+  if (!ua) return "laptop";
+  const u = ua.toLowerCase();
+  if (
+    u.includes("appletv") ||
+    u.includes("tvos") ||
+    u.includes("smart-tv") ||
+    u.includes("smarttv") ||
+    u.includes("googletv") ||
+    u.includes("crkey") ||
+    u.includes("roku") ||
+    u.includes("web0s") ||
+    u.includes("tizen") ||
+    u.includes("netcast")
+  ) {
+    return "tv";
+  }
+  if (u.includes("ipad") || (u.includes("tablet") && !u.includes("mobile"))) {
+    return "tablet";
+  }
+  if (u.includes("iphone") || u.includes("ipod") || u.includes("mobile") || u.includes("android")) {
+    return "phone";
+  }
+  return "laptop";
+}
+
 function summarizeUserAgent(ua: string | null): string {
   if (!ua) return "Unknown device";
   // Light-touch UA sniff — just enough to render a useful label
@@ -201,10 +330,24 @@ function summarizeUserAgent(ua: string | null): string {
 
 function formatAge(ms: number): string {
   const diffMin = Math.max(0, Math.floor((Date.now() - ms) / 60_000));
-  if (diffMin < 1) return "just now";
+  if (diffMin < 1) return "Just now";
   if (diffMin < 60) return `${diffMin}m ago`;
   if (diffMin < 60 * 24) return `${Math.floor(diffMin / 60)}h ago`;
   return `${Math.floor(diffMin / (60 * 24))}d ago`;
+}
+
+/// Relative future for the Expires column ("in 30 days"), matching the
+/// mockup. Operates on the same absolute `expires_at` the data carries.
+function formatExpiresIn(ms: number): string {
+  const diffMin = Math.floor((ms - Date.now()) / 60_000);
+  if (diffMin <= 0) return "expired";
+  if (diffMin < 60) return `in ${diffMin}m`;
+  if (diffMin < 60 * 24) {
+    const h = Math.floor(diffMin / 60);
+    return `in ${h}h`;
+  }
+  const d = Math.floor(diffMin / (60 * 24));
+  return `in ${d} ${d === 1 ? "day" : "days"}`;
 }
 
 function parseError(e: unknown): string {

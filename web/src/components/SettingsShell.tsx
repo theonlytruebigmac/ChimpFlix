@@ -9,6 +9,7 @@ import { CommandPalette, type CommandItem } from "@/components/CommandPalette";
 interface NavItem {
   href: string;
   label: string;
+  icon: keyof typeof NAV_ICONS;
 }
 interface NavGroup {
   title: string;
@@ -19,17 +20,17 @@ const YOU_GROUPS: NavGroup[] = [
   {
     title: "Your account",
     items: [
-      { href: "/settings/account", label: "Account" },
-      { href: "/settings/playback", label: "Playback" },
-      { href: "/settings/integrations", label: "Integrations" },
+      { href: "/settings/account", label: "Account", icon: "account" },
+      { href: "/settings/playback", label: "Playback", icon: "playback" },
+      { href: "/settings/integrations", label: "Integrations", icon: "integrations" },
     ],
   },
   {
     title: "Preferences",
     items: [
-      { href: "/settings/notifications", label: "Notifications" },
-      { href: "/settings/home", label: "Home & visibility" },
-      { href: "/settings/devices", label: "Devices & sessions" },
+      { href: "/settings/notifications", label: "Notifications", icon: "bell" },
+      { href: "/settings/home", label: "Home & visibility", icon: "home" },
+      { href: "/settings/devices", label: "Devices & sessions", icon: "devices" },
     ],
   },
 ];
@@ -38,40 +39,65 @@ const SERVER_GROUPS: NavGroup[] = [
   {
     title: "Operate",
     items: [
-      { href: "/settings/admin/overview", label: "Overview" },
-      { href: "/settings/admin/activity", label: "Activity & stats" },
-      { href: "/settings/admin/status/alerts", label: "Alerts" },
+      { href: "/settings/admin/overview", label: "Overview", icon: "overview" },
+      { href: "/settings/admin/activity", label: "Activity & stats", icon: "activity" },
+      { href: "/settings/admin/status/alerts", label: "Alerts", icon: "alerts" },
     ],
   },
   {
     title: "Server",
     items: [
-      { href: "/settings/admin/general", label: "General" },
-      { href: "/settings/admin/network", label: "Network" },
-      { href: "/settings/admin/transcoding", label: "Transcoding" },
-      { href: "/settings/admin/credentials", label: "Credentials" },
-      { href: "/settings/admin/notifications", label: "Notifications" },
+      { href: "/settings/admin/general", label: "General", icon: "general" },
+      { href: "/settings/admin/network", label: "Network", icon: "network" },
+      { href: "/settings/admin/transcoding", label: "Transcoding", icon: "transcoding" },
+      { href: "/settings/admin/credentials", label: "Credentials", icon: "credentials" },
+      { href: "/settings/admin/notifications", label: "Notifications", icon: "mail" },
     ],
   },
   {
     title: "Library",
     items: [
-      { href: "/settings/admin/libraries", label: "Libraries" },
-      { href: "/settings/admin/tasks", label: "Tasks & jobs" },
+      { href: "/settings/admin/libraries", label: "Libraries", icon: "libraries" },
+      { href: "/settings/admin/tasks", label: "Tasks & jobs", icon: "tasks" },
     ],
   },
   {
     title: "Users",
-    items: [{ href: "/settings/admin/users", label: "Users" }],
+    items: [{ href: "/settings/admin/users", label: "Users", icon: "users" }],
   },
   {
     title: "Maintenance",
     items: [
-      { href: "/settings/admin/maintenance", label: "Maintenance" },
-      { href: "/settings/admin/logs", label: "Logs & audit" },
+      { href: "/settings/admin/maintenance", label: "Maintenance", icon: "maintenance" },
+      { href: "/settings/admin/logs", label: "Logs & audit", icon: "logs" },
     ],
   },
 ];
+
+/// Stroke icons for the sidebar nav, keyed by NavItem.icon. 24px viewBox,
+/// rendered at 17px by `.cf-nav-item svg`. Kept here (not a shared icon
+/// set) because these are settings-nav-specific.
+const NAV_ICONS = {
+  account: <><circle cx="12" cy="8" r="4" /><path d="M4 20a8 8 0 0 1 16 0" /></>,
+  playback: <path d="M7 5v14l11-7z" />,
+  integrations: <><path d="M9 7L5 11a4 4 0 0 0 6 6l1-1" /><path d="M15 17l4-4a4 4 0 0 0-6-6l-1 1" /></>,
+  bell: <><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.5 21a1.5 1.5 0 0 0 3 0" /></>,
+  home: <><path d="M3 11l9-8 9 8" /><path d="M5 10v10h14V10" /></>,
+  devices: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
+  overview: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
+  activity: <path d="M3 12h4l3 8 4-16 3 8h4" />,
+  alerts: <><path d="M12 3l9 16H3z" /><path d="M12 10v4M12 17v.5" /></>,
+  general: <><circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2" /></>,
+  network: <><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18" /></>,
+  transcoding: <><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2" /></>,
+  credentials: <><circle cx="8" cy="15" r="4" /><path d="M11 12l8-8 2 2-2 2 2 2-3 3-2-2-3 3" /></>,
+  mail: <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 7l9 6 9-6" /></>,
+  libraries: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />,
+  tasks: <><path d="M9 6h11M9 12h11M9 18h11" /><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2" /></>,
+  users: <><circle cx="9" cy="8" r="3" /><path d="M3 20a6 6 0 0 1 12 0" /><path d="M16 5.5a3 3 0 0 1 0 6M21 20a6 6 0 0 0-4-5.6" /></>,
+  maintenance: <path d="M14 7a4 4 0 0 0-5.5 5.5L4 17l3 3 4.5-4.5A4 4 0 0 0 17 10l-2.5 2.5-2.5-2.5z" />,
+  logs: <><path d="M6 2h9l5 5v15H6z" /><path d="M14 2v6h6M9 13h7M9 17h7" /></>,
+} as const;
 
 /// Unified settings sidebar shell. One left nav that switches between the
 /// personal ("You") and server ("Server", owner-only) contexts based on the
@@ -133,13 +159,11 @@ export function SettingsShell({ isOwner }: { isOwner: boolean }) {
   );
 
   const nav = (
-    <nav className="flex flex-col gap-6 text-sm">
+    <nav className="flex flex-col gap-2">
       {groups.map((group) => (
-        <div key={group.title}>
-          <div className="mb-2 px-3 text-[11px] font-semibold uppercase tracking-wider text-white/40">
-            {group.title}
-          </div>
-          <ul className="flex flex-col gap-px">
+        <div key={group.title} className="cf-nav-group">
+          <div className="cf-nav-label">{group.title}</div>
+          <ul>
             {group.items.map((item) => {
               const active = item.href === activeHref;
               return (
@@ -148,12 +172,19 @@ export function SettingsShell({ isOwner }: { isOwner: boolean }) {
                     href={item.href}
                     aria-current={active ? "page" : undefined}
                     onClick={() => setDrawerOpen(false)}
-                    className={`block rounded-md px-3 py-1.5 transition-colors ${
-                      active
-                        ? "bg-white/10 text-white"
-                        : "text-white/70 hover:bg-white/5 hover:text-white"
-                    }`}
+                    className={`cf-nav-item${active ? " cf-active" : ""}`}
                   >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden
+                    >
+                      {NAV_ICONS[item.icon]}
+                    </svg>
                     {item.label}
                   </Link>
                 </li>

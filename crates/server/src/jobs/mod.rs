@@ -267,6 +267,9 @@ pub fn build_router() -> JobRouter {
         .register(handlers::trakt_push_user_history::KIND, |s, p| {
             handlers::trakt_push_user_history::run(s, p)
         })
+        .register(handlers::notify_new_content::KIND, |s, p| {
+            handlers::notify_new_content::run(s, p)
+        })
         .build()
 }
 
