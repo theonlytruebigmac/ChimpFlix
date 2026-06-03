@@ -70,11 +70,23 @@ function castFramework(): any | null {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function configureCastContext(framework: any): boolean {
   try {
+    // `AutoJoinPolicy` lives on the legacy `chrome.cast` namespace, NOT on
+    // `cast.framework`. Reading `framework.AutoJoinPolicy` returns undefined,
+    // so `.ORIGIN_SCOPED` throws a TypeError *before* setOptions runs; the
+    // catch below then swallows it (devError is a no-op in prod) and the
+    // context is left UNCONFIGURED. Every later `requestSession()` then
+    // rejects with "Cannot start session before cast options are provided",
+    // which the button surfaces as the generic "Couldn't open the Cast menu
+    // on this device." toast — with the real cause invisible in production.
+    // Read the enum from the correct namespace, keeping the literal value as
+    // a defensive fallback so a future SDK shuffle can't re-break setOptions.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chromeCast = (window as CastWindow).chrome?.cast as any;
     framework.CastContext.getInstance().setOptions({
       receiverApplicationId: RECEIVER_APP_ID,
       // ORIGIN_SCOPED lets the SDK silently re-attach to a live session
       // if the user navigates between pages while a cast is active.
-      autoJoinPolicy: framework.AutoJoinPolicy.ORIGIN_SCOPED,
+      autoJoinPolicy: chromeCast?.AutoJoinPolicy?.ORIGIN_SCOPED ?? "origin_scoped",
     });
     return true;
   } catch (e) {

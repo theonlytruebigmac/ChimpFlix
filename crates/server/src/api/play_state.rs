@@ -438,11 +438,12 @@ async fn build_history_event(
         }
     } else if let Some(id) = episode_id {
         match trakt_sync::episode_trakt_coords(&state.pool, id).await {
-            Ok(Some((show_ids, season, episode))) => {
+            Ok(Some(coords)) => {
                 Some(chimpflix_metadata::HistoryPush::Episode {
-                    show_ids,
-                    season,
-                    episode,
+                    show_ids: coords.show_ids,
+                    episode_ids: coords.episode_ids,
+                    season: coords.season,
+                    episode: coords.episode,
                     watched_at: now_iso,
                 })
             }

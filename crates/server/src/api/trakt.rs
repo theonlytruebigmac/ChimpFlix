@@ -1020,7 +1020,7 @@ pub async fn put_episode_rating(
     let row = queries::set_user_rating(&state.pool, user.id, None, Some(id), input.rating)
         .await
         .map_err(|e| ApiError::validation(format!("{e:#}")))?;
-    if let Ok(Some((show_ids, season, episode))) =
+    if let Ok(Some(coords)) =
         trakt_sync::episode_trakt_coords(&state.pool, id).await
     {
         let state_clone = state.clone();
@@ -1029,9 +1029,9 @@ pub async fn put_episode_rating(
                 &state_clone,
                 user.id,
                 chimpflix_metadata::RatingPush::Episode {
-                    show_ids,
-                    season,
-                    episode,
+                    show_ids: coords.show_ids,
+                    season: coords.season,
+                    episode: coords.episode,
                     rating: input.rating,
                     rated_at: trakt_sync::epoch_ms_to_iso(row.rated_at),
                 },
@@ -1076,7 +1076,7 @@ pub async fn delete_episode_rating(
     let _ = queries::delete_user_rating(&state.pool, user.id, None, Some(id))
         .await
         .map_err(ApiError::Internal)?;
-    if let Ok(Some((show_ids, season, episode))) =
+    if let Ok(Some(coords)) =
         trakt_sync::episode_trakt_coords(&state.pool, id).await
     {
         let state_clone = state.clone();
@@ -1085,9 +1085,9 @@ pub async fn delete_episode_rating(
                 &state_clone,
                 user.id,
                 chimpflix_metadata::RatingPush::Episode {
-                    show_ids,
-                    season,
-                    episode,
+                    show_ids: coords.show_ids,
+                    season: coords.season,
+                    episode: coords.episode,
                     rating: 0,
                     rated_at: trakt_sync::epoch_ms_to_iso(now_ms()),
                 },

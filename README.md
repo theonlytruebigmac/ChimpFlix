@@ -32,6 +32,9 @@ style web UI, packaged for Docker, and easy to self-host.
   decode/encode (NVENC / VAAPI / QSV / VideoToolbox / AMF), HDR→SDR
   tonemap, two-pass loudness normalization, and burned/sidecar
   subtitle paths.
+- Cast to Chromecast / Google TV via a custom, HLS-aware CAF receiver
+  (token-authenticated manifest/segment sub-requests), plus AirPlay on
+  Safari/iOS. See [docs/cast-receiver.md](docs/cast-receiver.md) for setup.
 - Multi-user authentication (with 2FA), per-library access control, and
   a three-tier role hierarchy (Owner > Admin > User).
 - Admin surface: scheduled-task scheduler with maintenance windows,
@@ -189,6 +192,9 @@ checklist before exposing the server publicly.
   boundaries, process model, request lifecycles.
 - [docs/SCHEMA.md](docs/SCHEMA.md) — SQLite schema for v0.1.
 - [docs/API.md](docs/API.md) — REST endpoints and WebSocket event catalog.
+- [docs/cast-receiver.md](docs/cast-receiver.md) — Google Cast custom
+  receiver setup: App ID registration, test-device registration, and
+  on-device verification.
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — reverse-proxy recipes,
   trusted-proxy config, TLS, public-exposure preflight.
 - [docs/PUBLIC_RELEASE_HARDENING.md](docs/PUBLIC_RELEASE_HARDENING.md)

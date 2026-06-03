@@ -1,5 +1,9 @@
 # Rust
 /target/
+# Stray rustc default output — `rustc foo.rs` run at the repo root (outside
+# cargo) emits these instead of using target/. Not build inputs; never commit.
+/rust_out
+/librust_out.rlib
 
 # Node / Next.js (covers both root and web/)
 node_modules/

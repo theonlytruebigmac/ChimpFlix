@@ -13559,6 +13559,11 @@ pub struct WatchedEpisodeForPush {
     pub show_tmdb_id: Option<i64>,
     pub show_imdb_id: Option<String>,
     pub show_tvdb_id: Option<i64>,
+    /// The episode's OWN external ids. When present these let Trakt resolve
+    /// the exact episode regardless of how its season is numbered locally —
+    /// the fix for anime whose TMDB-style numbering misses Trakt's TVDB one.
+    pub episode_tmdb_id: Option<i64>,
+    pub episode_tvdb_id: Option<i64>,
     pub season: i32,
     pub episode: i32,
     pub watched_at: i64,
@@ -13580,6 +13585,7 @@ pub async fn list_watched_episodes_for_push(
         sqlx::query(
             "SELECT ps.episode_id AS episode_id, \
                     i.tmdb_id AS show_tmdb, i.imdb_id AS show_imdb, i.tvdb_id AS show_tvdb, \
+                    e.tmdb_id AS ep_tmdb, e.tvdb_id AS ep_tvdb, \
                     s.season_number AS season, e.episode_number AS episode, \
                     ps.last_played_at AS watched_at \
              FROM play_state ps \
@@ -13602,6 +13608,7 @@ pub async fn list_watched_episodes_for_push(
         sqlx::query(
             "SELECT ps.episode_id AS episode_id, \
                     i.tmdb_id AS show_tmdb, i.imdb_id AS show_imdb, i.tvdb_id AS show_tvdb, \
+                    e.tmdb_id AS ep_tmdb, e.tvdb_id AS ep_tvdb, \
                     s.season_number AS season, e.episode_number AS episode, \
                     ps.last_played_at AS watched_at \
              FROM play_state ps \
@@ -13626,6 +13633,8 @@ pub async fn list_watched_episodes_for_push(
             show_tmdb_id: r.try_get::<Option<i64>, _>("show_tmdb").ok().flatten(),
             show_imdb_id: r.try_get::<Option<String>, _>("show_imdb").ok().flatten(),
             show_tvdb_id: r.try_get::<Option<i64>, _>("show_tvdb").ok().flatten(),
+            episode_tmdb_id: r.try_get::<Option<i64>, _>("ep_tmdb").ok().flatten(),
+            episode_tvdb_id: r.try_get::<Option<i64>, _>("ep_tvdb").ok().flatten(),
             season: r.try_get("season")?,
             episode: r.try_get("episode")?,
             watched_at: r.try_get("watched_at")?,
@@ -16397,6 +16406,20 @@ mod tests {
         .bind(now)
         .bind(now)
         .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // reconcile_trakt_history only marks episodes the user actually has
+        // on disk (the placeholder guard), so the episode needs a live
+        // media_files row or it's correctly skipped.
+        sqlx::query(
+            "INSERT INTO media_files (episode_id, path, size_bytes, mtime_ms, scanned_at)
+             VALUES (?, '/media/a-show/s01e03.mkv', 100, ?, ?)",
+        )
+        .bind(episode_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
         .await
         .unwrap();
 

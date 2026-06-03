@@ -152,6 +152,17 @@ fn is_unauthorized_error(err: &anyhow::Error) -> bool {
     chain.contains("returned 401")
 }
 
+/// Detect a Trakt 404 in an error chain. On `/scrobble/*` a 404 means Trakt
+/// could not resolve the title from the ids + season/episode we sent. For
+/// anime this is an EXPECTED metadata gap — local libraries commonly number
+/// seasons TMDB-style, which doesn't line up with Trakt's TVDB-based season
+/// structure, so an episode that exists locally has no counterpart on Trakt.
+/// It's best-effort and doesn't affect local playback or watched-state, so
+/// the caller logs it at DEBUG rather than spamming WARN every start/stop.
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("returned 404")
+}
+
 /// Push a single watched event to Trakt for every linked user (used by
 /// the play_state hooks). Best-effort: per-user failures are warned and
 /// don't bubble up to the caller. INFO-logs on success so an operator
@@ -253,6 +264,17 @@ pub async fn scrobble_event(
             tracing::info!(user_id, event = %label, "Trakt scrobble ok");
         }
         Ok(None) => {}
+        Err(e) if is_not_found_error(&e) => {
+            // Trakt can't match this title (commonly anime whose local
+            // TMDB season/episode numbering doesn't line up with Trakt's
+            // TVDB-based structure). Best-effort — playback + watched-state
+            // are unaffected — so keep it out of the WARN stream.
+            tracing::debug!(
+                user_id,
+                event = %label,
+                "Trakt scrobble skipped — title not found on Trakt (likely anime season/episode numbering mismatch)"
+            );
+        }
         Err(e) => {
             warn!(user_id, event = %label, error = %format!("{e:#}"), "Trakt scrobble failed");
         }
@@ -269,11 +291,12 @@ async fn build_scrobble_event(
         let ids = item_trakt_ids(pool, id).await?;
         Some(ScrobblePush::Movie { ids, progress })
     } else if let Some(id) = episode_id {
-        let (show_ids, season, episode) = episode_trakt_coords(pool, id).await.ok().flatten()?;
+        let coords = episode_trakt_coords(pool, id).await.ok().flatten()?;
         Some(ScrobblePush::Episode {
-            show_ids,
-            season,
-            episode,
+            show_ids: coords.show_ids,
+            episode_ids: coords.episode_ids,
+            season: coords.season,
+            episode: coords.episode,
             progress,
         })
     } else {
@@ -293,13 +316,20 @@ fn describe_scrobble_event(action: ScrobbleAction, event: &ScrobblePush) -> Stri
         }
         ScrobblePush::Episode {
             show_ids,
+            episode_ids,
             season,
             episode,
             progress,
-        } => format!(
-            "{action_label} show {} S{season:02}E{episode:02} @ {progress:.1}%",
-            describe_ids(show_ids)
-        ),
+        } => {
+            // Surface the id we actually resolve by so a 404 in the log is
+            // diagnosable (episode-id path vs show+season/number fallback).
+            let target = if episode_ids.is_empty() {
+                describe_ids(show_ids)
+            } else {
+                format!("ep {}", describe_ids(episode_ids))
+            };
+            format!("{action_label} show {target} S{season:02}E{episode:02} @ {progress:.1}%")
+        }
     }
 }
 
@@ -801,6 +831,11 @@ pub async fn bulk_push_user_history(
                 imdb: e.show_imdb_id.clone(),
                 tvdb: e.show_tvdb_id,
             },
+            episode_ids: TraktIdSet {
+                tmdb: e.episode_tmdb_id,
+                imdb: None,
+                tvdb: e.episode_tvdb_id,
+            },
             season: e.season,
             episode: e.episode,
             watched_at: epoch_ms_to_iso(e.watched_at),
@@ -1214,9 +1249,10 @@ pub async fn item_trakt_ids(pool: &SqlitePool, item_id: i64) -> Option<TraktIdSe
 pub async fn episode_trakt_coords(
     pool: &SqlitePool,
     episode_id: i64,
-) -> Result<Option<(TraktIdSet, i32, i32)>> {
+) -> Result<Option<EpisodeCoords>> {
     let row = sqlx::query(
         "SELECT i.tmdb_id AS show_tmdb, i.imdb_id AS show_imdb, i.tvdb_id AS show_tvdb,
+                e.tmdb_id AS ep_tmdb, e.tvdb_id AS ep_tvdb,
                 s.season_number AS season,
                 e.episode_number AS episode
          FROM episodes e
@@ -1228,18 +1264,43 @@ pub async fn episode_trakt_coords(
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    let ids = TraktIdSet {
+    let show_ids = TraktIdSet {
         tmdb: row.try_get::<Option<i64>, _>("show_tmdb").ok().flatten(),
         imdb: row.try_get::<Option<String>, _>("show_imdb").ok().flatten(),
         tvdb: row.try_get::<Option<i64>, _>("show_tvdb").ok().flatten(),
     };
+    // The episode's OWN ids. Episodes carry no imdb column, only tmdb/tvdb.
+    let episode_ids = TraktIdSet {
+        tmdb: row.try_get::<Option<i64>, _>("ep_tmdb").ok().flatten(),
+        imdb: None,
+        tvdb: row.try_get::<Option<i64>, _>("ep_tvdb").ok().flatten(),
+    };
     let season: i32 = row.try_get("season")?;
     let episode: i32 = row.try_get("episode")?;
-    if ids.is_empty() {
+    // Nothing Trakt can match against if we have neither a show id nor an
+    // episode id — skip. An episode id alone is enough (Trakt infers the
+    // show), so don't gate on show ids being present.
+    if show_ids.is_empty() && episode_ids.is_empty() {
         Ok(None)
     } else {
-        Ok(Some((ids, season, episode)))
+        Ok(Some(EpisodeCoords {
+            show_ids,
+            episode_ids,
+            season,
+            episode,
+        }))
     }
+}
+
+/// Trakt addressing coordinates for a local episode: the parent show's id
+/// set, the episode's OWN id set (preferred when present — see
+/// [`ScrobblePush::Episode`]), and the local season/episode numbers used as
+/// the fallback when no episode-level id exists.
+pub struct EpisodeCoords {
+    pub show_ids: TraktIdSet,
+    pub episode_ids: TraktIdSet,
+    pub season: i32,
+    pub episode: i32,
 }
 
 #[cfg(test)]

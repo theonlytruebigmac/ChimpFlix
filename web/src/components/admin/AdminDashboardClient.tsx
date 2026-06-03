@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   admin as adminApi,
   type DashboardResponse,
@@ -40,6 +40,14 @@ function pillClass(tone: PillTone): string {
 // drops without reconnecting.
 const POLL_INTERVAL_MS = 30_000;
 
+// Concurrent-streams sparkline: a REAL rolling window of the live session
+// count, sampled client-side (a 30-minute server-side history series is
+// net-new backend work). Idle => all-zero samples => the CSS 2px baseline,
+// which reads as "nothing happening" — unlike the old synthetic 35→100%
+// ramp that drew tall bars even with zero active streams.
+const SPARKLINE_BARS = 15;
+const SPARKLINE_SAMPLE_MS = 4_000; // 15 × 4s ≈ 60s window
+
 export function AdminDashboardClient({ initial }: Props) {
   const [data, setData] = useState<DashboardResponse>(initial);
   const [tasks, setTasks] = useState<ScheduledTask[] | null>(null);
@@ -47,6 +55,15 @@ export function AdminDashboardClient({ initial }: Props) {
   // Track in-flight stop requests per session so only that row's button is disabled.
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  // Rolling history of the live concurrent-stream count for the sparkline.
+  // Seeded flat at the current count; the sampler below scrolls real samples
+  // in so the card reflects ACTUAL recent activity.
+  const [concurrentHistory, setConcurrentHistory] = useState<number[]>(() =>
+    Array<number>(SPARKLINE_BARS).fill(initial.active_transcodes.length),
+  );
+  // Latest live count, kept in a ref so the once-mounted sampler interval can
+  // read it without resetting on every WS-driven re-render.
+  const liveCountRef = useRef(initial.active_transcodes.length);
 
   // Tasks + secrets are fetched separately from the dashboard payload
   // — same admin scope, different endpoints. Tasks refresh on the 30s
@@ -177,6 +194,23 @@ export function AdminDashboardClient({ initial }: Props) {
     };
   }, []);
 
+  // Keep the latest live count in the ref (updated in an effect, not during
+  // render) so the sampler interval below always reads the current value.
+  useEffect(() => {
+    liveCountRef.current = data.active_transcodes.length;
+  }, [data]);
+
+  // Sample the live concurrent count into the rolling sparkline window on a
+  // steady cadence so the chart scrolls and an idle server fills with zeros.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setConcurrentHistory((h) =>
+        [...h, liveCountRef.current].slice(-SPARKLINE_BARS),
+      );
+    }, SPARKLINE_SAMPLE_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
   async function stopSession(id: string) {
     setStoppingIds((prev) => new Set(prev).add(id));
     try {
@@ -204,6 +238,9 @@ export function AdminDashboardClient({ initial }: Props) {
     0,
   );
   const sessionCount = data.active_transcodes.length;
+  // Normalise the rolling history to bar heights. All-zero (idle) leaves the
+  // peak at 1 so every bar is 0% → collapses to the CSS 2px baseline.
+  const concurrentPeak = Math.max(1, ...concurrentHistory);
   const hwSessions = data.active_transcodes.filter(
     (s) => !s.encoder.toLowerCase().includes("software"),
   ).length;
@@ -469,16 +506,22 @@ export function AdminDashboardClient({ initial }: Props) {
             </div>
             <div className="cf-card-body cf-pad">
               <div className="cf-sparkline">
-                {sparklineBars(sessionCount).map((h, i) => (
-                  <i key={i} style={{ height: `${h}%` }} />
+                {concurrentHistory.map((v, i) => (
+                  <i
+                    key={i}
+                    style={{ height: `${(v / concurrentPeak) * 100}%` }}
+                  />
                 ))}
               </div>
               <div
                 className="cf-flex cf-between cf-faint"
                 style={{ fontSize: 11, marginTop: 8 }}
               >
-                <span>now</span>
-                <span>{sessionCount} active</span>
+                <span>
+                  {Math.round((SPARKLINE_BARS * SPARKLINE_SAMPLE_MS) / 1000)}s
+                  ago
+                </span>
+                <span>now · {sessionCount} active</span>
               </div>
             </div>
           </div>
@@ -707,24 +750,6 @@ function streamTag(s: DashboardSession) {
       HW transcode
     </span>
   );
-}
-
-// A small deterministic sparkline driven by the current concurrent-stream
-// count. 30-minute history is net-new backend; until then this renders a
-// gentle ramp that ends on the live count so the card reads as "live now"
-// without inventing past data.
-function sparklineBars(now: number): number[] {
-  const bars = 15;
-  const peak = Math.max(1, now, 4);
-  const out: number[] = [];
-  for (let i = 0; i < bars; i += 1) {
-    const t = i / (bars - 1);
-    const level = Math.round((0.35 + 0.65 * t) * 100);
-    out.push(Math.max(8, Math.min(100, level)));
-  }
-  // Anchor the last bar to the live ratio so "now" is honest.
-  out[bars - 1] = Math.max(8, Math.round((now / peak) * 100));
-  return out;
 }
 
 // ─── Activity feed builder ─────────────────────────────────────────
