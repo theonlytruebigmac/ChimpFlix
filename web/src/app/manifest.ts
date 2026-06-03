@@ -8,7 +8,7 @@ import { brandName } from "@/lib/env";
 // proper PWA that shares cookies + storage with the regular Chrome jar.
 export default function manifest(): MetadataRoute.Manifest {
   const name = brandName();
-  return {
+  const base: MetadataRoute.Manifest = {
     name,
     short_name: name,
     description: "Personal streaming library",
@@ -53,4 +53,19 @@ export default function manifest(): MetadataRoute.Manifest {
       },
     ],
   };
+  return {
+    ...base,
+    // A stable `id` makes the OS treat this as one installable app, and
+    // `launch_handler` with `focus-existing` refocuses the single running
+    // app window when the media / "now playing" notification is tapped —
+    // instead of Chrome spawning a fresh (blank) tab, which is the symptom
+    // users hit tapping the Android cast notification. `navigate-existing`
+    // is the fallback Chrome applies when focus-existing isn't honored.
+    // (Cast/now-playing refocus is materially more reliable from an
+    // installed PWA than a bare browser tab, which Chrome can't
+    // single-instance.) Asserted because `launch_handler` is newer than
+    // Next's MetadataRoute.Manifest type.
+    id: "/",
+    launch_handler: { client_mode: ["focus-existing", "navigate-existing"] },
+  } as MetadataRoute.Manifest;
 }

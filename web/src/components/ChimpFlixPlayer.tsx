@@ -15,7 +15,6 @@ import type Hls from "hls.js";
 import {
   ChimpFlixApiError,
   auth as authApi,
-  cast as castApi,
   stream as streamApi,
   playState as playStateApi,
   seasons as seasonsApi,
@@ -24,12 +23,22 @@ import {
 import { plexImage } from "@/lib/image";
 import {
   buildCastUrl,
+  castPlayPause,
+  castSeekToMediaTime,
+  castSetVolume,
+  castToggleMute,
+  ensureCastToken,
+  getRemoteSnapshot,
+  loadCastMedia,
+  setCastTrackController,
   subscribeRemotePlayback,
   useCastState,
   type CastMediaPayload,
+  type CastTrackOption,
   type RemotePlaybackState,
 } from "@/lib/cast";
 import { CastButton } from "./CastButton";
+import { CastRemote } from "./cast/CastRemote";
 import { TOAST_DISMISS_LONG_MS, TOAST_DISMISS_PLAYER_MS } from "@/lib/toast";
 import { devError, devWarn } from "@/lib/dev-log";
 import { detectClientCapabilities, isSafari } from "@/lib/client-caps";
@@ -178,6 +187,13 @@ export type EpisodeSibling = {
 interface Props {
   title: string;
   subtitle?: string;
+  /// Poster / cover art URL for the cast now-playing screen + the
+  /// app-wide mini/expanded controller + the OS media-notification chip.
+  /// Only ABSOLUTE (http/https) URLs are used for the Cast receiver,
+  /// which fetches art without our cookie — relative `/api/...` art is
+  /// ignored for casting. Optional; the remote falls back to a branded
+  /// card when absent.
+  posterUrl?: string;
   mediaFileId: number;
   // Best-known duration in milliseconds. Comes from the file's metadata
   // (ffprobe) — authoritative across the whole title, unlike `video.duration`
@@ -491,6 +507,7 @@ function SkipMarkerButton({
 export function ChimpFlixPlayer({
   title,
   subtitle,
+  posterUrl,
   mediaFileId,
   durationMs,
   startPositionMs = 0,
@@ -588,6 +605,27 @@ export function ChimpFlixPlayer({
   /// that can break a session.
   const castState = useCastState();
   const isCasting = castState.connected;
+  // Mirror of `isCasting` for reads inside effects/handlers that must NOT
+  // re-subscribe when casting toggles (the session-creation effect, the
+  // local play() recovery callers). Synced in the cast-start effect below.
+  const isCastingRef = useRef(false);
+  // The cookieless Cast receiver can only fetch ABSOLUTE poster URLs
+  // (e.g. TMDB); a relative `/api/...` art path is dropped so the remote
+  // shows its branded card instead of a broken image on the TV.
+  const castPosterUrl =
+    posterUrl && /^https?:\/\//i.test(posterUrl) ? posterUrl : undefined;
+  // Last source-time (ms) the receiver reported during casting. On
+  // cast-end we rebuild a working local session at this position — a
+  // track/quality switch while casting rebuilds the transcode onto the
+  // RECEIVER and leaves the local <video> pointing at a now-deleted
+  // session, so a plain resume would 404. Rebuilding also lands the local
+  // player where the TV left off instead of the stale cast-start point.
+  const lastCastSourceMsRef = useRef<number | null>(null);
+  // One-shot flag: suppress the next autoplay in the session-attach path.
+  // Set when rebuilding on cast-end so the local player comes up PAUSED
+  // (the user resumes deliberately) rather than surprising someone who
+  // walked away by auto-starting audio.
+  const suppressAutoplayOnceRef = useRef(false);
   // Captured the resume position so a track switch mid-playback comes back
   // to roughly where the user was, not the original startPositionMs.
   // Always source-time (file timeline), not HLS media-time.
@@ -1197,6 +1235,12 @@ export function ChimpFlixPlayer({
   const attemptPlay = useCallback(async () => {
     const v = videoRef.current;
     if (!v) return;
+    if (suppressAutoplayOnceRef.current) {
+      // Consumed once: the local session rebuilt on cast-end should come
+      // up paused, not auto-start.
+      suppressAutoplayOnceRef.current = false;
+      return;
+    }
     try {
       await v.play();
       setAutoplayBlocked(false);
@@ -1480,6 +1524,56 @@ export function ChimpFlixPlayer({
         resp.session.mode === "transcode"
           ? resp.session.start_position_ms
           : 0;
+
+      // ---- Casting: hand this session to the RECEIVER, not the local
+      // <video>. While a Cast session is live the local element stays
+      // dark; a subtitle/audio/quality switch or an out-of-window seek
+      // re-runs this effect, builds a fresh transcode, and we load it
+      // onto the TV at the current position. Subs are burned in and
+      // audio/quality rebuild the transcode, so a reload is the only
+      // correct switch path (there is no cheap in-stream track edit).
+      // The initial cast (from the toolbar button) is handled separately
+      // by resolveCastMedia + the CastButton; this branch covers every
+      // change AFTER casting has started.
+      if (isCastingRef.current && castSourceRef.current) {
+        const src = castSourceRef.current;
+        // Receiver media-time of the current position: the new session's
+        // media-time 0 maps to source-time `sessionStartMsRef.current`,
+        // so the position to resume at is the delta (≈0 for a freshly
+        // rooted session; the offset from the encoder origin for an
+        // adopted find_compatible session; full position for direct play
+        // where the offset is 0).
+        const startMediaS = Math.max(
+          0,
+          (resumeMs - sessionStartMsRef.current) / 1000,
+        );
+        void (async () => {
+          let token: string;
+          try {
+            token = await ensureCastToken();
+          } catch (e) {
+            devWarn("[cast] token sign failed on session reload", e);
+            return;
+          }
+          if (cancelled) return;
+          const ok = await loadCastMedia({
+            url: buildCastUrl(src.url, token),
+            contentType: src.contentType,
+            title,
+            subtitle,
+            posterUrl: castPosterUrl,
+            mediaKind: episodeId != null ? "episode" : "movie",
+            seriesTitle: showTitle,
+            startTimeS: startMediaS,
+            durationS: src.durationS,
+          });
+          if (!ok && !cancelled) {
+            showNotice("Couldn't update the cast stream on your TV.");
+          }
+        })();
+        setLoading(false);
+        return;
+      }
 
       function applyResume() {
         if (!video) return;
@@ -2025,6 +2119,15 @@ export function ChimpFlixPlayer({
       setBufferedEnd(end + sessionStartMsRef.current / 1000);
     };
     const onPlay = () => {
+      // Catch-all: while casting the local element must stay dark. If
+      // anything starts it (autoplay on a re-roll, recovery kick, canplay
+      // refire, PiP exit), re-pause immediately so audio never plays
+      // under the cast remote. This backstops the cast-start pause +
+      // per-caller guards.
+      if (isCastingRef.current) {
+        video.pause();
+        return;
+      }
       setPlaying(true);
       setAutoplayBlocked(false);
     };
@@ -2376,6 +2479,11 @@ export function ChimpFlixPlayer({
   useEffect(() => {
     if (typeof navigator === "undefined") return;
     if (!("mediaSession" in navigator)) return;
+    // While casting, CastDock owns the media session (its metadata +
+    // action handlers drive the receiver, and it stays mounted app-wide).
+    // Yield so we don't fight it; on cast-end this effect re-runs
+    // (isCasting dep) and reclaims the local lock-screen controls.
+    if (isCasting) return;
     const ms = navigator.mediaSession;
     const v = videoRef.current;
     if (!v) return;
@@ -2417,7 +2525,7 @@ export function ChimpFlixPlayer({
         // ignore
       }
     };
-  }, [title, subtitle]);
+  }, [title, subtitle, isCasting]);
 
   // Persist play position + run the watched-threshold scrobble for a
   // given SOURCE-time position. Extracted so the local <video> reporter
@@ -2574,6 +2682,7 @@ export function ChimpFlixPlayer({
       if (!snap || !snap.isMediaLoaded || !(snap.currentTimeS > 0)) return;
       const ms = Math.floor(snap.currentTimeS * 1000 + offsetMs());
       lastGoodMs = ms;
+      lastCastSourceMsRef.current = ms;
       lastWasPlaying = !snap.isPaused;
       reportProgress(ms, lastWasPlaying);
     };
@@ -2717,6 +2826,13 @@ export function ChimpFlixPlayer({
 
   // Imperative controls.
   const togglePlay = useCallback(() => {
+    if (isCastingRef.current) {
+      // Drive the receiver, not the (paused) local element. playOrPause
+      // flips based on the TV's actual state, so it's correct even if a
+      // second sender / TV remote changed it.
+      castPlayPause();
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) {
@@ -2774,9 +2890,26 @@ export function ChimpFlixPlayer({
   // single NaN propagating into a `setCurrentTime`/`seekTo` chain
   // would land the player at an undefined position.
   const seekTo = useCallback((time: number) => {
+    if (!Number.isFinite(time) || time < 0) return;
+    if (isCastingRef.current) {
+      // Casting: seek the RECEIVER. Convert source-time → the receiver's
+      // media-time (source minus the session's encode-start offset).
+      // In-window → a RemotePlayerController seek (instant). A target
+      // before the session's encode origin isn't in the receiver's
+      // manifest, so rebuild the transcode there and reload it onto the
+      // TV — mirroring the local out-of-window restart path.
+      const sessionStartSec = sessionStartMsRef.current / 1000;
+      const mediaTarget = time - sessionStartSec;
+      if (mediaTarget < 0) {
+        triggerSessionRestart(time);
+      } else {
+        castSeekToMediaTime(mediaTarget);
+      }
+      liveTimeMsRef.current = Math.floor(time * 1000);
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
-    if (!Number.isFinite(time) || time < 0) return;
     const sessionStartSec = sessionStartMsRef.current / 1000;
     const offsetSec = time - sessionStartSec;
     if (offsetSec < 0) {
@@ -2824,6 +2957,16 @@ export function ChimpFlixPlayer({
 
   const seekBy = useCallback(
     (delta: number) => {
+      if (isCastingRef.current) {
+        // Source-time of the receiver's current position = its media-time
+        // plus the session start offset. seekTo then re-converts and
+        // drives the TV.
+        const snap = getRemoteSnapshot();
+        const srcTimeSec =
+          snap.currentTimeS + sessionStartMsRef.current / 1000;
+        seekTo(srcTimeSec + delta);
+        return;
+      }
       const v = videoRef.current;
       if (!v) return;
       const cur = v.currentTime;
@@ -3075,6 +3218,10 @@ export function ChimpFlixPlayer({
   }, [activeMarkerOverlay, prefs.autoSkipIntro, seekTo]);
 
   const toggleMute = useCallback(() => {
+    if (isCastingRef.current) {
+      castToggleMute();
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     v.muted = !v.muted;
@@ -3118,28 +3265,30 @@ export function ChimpFlixPlayer({
     if (!source) return null;
     let token: string;
     try {
-      const resp = await castApi.sign();
-      token = resp.token;
+      token = await ensureCastToken();
     } catch (e) {
       devWarn("[cast] sign request failed", e);
       return null;
     }
     const url = buildCastUrl(source.url, token);
-    // Hand the receiver wall-clock source-time, not HLS media-time
-    // — for a transcode session the latter starts at 0 even when we
-    // joined mid-file, and we want the receiver to land where the
-    // user was watching on screen.
-    const liveS = (videoRef.current?.currentTime ?? 0) +
-      sessionStartMsRef.current / 1000;
+    // `LoadRequest.currentTime` is RECEIVER MEDIA-time. Our transcoder
+    // zeroes HLS PTS (`setpts=PTS-STARTPTS`), so media-time 0 is the
+    // session's encode start and the local element's `currentTime` IS
+    // that media-time. Pass it directly — adding `sessionStartMs`
+    // (source-time) would over-seek a resumed cast by the session offset.
+    const mediaS = videoRef.current?.currentTime ?? 0;
     return {
       url,
       contentType: source.contentType,
       title,
       subtitle,
-      startTimeS: Number.isFinite(liveS) ? liveS : undefined,
+      posterUrl: castPosterUrl,
+      mediaKind: episodeId != null ? "episode" : "movie",
+      seriesTitle: showTitle,
+      startTimeS: Number.isFinite(mediaS) ? Math.max(0, mediaS) : undefined,
       durationS: source.durationS,
     };
-  }, [title, subtitle]);
+  }, [title, subtitle, castPosterUrl, episodeId, showTitle]);
 
   // Pause local playback the moment a cast session goes live. We
   // do *not* auto-resume on disconnect — a user who ended their
@@ -3150,16 +3299,37 @@ export function ChimpFlixPlayer({
   // the UI down without a dedicated callback.
   const wasCastingRef = useRef(false);
   useEffect(() => {
-    if (isCasting && !wasCastingRef.current) {
+    isCastingRef.current = isCasting;
+    if (isCasting) {
+      // Pause the local element on cast-start. The catch-all guard in the
+      // `onPlay` listener re-pauses if anything (autoplay on a session
+      // re-roll, stall-recovery kick, canplay refire, PiP exit) tries to
+      // restart it while casting — so audio never plays under the remote.
       wasCastingRef.current = true;
       const v = videoRef.current;
       if (v && !v.paused) v.pause();
-    } else if (!isCasting && wasCastingRef.current) {
+    } else if (wasCastingRef.current) {
       wasCastingRef.current = false;
+      // Cast ended (user stopped, or receiver-side disconnect). Rebuild a
+      // fresh local session at the TV's last position so resuming locally
+      // works — a track switch during the cast left the local element on
+      // a deleted session — and lands where the user was watching rather
+      // than the stale cast-start point. Kept paused (suppress autoplay +
+      // mark user-paused) so it doesn't surprise someone who walked away.
+      const resumeMs = lastCastSourceMsRef.current;
+      if (resumeMs != null && resumeMs > 0) {
+        userPausedRef.current = true;
+        suppressAutoplayOnceRef.current = true;
+        liveTimeMsRef.current = resumeMs;
+        triggerSessionRestart(resumeMs / 1000);
+      }
     }
-  }, [isCasting]);
+  }, [isCasting, triggerSessionRestart]);
 
   const togglePip = useCallback(() => {
+    // PiP of the paused, dark local element while casting is meaningless
+    // — the picture is on the TV. No-op rather than pop a blank PiP.
+    if (isCastingRef.current) return;
     const v = videoRef.current;
     if (!v) return;
     // PiP can be force-disabled per-element by extensions / a11y tools.
@@ -3261,9 +3431,15 @@ export function ChimpFlixPlayer({
   }, [subtitleSel, externalSubUrl, activeSubtitleTracks, selectSubtitle]);
 
   const setVolumeValue = useCallback((value: number) => {
+    const clamped = Math.max(0, Math.min(1, value));
+    if (isCastingRef.current) {
+      // Drive the receiver's volume; leave the local element + saved
+      // volume preference untouched (the TV's level is its own thing).
+      castSetVolume(clamped);
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
-    const clamped = Math.max(0, Math.min(1, value));
     v.volume = clamped;
     const wasMuted = v.muted;
     if (clamped > 0 && wasMuted) v.muted = false;
@@ -3274,12 +3450,76 @@ export function ChimpFlixPlayer({
   }, []);
 
   const setSpeed = useCallback((rate: number) => {
+    if (isCastingRef.current) {
+      // Playback speed isn't exposed by the Chromecast media protocol
+      // (RemotePlayerController has no rate control, and the stock
+      // receiver ignores it). Supporting it would need a custom
+      // SET_PLAYBACK_RATE message in our receiver — deferred — so we tell
+      // the user rather than silently no-op the local element.
+      showNotice("Playback speed isn't available while casting");
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     v.playbackRate = rate;
     setPlaybackRate(rate);
     updatePrefs({ playbackRate: rate });
-  }, []);
+  }, [showNotice]);
+
+  // Publish the active track/quality controls to the app-wide cast
+  // surface while casting, so the mini/expanded controller can switch
+  // subtitles, audio, and quality. Each switch sets player state, which
+  // re-runs the session effect; its cast branch rebuilds the transcode
+  // and reloads it on the receiver at the current position. Cleared when
+  // not casting / on unmount, leaving a transport-only remote.
+  useEffect(() => {
+    if (!isCasting) {
+      setCastTrackController(null);
+      return;
+    }
+    const audio: CastTrackOption[] = activeAudioTracks.map((t) => ({
+      label: t.label,
+      active: audioSel === t.idx,
+      onSelect: () => selectAudio(t.idx),
+    }));
+    // "Off" + embedded burn-in tracks only. External (<track>) subtitles
+    // are local-only — the receiver plays burned-in HLS — so they're
+    // omitted from the cast menu.
+    const subtitle: CastTrackOption[] = [
+      {
+        label: "Off",
+        active:
+          externalSubUrl === null &&
+          (subtitleSel === null || subtitleSel === undefined),
+        onSelect: () => selectSubtitle(null),
+      },
+      ...activeSubtitleTracks
+        .filter((t) => !t.externalUrl)
+        .map((t) => ({
+          label: t.label,
+          active: externalSubUrl === null && subtitleSel === t.idx,
+          onSelect: () => selectSubtitle(t),
+        })),
+    ];
+    const quality: CastTrackOption[] = QUALITY_OPTIONS.map((q) => ({
+      label: q.label,
+      active: qualitySel.height === q.height,
+      onSelect: () => setQualitySel(q),
+    }));
+    setCastTrackController({ audio, subtitle, quality, busy: loading });
+    return () => setCastTrackController(null);
+  }, [
+    isCasting,
+    activeAudioTracks,
+    activeSubtitleTracks,
+    audioSel,
+    subtitleSel,
+    externalSubUrl,
+    qualitySel,
+    loading,
+    selectAudio,
+    selectSubtitle,
+  ]);
 
   // Keyboard shortcuts.
   useEffect(() => {
@@ -3486,7 +3726,26 @@ export function ChimpFlixPlayer({
       {loading && !error && !autoplayBlocked && <LoadingSpinner />}
       {autoplayBlocked && !error && <BigPlayButton onClick={attemptPlay} />}
       {reconnecting && !error && <ReconnectingOverlay />}
-      {isCasting && !error && <CastingOverlay title={title} />}
+      {isCasting && !error && (
+        <div className="absolute inset-0 z-30">
+          {/* The connected-cast remote replaces the local frame: artwork,
+              a scrub bar bound to the TV, transport, volume, and the
+              track/quality menus — all driving the receiver. */}
+          <CastRemote variant="embedded" />
+          {/* Always-visible exit. Leaving the player keeps the cast going
+              and drops to the app-wide mini-controller (CastDock). Lives
+              above the remote and never auto-hides — the fix for "the
+              overlay couldn't be dismissed". */}
+          <Link
+            href={backHref}
+            aria-label="Back"
+            className="absolute left-3 top-[max(0.75rem,env(safe-area-inset-top))] z-10 flex items-center gap-2 rounded-full bg-black/40 p-2 text-white/85 backdrop-blur transition-colors hover:text-white sm:left-6"
+          >
+            <BackIcon />
+            <span className="hidden text-sm font-medium sm:inline">Back</span>
+          </Link>
+        </div>
+      )}
       {notice && !error && (
         <div
           role="status"
@@ -5274,44 +5533,6 @@ function ReconnectingOverlay() {
       <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/75 px-3 py-1.5 text-xs font-medium text-white/85 shadow-lg backdrop-blur-sm">
         <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-(--color-accent)" />
         Reconnecting…
-      </div>
-    </div>
-  );
-}
-
-/// Shown over the local frame while a Cast session is active. The
-/// receiver paints the video on the TV; locally we go dark so the
-/// laptop screen doesn't double-render and waste battery. The "Stop
-/// casting" button on the toolbar (`CastButton` in connected state)
-/// is how the user comes back.
-function CastingOverlay({ title }: { title: string }) {
-  return (
-    <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/85 text-center text-white">
-      <svg
-        width="64"
-        height="64"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-(--color-accent)"
-        aria-hidden
-      >
-        <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
-        <path d="M2 12a8 8 0 0 1 8 8" />
-        <path d="M2 16a4 4 0 0 1 4 4" />
-        <circle cx="3" cy="20" r="1.2" fill="currentColor" stroke="none" />
-      </svg>
-      <div className="mt-6 text-sm tracking-wide text-white/55 uppercase">
-        Casting
-      </div>
-      <div className="mt-1 max-w-md truncate text-2xl font-semibold">
-        {title}
-      </div>
-      <div className="mt-4 text-xs text-white/40">
-        Use the toolbar button to stop casting.
       </div>
     </div>
   );

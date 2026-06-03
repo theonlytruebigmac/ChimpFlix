@@ -42,6 +42,10 @@ interface Resolved {
   mediaFileId: number;
   title: string;
   subtitle?: string;
+  /// Cover art for the cast now-playing screen + mini/expanded
+  /// controller + OS media chip. Only absolute (TMDB) URLs reach the
+  /// cookieless Cast receiver; relative `/api/...` art is ignored there.
+  posterUrl?: string;
   itemId?: number;
   episodeId?: number;
   startPositionMs: number;
@@ -260,6 +264,7 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
   return {
     mediaFileId: file.id,
     title: detail.title,
+    posterUrl: plexImage(detail.poster_path ?? undefined, 300, 450) ?? undefined,
     itemId: detail.id,
     startPositionMs: detail.play_state?.position_ms ?? 0,
     durationMs: file.duration_ms ?? detail.duration_ms ?? undefined,
@@ -321,6 +326,7 @@ async function resolveEpisode(
     mediaFileId: file.id,
     title: show.title,
     subtitle: `S${episode.season_number} · E${episode.episode_number} · ${episode.title}`,
+    posterUrl: plexImage(episode.thumb_path ?? undefined, 480, 270) ?? undefined,
     episodeId: episode.id,
     startPositionMs: episode.play_state?.position_ms ?? 0,
     durationMs: file.duration_ms ?? episode.duration_ms ?? undefined,
@@ -572,6 +578,7 @@ export default async function WatchPage({
     <ChimpFlixPlayer
       title={resolved.title}
       subtitle={resolved.subtitle}
+      posterUrl={resolved.posterUrl}
       mediaFileId={resolved.mediaFileId}
       durationMs={resolved.durationMs}
       startPositionMs={resolved.startPositionMs}

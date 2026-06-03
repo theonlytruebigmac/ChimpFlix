@@ -17,7 +17,13 @@
 /// receiver loads. See [`crates/server/src/auth/cast_token.rs`].
 "use client";
 
-import { useEffect, useState, type RefObject } from "react";
+import {
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type RefObject,
+} from "react";
+import { cast as castApi } from "@/lib/chimpflix-api";
 import { devError, devWarn } from "@/lib/dev-log";
 
 /// Cast receiver application ID.
@@ -110,11 +116,18 @@ export function loadCastSdk(): Promise<boolean> {
   }
   castSdkLoad = new Promise<boolean>((resolve) => {
     // Hard ceiling on how long we'll wait for the SDK to phone home.
-    // On Android Chrome installed as a standalone PWA, the SDK script
-    // *loads* (no onerror) but never calls __onGCastApiAvailable — the
-    // system Cast media-router IPC isn't proxied through to standalone
-    // web apps. Without a timeout the promise hangs and `cast.available`
-    // never flips, with no log line to tell the operator why.
+    // On a cold mobile load the chained gstatic framework script can be
+    // slow to initialise and fire __onGCastApiAvailable; without a
+    // timeout the promise would hang and `cast.available` never flips,
+    // with no log line to tell the operator why.
+    //
+    // NOTE (corrected): an earlier version of this comment claimed an
+    // installed standalone PWA can't cast at all ("Cast IPC not proxied").
+    // Field testing disproved that — an installed PWA is in practice the
+    // MORE reliable cast surface (it single-instances and owns its
+    // scope). The timeout is only a backstop against a wedged/absent
+    // SDK; it is NOT a statement that PWAs lack Cast. `useCastState`
+    // polls for the framework afterwards in every display mode.
     //
     // 15s (was 8s): on a cold mobile load the chained framework script
     // from gstatic can take >8s to initialise and fire the callback. The
@@ -134,7 +147,7 @@ export function loadCastSdk(): Promise<boolean> {
     const timer = window.setTimeout(() => {
       finalize(
         false,
-        "SDK timeout — __onGCastApiAvailable never fired. Likely cause: Android standalone PWA (Cast IPC not proxied) or browser without Cast support.",
+        "SDK timeout — __onGCastApiAvailable never fired within 15s (slow cold load, or a browser without Cast support). useCastState polls the framework as a backstop and self-heals if it appears late.",
       );
     }, timeoutMs);
     w.__onGCastApiAvailable = (available: boolean) => {
@@ -280,18 +293,17 @@ export function useCastState(): CastState {
         tryWire();
         return;
       }
-      // loadCastSdk reported unavailable. In a standalone PWA that's real:
-      // Android doesn't proxy the Cast media-router IPC into installed web
-      // apps, so the framework exists but the picker can't enumerate
-      // devices — keep the button hidden rather than show a dead one. In a
-      // normal browser tab the framework can still finish initialising
-      // after loadCastSdk's load-timeout already resolved false on a slow
-      // connection, so poll briefly and self-heal instead of needing a
-      // page reload.
-      const standalone =
-        window.matchMedia("(display-mode: standalone)").matches ||
-        window.matchMedia("(display-mode: minimal-ui)").matches;
-      if (standalone) return;
+      // loadCastSdk reported unavailable — but that verdict is usually a
+      // slow cold load on mobile rather than a real "no Cast here". An
+      // earlier version bailed out for standalone PWAs on the theory that
+      // Android doesn't proxy the Cast IPC into installed apps; field
+      // testing disproved that (an installed PWA is in practice the MORE
+      // reliable cast surface), and the early-out could leave a working
+      // Cast button permanently hidden whenever the SDK merely finished
+      // after our load timeout. So we now poll for the framework in BOTH
+      // the browser-tab and the standalone-PWA case and self-heal instead
+      // of needing a reload. The poll is harmless when Cast genuinely
+      // isn't available — it just times out after ~40 tries.
       if (tryWire()) return;
       let tries = 0;
       pollTimer = window.setInterval(() => {
@@ -321,8 +333,23 @@ export interface CastMediaPayload {
   title?: string;
   subtitle?: string;
   posterUrl?: string;
-  /// Initial playback position in seconds. Pass to seek the
-  /// receiver to where the user was watching locally.
+  /// "movie" | "episode" selects the typed Cast metadata class so the
+  /// receiver now-playing screen + the phone's OS media notification
+  /// render the right shape (series/season/episode vs film). Anything
+  /// else falls back to GenericMediaMetadata.
+  mediaKind?: "movie" | "episode";
+  /// Episode-only: series title + season/episode numbers for
+  /// TvShowMediaMetadata. Ignored for movies.
+  seriesTitle?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
+  /// Initial playback position in seconds, expressed in RECEIVER
+  /// MEDIA-TIME — i.e. seconds from the start of the loaded HLS
+  /// manifest, which our transcoder resets to 0 via
+  /// `setpts=PTS-STARTPTS` regardless of the source seek point. This is
+  /// the local `<video>.currentTime`, NOT source-time: passing
+  /// source-time would over-seek a resumed cast by the session's start
+  /// offset.
   startTimeS?: number;
   /// Duration in seconds — lets the receiver paint a complete
   /// progress bar before the first manifest fetch returns.
@@ -395,9 +422,34 @@ export async function loadCastMedia(media: CastMediaPayload): Promise<boolean> {
     mediaInfo.streamType = chromeCast.media.StreamType.BUFFERED;
     if (media.durationS != null) mediaInfo.duration = media.durationS;
     if (media.title || media.subtitle || media.posterUrl) {
-      const metadata = new chromeCast.media.GenericMediaMetadata();
-      if (media.title) metadata.title = media.title;
-      if (media.subtitle) metadata.subtitle = media.subtitle;
+      // Typed metadata drives the receiver now-playing screen, the
+      // mini/expanded controller artwork, and the phone's OS media chip.
+      // Episodes use TvShowMediaMetadata (series + S/E) so the TV reads
+      // "Series — S2 · E5 — Title" rather than a flat string; everything
+      // else uses Movie/Generic. The poster MUST be an absolute,
+      // receiver-fetchable URL — the receiver carries no cookie — so the
+      // caller only hands us absolute art (e.g. TMDB) or omits it.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let metadata: any;
+      if (media.mediaKind === "episode") {
+        metadata = new chromeCast.media.TvShowMediaMetadata();
+        if (media.seriesTitle) metadata.seriesTitle = media.seriesTitle;
+        if (media.title) metadata.title = media.title;
+        if (media.seasonNumber != null) metadata.season = media.seasonNumber;
+        if (media.episodeNumber != null) metadata.episode = media.episodeNumber;
+        // GenericMediaMetadata.subtitle has no TvShow analogue; keep the
+        // "S2 · E5 · Title" string discoverable for receivers that only
+        // read the generic field by mirroring it onto subtitle too.
+        if (media.subtitle) metadata.subtitle = media.subtitle;
+      } else if (media.mediaKind === "movie") {
+        metadata = new chromeCast.media.MovieMediaMetadata();
+        if (media.title) metadata.title = media.title;
+        if (media.subtitle) metadata.subtitle = media.subtitle;
+      } else {
+        metadata = new chromeCast.media.GenericMediaMetadata();
+        if (media.title) metadata.title = media.title;
+        if (media.subtitle) metadata.subtitle = media.subtitle;
+      }
       if (media.posterUrl) {
         metadata.images = [new chromeCast.Image(media.posterUrl)];
       }
@@ -494,6 +546,291 @@ export function buildCastUrl(localPath: string, token: string): string {
   const absolute = new URL(localPath, window.location.origin);
   absolute.searchParams.set("ct", token);
   return absolute.toString();
+}
+
+// ---------------------------------------------------------------------------
+// Cast token cache
+// ---------------------------------------------------------------------------
+
+/// Re-sign a cast token only when we're inside this margin of its
+/// expiry. The token is user-scoped (not bound to a stream/session), so
+/// one token is valid across every reload — track/quality switches,
+/// session restarts on seek — for its whole 6h TTL. Caching avoids a
+/// `/cast/sign` round-trip on each of those.
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+let cachedToken: { token: string; expiresAtMs: number } | null = null;
+
+/// Return a valid cast token, minting a fresh one only when none is
+/// cached or the cached one is within ~5 min of expiry. Throws if the
+/// sign request fails (caller decides how to surface it).
+export async function ensureCastToken(): Promise<string> {
+  const now = Date.now();
+  if (cachedToken && cachedToken.expiresAtMs - now > TOKEN_REFRESH_MARGIN_MS) {
+    return cachedToken.token;
+  }
+  const resp = await castApi.sign();
+  cachedToken = { token: resp.token, expiresAtMs: resp.expires_at_ms };
+  return resp.token;
+}
+
+// ---------------------------------------------------------------------------
+// Remote control — the sender driving the receiver
+// ---------------------------------------------------------------------------
+
+// One RemotePlayer + RemotePlayerController pair, process-wide. The Cast
+// SDK allows many controllers on one device, but a single shared pair
+// means every control surface — the immersive /watch player, the
+// app-wide mini + expanded controller, and the OS media-notification
+// action handlers — drives the SAME object and reads ONE source of
+// truth. It lives at module scope, so the session stays fully
+// controllable from anywhere in the app even after the player page
+// unmounts (that persistence is what makes "app-wide" possible).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let remotePlayer: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let remoteController: any = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function ensureRemote(): { player: any; controller: any } | null {
+  const framework = castFramework();
+  if (!framework) return null;
+  try {
+    if (!remotePlayer) {
+      remotePlayer = new framework.RemotePlayer();
+      remoteController = new framework.RemotePlayerController(remotePlayer);
+    }
+    return { player: remotePlayer, controller: remoteController };
+  } catch (e) {
+    devWarn("[cast] RemotePlayer init failed", e);
+    return null;
+  }
+}
+
+/// Toggle play/pause on the RECEIVER (not the local element). The SDK
+/// figures out which way to flip from the receiver's current state, so
+/// a single call is correct regardless of what another sender did.
+export function castPlayPause(): void {
+  const r = ensureRemote();
+  if (!r) return;
+  try {
+    r.controller.playOrPause();
+  } catch (e) {
+    devWarn("[cast] playOrPause failed", e);
+  }
+}
+
+/// Seek the receiver to an absolute MEDIA-time (seconds from the start
+/// of the loaded HLS manifest — our transcoder zeroes PTS, so media-time
+/// 0 is wherever the session was rooted). The SDK idiom is set-then-call:
+/// write `player.currentTime`, then invoke the no-arg `controller.seek()`.
+export function castSeekToMediaTime(mediaSec: number): void {
+  const r = ensureRemote();
+  if (!r || !Number.isFinite(mediaSec)) return;
+  try {
+    r.player.currentTime = Math.max(0, mediaSec);
+    r.controller.seek();
+  } catch (e) {
+    devWarn("[cast] seek failed", e);
+  }
+}
+
+/// Set receiver volume (0..1). Set-then-call, same as seek.
+export function castSetVolume(level: number): void {
+  const r = ensureRemote();
+  if (!r) return;
+  try {
+    r.player.volumeLevel = Math.max(0, Math.min(1, level));
+    r.controller.setVolumeLevel();
+  } catch (e) {
+    devWarn("[cast] setVolumeLevel failed", e);
+  }
+}
+
+/// Toggle mute on the receiver.
+export function castToggleMute(): void {
+  const r = ensureRemote();
+  if (!r) return;
+  try {
+    r.controller.muteOrUnmute();
+  } catch (e) {
+    devWarn("[cast] muteOrUnmute failed", e);
+  }
+}
+
+/// Rich, render-ready snapshot of the receiver's playback as the sender
+/// sees it. Distinct from [`RemotePlaybackState`] (the leaner shape the
+/// player's progress reporter consumes): this carries everything a
+/// remote-control UI binds to — transport state, volume, the capability
+/// flags that gate which controls are enabled, and the now-playing
+/// title/artwork/device for the mini + expanded controller.
+export interface RemoteControlState {
+  isConnected: boolean;
+  isMediaLoaded: boolean;
+  isPaused: boolean;
+  /// Media-time (seconds within the loaded manifest).
+  currentTimeS: number;
+  durationS: number;
+  volume: number;
+  isMuted: boolean;
+  canSeek: boolean;
+  canPause: boolean;
+  canControlVolume: boolean;
+  title: string | null;
+  imageUrl: string | null;
+  deviceName: string | null;
+}
+
+const EMPTY_REMOTE: RemoteControlState = {
+  isConnected: false,
+  isMediaLoaded: false,
+  isPaused: false,
+  currentTimeS: 0,
+  durationS: 0,
+  volume: 1,
+  isMuted: false,
+  canSeek: true,
+  canPause: true,
+  canControlVolume: true,
+  title: null,
+  imageUrl: null,
+  deviceName: null,
+};
+
+/// Imperative read of the current remote state — for control handlers
+/// (e.g. the player's keyboard seek) that need the receiver's live
+/// position without subscribing through React. Returns EMPTY_REMOTE
+/// when the framework/session isn't up yet.
+export function getRemoteSnapshot(): RemoteControlState {
+  const framework = castFramework();
+  let deviceName: string | null = null;
+  try {
+    const session = framework?.CastContext.getInstance().getCurrentSession();
+    deviceName = session?.getCastDevice?.()?.friendlyName ?? null;
+  } catch {
+    /* no session */
+  }
+  const r = ensureRemote();
+  if (!r) return { ...EMPTY_REMOTE, deviceName };
+  const p = r.player;
+  return {
+    isConnected: !!p.isConnected,
+    isMediaLoaded: !!p.isMediaLoaded,
+    isPaused: !!p.isPaused,
+    currentTimeS: p.currentTime ?? 0,
+    durationS: p.duration ?? 0,
+    volume: p.volumeLevel ?? 1,
+    isMuted: !!p.isMuted,
+    // Capability flags default to true unless the receiver explicitly
+    // says false — receiver state is authoritative.
+    canSeek: p.canSeek !== false,
+    canPause: p.canPause !== false,
+    canControlVolume: p.canControlVolume !== false,
+    title: p.title ?? null,
+    imageUrl: p.imageUrl ?? null,
+    deviceName,
+  };
+}
+
+/// Subscribe to the rich remote state for a control UI. Fires on every
+/// receiver change (ANY_CHANGE) so the scrubber, play/pause icon,
+/// volume, and now-playing labels stay in lockstep with the TV — even
+/// when another sender or a TV remote drives it. Polls briefly for the
+/// framework if it isn't ready yet, then self-heals.
+export function useRemotePlayback(): RemoteControlState {
+  const [state, setState] = useState<RemoteControlState>(EMPTY_REMOTE);
+  useEffect(() => {
+    let cancelled = false;
+    let cleanup: (() => void) | null = null;
+    const attach = (): boolean => {
+      const framework = castFramework();
+      const r = ensureRemote();
+      if (!framework || !r) return false;
+      const evt = framework.RemotePlayerEventType.ANY_CHANGE;
+      const onChange = () => {
+        if (!cancelled) setState(getRemoteSnapshot());
+      };
+      r.controller.addEventListener(evt, onChange);
+      onChange();
+      cleanup = () => {
+        try {
+          r.controller.removeEventListener(evt, onChange);
+        } catch {
+          /* controller already torn down */
+        }
+      };
+      return true;
+    };
+    if (attach()) return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+    // Framework not ready — poll, same backstop pattern as useCastState.
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      if (cancelled || attach() || tries++ >= 40) window.clearInterval(timer);
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      cleanup?.();
+    };
+  }, []);
+  return state;
+}
+
+// ---------------------------------------------------------------------------
+// Track / quality controller hand-off
+// ---------------------------------------------------------------------------
+
+// Switching subtitles (burned in), audio, or quality on the receiver
+// isn't a cheap `editTracksInfo` — each rebuilds the transcode, so it's
+// a re-sign + `loadMedia` at the current position. That logic lives in
+// the player (it owns `createSession`), so the active <ChimpFlixPlayer>
+// REGISTERS its switch callbacks here while mounted. The app-wide
+// expanded controller renders the track menus only while a controller is
+// registered (i.e. you're on the watch page); after you navigate away
+// the menus disappear but transport (play/pause/seek/volume) keeps
+// working off the singleton above.
+
+export interface CastTrackOption {
+  label: string;
+  active: boolean;
+  onSelect: () => void;
+}
+
+export interface CastTrackController {
+  audio: CastTrackOption[];
+  subtitle: CastTrackOption[];
+  quality: CastTrackOption[];
+  /// True while a switch is reloading on the receiver — lets the UI
+  /// disable the menus + show a spinner so the user doesn't queue five
+  /// reloads.
+  busy: boolean;
+}
+
+let trackController: CastTrackController | null = null;
+const trackSubs = new Set<() => void>();
+
+/// Publish (or clear, with `null`) the active player's track/quality
+/// controls so the app-wide expanded controller can drive them.
+export function setCastTrackController(c: CastTrackController | null): void {
+  trackController = c;
+  trackSubs.forEach((fn) => fn());
+}
+
+/// Subscribe to the registered track controller. Returns null when no
+/// player is mounted (transport-only remote).
+export function useCastTrackController(): CastTrackController | null {
+  return useSyncExternalStore(
+    (cb) => {
+      trackSubs.add(cb);
+      return () => {
+        trackSubs.delete(cb);
+      };
+    },
+    () => trackController,
+    () => null,
+  );
 }
 
 // ---------------------------------------------------------------------------
