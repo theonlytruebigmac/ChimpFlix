@@ -622,7 +622,18 @@ async fn collect_candidates(roots: &[String]) -> Result<CandidateScan> {
                 warn!(root = %root.display(), "library root does not exist");
                 continue;
             }
-            reachable_roots.push(root.clone());
+            // Whether the walk produced at least one *successful* entry.
+            // We only commit the root to `reachable_roots` AFTER the walk
+            // if this is true. Pushing it upfront was a TOCTOU bug: if the
+            // mount disappeared between `exists()` above and the walk
+            // below, every WalkDir entry errors, `out` stays empty for the
+            // root, yet it was already marked reachable — so scan_inner's
+            // reconciliation pass would soft-delete every DB row under it
+            // (silently wiping an entire library on a brief NFS/removable
+            // hiccup). A mounted-but-empty directory still yields its own
+            // root entry successfully, so legitimately empty libraries are
+            // unaffected.
+            let mut saw_entry = false;
             // `follow_links(false)` keeps us from descending through
             // symlinks, which handles the common cycle case (Library
             // -> Show -> ../). The `max_depth` cap is a belt: a
@@ -645,7 +656,10 @@ async fn collect_candidates(roots: &[String]) -> Result<CandidateScan> {
                 })
             {
                 let entry = match entry {
-                    Ok(e) => e,
+                    Ok(e) => {
+                        saw_entry = true;
+                        e
+                    }
                     Err(e) => {
                         warn!(error = %e, "walk error");
                         continue;
@@ -659,6 +673,18 @@ async fn collect_candidates(roots: &[String]) -> Result<CandidateScan> {
                     continue;
                 }
                 out.push((root.clone(), path));
+            }
+            // Commit reachability only if the walk actually read something.
+            // Zero successful entries == the root vanished mid-scan; do NOT
+            // scope reconciliation to it (see `saw_entry` rationale above).
+            if saw_entry {
+                reachable_roots.push(root.clone());
+            } else {
+                warn!(
+                    root = %root.display(),
+                    "library root produced no readable entries; treating as \
+                     unreachable to avoid mass soft-delete"
+                );
             }
         }
         CandidateScan {
@@ -2465,7 +2491,10 @@ async fn refresh_show_episodes(
                 // Logs page with a row per missing season. Other errors
                 // (5xx, network) still warn.
                 let msg = format!("{e:#}");
-                if msg.contains("404") {
+                // Match the exact bail! format "TMDB {url} returned {status}" to avoid
+                // a false positive when show_tmdb_id or season_number happens to equal
+                // 404, which would put "404" in the URL segment, not the status.
+                if msg.contains("returned 404") {
                     debug!(
                         show_id,
                         season_number,
@@ -2933,7 +2962,10 @@ async fn fetch_season_cached(
             // transient; propagate without caching so a future
             // episode might succeed.
             let msg = format!("{e:#}");
-            if msg.contains("404") {
+            // Match the exact bail! format "TMDB {url} returned {status}" to avoid
+            // a false positive when show_tmdb_id happens to equal 404 (placing "404"
+            // in the URL segment rather than in the HTTP status string).
+            if msg.contains("returned 404") {
                 let mut guard = cache.lock().await;
                 guard.entry(key).or_insert(CachedSeason::Missing);
                 // Log the first 404 once so the operator sees it

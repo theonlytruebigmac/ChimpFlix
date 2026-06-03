@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Children, useCallback, useEffect, useRef, useState } from "react";
 import { SmartRuleBuilder } from "@/components/admin/SmartRuleBuilder";
 import {
   ChimpFlixApiError,
@@ -179,7 +179,7 @@ function Section({
   last?: boolean;
   children: React.ReactNode;
 }) {
-  const hasChildren = Array.isArray(children) && children.length > 0;
+  const hasChildren = Children.count(children) > 0;
   return (
     <div className="cf-card" style={last ? { marginBottom: 0 } : undefined}>
       <div className="cf-card-head">
@@ -415,14 +415,18 @@ function ManualCollectionDetail({
   const [editing, setEditing] = useState(false);
 
   const loadDetail = useCallback(async () => {
+    // Guard against setState on an unmounted component (e.g. row collapsed
+    // while a reload triggered by addItems/removeItem/move is still in flight).
+    let cancelled = false;
     try {
       const d = await collectionsApi.get(collection.id);
-      setDetail(d);
+      if (!cancelled) setDetail(d);
     } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
+      if (!cancelled) onError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (!cancelled) setLoading(false);
     }
+    return () => { cancelled = true; };
   }, [collection.id, onError]);
 
   useEffect(() => {

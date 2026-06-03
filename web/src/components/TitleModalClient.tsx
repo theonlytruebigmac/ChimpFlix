@@ -432,7 +432,6 @@ function TitleModalView({
               detail.original_title.trim() !== title.trim() && (
                 <div
                   className="mt-2 max-w-3xl text-sm text-white/65 drop-shadow"
-                  lang="ja"
                   title="Original title"
                 >
                   {detail.original_title}
@@ -1258,6 +1257,7 @@ function TagBar({ itemId }: { itemId: number }) {
   }
 
   async function removeTag(tagId: number) {
+    if (busy) return;
     setBusy(true);
     try {
       await tagsApi.remove(itemId, tagId);
@@ -1749,15 +1749,20 @@ function AddToCollectionDialog({
   const [toast, setToast] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
+  // Guard setState calls in refresh() against running after unmount.
+  const cancelledRef = useRef(false);
+  useEffect(() => () => { cancelledRef.current = true; }, []);
 
   const refresh = useCallback(async () => {
     try {
       const r = await collectionsApi.list();
-      setManualCollections(r.collections.filter((c) => c.kind === "manual"));
+      if (!cancelledRef.current)
+        setManualCollections(r.collections.filter((c) => c.kind === "manual"));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!cancelledRef.current)
+        setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (!cancelledRef.current) setLoading(false);
     }
   }, []);
 
@@ -1827,6 +1832,7 @@ function AddToCollectionDialog({
     <div
       role="dialog"
       aria-modal="true"
+      aria-labelledby="add-collection-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -1834,7 +1840,7 @@ function AddToCollectionDialog({
     >
       <div className="w-full max-w-md rounded-lg border border-white/15 bg-neutral-950 p-6 shadow-2xl space-y-4">
         <div className="flex items-baseline justify-between gap-2">
-          <h2 className="text-lg font-semibold">Add to collection</h2>
+          <h2 id="add-collection-title" className="text-lg font-semibold">Add to collection</h2>
           <button
             type="button"
             onClick={onClose}
@@ -1984,13 +1990,14 @@ function DeleteMediaDialog({
     <div
       role="dialog"
       aria-modal="true"
+      aria-labelledby="delete-media-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onClick={(e) => {
-        if (e.target === e.currentTarget) dismiss();
+        if (e.target === e.currentTarget && !busy) dismiss();
       }}
     >
       <div className="w-full max-w-md rounded-lg border border-red-500/30 bg-neutral-950 p-6 shadow-2xl">
-        <h2 className="text-lg font-semibold text-red-300">
+        <h2 id="delete-media-title" className="text-lg font-semibold text-red-300">
           Delete from disk
         </h2>
         {done ? (

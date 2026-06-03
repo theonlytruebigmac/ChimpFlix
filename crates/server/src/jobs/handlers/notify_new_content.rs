@@ -156,6 +156,12 @@ async fn notify_movies(
         return;
     }
 
+    // Record to the ledger BEFORE dispatching notifications. `ON CONFLICT DO
+    // NOTHING` makes this idempotent: if the process crashes between recording
+    // and sending, the next job run sees the ledger rows and skips re-sending,
+    // trading a possible miss for preventing duplicate delivery.
+    record_movies(state, library.id, movies).await;
+
     if movies.len() >= MOVIE_DETAIL_THRESHOLD {
         // Summary path — one notification for the whole batch.
         let payload = notifier::NewMovieBatchPayload {
@@ -196,8 +202,6 @@ async fn notify_movies(
             .await;
         }
     }
-
-    record_movies(state, library.id, movies).await;
 }
 
 /// Group new episodes per show, then send ONE notification per show to the
@@ -250,6 +254,11 @@ async fn notify_episodes(
             continue;
         }
 
+        // Record to the ledger BEFORE dispatching notifications (same
+        // rationale as notify_movies: prefer a miss on crash over duplicate
+        // delivery; `ON CONFLICT DO NOTHING` makes retries safe).
+        record_episodes(state, library_id, group).await;
+
         let show_title = group[0].show_title.as_str();
         if group.len() == 1 {
             let ep = &group[0];
@@ -290,8 +299,6 @@ async fn notify_episodes(
             )
             .await;
         }
-
-        record_episodes(state, library_id, group).await;
     }
 }
 

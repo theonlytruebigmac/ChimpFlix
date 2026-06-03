@@ -2174,6 +2174,15 @@ async fn spawn_ffmpeg(
                     // detailed exit code, its detail wins.
                     heartbeat_health
                         .mark_exited("no longer alive (heartbeat probe)", now_ms());
+                    // Now that ffmpeg is DEFINITIVELY gone, cap each
+                    // variant playlist with `#EXT-X-ENDLIST`. This is the
+                    // authoritative finalize point: the stderr-drain task
+                    // only finalizes when *it* reaped the child, so a
+                    // session whose stderr pipe closed early while ffmpeg
+                    // kept running relies on this path to close out the
+                    // playlist. finalize_playlists is idempotent, so an
+                    // overlap with the stderr-drain finalize is harmless.
+                    finalize_playlists(&session_dir_str).await;
                     break;
                 }
                 // Count segment files across all variant dirs.
@@ -2361,7 +2370,17 @@ async fn spawn_ffmpeg(
             // recover" — even though the encoder is actually done.
             // Idempotent: we only append if the marker isn't already
             // present, so a clean-exit playlist stays unchanged.
-            finalize_playlists(&session_dir_for_finalize).await;
+            //
+            // CRITICAL: only finalize when ffmpeg has DEFINITIVELY exited.
+            // The stderr pipe can drain while the encoder is still alive
+            // and appending segments ("still running"); writing ENDLIST
+            // into a live manifest makes HLS.js treat the stream as
+            // complete at that point and stop fetching — a false EOF mid-
+            // playback. In that case we leave finalize to the heartbeat
+            // monitor, which fires only after confirming the pid is gone.
+            if !exit_detail.starts_with("still running") {
+                finalize_playlists(&session_dir_for_finalize).await;
+            }
         });
     }
 
@@ -2611,25 +2630,66 @@ async fn extract_full_webvtt_to(
             .await
             .with_context(|| format!("create cache dir {}", parent.display()))?;
     }
+    // Write to a per-call temp file then atomically rename to `dest`.
+    // Two concurrent sessions targeting the same (input, si) would
+    // otherwise both run ffmpeg with `-y` writing to the identical
+    // path, producing interleaved / truncated WebVTT. With the
+    // temp-then-rename approach each writer owns its own file; the
+    // last rename wins, leaving a complete file from exactly one
+    // ffmpeg invocation.
+    let mut rand_buf = [0u8; 8];
+    let _ = fill_random(&mut rand_buf); // best-effort; all-zero suffix still avoids cross-call collisions in practice
+    let suffix = hex::encode(rand_buf);
+    // Append the temp marker rather than `with_extension`, which would
+    // REPLACE `.vtt` and leave `0.tmp.<hex>`. We pass `-f webvtt`
+    // explicitly below so ffmpeg never has to infer the muxer from the
+    // filename, but keeping `.vtt` in the temp name also keeps stray
+    // temp files self-describing and matches the final artifact.
+    let mut tmp_name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".tmp.{suffix}"));
+    let tmp_dest = dest.with_file_name(tmp_name);
+
     let status = Command::new(&cfg.ffmpeg)
         .args(["-y", "-loglevel", "error", "-nostdin"])
         .arg("-i")
         .arg(crate::safe_ffmpeg_input(input))
         .args(["-map", &format!("0:s:{si}")])
         .args(["-c:s", "webvtt"])
-        .arg(dest)
+        // Force the WebVTT muxer explicitly. The temp output path has a
+        // randomized suffix, so ffmpeg cannot infer the format from the
+        // extension — without this it dies with "Unable to find a
+        // suitable output format" (exit 1), which 404s every cache-miss
+        // subtitle sidecar.
+        .args(["-f", "webvtt"])
+        .arg(&tmp_dest)
         .status()
         .await
         .with_context(|| "spawn ffmpeg for webvtt extraction")?;
     if !status.success() {
+        // Clean up the temp file; ignore errors (it may not exist).
+        let _ = tokio::fs::remove_file(&tmp_dest).await;
         anyhow::bail!("ffmpeg webvtt extraction exited {:?}", status.code());
     }
-    if tokio::fs::metadata(dest).await.is_err() {
+    if tokio::fs::metadata(&tmp_dest).await.is_err() {
         anyhow::bail!(
             "webvtt extraction reported success but {} is missing",
-            dest.display()
+            tmp_dest.display()
         );
     }
+    // Atomic rename: replaces any concurrent writer's result with an
+    // equally valid complete file, so readers always see a whole VTT.
+    tokio::fs::rename(&tmp_dest, dest)
+        .await
+        .with_context(|| {
+            format!(
+                "rename {} → {}",
+                tmp_dest.display(),
+                dest.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -2860,10 +2920,7 @@ async fn extract_webvtt_sidecar(
     offset_ms: i64,
     session_dir: &Path,
 ) -> Result<()> {
-    // The session dir is e.g. `$CACHE_ROOT/sessions/<session_id>`;
-    // walk up two levels to get the cache root. This works because
-    // TranscodeManager::start creates the session dir under
-    // `<cache_root>/<session_id>` consistently.
+    // session_dir is `<cache_root>/<session_id>`; one .parent() yields the cache root.
     let cache_root = session_dir.parent().unwrap_or(session_dir);
     // media_file_id isn't visible here; instead key the cache by
     // the input file path's canonical form (resolved symlinks +
@@ -2958,36 +3015,37 @@ async fn extract_webvtt_sidecar(
     Ok(())
 }
 
-/// Filesystem-safe key for the subtitle cache directory. Strip
-/// directory separators and other special characters from the
-/// file path so the resulting string nests under
-/// `$CACHE_ROOT/subs/<key>/<si>.vtt` without trying to escape the
-/// cache root or create weird subdirectories.
+/// Filesystem-safe key for the subtitle cache directory. Produces a
+/// short sanitized prefix (for human debuggability) plus an FNV-1a hash
+/// of the FULL original path, so the result nests under
+/// `$CACHE_ROOT/subs/<key>/<si>.vtt` without escaping the cache root.
+///
+/// The hash is ALWAYS appended — not just for over-long paths. The
+/// sanitizing step collapses `/`, spaces, and every other special
+/// character to `_`, so two structurally different paths (e.g.
+/// `".../foo bar.mkv"` and `".../foo/bar.mkv"`) sanitize to the same
+/// string and would otherwise share a subtitle cache key, serving one
+/// file's subtitles for the other. Hashing the unsanitized path (which
+/// still contains the real separators) keeps the key unique.
 fn path_cache_key(input: &Path) -> String {
     let s = input.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+    // Sanitized, length-capped prefix purely for readability when
+    // eyeballing the cache dir; correctness comes from the hash below.
+    let mut prefix = String::with_capacity(s.len().min(160));
+    for ch in s.chars().take(160) {
         if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
-            out.push(ch);
+            prefix.push(ch);
         } else {
-            out.push('_');
+            prefix.push('_');
         }
     }
-    // Filesystem limits on filename length are usually 255 bytes;
-    // for very long paths (deep nesting, long titles) the safe
-    // upper bound is "fold the tail into a short hash". Crude but
-    // collision-safe for normal libraries.
-    if out.len() > 200 {
-        let head: String = out.chars().take(160).collect();
-        let mut h: u64 = 1469598103934665603;
-        for b in out.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(1099511628211);
-        }
-        format!("{head}_{h:016x}")
-    } else {
-        out
+    // FNV-1a over the full original path string (separators included).
+    let mut h: u64 = 1469598103934665603;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
     }
+    format!("{prefix}_{h:016x}")
 }
 
 /// Pull a single text-subtitle stream out of the source file into a
@@ -3144,9 +3202,9 @@ fn generate_id() -> String {
 
 fn fill_random(buf: &mut [u8]) -> Result<()> {
     use rand_core::{OsRng, RngCore};
-    let mut rng = OsRng;
-    rng.fill_bytes(buf);
-    Ok(())
+    // try_fill_bytes returns Err on OS-level RNG failure; fill_bytes
+    // would panic instead, making the Err branch in generate_id dead.
+    OsRng.try_fill_bytes(buf).map_err(|e| anyhow::anyhow!("OsRng: {e}"))
 }
 
 /// Map the codec name we get from ffprobe / DB columns to the

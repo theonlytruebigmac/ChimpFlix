@@ -54,7 +54,7 @@ pub async fn alerts(
     _owner: OwnerAuth,
     Query(params): Query<AlertsParams>,
 ) -> Result<Json<AlertsResponse>, ApiError> {
-    let limit = params.limit.unwrap_or(50);
+    let limit = params.limit.unwrap_or(50).min(500);
     // Alerts surface = recent WARN/ERROR log lines + the audit feed.
     let log_alerts = state.log_buffer.snapshot(Some("WARN"), limit as usize);
     let audit = queries::list_audit(&state.pool, None, limit)
@@ -148,7 +148,7 @@ pub struct VerifyAllResponse {
 /// because every media_file gets stat()'d — surface a spinner.
 pub async fn verify_all(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
 ) -> Result<Json<VerifyAllResponse>, ApiError> {
     let libs = queries::list_libraries(&state.pool, None)
         .await
@@ -178,6 +178,26 @@ pub async fn verify_all(
             }
         }
     }
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "maintenance.verify_all".into(),
+            target_kind: Some("instance".into()),
+            target_id: Some("1".into()),
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "libraries_checked": out.libraries_checked,
+                "files_checked": out.files_checked,
+                "files_missing": out.files_missing,
+                "newly_marked_removed": out.newly_marked_removed,
+                "returned_files": out.returned_files,
+            }))
+            .ok(),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
     Ok(Json(out))
 }
 
@@ -204,7 +224,7 @@ pub struct PurgeAllResponse {
 /// underlying query, just on-demand.
 pub async fn purge_all(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
     Query(q): Query<PurgeAllQuery>,
 ) -> Result<Json<PurgeAllResponse>, ApiError> {
     let grace_days = q.grace_days.unwrap_or(7).max(0);
@@ -228,12 +248,33 @@ pub async fn purge_all(
             }
         });
     }
-    Ok(Json(PurgeAllResponse {
+    let resp = PurgeAllResponse {
         files_purged: report.files_purged,
         episodes_purged: report.episodes_purged,
         seasons_purged: report.seasons_purged,
         items_purged: report.items_purged,
-    }))
+    };
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "maintenance.purge_all".into(),
+            target_kind: Some("instance".into()),
+            target_id: Some("1".into()),
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "grace_days": grace_days,
+                "files_purged": resp.files_purged,
+                "episodes_purged": resp.episodes_purged,
+                "seasons_purged": resp.seasons_purged,
+                "items_purged": resp.items_purged,
+            }))
+            .ok(),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
+    Ok(Json(resp))
 }
 
 #[derive(Serialize)]
@@ -250,7 +291,7 @@ pub struct VacuumResponse {
 /// our scale (< 1 GB DB) it takes a couple of seconds.
 pub async fn vacuum_database(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
 ) -> Result<Json<VacuumResponse>, ApiError> {
     let db_path = state.data_dir.join("chimpflix.db");
     let before = tokio::fs::metadata(&db_path)
@@ -267,12 +308,30 @@ pub async fn vacuum_database(
         .map(|m| m.len() as i64)
         .unwrap_or(0);
     let duration_ms = chimpflix_common::now_ms() - started;
-    Ok(Json(VacuumResponse {
+    let resp = VacuumResponse {
         bytes_reclaimed: before - after,
         before_bytes: before,
         after_bytes: after,
         duration_ms,
-    }))
+    };
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "maintenance.vacuum".into(),
+            target_kind: Some("instance".into()),
+            target_id: Some("1".into()),
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "bytes_reclaimed": resp.bytes_reclaimed,
+                "duration_ms": resp.duration_ms,
+            }))
+            .ok(),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
+    Ok(Json(resp))
 }
 
 #[derive(Serialize)]
@@ -288,7 +347,7 @@ pub struct ClearTranscodeCacheResponse {
 /// for "the cache is full of stale segments and I want them gone".
 pub async fn clear_transcode_cache(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
 ) -> Result<Json<ClearTranscodeCacheResponse>, ApiError> {
     let cache_root = state.data_dir.join("cache/sessions");
     // Set of currently-live session ids — directories matching one
@@ -326,10 +385,28 @@ pub async fn clear_transcode_cache(
             removed += 1;
         }
     }
-    Ok(Json(ClearTranscodeCacheResponse {
+    let resp = ClearTranscodeCacheResponse {
         sessions_removed: removed,
         bytes_freed: bytes,
-    }))
+    };
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "maintenance.clear_transcode_cache".into(),
+            target_kind: Some("instance".into()),
+            target_id: Some("1".into()),
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "sessions_removed": resp.sessions_removed,
+                "bytes_freed": resp.bytes_freed,
+            }))
+            .ok(),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
+    Ok(Json(resp))
 }
 
 /// Recursive total size of a directory in bytes. Returns 0 on any

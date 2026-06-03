@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ContextSwitcher } from "@/components/admin/ui/ContextSwitcher";
 import { CommandPalette, type CommandItem } from "@/components/CommandPalette";
 
@@ -121,6 +121,11 @@ export function SettingsShell({ isOwner }: { isOwner: boolean }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
+  // Refs for focus management: the panel holds focusable children; the trigger
+  // button receives focus back when the drawer closes.
+  const drawerPanelRef = useRef<HTMLDivElement>(null);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
+
   // Global ⌘K. Esc also closes the mobile drawer.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -133,6 +138,48 @@ export function SettingsShell({ isOwner }: { isOwner: boolean }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Focus trap: when the drawer opens, move focus to the first focusable element
+  // inside the panel; when it closes, return focus to the trigger button.
+  useEffect(() => {
+    if (!drawerOpen) {
+      menuTriggerRef.current?.focus();
+      return;
+    }
+
+    const panel = drawerPanelRef.current;
+    if (!panel) return;
+
+    const focusableSelectors =
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+    // Move focus into the drawer on open.
+    const firstFocusable = panel.querySelector<HTMLElement>(focusableSelectors);
+    firstFocusable?.focus();
+
+    // Trap Tab / Shift+Tab within the panel while the drawer is open.
+    const trapFocus = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      const focusable = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelectors));
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+
+    panel.addEventListener("keydown", trapFocus);
+    return () => panel.removeEventListener("keydown", trapFocus);
+  }, [drawerOpen]);
 
   const commandItems: CommandItem[] = useMemo(() => {
     const you = YOU_GROUPS.flatMap((g) =>
@@ -213,6 +260,7 @@ export function SettingsShell({ isOwner }: { isOwner: boolean }) {
       {/* Mobile bar: menu trigger + current context + quick search */}
       <div className="mb-2 flex items-center gap-2 lg:hidden">
         <button
+          ref={menuTriggerRef}
           type="button"
           onClick={() => setDrawerOpen(true)}
           aria-label="Open settings menu"
@@ -246,6 +294,7 @@ export function SettingsShell({ isOwner }: { isOwner: boolean }) {
           aria-label="Settings menu"
         >
           <div
+            ref={drawerPanelRef}
             className="zf-rise-in absolute inset-y-0 left-0 w-72 max-w-[85vw] overflow-y-auto border-r border-white/10 bg-(--color-surface) p-4"
             onClick={(e) => e.stopPropagation()}
           >

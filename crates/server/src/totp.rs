@@ -6,6 +6,10 @@
 //! the recovery-code format (hex hyphenated, hashed at rest), and the
 //! short-lived "TOTP challenge" token used by the two-step login flow.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result};
 use chimpflix_common::{EncryptedBlob, Vault};
 use hmac::{Hmac, Mac};
@@ -188,6 +192,43 @@ pub fn hash_recovery_code(code: &str) -> String {
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Domain-separation prefix mixed into the challenge HMAC. The TOTP
+/// challenge and the cast token (`crate::auth::cast_token`) share the
+/// session secret and an identical `"{user_id}:{ms}"` payload; without
+/// this prefix a TOTP challenge (handed out after the password step but
+/// before 2FA is satisfied) would verify as a cast token, bypassing 2FA
+/// on the stream surface. Keep in sync with `CAST_TOKEN_DOMAIN`.
+const TOTP_CHALLENGE_DOMAIN: &[u8] = b"totp:";
+
+/// In-process single-use registry for redeemed TOTP-challenge tokens.
+/// Keyed by the raw HMAC signature bytes; stores the expiry (exp_ms) so
+/// stale entries can be evicted without a background task. Eviction runs
+/// inline on every `consume_challenge` call — the set is bounded by the
+/// number of active challenges at any moment (CHALLENGE_TTL_SECS = 5min,
+/// so at most one entry per login-in-progress).
+static CONSUMED_CHALLENGES: LazyLock<Mutex<HashMap<Vec<u8>, i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Mark a challenge signature as consumed. Returns `false` if the
+/// signature was already in the set (replay attempt), `true` if it was
+/// fresh (caller should proceed). Evicts expired entries on each call to
+/// keep the map small.
+fn consume_challenge(sig: &[u8], exp_ms: i64) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(i64::MAX);
+    let mut guard = CONSUMED_CHALLENGES.lock().expect("CONSUMED_CHALLENGES mutex");
+    // Evict entries whose challenge has already expired — they can never
+    // be replayed against parse_challenge either (expiry is checked there).
+    guard.retain(|_, &mut ex| ex > now_ms);
+    if guard.contains_key(sig) {
+        return false; // replay: same token already redeemed
+    }
+    guard.insert(sig.to_vec(), exp_ms);
+    true
+}
+
 /// Mint a TOTP-challenge token. Format: `{user_id}:{exp_ms}:{hmac_hex}`.
 /// Signed with the same secret used for session cookies — rotating the
 /// secret invalidates outstanding challenges, which is the desired
@@ -198,6 +239,9 @@ pub fn build_challenge(user_id: i64, exp_ms: i64, secret: &[u8]) -> String {
     format!("{payload}:{}", hex::encode(sig))
 }
 
+/// Parse and redeem a TOTP-challenge token. Returns the user_id on
+/// success. Returns `None` when the token is expired, tampered, or has
+/// already been consumed (single-use enforcement).
 pub fn parse_challenge(value: &str, secret: &[u8], now_ms: i64) -> Option<i64> {
     let mut parts = value.splitn(3, ':');
     let user_id: i64 = parts.next()?.parse().ok()?;
@@ -207,10 +251,15 @@ pub fn parse_challenge(value: &str, secret: &[u8], now_ms: i64) -> Option<i64> {
 
     let payload = format!("{user_id}:{exp_ms}");
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+    mac.update(TOTP_CHALLENGE_DOMAIN);
     mac.update(payload.as_bytes());
     mac.verify_slice(&sig).ok()?;
 
     if exp_ms < now_ms {
+        return None;
+    }
+    // Single-use: reject if this exact token has been redeemed before.
+    if !consume_challenge(&sig, exp_ms) {
         return None;
     }
     Some(user_id)
@@ -218,6 +267,7 @@ pub fn parse_challenge(value: &str, secret: &[u8], now_ms: i64) -> Option<i64> {
 
 fn sign(payload: &str, secret: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(TOTP_CHALLENGE_DOMAIN);
     mac.update(payload.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
@@ -247,6 +297,17 @@ mod tests {
         let mut token = build_challenge(42, 1_000_000_000, secret);
         // Flip a byte in the user-id portion.
         token.replace_range(0..2, "99");
+        assert!(parse_challenge(&token, secret, 0).is_none());
+    }
+
+    #[test]
+    fn challenge_rejects_replay() {
+        let secret = b"32-byte-test-secret-padding-9999";
+        // Use a far-future exp to avoid expiry interference.
+        let token = build_challenge(99, 9_000_000_000_000, secret);
+        // First use succeeds.
+        assert_eq!(parse_challenge(&token, secret, 0), Some(99));
+        // Second use of the exact same token is rejected.
         assert!(parse_challenge(&token, secret, 0).is_none());
     }
 

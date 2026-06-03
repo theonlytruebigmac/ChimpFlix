@@ -39,11 +39,11 @@ export function AdminPrerollClient({
     setError(null);
     try {
       const next = await prerollApi.upload(file);
-      setStatus(next);
+      if (aliveRef.current) setStatus(next);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (aliveRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(null);
+      if (aliveRef.current) setBusy(null);
     }
   }
 
@@ -53,18 +53,20 @@ export function AdminPrerollClient({
     setError(null);
     try {
       await prerollApi.clear();
-      setStatus({
-        enabled: false,
-        configured: false,
-        url: null,
-        size_bytes: null,
-        volume,
-      });
-      setEnabled(false);
+      if (aliveRef.current) {
+        setStatus({
+          enabled: false,
+          configured: false,
+          url: null,
+          size_bytes: null,
+          volume,
+        });
+        setEnabled(false);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (aliveRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(null);
+      if (aliveRef.current) setBusy(null);
     }
   }
 
@@ -73,13 +75,15 @@ export function AdminPrerollClient({
     setError(null);
     try {
       await adminApi.settings.patch({ preroll_enabled: next });
-      setEnabled(next);
-      setStatus((s) => ({ ...s, enabled: next }));
-      setSavedAt(Date.now());
+      if (aliveRef.current) {
+        setEnabled(next);
+        setStatus((s) => ({ ...s, enabled: next }));
+        setSavedAt(Date.now());
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (aliveRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(null);
+      if (aliveRef.current) setBusy(null);
     }
   }
 

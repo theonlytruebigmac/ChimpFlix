@@ -648,49 +648,18 @@ async fn create_session_impl(
             ))
         }
         PlayMode::Transcode => {
-            // Enforce the operator's concurrent-transcode cap. WEEK 1 #9
-            // in `docs/PUBLIC_RELEASE_HARDENING.md` flagged the prior
-            // shape as a TOCTOU race — two requests both saw
-            // `current < max` and both started, putting `current` at
-            // `max + 1`. The `start_gate` mutex serialises the check +
-            // session-spawn path so the cap is enforced atomically
-            // against itself. The lock is held only across the
-            // start-session call site below; cancel/keepalive/etc do
-            // not contend on it.
+            // The start_gate mutex serialises the cap check + session-spawn
+            // path so the global cap is enforced atomically — no TOCTOU race
+            // where two requests both see `current < max` and both start
+            // (WEEK 1 #9 in `docs/PUBLIC_RELEASE_HARDENING.md`). The lock is
+            // held only across the start-session call site below;
+            // cancel/keepalive/etc do not contend on it.
+            //
+            // NOTE: the actual cap check is deferred until after
+            // `find_compatible` below so reconnects to an existing session
+            // (page reload, player remount) are never blocked with 429 —
+            // an adopted session consumes no new encoder slot.
             let _start_gate = state.transcoder.lock_start_gate().await;
-            let max_concurrent = state.settings.read().await.transcoder_max_concurrent;
-            let current = state.transcoder.list_sessions().len() as i64;
-            if current >= max_concurrent {
-                return Err(ApiError::TooManyRequests(format!(
-                    "transcoder is at capacity ({current}/{max_concurrent} concurrent sessions)"
-                )));
-            }
-
-            // Per-user remote-stream cap. When the operator set
-            // `max_remote_streams_per_user > 0`, requests originating
-            // outside `lan_networks` are rate-limited per-user. LAN
-            // requests bypass — the point of the cap is to keep one
-            // remote user from monopolising the encoder while still
-            // letting trusted local clients play freely. Both
-            // settings are hot-reloaded.
-            let (remote_cap, lan_raw) = {
-                let s = state.settings.read().await;
-                (s.max_remote_streams_per_user, s.lan_networks.clone())
-            };
-            if remote_cap > 0 && is_remote_request(ip, &lan_raw) {
-                let mine = state
-                    .transcoder
-                    .list_sessions()
-                    .iter()
-                    .filter(|s| s.user_id == user.id)
-                    .count() as i64;
-                if mine >= remote_cap {
-                    return Err(ApiError::TooManyRequests(format!(
-                        "you have {mine}/{remote_cap} remote streams in flight; \
-                         close one before starting another",
-                    )));
-                }
-            }
 
             // Resolve the codec of the chosen subtitle stream so the
             // transcoder can pick the right filter path (text vs picture
@@ -1013,6 +982,43 @@ async fn create_session_impl(
                 ));
             }
 
+            // No existing session — we are about to spawn a new ffmpeg
+            // process. Enforce capacity caps now, after the reconnect
+            // fast-path above so page reloads never hit 429.
+            let max_concurrent = state.settings.read().await.transcoder_max_concurrent;
+            let current = state.transcoder.list_sessions().len() as i64;
+            if current >= max_concurrent {
+                return Err(ApiError::TooManyRequests(format!(
+                    "transcoder is at capacity ({current}/{max_concurrent} concurrent sessions)"
+                )));
+            }
+
+            // Per-user remote-stream cap. When the operator set
+            // `max_remote_streams_per_user > 0`, requests originating
+            // outside `lan_networks` are rate-limited per-user. LAN
+            // requests bypass — the point of the cap is to keep one
+            // remote user from monopolising the encoder while still
+            // letting trusted local clients play freely. Both
+            // settings are hot-reloaded.
+            let (remote_cap, lan_raw) = {
+                let s = state.settings.read().await;
+                (s.max_remote_streams_per_user, s.lan_networks.clone())
+            };
+            if remote_cap > 0 && is_remote_request(ip, &lan_raw) {
+                let mine = state
+                    .transcoder
+                    .list_sessions()
+                    .iter()
+                    .filter(|s| s.user_id == user.id)
+                    .count() as i64;
+                if mine >= remote_cap {
+                    return Err(ApiError::TooManyRequests(format!(
+                        "you have {mine}/{remote_cap} remote streams in flight; \
+                         close one before starting another",
+                    )));
+                }
+            }
+
             let session = state
                 .transcoder
                 .start(
@@ -1258,9 +1264,18 @@ pub async fn delete_session(
     if id == "direct" {
         if let Some(mf_id) = q.media_file_id {
             let state_clone = state.clone();
-            let user_id = user.id;
+            let user_clone = user.clone();
             tokio::spawn(async move {
-                emit_direct_stop_event(&state_clone, user_id, mf_id).await;
+                // Silently skip the scrobble if the caller has no access to
+                // this file's library — prevents marking arbitrary content
+                // as watched by supplying a foreign media_file_id.
+                if ensure_file_playable(&state_clone, &user_clone, mf_id)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                emit_direct_stop_event(&state_clone, user_clone.id, mf_id).await;
             });
         }
         return Ok(StatusCode::NO_CONTENT);
@@ -1472,13 +1487,21 @@ pub async fn variant_file(
         }
     }
 
-    if !path.exists() {
+    // Use the async stat to avoid blocking a Tokio worker thread on a
+    // potentially slow NAS/NFS mount (std::path::exists() is synchronous).
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Err(ApiError::NotFound);
     }
 
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| ApiError::Internal(anyhow::Error::from(e)))?;
+    // Guard: if ffmpeg created the manifest file but hasn't written any
+    // bytes yet (e.g. deadline elapsed during startup), return 404 rather
+    // than a 200 with an empty body that HLS.js can't parse.
+    if is_manifest && bytes.is_empty() {
+        return Err(ApiError::NotFound);
+    }
     // Bandwidth metering: every segment + playlist GET adds to the
     // per-session counter. Flushed to playback_events at session close
     // — segment-grained DB writes would dominate the actual segment
@@ -1698,7 +1721,9 @@ pub fn assess_hw_coverage(
 
 pub fn pick_container(
     source_video_codec: Option<&str>,
-    source_audio_codec: Option<&str>,
+    // source_audio_codec was used by the audio_needs_fmp4 path, which is
+    // dead until the ffmpeg 5.1 Opus/FLAC muxer bug is resolved.
+    _source_audio_codec: Option<&str>,
     client: &ClientCapabilities,
     subtitle_index: Option<u32>,
 ) -> chimpflix_transcoder::ContainerFormat {
@@ -1707,26 +1732,21 @@ pub fn pick_container(
         return ContainerFormat::Ts;
     }
     let vc = source_video_codec.map(normalize_video_codec);
-    let ac = source_audio_codec.map(normalize_audio_codec);
     let browser_supports_video = vc.as_deref().is_some_and(|c| {
         client
             .supported_video_codecs
             .iter()
             .any(|x| normalize_video_codec(x) == c)
     });
-    let browser_supports_audio = ac.as_deref().is_some_and(|c| {
-        client
-            .supported_audio_codecs
-            .iter()
-            .any(|x| normalize_audio_codec(x) == c)
-    });
     let video_needs_fmp4 = vc.as_deref().is_some_and(|c| {
         !video_carriable(c, ContainerFormat::Ts) && video_carriable(c, ContainerFormat::Fmp4)
     }) && browser_supports_video;
-    let audio_needs_fmp4 = ac.as_deref().is_some_and(|c| {
-        !audio_carriable(c, ContainerFormat::Ts) && audio_carriable(c, ContainerFormat::Fmp4)
-    }) && browser_supports_audio;
-    if video_needs_fmp4 || audio_needs_fmp4 {
+    // Note: `audio_needs_fmp4` is intentionally absent. Both Ts and Fmp4
+    // carry the same audio codec set (ffmpeg 5.1's mp4 muxer bug with
+    // Opus/FLAC forces those to re-encode to AAC). The expression
+    // `!audio_carriable(c, Ts) && audio_carriable(c, Fmp4)` is always
+    // false, so fMP4 selection is driven by video only.
+    if video_needs_fmp4 {
         ContainerFormat::Fmp4
     } else {
         ContainerFormat::Ts
@@ -1846,8 +1866,12 @@ fn is_10bit_pix_fmt(pix_fmt: &str) -> bool {
         || lower.contains("10be")
         || lower.contains("12le")
         || lower.contains("12be")
-        || lower == "p010le"
-        || lower == "p010be"
+        // Packed planar formats: p010 (HEVC Main10 on Windows/D3D paths)
+        // and p016 (16-bit packed, also Main10 on some muxers). Use
+        // starts_with to catch p010le/p010be/p010 and p016le/p016be/p016.
+        // Aligned with the transcoder's own `source_is_10bit` check.
+        || lower.starts_with("p010")
+        || lower.starts_with("p016")
 }
 
 /// True when a video codec can be muxed into the given HLS

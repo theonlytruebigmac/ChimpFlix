@@ -870,6 +870,12 @@ export interface Item {
   tagline: string | null;
   duration_ms: number | null;
   rating_audience: number | null;
+  /**
+   * Content/age rating (e.g. "PG-13", "TV-MA"); free-text, may be null.
+   * Optional so looser item shapes (ApiItem, partial rows) stay assignable;
+   * the full `GET /items/:id` response always includes it.
+   */
+  rating_age?: string | null;
   tmdb_id: number | null;
   imdb_id: string | null;
   tvdb_id: number | null;
@@ -2687,6 +2693,11 @@ export function safeLocalPath(
   if (candidate.startsWith("/\\")) return fallback;
   // Reject control characters that could break the URL boundary.
   if (/[\x00-\x1f]/.test(candidate)) return fallback;
+  // Reject anything before the first '/' (after the leading slash) that
+  // contains a colon — e.g. '/javascript:alert(1)' or '/:scheme/path'.
+  const nextSlash = candidate.indexOf("/", 1);
+  const firstSegment = nextSlash === -1 ? candidate.slice(1) : candidate.slice(1, nextSlash);
+  if (firstSegment.includes(":")) return fallback;
   return candidate;
 }
 
@@ -2854,7 +2865,7 @@ export const auth = {
     username: string;
     password: string;
     display_name?: string;
-  }) => apiFetch<AuthResponse>("/auth/register", { method: "POST", body: input }),
+  }) => apiFetch<AuthResponse>("/auth/register", { method: "POST", body: input, noAuth: true }),
   listInvites: () =>
     apiFetch<{ invites: InviteListEntry[] }>("/admin/invites"),
   createInvite: (input: CreateInviteInput) =>
@@ -3337,13 +3348,11 @@ export const playState = {
   onDeck: () => apiFetch<OnDeckResponse>("/play-state/on-deck"),
   history: (opts: { limit?: number; page?: number } = {}) =>
     apiFetch<{ items: ListedItem[]; total: number }>("/play-state/history", {
-      query:
-        opts.limit || opts.page
-          ? {
-              ...(opts.limit ? { limit: opts.limit } : {}),
-              ...(opts.page ? { page: opts.page } : {}),
-            }
-          : undefined,
+      // Use != null so that 0 is forwarded (not silently dropped by truthiness).
+      query: {
+        ...(opts.limit != null ? { limit: opts.limit } : {}),
+        ...(opts.page != null ? { page: opts.page } : {}),
+      },
     }),
   config: () => apiFetch<PlayStateConfig>("/play-state/config"),
 };
@@ -3411,10 +3420,17 @@ export const collections = {
   uploadPoster: async (id: number, file: File) => {
     const fd = new FormData();
     fd.append("file", file);
+    // Bypasses apiFetch (multipart, not JSON), so the double-submit CSRF
+    // header must be attached by hand or the server 403s. Mirror
+    // preroll.upload.
+    const headers: Record<string, string> = {};
+    const csrf = readCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
     const res = await fetch(`/api/v1/admin/collections/${id}/poster`, {
       method: "POST",
       body: fd,
       credentials: "include",
+      headers,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -3424,10 +3440,16 @@ export const collections = {
   uploadBackdrop: async (id: number, file: File) => {
     const fd = new FormData();
     fd.append("file", file);
+    // See uploadPoster — multipart bypass of apiFetch needs the CSRF
+    // header attached manually.
+    const headers: Record<string, string> = {};
+    const csrf = readCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
     const res = await fetch(`/api/v1/admin/collections/${id}/backdrop`, {
       method: "POST",
       body: fd,
       credentials: "include",
+      headers,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -4111,9 +4133,16 @@ export interface ClearTranscodeCacheResult {
 /// in a Blob and synthesize a click on a hidden <a> to surface the
 /// browser's native save dialog.
 export async function downloadBackup(): Promise<void> {
+  // Raw fetch (binary stream, not JSON) bypasses apiFetch, so attach the
+  // double-submit CSRF header by hand or the POST 403s. Mirror
+  // preroll.upload / collections.uploadPoster.
+  const headers: Record<string, string> = {};
+  const csrf = readCsrfToken();
+  if (csrf) headers["X-CSRF-Token"] = csrf;
   const res = await fetch("/api/v1/admin/backups", {
     method: "POST",
     credentials: "include",
+    headers,
   });
   if (!res.ok) {
     throw new Error(`backup failed: ${res.status}`);

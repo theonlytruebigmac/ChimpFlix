@@ -42,6 +42,7 @@ export function HeroTrailer({
 
     return () => {
       cancelled = true;
+      setVideoId(null); // clear old trailer immediately when ratingKey changes
       if (timer) window.clearTimeout(timer);
     };
   }, [ratingKey, delayMs]);

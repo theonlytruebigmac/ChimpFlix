@@ -290,6 +290,15 @@ pub async fn set_user_groups(
             "a user can belong to at most 64 groups",
         ));
     }
+    // Ensure the user exists; the DELETE+INSERT in set_user_groups succeeds
+    // silently for any user_id (including phantom ones) when group_ids is empty.
+    if queries::find_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
     queries::set_user_groups(&state.pool, user_id, &input.group_ids)
         .await
         .map_err(ApiError::Internal)?;
@@ -345,10 +354,23 @@ async fn audit_change(
     .await;
 }
 
-/// Minimal JSON string escaper for audit payloads. We don't want to
-/// pull serde_json::to_string in here for a single value — and the
-/// audit row is fine with hand-built JSON since the only field is a
-/// validated name (no embedded newlines/control chars to worry about).
+/// Minimal JSON string escaper for audit payloads. Escapes `\`, `"`,
+/// and ASCII control characters (0x00–0x1F) per RFC 8259.
 fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

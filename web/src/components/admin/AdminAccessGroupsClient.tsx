@@ -53,6 +53,8 @@ export function AdminAccessGroupsClient({
       setDetail(d);
     } catch (e) {
       setError(parseError(e));
+      // Re-throw so callers (onChanged) reject and don't show a false success notice.
+      throw e;
     } finally {
       setLoadingDetail(false);
     }
@@ -68,7 +70,7 @@ export function AdminAccessGroupsClient({
       setNewName("");
       setShowNew(false);
       await refreshList();
-      void loadDetail(group.id);
+      await loadDetail(group.id);
     } catch (e) {
       setError(parseError(e));
     } finally {

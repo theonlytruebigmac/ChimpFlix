@@ -98,6 +98,7 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
           <span className="cf-mono">optimize_versions</span> task produces it.
         </div>
         <button
+          type="button"
           onClick={() => setShowAdd((v) => !v)}
           className="cf-btn cf-primary cf-sm"
         >
@@ -191,6 +192,7 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
                     <td className="cf-num">
                       {v.status === "queued" || v.status === "running" ? (
                         <button
+                          type="button"
                           onClick={() => setAskCancelId(v.id)}
                           className="cf-btn cf-ghost cf-tiny cf-danger"
                         >
@@ -198,6 +200,7 @@ export function AdminOptimizedClient({ initial, presets }: Props) {
                         </button>
                       ) : (
                         <button
+                          type="button"
                           onClick={() => remove(v.id)}
                           className="cf-btn cf-ghost cf-tiny cf-danger"
                         >
@@ -286,7 +289,8 @@ function NewOptimizedForm({
   onError: (m: string | null) => void;
 }) {
   const [sourceFileId, setSourceFileId] = useState<number | "">("");
-  const [presetId, setPresetId] = useState<number>(presets[0]?.id ?? 0);
+  // Initialize from the first *enabled* preset so the state matches the rendered <option> list.
+  const [presetId, setPresetId] = useState<number>(presets.find((p) => p.enabled)?.id ?? 0);
   const [busy, setBusy] = useState(false);
 
   async function submit() {
@@ -343,6 +347,7 @@ function NewOptimizedForm({
           </Field>
           <div className="cf-flex" style={{ alignItems: "flex-end" }}>
             <button
+              type="button"
               disabled={busy || sourceFileId === ""}
               onClick={submit}
               className="cf-btn cf-primary cf-sm"

@@ -55,7 +55,7 @@ export function EditMetadataDialog({
     tagline: detail.tagline ?? "",
     summary: detail.summary ?? "",
     year: detail.year != null ? String(detail.year) : "",
-    rating_age: "",
+    rating_age: detail.rating_age ?? "",
     rating_audience:
       detail.rating_audience != null ? String(detail.rating_audience) : "",
   }));
@@ -209,6 +209,8 @@ export function EditMetadataDialog({
           return detail.summary ?? "";
         case "year":
           return detail.year != null ? String(detail.year) : "";
+        case "rating_age":
+          return detail.rating_age ?? "";
         case "rating_audience":
           return detail.rating_audience != null
             ? String(detail.rating_audience)

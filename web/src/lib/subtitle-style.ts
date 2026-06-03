@@ -154,12 +154,14 @@ export function subtitleStyleToAss(style: SubtitleStyle): string | null {
   const parts: string[] = [
     `Fontsize=${fontSize}`,
     `PrimaryColour=${primary}`,
-    `BackColour=${back}`,
     `BorderStyle=${borderStyle}`,
     `Outline=${outline}`,
     `Shadow=${shadow}`,
     `Alignment=2`,
   ];
+  // BackColour is only read by ASS when BorderStyle=3 (opaque box).
+  // Omit it entirely when the background is transparent (BorderStyle=1).
+  if (wantsBox) parts.push(`BackColour=${back}`);
   const fontname = assFontnameFor(style.fontFamily);
   if (fontname) parts.push(`Fontname=${fontname}`);
   return parts.join(",");

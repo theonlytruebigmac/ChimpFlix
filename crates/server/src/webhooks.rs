@@ -124,7 +124,9 @@ async fn fan_out(state: &AppState, evt: WebhookEvent) {
         if !mask.iter().any(|n| n == &evt.name) {
             continue;
         }
-        deliver_async(state.clone(), hook, evt.clone()).await;
+        // Spawn so the subscriber loop returns to rx.recv() immediately
+        // rather than blocking for N sequential DB inserts.
+        tokio::spawn(deliver_async(state.clone(), hook, evt.clone()));
     }
 }
 
@@ -170,6 +172,27 @@ async fn deliver_with_retries(
         match outcome {
             AttemptOutcome::Success => {
                 debug!(webhook_id = hook.id, delivery_id, "webhook delivered");
+                return;
+            }
+            // SSRF-blocked (and similar deterministic errors): write once and
+            // bail immediately — no sleep, no retry loop iteration.
+            AttemptOutcome::PermanentFailure { error } => {
+                let _ = queries::record_webhook_attempt(
+                    &state.pool,
+                    delivery_id,
+                    None,
+                    None,
+                    Some(error.as_str()),
+                    false,
+                    None,
+                )
+                .await;
+                warn!(
+                    webhook_id = hook.id,
+                    delivery_id,
+                    error,
+                    "webhook delivery permanently failed (not retrying)"
+                );
                 return;
             }
             AttemptOutcome::Retry { code, body, error } => {
@@ -218,6 +241,12 @@ enum AttemptOutcome {
         body: Option<String>,
         error: Option<String>,
     },
+    /// The failure is deterministic and retrying would be pointless (e.g. SSRF
+    /// block). Record one attempt with `delivered=false, next_retry_at=None`
+    /// and return immediately without sleeping or incrementing attempt_idx.
+    PermanentFailure {
+        error: String,
+    },
 }
 
 async fn attempt_once(
@@ -233,39 +262,29 @@ async fn attempt_once(
     // response body would be captured straight into webhook_deliveries
     // for the admin UI to render.
     if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(&hook.url).await {
-        let _ = queries::record_webhook_attempt(
-            &state.pool,
-            delivery_id,
-            None,
-            None,
-            Some(&format!("ssrf-blocked: {reason}")),
-            false,
-            None,
-        )
-        .await;
-        return AttemptOutcome::Retry {
-            code: None,
-            body: None,
-            error: Some(format!("ssrf-blocked: {reason}")),
+        // The URL resolves to a blocked address (loopback / RFC1918 /
+        // cloud-metadata). This is a deterministic, permanent failure —
+        // the URL won't become safe on retry — so return PermanentFailure
+        // and let deliver_with_retries write the single attempt record.
+        return AttemptOutcome::PermanentFailure {
+            error: format!("ssrf-blocked: {reason}"),
         };
     }
 
+    // Suppress redirects: `ensure_safe_outbound_url` above only vetted
+    // the initial URL. A malicious endpoint could return a 3xx pointing
+    // at loopback / RFC1918 / 169.254.169.254 and reqwest would follow
+    // it by default, defeating the SSRF guard. Treat any redirect as a
+    // terminal response (we record the 3xx code, never chase it).
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = queries::record_webhook_attempt(
-                &state.pool,
-                delivery_id,
-                None,
-                None,
-                Some(&format!("client build: {e}")),
-                false,
-                None,
-            )
-            .await;
+            // Let deliver_with_retries write the attempt record (consistent
+            // with all other Retry paths; avoids a double-increment).
             return AttemptOutcome::Retry {
                 code: None,
                 body: None,
@@ -352,6 +371,10 @@ async fn retry_pending(state: &AppState) -> anyhow::Result<()> {
         let Some(hook) = queries::get_webhook(&state.pool, &state.vault, webhook_id).await? else {
             continue;
         };
+        // Mirror the fan_out gate: skip webhooks disabled after the first attempt.
+        if !hook.enabled {
+            continue;
+        }
         let st = state.clone();
         tokio::spawn(async move {
             deliver_with_retries(st, hook, delivery_id, payload, attempts as usize).await;

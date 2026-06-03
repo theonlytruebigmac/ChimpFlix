@@ -43,9 +43,11 @@ export function AdminTranscodingTabs({
           return (
             <button
               key={t.id}
+              id={`tab-btn-${t.id}`}
               type="button"
               role="tab"
               aria-selected={on}
+              aria-controls={`tab-panel-${t.id}`}
               className={"cf-tab" + (on ? " cf-on" : "")}
               onClick={() => select(t.id)}
             >
@@ -54,13 +56,28 @@ export function AdminTranscodingTabs({
           );
         })}
       </div>
-      <div className={tab === "engine" ? "" : "hidden"}>
+      <div
+        id="tab-panel-engine"
+        role="tabpanel"
+        aria-labelledby="tab-btn-engine"
+        className={tab === "engine" ? "" : "hidden"}
+      >
         <AdminTranscoderClient {...engine} />
       </div>
-      <div className={tab === "presets" ? "" : "hidden"}>
+      <div
+        id="tab-panel-presets"
+        role="tabpanel"
+        aria-labelledby="tab-btn-presets"
+        className={tab === "presets" ? "" : "hidden"}
+      >
         <AdminPresetsClient {...presets} />
       </div>
-      <div className={tab === "preroll" ? "" : "hidden"}>
+      <div
+        id="tab-panel-preroll"
+        role="tabpanel"
+        aria-labelledby="tab-btn-preroll"
+        className={tab === "preroll" ? "" : "hidden"}
+      >
         <AdminPrerollClient {...preroll} />
       </div>
     </div>

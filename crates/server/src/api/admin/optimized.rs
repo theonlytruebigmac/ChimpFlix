@@ -57,6 +57,28 @@ pub async fn create(
         )));
     }
 
+    // Reject if an encode is actively running for this (source, preset) pair.
+    // The upsert in enqueue_optimized_version has no status guard, so without
+    // this check a re-submit would flip a running row back to 'queued' while
+    // the worker is still encoding — leaving the row stuck 'queued' forever
+    // once the worker's mark_optimized_finished no-ops on the missing 'running'
+    // guard. Return 409 so the caller knows to cancel first if desired.
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM optimized_versions
+         WHERE source_file_id = ? AND preset_id = ? AND status = 'running'",
+    )
+    .bind(input.source_file_id)
+    .bind(input.preset_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    if running > 0 {
+        return Err(ApiError::Conflict(
+            "an encode for this (source_file, preset) pair is already running; cancel it first"
+                .into(),
+        ));
+    }
+
     let row = queries::enqueue_optimized_version(&state.pool, input.clone())
         .await
         .map_err(ApiError::Internal)?;
@@ -157,14 +179,26 @@ pub async fn delete(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let path = queries::delete_optimized_version(&state.pool, id)
+    // Signal the worker to kill its ffmpeg child BEFORE removing the DB row.
+    // If the row is currently 'running', the worker polls the cancel set on
+    // each progress tick; without this the worker would run to completion
+    // wasting CPU/GPU cycles (the DB delete makes its mark_optimized_finished
+    // a no-op, but ffmpeg keeps encoding until it exits naturally). Sending
+    // the cancel for a non-running or non-existent id is harmless — the
+    // worker clears ids it handles, and ids are never reused.
+    state.request_optimize_cancel(id).await;
+
+    let output_path = queries::delete_optimized_version(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?;
+    // None means no row was deleted — the id never existed (or was already
+    // cleaned up). Mirror delete_preset's NotFound behaviour.
+    let Some(p) = output_path else {
+        return Err(ApiError::NotFound);
+    };
     // Best-effort file cleanup.
-    if let Some(p) = path {
-        if !p.is_empty() {
-            let _ = tokio::fs::remove_file(&p).await;
-        }
+    if !p.is_empty() {
+        let _ = tokio::fs::remove_file(&p).await;
     }
     let user_agent = headers
         .get(USER_AGENT)

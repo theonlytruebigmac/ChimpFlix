@@ -77,7 +77,10 @@ impl CircuitBreaker {
     pub fn allow(&self) -> bool {
         let mut g = self.inner.lock().unwrap();
         match g.state {
-            BreakerState::Closed | BreakerState::HalfOpen => true,
+            BreakerState::Closed => true,
+            // A probe is already in flight; block additional concurrent callers
+            // so only one request is used to test whether the provider recovered.
+            BreakerState::HalfOpen => false,
             BreakerState::Open => {
                 let cooled = g
                     .opened_at

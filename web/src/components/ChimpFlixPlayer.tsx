@@ -695,6 +695,11 @@ export function ChimpFlixPlayer({
     nonce: number;
   } | null>(null);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  // Ref mirror so onCanPlay can read autoplayBlocked without being listed
+  // as a dep of the video-event effect (which would tear down + re-register
+  // ALL listeners on every autoplay-block/unblock cycle).
+  const autoplayBlockedRef = useRef(false);
+  useEffect(() => { autoplayBlockedRef.current = autoplayBlocked; }, [autoplayBlocked]);
   // Local selection state. `undefined` = transcoder default. For subtitles
   // we use `null` to mean "explicitly off" (no subtitle_index sent).
   const [audioSel, setAudioSel] = useState<number | undefined>(audioIndex);
@@ -961,6 +966,15 @@ export function ChimpFlixPlayer({
   // WebVTT captions; CSS variables in here let `background-color`
   // and `color` be controlled live without re-mounting the
   // stylesheet.
+  // Validate a CSS color string before interpolating it into a style
+  // element. CSS.supports('color', v) is the canonical browser check;
+  // falls back to the supplied default on failure so a tampered server
+  // value can't break layout via CSS injection.
+  function safeColor(value: string, fallback: string): string {
+    if (typeof CSS !== "undefined" && CSS.supports("color", value)) return value;
+    return fallback;
+  }
+
   useEffect(() => {
     if (typeof document === "undefined") return;
     const STYLE_ID = "chimpflix-subtitle-style";
@@ -1005,10 +1019,12 @@ export function ChimpFlixPlayer({
     // for the "default" choice, meaning "let the browser pick its caption
     // default" — emit no rule in that case so we don't override the UA.
     const family = cssFontFamilyForSubtitleStyle(subtitleStyle.fontFamily);
+    const safeBg = safeColor(subtitleStyle.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor);
+    const safeText = safeColor(subtitleStyle.textColor, DEFAULT_SUBTITLE_STYLE.textColor);
     const cssBlock = `
-      background: ${subtitleStyle.backgroundColor} !important;
-      background-color: ${subtitleStyle.backgroundColor} !important;
-      color: ${subtitleStyle.textColor} !important;
+      background: ${safeBg} !important;
+      background-color: ${safeBg} !important;
+      color: ${safeText} !important;
       font-size: ${subtitleStyle.fontSizePx}px !important;
       ${family ? `font-family: ${family} !important;` : ""}
       line-height: 1.25 !important;
@@ -1062,8 +1078,8 @@ export function ChimpFlixPlayer({
       document.head.appendChild(styleEl);
     }
     const fontSize = Math.max(8, Math.min(128, subtitleStyle.fontSizePx));
-    const bg = subtitleStyle.backgroundColor;
-    const color = subtitleStyle.textColor;
+    const bg = safeColor(subtitleStyle.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor);
+    const color = safeColor(subtitleStyle.textColor, DEFAULT_SUBTITLE_STYLE.textColor);
     const family = cssFontFamilyForSubtitleStyle(subtitleStyle.fontFamily);
     // Edge → CSS text-shadow. Outline = multi-direction tight shadow
     // (poor man's stroke; CSS doesn't have a real text-stroke that
@@ -1536,6 +1552,7 @@ export function ChimpFlixPlayer({
         // call attemptPlay() on a stale closure — visible in profilers
         // as a slow accumulation of detached HTMLVideoElement references.
         let warmupSafetyTimer: number | null = null;
+        let reconnectClearTimer: number | null = null;
         try {
           const HlsModule = (await import("hls.js")).default;
           if (cancelled) return;
@@ -1735,7 +1752,8 @@ export function ChimpFlixPlayer({
                   hls.startLoad();
                   // Clear the reconnecting overlay after a beat; if
                   // the error returns we'll flip it back on.
-                  window.setTimeout(() => setReconnecting(false), 1500);
+                  if (reconnectClearTimer !== null) window.clearTimeout(reconnectClearTimer);
+                  reconnectClearTimer = window.setTimeout(() => { reconnectClearTimer = null; setReconnecting(false); }, 1500);
                   return;
                 case HlsModule.ErrorTypes.MEDIA_ERROR:
                   if (mediaRecoveryAttempts < MAX_MEDIA_RECOVERY) {
@@ -1747,7 +1765,8 @@ export function ChimpFlixPlayer({
                       hls.swapAudioCodec();
                     }
                     hls.recoverMediaError();
-                    window.setTimeout(() => setReconnecting(false), 1500);
+                    if (reconnectClearTimer !== null) window.clearTimeout(reconnectClearTimer);
+                    reconnectClearTimer = window.setTimeout(() => { reconnectClearTimer = null; setReconnecting(false); }, 1500);
                     return;
                   }
                   break;
@@ -1764,6 +1783,10 @@ export function ChimpFlixPlayer({
               if (warmupSafetyTimer !== null) {
                 window.clearTimeout(warmupSafetyTimer);
                 warmupSafetyTimer = null;
+              }
+              if (reconnectClearTimer !== null) {
+                window.clearTimeout(reconnectClearTimer);
+                reconnectClearTimer = null;
               }
               hls.destroy();
               // Firefox holds onto the MediaSource and SourceBuffers
@@ -2012,7 +2035,9 @@ export function ChimpFlixPlayer({
       // Only auto-(re)start if the user hasn't deliberately paused.
       // `canplay` re-fires on its own after buffer refills / recovery /
       // refocus; without this guard each refire resumes a paused video.
-      if (video.paused && !autoplayBlocked && !userPausedRef.current) {
+      // Read via ref so autoplayBlocked doesn't sit in the outer effect's
+      // deps and trigger a full listener teardown on every block/unblock.
+      if (video.paused && !autoplayBlockedRef.current && !userPausedRef.current) {
         attemptPlay();
       }
     };
@@ -2089,7 +2114,7 @@ export function ChimpFlixPlayer({
       video.removeEventListener("volumechange", onVolumeChange);
       video.removeEventListener("error", onMediaError);
     };
-  }, [attemptPlay, autoplayBlocked, durationMs]);
+  }, [attemptPlay, durationMs]);
 
   // Stall-recovery watchdog. Two paths to detect a stall:
   //   1. `waiting` event — the browser tells us directly that playback
@@ -2535,6 +2560,7 @@ export function ChimpFlixPlayer({
     if (itemId == null && episodeId == null) return;
     let snap: RemotePlaybackState | null = null;
     let lastGoodMs: number | null = null;
+    let lastWasPlaying = true;
     const unsub = subscribeRemotePlayback((s) => {
       snap = s;
     });
@@ -2548,7 +2574,8 @@ export function ChimpFlixPlayer({
       if (!snap || !snap.isMediaLoaded || !(snap.currentTimeS > 0)) return;
       const ms = Math.floor(snap.currentTimeS * 1000 + offsetMs());
       lastGoodMs = ms;
-      reportProgress(ms, !snap.isPaused);
+      lastWasPlaying = !snap.isPaused;
+      reportProgress(ms, lastWasPlaying);
     };
     const interval = window.setInterval(tick, PLAY_STATE_INTERVAL_MS);
     return () => {
@@ -2556,7 +2583,7 @@ export function ChimpFlixPlayer({
       unsub();
       // Persist the last known-good position (not the zeroed teardown
       // snapshot) so ending the cast resumes where the TV stopped.
-      if (lastGoodMs != null) reportProgress(lastGoodMs, true);
+      if (lastGoodMs != null) reportProgress(lastGoodMs, lastWasPlaying);
     };
   }, [isCasting, itemId, episodeId, reportProgress]);
 
@@ -2829,11 +2856,18 @@ export function ChimpFlixPlayer({
   // (150ms × small closure), but inconsistent with how the other
   // player timers are managed.
   const suppressClearTimerRef = useRef<number | null>(null);
+  // Tracks the 650ms auto-clear timer for the seek-flash animation.
+  // Cancelled on unmount to avoid calling setSeekFlash on a dead component.
+  const seekFlashTimerRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
       if (suppressClearTimerRef.current !== null) {
         window.clearTimeout(suppressClearTimerRef.current);
         suppressClearTimerRef.current = null;
+      }
+      if (seekFlashTimerRef.current !== null) {
+        window.clearTimeout(seekFlashTimerRef.current);
+        seekFlashTimerRef.current = null;
       }
     };
   }, []);
@@ -2902,9 +2936,11 @@ export function ChimpFlixPlayer({
         });
         // Auto-clear the flash after the animation finishes so a
         // re-tap of the same side fires a fresh animation rather than
-        // continuing the previous one.
+        // continuing the previous one. Tracked so unmount can cancel it.
         const myNonce = seekFlashIdRef.current;
-        window.setTimeout(() => {
+        if (seekFlashTimerRef.current !== null) window.clearTimeout(seekFlashTimerRef.current);
+        seekFlashTimerRef.current = window.setTimeout(() => {
+          seekFlashTimerRef.current = null;
           setSeekFlash((cur) => (cur?.nonce === myNonce ? null : cur));
         }, 650);
         lastTapRef.current = null;
@@ -2966,11 +3002,7 @@ export function ChimpFlixPlayer({
       for (let i = 0; i < v.buffered.length; i++) {
         bufferedEndSec = Math.max(bufferedEndSec, v.buffered.end(i));
       }
-      if (
-        targetHlsSec >= 0 &&
-        targetHlsSec <= bufferedEndSec &&
-        targetHlsSec >= 0
-      ) {
+      if (targetHlsSec >= 0 && targetHlsSec <= bufferedEndSec) {
         return;
       }
       const livePrefs = getPrefs();
@@ -4566,6 +4598,19 @@ function VolumeControl({
   const [hovered, setHovered] = useState(false);
   const trackRef = useRef<HTMLDivElement>(null);
   const effectiveVolume = muted ? 0 : volume;
+  // Refs to active drag listeners so the cleanup effect can remove them
+  // if the component unmounts while a drag is still in progress.
+  const dragMoveRef = useRef<((e: PointerEvent) => void) | null>(null);
+  const dragUpRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (dragMoveRef.current)
+        window.removeEventListener("pointermove", dragMoveRef.current);
+      if (dragUpRef.current)
+        window.removeEventListener("pointerup", dragUpRef.current);
+    };
+  }, []);
 
   function pointToVolume(clientX: number): number {
     const track = trackRef.current;
@@ -4582,7 +4627,11 @@ function VolumeControl({
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      dragMoveRef.current = null;
+      dragUpRef.current = null;
     };
+    dragMoveRef.current = onMove;
+    dragUpRef.current = onUp;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -4755,6 +4804,8 @@ function EpisodesControl({
   } | null>(null);
   const [loadingSeason, setLoadingSeason] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Monotonic counter to discard results from superseded season fetches.
+  const seasonReqIdRef = useRef(0);
 
   const viewSeasonId = override?.seasonId ?? currentSeasonId;
   const viewEpisodes = override?.episodes ?? episodes;
@@ -4788,9 +4839,14 @@ function EpisodesControl({
   }, [open, handleClose, pickerOpen]);
 
   async function switchSeason(seasonId: number) {
+    // Stamp this request so a stale response from a previous season
+    // fetch doesn't overwrite the result of the most-recent click.
+    const reqId = ++seasonReqIdRef.current;
     setLoadingSeason(true);
     try {
       const season = await seasonsApi.get(seasonId);
+      // Discard if another season was requested while this one was in flight.
+      if (reqId !== seasonReqIdRef.current) return;
       const mapped: EpisodeSibling[] = season.episodes.map((e) => ({
         ratingKey: `e${e.id}`,
         title: e.title,
@@ -4815,7 +4871,8 @@ function EpisodesControl({
       // Best-effort — leave the existing pane in place if the season
       // fetch fails so the user isn't stuck in a half-loaded picker.
     } finally {
-      setLoadingSeason(false);
+      // Only clear the loading spinner for the active request.
+      if (reqId === seasonReqIdRef.current) setLoadingSeason(false);
     }
   }
 
@@ -5615,6 +5672,10 @@ function ProgressBar({
   // would session-restart on every micromove past the buffer.
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const hintTimerRef = useRef<number | null>(null);
+  // Refs to active drag listeners so the cleanup effect can remove them
+  // if the component unmounts while a scrub drag is still in progress.
+  const scrubMoveRef = useRef<((e: PointerEvent) => void) | null>(null);
+  const scrubUpRef = useRef<(() => void) | null>(null);
   // Mirrored width of the progress track. Read during render to map
   // `hoverX` → time; updated by a ResizeObserver. Storing in state
   // (vs. reading trackRef.current.getBoundingClientRect() at render
@@ -5631,6 +5692,17 @@ function ProgressBar({
     });
     ro.observe(node);
     return () => ro.disconnect();
+  }, []);
+
+  // Cancel any in-progress scrub drag on unmount so the global
+  // pointermove/pointerup listeners don't outlive the component.
+  useEffect(() => {
+    return () => {
+      if (scrubMoveRef.current)
+        window.removeEventListener("pointermove", scrubMoveRef.current);
+      if (scrubUpRef.current)
+        window.removeEventListener("pointerup", scrubUpRef.current);
+    };
   }, []);
 
   const pointToTime = useCallback(
@@ -5684,12 +5756,16 @@ function ProgressBar({
       }
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      scrubMoveRef.current = null;
+      scrubUpRef.current = null;
       // Commit ONCE at release — `seekTo` either does a native
       // currentTime jump (if buffered) or tears down + restarts the
       // session at this position. No more multi-restart cascade
       // from intermediate drag positions.
       onSeek(lastT);
     };
+    scrubMoveRef.current = onMove;
+    scrubUpRef.current = onUp;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };

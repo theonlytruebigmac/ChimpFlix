@@ -104,10 +104,14 @@ export function addToMyList(ratingKey: string): void {
   fetch(`/api/v1/my-list/${id}`, {
     method: "POST",
     headers: csrfHeaders(),
-  }).catch(() => {
-    cache?.delete(ratingKey);
-    notify();
-  });
+  })
+    // fetch() only rejects on network errors; convert HTTP errors to
+    // rejections so the .catch() rollback fires for 401/403/500 too.
+    .then((res) => { if (!res.ok) throw new Error(`/my-list: ${res.status}`); })
+    .catch(() => {
+      cache?.delete(ratingKey);
+      notify();
+    });
 }
 
 export function removeFromMyList(ratingKey: string): void {
@@ -124,10 +128,14 @@ export function removeFromMyList(ratingKey: string): void {
   fetch(`/api/v1/my-list/${id}`, {
     method: "DELETE",
     headers: csrfHeaders(),
-  }).catch(() => {
-    cache?.add(ratingKey);
-    notify();
-  });
+  })
+    // fetch() only rejects on network errors; convert HTTP errors to
+    // rejections so the .catch() rollback fires for 401/403/500 too.
+    .then((res) => { if (!res.ok) throw new Error(`/my-list: ${res.status}`); })
+    .catch(() => {
+      cache?.add(ratingKey);
+      notify();
+    });
 }
 
 export const MY_LIST_EVENT = EVENT;
@@ -144,12 +152,15 @@ export function useMyListItem(ratingKey: string): {
   const [inList, setInList] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     function update() {
+      if (cancelled) return;
       setInList(isInMyList(ratingKey));
     }
     void ensureLoaded().then(update);
     window.addEventListener(EVENT, update);
     return () => {
+      cancelled = true;
       window.removeEventListener(EVENT, update);
     };
   }, [ratingKey]);

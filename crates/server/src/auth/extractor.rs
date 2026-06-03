@@ -11,6 +11,7 @@ use axum::http::request::Parts;
 use chimpflix_common::now_ms;
 use chimpflix_library::UserRole;
 use chimpflix_library::queries;
+use ipnet::IpNet;
 use tokio::sync::RwLock;
 
 use crate::api::error::ApiError;
@@ -18,6 +19,15 @@ use crate::auth::{cookie, cookie_name};
 use crate::client_ip::EffectiveClientIp;
 use crate::net;
 use crate::state::AppState;
+
+/// Process-local cache of the last-parsed `auth_bypass_cidrs` list.
+/// Stores the raw string alongside the parsed `Vec<IpNet>` so the hot
+/// path (every authenticated request) can skip `parse_cidr_list` as
+/// long as the setting hasn't changed. The raw string is a cheap `==`
+/// check; re-parsing only happens on the first request after an admin
+/// updates the CIDR setting (rare).
+static BYPASS_CIDR_CACHE: LazyLock<RwLock<(String, Vec<IpNet>)>> =
+    LazyLock::new(|| RwLock::new((String::new(), Vec::new())));
 
 /// Process-local set of client IPs that have already triggered an
 /// info-level "network bypass granted" audit log. Keeps logging
@@ -79,11 +89,28 @@ impl FromRequestParts<AppState> for AuthUser {
         // `X-Forwarded-For: 192.168.x.x` to gain owner — without a
         // trusted proxy in front, headers are ignored, and the LAN
         // CIDR won't match a public peer IP.
-        let bypass_raw = state.settings.read().await.auth_bypass_cidrs.clone();
-        if !bypass_raw.trim().is_empty() {
-            if let Some(ip) = client_ip(parts) {
-                let nets = net::parse_cidr_list(&bypass_raw);
-                if net::ip_in_list(ip, &nets) {
+        //
+        // Only proceed when there's actually a client IP to match
+        // (avoids acquiring the settings lock on every request when
+        // the middleware didn't run, e.g. in tests).
+        if let Some(ip) = client_ip(parts) {
+            let bypass_raw = state.settings.read().await.auth_bypass_cidrs.clone();
+            if !bypass_raw.trim().is_empty() {
+                // Return the cached parsed list if the raw string is
+                // unchanged; re-parse and update on mismatch (happens
+                // only after an admin edits the setting).
+                let nets_snapshot = {
+                    let cache = BYPASS_CIDR_CACHE.read().await;
+                    if cache.0 == bypass_raw {
+                        cache.1.clone()
+                    } else {
+                        drop(cache);
+                        let parsed = net::parse_cidr_list(&bypass_raw);
+                        *BYPASS_CIDR_CACHE.write().await = (bypass_raw, parsed.clone());
+                        parsed
+                    }
+                };
+                if net::ip_in_list(ip, &nets_snapshot) {
                     if let Some(owner) = queries::find_first_owner(&state.pool)
                         .await
                         .map_err(ApiError::Internal)?
@@ -160,6 +187,16 @@ impl FromRequestParts<AppState> for AuthUser {
             .await
             .map_err(ApiError::Internal)?
             .ok_or(ApiError::Unauthorized)?;
+
+        // Locked-account gate: mirror the /auth/login check on every
+        // authenticated request so an account an admin has disabled
+        // can't keep riding a session minted before the lock. The user
+        // row is already loaded above, so this is a free in-memory field
+        // test — no extra DB read. Owners can't be locked (the admin
+        // lock route refuses), so the role guard matches login.
+        if user.locked && user.role != UserRole::Owner {
+            return Err(ApiError::Unauthorized);
+        }
 
         // Best-effort: update last_seen_at without blocking the request.
         let pool = state.pool.clone();
@@ -258,6 +295,12 @@ impl FromRequestParts<AppState> for StreamAuthUser {
                         .await
                         .map_err(ApiError::Internal)?
                         .ok_or(ApiError::Unauthorized)?;
+                    // Same locked-account gate as the cookie path: a cast
+                    // token minted before the account was locked must not
+                    // outlive the lock.
+                    if user.locked && user.role != UserRole::Owner {
+                        return Err(ApiError::Unauthorized);
+                    }
                     return Ok(StreamAuthUser(AuthUser {
                         id: user.id,
                         username: user.username,

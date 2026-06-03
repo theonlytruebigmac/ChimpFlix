@@ -417,10 +417,27 @@ async fn worker_loop(
         // worker started, then we re-check; once cleared, we fall
         // through to the claim path. Polled at watch's event
         // granularity (not a sleep loop) so wake-up is prompt.
+        // We also select on count_rx so a pool shrink during a scan
+        // is observed immediately rather than waiting for the gate
+        // to clear first.
         while *scan_exclusive_rx.borrow() {
-            if scan_exclusive_rx.changed().await.is_err() {
-                // Sender dropped — server shutting down; bow out.
-                return;
+            tokio::select! {
+                res = scan_exclusive_rx.changed() => {
+                    if res.is_err() {
+                        // Sender dropped — server shutting down; bow out.
+                        return;
+                    }
+                }
+                res = count_rx.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                    // Re-check self-exit in case pool was shrunk.
+                    if worker_id >= *count_rx.borrow() {
+                        info!(worker = worker_id, "job worker draining (pool shrunk)");
+                        return;
+                    }
+                }
             }
         }
         let saturated = limiter.saturated_kinds().await;
@@ -528,10 +545,45 @@ async fn worker_loop(
                     kind: kind.clone(),
                     progress_sink,
                 };
-                let result = progress::JobContext::scope(job_ctx, async {
-                    handler(state.clone(), payload).await
-                })
-                .await;
+                // Spawn the handler in its own task so a panic inside
+                // the handler does not kill this worker task. A panicking
+                // spawned task yields `Err(JoinError::is_panic())`;
+                // we convert that into a normal job failure below so the
+                // job row is transitioned out of `running` and the
+                // progress entry is cleaned up even on panic.
+                let handler_state = state.clone();
+                let join = tokio::task::spawn(async move {
+                    progress::JobContext::scope(job_ctx, async {
+                        handler(handler_state, payload).await
+                    })
+                    .await
+                });
+                // Flatten the JoinError (panic) into an anyhow::Error so
+                // the existing Ok/Err match below handles it uniformly.
+                let result: Result<()> = match join.await {
+                    Ok(inner) => inner,
+                    Err(join_err) => {
+                        // Extract a human-readable panic message if the
+                        // payload is a &str or String; fall back to a
+                        // generic label so the job row still records
+                        // something useful.
+                        let msg = if join_err.is_panic() {
+                            let payload = join_err.into_panic();
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|s| format!("handler panicked: {s}"))
+                                .or_else(|| {
+                                    payload
+                                        .downcast_ref::<String>()
+                                        .map(|s| format!("handler panicked: {s}"))
+                                })
+                                .unwrap_or_else(|| "handler panicked".to_string())
+                        } else {
+                            "handler task cancelled".to_string()
+                        };
+                        Err(anyhow::anyhow!(msg))
+                    }
+                };
                 state.job_progress.finish(job.id);
                 // Heartbeat is aborted by `_heartbeat`'s Drop on scope exit
                 // (covers both normal flow and handler panic).

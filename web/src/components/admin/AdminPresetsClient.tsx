@@ -20,8 +20,12 @@ export function AdminPresetsClient({ presets }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   async function refreshPresets() {
-    const r = await adminApi.transcoder.listPresets();
-    setAllPresets(r.presets);
+    try {
+      const r = await adminApi.transcoder.listPresets();
+      setAllPresets(r.presets);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   return (

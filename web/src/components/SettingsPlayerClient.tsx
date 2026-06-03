@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import { auth as authApi } from "@/lib/chimpflix-api";
 import { usePrefs } from "@/lib/prefs";
@@ -19,6 +19,13 @@ import {
 // settings-local on purpose: the player's own SubtitleStylePanel lives
 // outside `.cf-console`, so it can't share these scoped classes — both
 // drive the same SubtitleStyle model + PATCH, so behavior matches.
+
+type SaveState =
+  | { kind: "idle" }
+  | { kind: "saving" }
+  | { kind: "saved" }
+  | { kind: "error"; message: string };
+
 export function SettingsPlayerClient({
   initialSubtitleStyle,
 }: {
@@ -27,11 +34,15 @@ export function SettingsPlayerClient({
   const [prefs, updatePrefs] = usePrefs();
   const [subtitleStyle, setSubtitleStyleLocal] =
     useState<SubtitleStyle>(initialSubtitleStyle);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  // "idle" on mount — savebar hidden until the user makes a change.
+  const [saveState, setSaveState] = useState<SaveState>({ kind: "idle" });
+  // Latest request sequence; the most-recent PATCH wins (rapid clicks coalesce).
+  const reqSeq = useRef(0);
 
   const setSubtitleStyle = useCallback((next: SubtitleStyle) => {
     setSubtitleStyleLocal(next);
-    setSaveError(null);
+    const seq = ++reqSeq.current;
+    setSaveState({ kind: "saving" });
     authApi
       .updateMe({
         subtitle_font_size_px: next.fontSizePx,
@@ -41,11 +52,18 @@ export function SettingsPlayerClient({
         subtitle_edge: next.edge,
         subtitle_bottom_inset_pct: next.bottomInsetPct,
       })
+      .then(() => {
+        if (reqSeq.current === seq) setSaveState({ kind: "saved" });
+      })
       .catch((e: unknown) => {
-        // Keep the local pick visible so the viewer sees their choice,
-        // but flag that it won't survive a refresh — a silent swallow
-        // leaves users confused when settings revert.
-        setSaveError(e instanceof Error ? e.message : String(e));
+        if (reqSeq.current === seq)
+          // Keep the local pick visible so the viewer sees their choice,
+          // but flag that it won't survive a refresh — a silent swallow
+          // leaves users confused when settings revert.
+          setSaveState({
+            kind: "error",
+            message: e instanceof Error ? e.message : String(e),
+          });
       });
   }, []);
 
@@ -275,32 +293,39 @@ export function SettingsPlayerClient({
         </div>
       </div>
 
-      {/* ── save status ─────────────────────────────────────────────── */}
-      <div className="cf-savebar">
-        <div className="cf-sb-status">
-          {saveError ? (
-            <>
-              <span className="cf-dot" style={{ background: "var(--err)" }} />
-              Couldn&apos;t save subtitle style — {saveError}. Changes revert on
-              refresh.
-            </>
-          ) : (
-            <>
-              <span className="cf-dot" style={{ background: "var(--ok)" }} />
-              All changes saved
-            </>
-          )}
+      {/* ── save status — hidden until the user makes the first change ── */}
+      {saveState.kind !== "idle" && (
+        <div className="cf-savebar">
+          <div className="cf-sb-status">
+            {saveState.kind === "saving" ? (
+              <>
+                <span className="cf-dot" style={{ background: "var(--faint)" }} />
+                Saving…
+              </>
+            ) : saveState.kind === "error" ? (
+              <>
+                <span className="cf-dot" style={{ background: "var(--err)" }} />
+                Couldn&apos;t save subtitle style — {saveState.message}. Changes
+                revert on refresh.
+              </>
+            ) : (
+              <>
+                <span className="cf-dot" style={{ background: "var(--ok)" }} />
+                All changes saved
+              </>
+            )}
+          </div>
+          <div className="cf-sb-actions">
+            <button
+              type="button"
+              className="cf-btn cf-ghost cf-sm"
+              onClick={resetEverything}
+            >
+              Reset everything
+            </button>
+          </div>
         </div>
-        <div className="cf-sb-actions">
-          <button
-            type="button"
-            className="cf-btn cf-ghost cf-sm"
-            onClick={resetEverything}
-          >
-            Reset everything
-          </button>
-        </div>
-      </div>
+      )}
     </div>
   );
 }

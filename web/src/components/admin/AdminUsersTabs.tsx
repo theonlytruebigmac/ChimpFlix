@@ -50,9 +50,11 @@ export function AdminUsersTabs({
           return (
             <button
               key={t.id}
+              id={`tab-${t.id}`}
               type="button"
               role="tab"
               aria-selected={on}
+              aria-controls={`panel-${t.id}`}
               onClick={() => select(t.id)}
               className={`cf-tab${on ? " cf-on" : ""}`}
             >
@@ -64,11 +66,13 @@ export function AdminUsersTabs({
           );
         })}
       </div>
-      <div className={tab === "people" ? "" : "hidden"}>{people}</div>
-      <div className={tab === "access" ? "" : "hidden"}>{access}</div>
-      <div className={tab === "groups" ? "" : "hidden"}>{groups}</div>
-      <div className={tab === "devices" ? "" : "hidden"}>{devices}</div>
-      <div className={tab === "invites" ? "" : "hidden"}>{invites}</div>
+      {/* role="tabpanel" + aria-labelledby wire each panel back to its tab button.
+          The HTML `hidden` attribute (not className) ensures AT skips inactive panels. */}
+      <div id="panel-people" role="tabpanel" aria-labelledby="tab-people" hidden={tab !== "people"}>{people}</div>
+      <div id="panel-access" role="tabpanel" aria-labelledby="tab-access" hidden={tab !== "access"}>{access}</div>
+      <div id="panel-groups" role="tabpanel" aria-labelledby="tab-groups" hidden={tab !== "groups"}>{groups}</div>
+      <div id="panel-devices" role="tabpanel" aria-labelledby="tab-devices" hidden={tab !== "devices"}>{devices}</div>
+      <div id="panel-invites" role="tabpanel" aria-labelledby="tab-invites" hidden={tab !== "invites"}>{invites}</div>
     </>
   );
 }

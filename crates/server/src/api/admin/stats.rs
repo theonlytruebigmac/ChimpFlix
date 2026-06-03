@@ -21,6 +21,16 @@ use crate::api::error::ApiError;
 use crate::auth::AdminAuth;
 use crate::state::AppState;
 
+/// Return true if the user with `user_id` has the Owner role. Performs a
+/// single point-lookup; errors are treated conservatively as "is owner"
+/// so a DB hiccup never leaks owner data to a non-owner admin.
+async fn user_is_owner(state: &AppState, user_id: i64) -> bool {
+    match queries::find_user_by_id(&state.pool, user_id).await {
+        Ok(Some(u)) => matches!(u.role, chimpflix_library::UserRole::Owner),
+        _ => true, // conservative: treat unknown as owner on error
+    }
+}
+
 /// Convert a `days` query param into an epoch-ms cutoff. Default 30,
 /// hard-bounded to keep the indexed range queries snappy.
 fn since_ms(days: Option<i64>) -> i64 {
@@ -214,15 +224,27 @@ pub struct TopUsersResponse {
 
 pub async fn top_users(
     State(state): State<AppState>,
-    _admin: AdminAuth,
+    AdminAuth(actor): AdminAuth,
     Query(q): Query<TopQuery>,
 ) -> Result<Json<TopUsersResponse>, ApiError> {
     let days = q.days.unwrap_or(30).clamp(1, 365);
     // Clamp to a sane upper bound — see /activity for rationale.
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    let users = queries::top_users_by_plays(&state.pool, since_ms(Some(days)), limit)
+    let mut users = queries::top_users_by_plays(&state.pool, since_ms(Some(days)), limit)
         .await
         .map_err(ApiError::Internal)?;
+    // Consistent with the activity() guard: non-Owner admins must not
+    // learn the Owner's username or viewing habits via the aggregated
+    // top-users list either.
+    if !matches!(actor.role, chimpflix_library::UserRole::Owner) {
+        let mut filtered = Vec::with_capacity(users.len());
+        for row in users {
+            if !user_is_owner(&state, row.user_id).await {
+                filtered.push(row);
+            }
+        }
+        users = filtered;
+    }
     Ok(Json(TopUsersResponse { days, users }))
 }
 
@@ -255,8 +277,20 @@ pub struct NowPlayingResponse {
 
 pub async fn now_playing(
     State(state): State<AppState>,
-    _admin: AdminAuth,
+    AdminAuth(actor): AdminAuth,
 ) -> Result<Json<NowPlayingResponse>, ApiError> {
-    let sessions = enrich_sessions(&state, state.transcoder.list_sessions()).await;
+    let mut raw_sessions = state.transcoder.list_sessions();
+    // Consistent with the activity() guard: non-Owner admins must not
+    // see the Owner's live session (username + media title) here either.
+    if !matches!(actor.role, chimpflix_library::UserRole::Owner) {
+        let mut visible = Vec::with_capacity(raw_sessions.len());
+        for s in raw_sessions {
+            if !user_is_owner(&state, s.user_id).await {
+                visible.push(s);
+            }
+        }
+        raw_sessions = visible;
+    }
+    let sessions = enrich_sessions(&state, raw_sessions).await;
     Ok(Json(NowPlayingResponse { sessions }))
 }

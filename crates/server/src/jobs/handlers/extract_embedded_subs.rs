@@ -12,8 +12,9 @@
 //! Gated by `embedded_subs_extract_enabled` — a separate switch from
 //! `subtitle_fetch_enabled` (external OpenSubtitles fetch). Operators
 //! often want one but not the other: embedded extract is free, while
-//! external fetch costs rate-limited API calls. Per-language dedup
-//! means turning the gate on later doesn't redo what's already there.
+//! external fetch costs rate-limited API calls. Per-stream dedup
+//! (keyed on both language and stream index) means turning the gate on
+//! later doesn't redo what's already there.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -89,7 +90,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
     let mut extracted = 0usize;
     let mut skipped = 0usize;
     for stream in &streams {
-        let dest = sidecar_path(&media_path, &stream.lang);
+        let dest = sidecar_path(&media_path, &stream.lang, stream.index);
         if dest.exists() {
             skipped += 1;
             continue;
@@ -177,16 +178,39 @@ fn is_pgs(codec: &str) -> bool {
     matches!(codec, "hdmv_pgs_subtitle" | "dvb_subtitle" | "dvd_subtitle")
 }
 
-/// Build the sidecar path: `<source stem>.<lang>.vtt`. Same
-/// convention as `fetch_subtitles_item`, so the player picks both up
-/// uniformly.
-fn sidecar_path(source: &Path, lang: &str) -> PathBuf {
+/// Sanitize a container-supplied language tag before it is interpolated
+/// into a filename. The `language` stream tag is attacker-controlled (a
+/// crafted media file can set it to any string); without this, a value
+/// containing `/` or `..` flows into `set_file_name` below and lets the
+/// sidecar escape the media directory (path traversal — e.g. writing a
+/// `.vtt` into an arbitrary location). Restrict to the BCP-47 / ISO-639
+/// charset (`[A-Za-z0-9-]`) and a sane length, falling back to `und`.
+fn sanitize_lang(lang: &str) -> String {
+    let cleaned: String = lang
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(16)
+        .collect();
+    if cleaned.is_empty() {
+        "und".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Build the sidecar path: `<source stem>.<lang>.<stream_index>.vtt`.
+/// The stream index disambiguates same-language tracks (e.g. a forced
+/// track and a full-dialogue track both tagged "eng" in an MKV). Without
+/// it, the second same-language stream would find `dest.exists() == true`
+/// and be silently skipped. `lang` is sanitized to prevent path traversal.
+fn sidecar_path(source: &Path, lang: &str, stream_index: i32) -> PathBuf {
     let mut p = source.to_path_buf();
     let stem = source
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("subs");
-    p.set_file_name(format!("{stem}.{lang}.vtt"));
+    let lang = sanitize_lang(lang);
+    p.set_file_name(format!("{stem}.{lang}.{stream_index}.vtt"));
     p
 }
 
@@ -254,15 +278,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidecar_path_appends_lang_and_vtt() {
-        let p = sidecar_path(Path::new("/movies/Inception.mkv"), "en");
-        assert_eq!(p.to_string_lossy(), "/movies/Inception.en.vtt");
+    fn sidecar_path_appends_lang_index_and_vtt() {
+        let p = sidecar_path(Path::new("/movies/Inception.mkv"), "en", 2);
+        assert_eq!(p.to_string_lossy(), "/movies/Inception.en.2.vtt");
+    }
+
+    #[test]
+    fn sidecar_path_different_indices_produce_distinct_paths() {
+        // Two "eng" streams (e.g. forced + full-dialogue) must not collide.
+        let p0 = sidecar_path(Path::new("/movies/Inception.mkv"), "eng", 0);
+        let p1 = sidecar_path(Path::new("/movies/Inception.mkv"), "eng", 1);
+        assert_ne!(p0, p1);
+        assert_eq!(p0.to_string_lossy(), "/movies/Inception.eng.0.vtt");
+        assert_eq!(p1.to_string_lossy(), "/movies/Inception.eng.1.vtt");
     }
 
     #[test]
     fn sidecar_path_handles_und_language() {
-        let p = sidecar_path(Path::new("/show/S01E01.mkv"), "und");
-        assert_eq!(p.to_string_lossy(), "/show/S01E01.und.vtt");
+        let p = sidecar_path(Path::new("/show/S01E01.mkv"), "und", 0);
+        assert_eq!(p.to_string_lossy(), "/show/S01E01.und.0.vtt");
     }
 
     #[test]

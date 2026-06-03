@@ -20,6 +20,7 @@ export function Seg<T extends string>({
   size = "md",
   accent = false,
   className = "",
+  "aria-label": ariaLabel,
 }: {
   options: SegOption<T>[];
   value: T;
@@ -29,11 +30,15 @@ export function Seg<T extends string>({
   /// white wash. Use sparingly — e.g. a primary time-window selector.
   accent?: boolean;
   className?: string;
+  /// Accessible name for the button group. Pass the same text as the
+  /// visible label to the left so screen readers announce context.
+  "aria-label"?: string;
 }) {
   const pad = size === "sm" ? "px-2.5 py-1 text-[12px]" : "px-3 py-1.5 text-[13px]";
   return (
     <div
       role="group"
+      aria-label={ariaLabel}
       className={`inline-flex gap-1 rounded-md border border-white/10 bg-white/4 p-1 ${className}`}
     >
       {options.map((opt) => {

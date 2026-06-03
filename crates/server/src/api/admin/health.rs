@@ -107,12 +107,19 @@ pub async fn get(
     // anyway, and the typical case (most files present) iterates the
     // full 200 doing one stat per row — 200 stat calls on a container
     // mount is the dominant cost of this endpoint.
+    //
+    // `removed_at IS NULL` excludes files already soft-deleted by a
+    // previous verify run so they don't surface again as spurious hits.
+    // `ORDER BY RANDOM()` gives a uniform sample across the whole
+    // library rather than just the 50 most recently added rows, so an
+    // old disconnected drive is as likely to surface as a new one.
     let q_candidates = sqlx::query(
         "SELECT mf.id AS id, mf.path AS path, i.title AS item_title, e.title AS episode_title
          FROM media_files mf
          LEFT JOIN items i ON i.id = mf.item_id
          LEFT JOIN episodes e ON e.id = mf.episode_id
-         ORDER BY mf.id DESC
+         WHERE mf.removed_at IS NULL
+         ORDER BY RANDOM()
          LIMIT 50",
     )
     .fetch_all(pool);

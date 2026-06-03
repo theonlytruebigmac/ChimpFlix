@@ -23,7 +23,7 @@ export default async function AccountSettingsPage() {
       user={user}
       membership={{
         username: user.username,
-        roleLabel: user.role === "owner" ? "Owner" : "User",
+        roleLabel: user.role === "owner" ? "Owner" : user.role === "admin" ? "Admin" : "User",
         isOwner: user.role === "owner",
         joined: formatDate(user.created_at),
         previousSignIn,

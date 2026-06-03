@@ -84,8 +84,9 @@ impl AniListClient {
             Some(y) => json!({
                 "search": query,
                 "type": "ANIME",
-                "startDate_greater": format!("{}0101", y),
-                "startDate_lesser": format!("{}1231", y),
+                // FuzzyDateInt is an Int scalar (e.g. 20230101); must be numeric not a string.
+                "startDate_greater": y as i64 * 10000 + 101,
+                "startDate_lesser": y as i64 * 10000 + 1231,
             }),
             None => json!({
                 "search": query,

@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import {
   friendlyErrorMessage,
   items as itemsApi,
@@ -32,6 +33,9 @@ export function MergeIntoDialog({
   onClose: () => void;
   onMerged: (target: ItemDetail) => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = "merge-dialog-title";
+
   const [query, setQuery] = useState(detail.title);
   const [candidates, setCandidates] = useState<ListedItem[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -44,13 +48,8 @@ export function MergeIntoDialog({
   /// styling.
   const [pending, setPending] = useState<ListedItem | null>(null);
 
-  useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [onClose]);
+  // Trap keyboard focus inside the dialog; also handles Escape → onClose.
+  useFocusTrap(dialogRef, { onClose });
 
   // Initial search uses the item's own title so the operator sees
   // likely-duplicate candidates immediately (same library + same kind +
@@ -92,11 +91,9 @@ export function MergeIntoDialog({
       onClose();
     } catch (e) {
       setError(friendlyErrorMessage(e));
-      // Surface the error back on the candidate list so the operator
-      // can pick a different target or close — keep `pending` so the
-      // confirm pane stays in place when the failure is transient
-      // (DB busy, etc.) and they want to retry.
-      setPending(null);
+      // Keep `pending` so the confirm pane stays in place when the
+      // failure is transient (DB busy, etc.) and the operator wants
+      // to retry. The error banner above the pane shows the reason.
     } finally {
       setMerging(null);
     }
@@ -114,12 +111,16 @@ export function MergeIntoDialog({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         className="zf-modal-in w-full max-w-3xl overflow-hidden rounded-lg border border-white/10 bg-(--color-surface) shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
           <div>
-            <h2 className="text-lg font-semibold">Merge into…</h2>
+            <h2 id={titleId} className="text-lg font-semibold">Merge into…</h2>
             <p className="mt-0.5 text-xs text-white/55">
               Move files from <span className="text-white/85">{detail.title}</span>
               {detail.year != null && ` (${detail.year})`} into another item in

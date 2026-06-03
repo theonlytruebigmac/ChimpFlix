@@ -9,6 +9,7 @@ import {
   type ServerSettingsUpdate,
   type TotpEnforcement,
 } from "@/lib/chimpflix-api";
+import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
   initial: ServerSettings;
@@ -54,10 +55,11 @@ export function AdminGeneralForm({ initial, version, dataDir }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
   const [rerunBusy, setRerunBusy] = useState(false);
+  const [askRerun, setAskRerun] = useState(false);
   const router = useRouter();
 
   const dirtyFields: Record<string, boolean> = {
-    "Server name": serverName !== baseline.server_name,
+    "Server name": serverName.trim() !== baseline.server_name,
     "Public URL": (publicUrl || null) !== baseline.public_url,
     "Two-factor enforcement": totpEnforcement !== baseline.totp_enforcement,
     "Allow new sign-ups": allowSignups !== baseline.allow_signups,
@@ -72,7 +74,8 @@ export function AdminGeneralForm({ initial, version, dataDir }: Props) {
     setError(null);
     setSaveBusy(true);
     const patch: ServerSettingsUpdate = {};
-    if (serverName !== baseline.server_name) patch.server_name = serverName.trim();
+    const trimmedName = serverName.trim();
+    if (trimmedName !== baseline.server_name) patch.server_name = trimmedName;
     if ((publicUrl || null) !== baseline.public_url) {
       patch.public_url = publicUrl.trim() || null;
     }
@@ -88,7 +91,7 @@ export function AdminGeneralForm({ initial, version, dataDir }: Props) {
     try {
       await adminApi.settings.patch(patch);
       setBaseline({
-        server_name: serverName,
+        server_name: trimmedName,
         public_url: publicUrl.trim() || null,
         telemetry_opt_in: telemetry,
         allow_signups: allowSignups,
@@ -119,6 +122,7 @@ export function AdminGeneralForm({ initial, version, dataDir }: Props) {
       await adminApi.settings.patch({ setup_completed: false });
       router.push("/onboarding");
     } catch (e) {
+      setAskRerun(false);
       setError(friendlyErrorMessage(e));
     } finally {
       setRerunBusy(false);
@@ -341,7 +345,7 @@ export function AdminGeneralForm({ initial, version, dataDir }: Props) {
               <button
                 type="button"
                 className="cf-btn cf-sm"
-                onClick={rerunWizard}
+                onClick={() => setAskRerun(true)}
                 disabled={rerunBusy}
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -353,6 +357,17 @@ export function AdminGeneralForm({ initial, version, dataDir }: Props) {
           </div>
         </div>
       </div>
+
+      {askRerun && (
+        <ConfirmDialog
+          title="Re-run setup wizard?"
+          body="This will redirect all users to the onboarding screen until setup is completed again. Existing libraries, secrets, and settings are not affected."
+          confirmLabel="Re-run wizard"
+          busy={rerunBusy}
+          onConfirm={() => void rerunWizard()}
+          onCancel={() => setAskRerun(false)}
+        />
+      )}
 
       {/* ── sticky save bar ───────────────────────────────────────────── */}
       {dirtyCount > 0 && (

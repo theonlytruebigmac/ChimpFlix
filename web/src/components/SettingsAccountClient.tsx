@@ -54,7 +54,7 @@ export function SettingsAccountClient({
 
       {/* ── PROFILE ───────────────────────────────────────────────── */}
       {tab === "profile" && (
-        <section role="tabpanel" aria-label="Profile">
+        <section role="tabpanel" id="tab-panel-profile" aria-labelledby="tab-btn-profile">
           <SettingsProfileClient initial={user} isOwner={membership.isOwner} />
 
           <div className="cf-card">
@@ -113,7 +113,7 @@ export function SettingsAccountClient({
 
       {/* ── SECURITY ──────────────────────────────────────────────── */}
       {tab === "security" && (
-        <section role="tabpanel" aria-label="Security">
+        <section role="tabpanel" id="tab-panel-security" aria-labelledby="tab-btn-security">
           <div className="cf-card">
             <div className="cf-card-head">
               <div>
@@ -147,7 +147,7 @@ export function SettingsAccountClient({
 
       {/* ── SESSIONS ──────────────────────────────────────────────── */}
       {tab === "sessions" && (
-        <section role="tabpanel" aria-label="Sessions">
+        <section role="tabpanel" id="tab-panel-sessions" aria-labelledby="tab-btn-sessions">
           <div className="cf-card">
             <div className="cf-card-head">
               <div>
@@ -179,7 +179,7 @@ export function SettingsAccountClient({
 
       {/* ── CONNECTIONS ───────────────────────────────────────────── */}
       {tab === "connections" && (
-        <section role="tabpanel" aria-label="Connections">
+        <section role="tabpanel" id="tab-panel-connections" aria-labelledby="tab-btn-connections">
           <div className="cf-card">
             <div className="cf-card-head">
               <div>
@@ -225,7 +225,9 @@ function TabButton({
     <button
       type="button"
       role="tab"
+      id={`tab-btn-${id}`}
       aria-selected={on}
+      aria-controls={`tab-panel-${id}`}
       className={"cf-tab" + (on ? " cf-on" : "")}
       onClick={() => onSelect(id)}
     >

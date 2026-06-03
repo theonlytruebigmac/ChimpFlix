@@ -9,7 +9,7 @@ use std::env;
 use anyhow::{Context, Result, bail};
 use chimpflix_common::{EncryptedBlob, Vault};
 use chimpflix_library::{NewAuditEntry, queries};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, Transaction};
 
 use crate::cli;
 
@@ -38,9 +38,14 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
         .await
         .context("open library DB")?;
 
-    let secrets = rotate_secrets(&pool, &old_vault, &new_vault).await?;
-    let webhooks = rotate_webhooks(&pool, &old_vault, &new_vault).await?;
-    let totps = rotate_user_totp(&pool, &old_vault, &new_vault).await?;
+    // All three tables are rotated inside a single transaction so a failure in
+    // any sub-step rolls back everything — preventing a mixed-key state where
+    // some tables have been re-encrypted with the new key and others have not.
+    let mut tx = pool.begin().await.context("begin vault rotation tx")?;
+    let secrets = rotate_secrets(&mut tx, &old_vault, &new_vault).await?;
+    let webhooks = rotate_webhooks(&mut tx, &old_vault, &new_vault).await?;
+    let totps = rotate_user_totp(&mut tx, &old_vault, &new_vault).await?;
+    tx.commit().await.context("commit vault rotation tx")?;
 
     let payload = serde_json::json!({
         "source": "cli",
@@ -72,13 +77,12 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn rotate_secrets(pool: &SqlitePool, old: &Vault, new: &Vault) -> Result<usize> {
+async fn rotate_secrets(tx: &mut Transaction<'_, Sqlite>, old: &Vault, new: &Vault) -> Result<usize> {
     let rows = sqlx::query("SELECT name, value_enc, nonce FROM secrets WHERE nonce IS NOT NULL")
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .context("scan secrets")?;
 
-    let mut tx = pool.begin().await.context("begin secrets tx")?;
     let mut count = 0;
     for row in rows {
         let name: String = row.try_get("name")?;
@@ -97,25 +101,23 @@ async fn rotate_secrets(pool: &SqlitePool, old: &Vault, new: &Vault) -> Result<u
             .bind(blob.value)
             .bind(blob.nonce)
             .bind(&name)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .with_context(|| format!("UPDATE secrets.{name}"))?;
         count += 1;
     }
-    tx.commit().await.context("commit secrets tx")?;
     Ok(count)
 }
 
-async fn rotate_webhooks(pool: &SqlitePool, old: &Vault, new: &Vault) -> Result<usize> {
+async fn rotate_webhooks(tx: &mut Transaction<'_, Sqlite>, old: &Vault, new: &Vault) -> Result<usize> {
     let rows = sqlx::query(
         "SELECT id, secret_enc, secret_nonce FROM webhooks
          WHERE secret_enc IS NOT NULL AND secret_nonce IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await
     .context("scan webhooks")?;
 
-    let mut tx = pool.begin().await.context("begin webhooks tx")?;
     let mut count = 0;
     for row in rows {
         let id: i64 = row.try_get("id")?;
@@ -134,25 +136,23 @@ async fn rotate_webhooks(pool: &SqlitePool, old: &Vault, new: &Vault) -> Result<
             .bind(blob.value)
             .bind(blob.nonce)
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .with_context(|| format!("UPDATE webhooks.id={id}"))?;
         count += 1;
     }
-    tx.commit().await.context("commit webhooks tx")?;
     Ok(count)
 }
 
-async fn rotate_user_totp(pool: &SqlitePool, old: &Vault, new: &Vault) -> Result<usize> {
+async fn rotate_user_totp(tx: &mut Transaction<'_, Sqlite>, old: &Vault, new: &Vault) -> Result<usize> {
     let rows = sqlx::query(
         "SELECT user_id, secret_enc, secret_nonce FROM user_totp
          WHERE secret_nonce IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await
     .context("scan user_totp")?;
 
-    let mut tx = pool.begin().await.context("begin user_totp tx")?;
     let mut count = 0;
     for row in rows {
         let user_id: i64 = row.try_get("user_id")?;
@@ -171,11 +171,10 @@ async fn rotate_user_totp(pool: &SqlitePool, old: &Vault, new: &Vault) -> Result
             .bind(blob.value)
             .bind(blob.nonce)
             .bind(user_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .with_context(|| format!("UPDATE user_totp.user_id={user_id}"))?;
         count += 1;
     }
-    tx.commit().await.context("commit user_totp tx")?;
     Ok(count)
 }

@@ -297,7 +297,7 @@ async function resolveEpisode(
   } catch {
     seasonEpisodesRaw = undefined;
   }
-  const next = await findNextEpisode(episode, seasonEpisodesRaw);
+  const next = await findNextEpisode(episode, seasonEpisodesRaw, show.seasons);
   const seasonEpisodes: EpisodeSibling[] | undefined = seasonEpisodesRaw?.map(
     (e) => ({
       ratingKey: `e${e.id}`,
@@ -348,9 +348,12 @@ async function resolveEpisode(
 /// Walks within the current season first, then falls back to the first
 /// episode of the next season. Returns null at the end of the series.
 /// Best-effort: any error swallows and the player just hides the button.
+/// `knownSeasons` is the season list already fetched by the caller (avoids
+/// a redundant itemsApi.get when the show was already loaded upstream).
 async function findNextEpisode(
   current: EpisodeDetail,
   seasonEpisodes: EpisodeListed[] | undefined,
+  knownSeasons?: SeasonSummary[],
 ): Promise<{ id: number; title: string; thumb?: string } | null> {
   try {
     if (seasonEpisodes) {
@@ -372,10 +375,11 @@ async function findNextEpisode(
         }
       }
     }
-    const show = await itemsApi.get(current.show_id);
-    const sIdx = show.seasons.findIndex((s) => s.id === current.season_id);
-    if (sIdx >= 0 && sIdx + 1 < show.seasons.length) {
-      const nextSeason = await seasonsApi.get(show.seasons[sIdx + 1].id);
+    // Use already-fetched seasons when available; fall back to an extra fetch.
+    const seasons = knownSeasons ?? (await itemsApi.get(current.show_id)).seasons;
+    const sIdx = seasons.findIndex((s) => s.id === current.season_id);
+    if (sIdx >= 0 && sIdx + 1 < seasons.length) {
+      const nextSeason = await seasonsApi.get(seasons[sIdx + 1].id);
       // First DOWNLOADED episode of the next season — an undownloaded
       // premiere placeholder must not become the Next target.
       const first = nextSeason.episodes.find((e) => episodeHasFile(e));

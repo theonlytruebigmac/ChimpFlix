@@ -67,6 +67,9 @@ const OP_LABELS: Record<OpKey, string> = {
 };
 
 interface UICondition {
+  /// Stable key assigned at creation so React can reconcile correctly
+  /// when conditions are removed or reordered.
+  id: string;
   field: FieldKey;
   op: OpKey;
   /// Stored as string for the input field; coerced at serialize time.
@@ -115,7 +118,7 @@ export function SmartRuleBuilder({ initialJson, onChange }: Props) {
       ...r,
       conditions: [
         ...r.conditions,
-        { field: "kind" as FieldKey, op: "eq" as OpKey, value: "movie" },
+        { id: crypto.randomUUID(), field: "kind" as FieldKey, op: "eq" as OpKey, value: "movie" },
       ],
     }));
   }
@@ -150,7 +153,7 @@ export function SmartRuleBuilder({ initialJson, onChange }: Props) {
       <ul className="space-y-2">
         {rule.conditions.map((c, idx) => (
           <li
-            key={idx}
+            key={c.id}
             className="flex flex-wrap items-center gap-2 rounded border border-white/10 bg-black/30 p-2"
           >
             <ConditionRow
@@ -313,7 +316,7 @@ function ValueInput({
 function parseRule(json: string): UIRule {
   const fallback: UIRule = {
     operator: "and",
-    conditions: [{ field: "kind", op: "eq", value: "movie" }],
+    conditions: [{ id: crypto.randomUUID(), field: "kind", op: "eq", value: "movie" }],
   };
   if (!json.trim()) return fallback;
   try {
@@ -326,12 +329,20 @@ function parseRule(json: string): UIRule {
       .filter((c): c is Record<string, unknown> => typeof c === "object" && c !== null)
       .map((c) => {
         const field = String(c.field ?? "kind") as FieldKey;
-        const op = String(c.op ?? "eq") as OpKey;
+        const rawOp = String(c.op ?? "eq") as OpKey;
+        // Normalize op to the field's allowed set so state is always valid;
+        // without this, a persisted op that drifted from the current vocab
+        // would stay in state and get re-serialized as-is.
+        const def = FIELD_DEFS[field as FieldKey];
+        const allowedOps = (def as { ops: readonly OpKey[] } | undefined)?.ops;
+        const op: OpKey =
+          allowedOps?.includes(rawOp) ? rawOp : (allowedOps?.[0] ?? "eq");
         const v = c.value;
         // `between` arrives as a 2-element array; everything else is
         // a scalar. Normalize for the form.
         if (Array.isArray(v)) {
           return {
+            id: crypto.randomUUID(),
             field,
             op,
             value: v[0] != null ? String(v[0]) : "",
@@ -339,6 +350,7 @@ function parseRule(json: string): UIRule {
           };
         }
         return {
+          id: crypto.randomUUID(),
           field,
           op,
           value: v != null ? String(v) : "",

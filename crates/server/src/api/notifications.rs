@@ -10,6 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chimpflix_library::{Notification, queries};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
@@ -43,14 +44,47 @@ pub async fn list(
 ) -> Result<Json<NotificationsListResponse>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
-    let notifications = queries::list_notifications(&state.pool, user.id, limit, offset)
-        .await
-        .map_err(ApiError::Internal)?;
-    let unread = queries::count_unread_notifications(&state.pool, user.id)
-        .await
-        .map_err(ApiError::Internal)?;
-    let total = queries::count_notifications(&state.pool, user.id)
-        .await
+    // Single query so the page rows, unread count, and total are all from
+    // the same SQLite snapshot — no risk of the badge count drifting from
+    // the list if a notification arrives or is marked-read between calls.
+    let rows = sqlx::query(
+        "SELECT n.*,
+                (SELECT COUNT(*) FROM notifications WHERE user_id = ?) AS total,
+                (SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL) AS unread
+           FROM notifications n
+          WHERE n.user_id = ?
+          ORDER BY n.created_at DESC
+          LIMIT ? OFFSET ?",
+    )
+    .bind(user.id)
+    .bind(user.id)
+    .bind(user.id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let (total, unread) = rows
+        .first()
+        .map(|r| {
+            let t: i64 = r.try_get("total").unwrap_or(0);
+            let u: i64 = r.try_get("unread").unwrap_or(0);
+            (t, u)
+        })
+        .unwrap_or((0, 0));
+    let notifications = rows
+        .iter()
+        .map(|r| -> anyhow::Result<Notification> {
+            Ok(Notification {
+                id: r.try_get("id")?,
+                user_id: r.try_get("user_id")?,
+                kind: r.try_get("kind")?,
+                payload_json: r.try_get("payload_json")?,
+                read_at: r.try_get::<Option<i64>, _>("read_at").ok().flatten(),
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
         .map_err(ApiError::Internal)?;
     Ok(Json(NotificationsListResponse {
         notifications,

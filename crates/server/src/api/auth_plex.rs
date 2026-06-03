@@ -188,8 +188,15 @@ pub async fn poll(
     headers: HeaderMap,
     Json(input): Json<PollInput>,
 ) -> Result<axum::response::Response, ApiError> {
-    let Some(pending) = state.plex_pin_lookup(&input.pin_handle).await else {
-        return Ok(Json(PollResponse::UnknownHandle).into_response());
+    // Atomic take: remove the entry under the lock so that a second
+    // concurrent request for the same pin_handle finds nothing and
+    // returns UnknownHandle, preventing duplicate user creation.
+    let pending = {
+        let mut cache = state.plex_pin_cache.lock().await;
+        match cache.remove(&input.pin_handle) {
+            Some(p) if p.expires_at > std::time::Instant::now() => p,
+            _ => return Ok(Json(PollResponse::UnknownHandle).into_response()),
+        }
     };
 
     let client = state
@@ -201,9 +208,14 @@ pub async fn poll(
         .await
         .map_err(ApiError::Internal)?;
     let token = match result {
-        PinPollResult::Pending => return Ok(Json(PollResponse::Pending).into_response()),
+        // Pin still pending: put the entry back so the next poll can
+        // try again (only this request consumed the slot).
+        PinPollResult::Pending => {
+            state.plex_pin_cache.lock().await.insert(input.pin_handle, pending);
+            return Ok(Json(PollResponse::Pending).into_response());
+        }
         PinPollResult::Expired => {
-            state.plex_pin_forget(&input.pin_handle).await;
+            // Entry was already removed above; nothing to forget.
             return Ok(Json(PollResponse::Expired).into_response());
         }
         PinPollResult::Ready(t) => t,
@@ -211,11 +223,12 @@ pub async fn poll(
 
     // We have a Plex token; resolve it to the underlying identity
     // exactly once and throw the token away.
+    // The handle was already removed from the cache at the top of this
+    // function, so no separate plex_pin_forget call is needed here.
     let plex_user = client
         .fetch_user(&token)
         .await
         .map_err(ApiError::Internal)?;
-    state.plex_pin_forget(&input.pin_handle).await;
 
     let external_id = plex_user.id.to_string();
     match pending.intent {
@@ -244,7 +257,7 @@ pub async fn poll(
             if current.id != user_id {
                 return Err(ApiError::Unauthorized);
             }
-            finalize_link(&state, &headers, user_id, &plex_user, &external_id).await
+            finalize_link(&state, &headers, Some(ip), user_id, &plex_user, &external_id).await
         }
     }
 }
@@ -373,7 +386,7 @@ async fn finalize_login(
             target_kind: Some("user".into()),
             target_id: Some(user.id.to_string()),
             payload_json: None,
-            ip: None,
+            ip: ip.map(|a| a.to_string()),
             user_agent,
         },
     )
@@ -415,15 +428,14 @@ async fn finalize_signup(
     // Refuse if this Plex identity is already linked to a different
     // ChimpFlix account — preserves the (provider, external_id)
     // uniqueness invariant cleanly instead of letting the INSERT 500.
-    if let Some((existing, _)) =
-        queries::find_user_by_provider(&state.pool, PLEX_PROVIDER, external_id)
-            .await
-            .map_err(ApiError::Internal)?
+    if queries::find_user_by_provider(&state.pool, PLEX_PROVIDER, external_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .is_some()
     {
-        return Err(ApiError::Conflict(format!(
-            "this Plex account is already linked to user '{}'",
-            existing.username
-        )));
+        return Err(ApiError::Conflict(
+            "this Plex account is already linked to another ChimpFlix account".into(),
+        ));
     }
 
     let username = allocate_username_from_external(&state.pool, &plex_user.username)
@@ -471,7 +483,7 @@ async fn finalize_signup(
             target_kind: Some("user".into()),
             target_id: Some(user.id.to_string()),
             payload_json: None,
-            ip: None,
+            ip: ip.map(|a| a.to_string()),
             user_agent,
         },
     )
@@ -487,6 +499,7 @@ async fn finalize_signup(
 async fn finalize_link(
     state: &AppState,
     headers: &HeaderMap,
+    ip: Option<std::net::IpAddr>,
     user_id: i64,
     plex_user: &PlexUser,
     external_id: &str,
@@ -500,10 +513,9 @@ async fn finalize_link(
             .map_err(ApiError::Internal)?
     {
         if existing.id != user_id {
-            return Err(ApiError::Conflict(format!(
-                "this Plex account is already linked to user '{}'",
-                existing.username
-            )));
+            return Err(ApiError::Conflict(
+                "this Plex account is already linked to another ChimpFlix account".into(),
+            ));
         }
         // Idempotent: linking the same account again is a no-op.
         return Ok(Json(PollResponse::Linked).into_response());
@@ -537,7 +549,7 @@ async fn finalize_link(
             target_kind: Some("user".into()),
             target_id: Some(user_id.to_string()),
             payload_json: None,
-            ip: None,
+            ip: ip.map(|a| a.to_string()),
             user_agent,
         },
     )

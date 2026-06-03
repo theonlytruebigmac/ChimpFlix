@@ -102,8 +102,11 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
 
     let now = chimpflix_common::now_ms();
     sqlx::query(
+        // COALESCE keeps the previously stored mtime when the filesystem
+        // can't supply one (NFS/CIFS/Docker volumes with mtime suppression),
+        // so the skip-guard stays effective on future runs.
         "UPDATE items
-         SET extras_scanned_at = ?, extras_dir_mtime = ?, updated_at = ?
+         SET extras_scanned_at = ?, extras_dir_mtime = COALESCE(?, extras_dir_mtime), updated_at = ?
          WHERE id = ?",
     )
     .bind(now)

@@ -172,6 +172,7 @@ export function AdminTranscoderClient({
     baseline.transcoder_gpu_device,
   );
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   // Detected hardware is server-rendered into the `capabilities` prop,
   // but the "Re-probe" button can refresh it at runtime without a page
   // reload — so the displayed chips read from this local copy.
@@ -306,6 +307,9 @@ export function AdminTranscoderClient({
   const dirtyCount = dirtyLabels.length;
 
   async function saveSettings() {
+    // Guard against concurrent saves from a double-click.
+    if (saving) return;
+    setSaving(true);
     setError(null);
     const patch = {
       transcoder_hw_accel: hwAccel,
@@ -325,27 +329,51 @@ export function AdminTranscoderClient({
       transcoder_gpu_device: gpuDevice,
     };
     try {
-      await adminApi.settings.patch(patch);
+      // Capture the server response so the baseline reflects server-persisted
+      // values (the backend may clamp or normalize individual fields).
+      const { settings: saved } = await adminApi.settings.patch(patch);
+      const savedHevc = (saved.transcoder_hevc_encoding_mode ?? "off") as HevcMode;
+      const savedGpu = saved.transcoder_gpu_device ?? "auto";
       setBaseline({
-        transcoder_hw_accel: hwAccel,
-        transcoder_max_concurrent: maxConcurrent,
-        transcoder_max_cpu_concurrent: maxCpuConcurrent,
+        transcoder_hw_accel: saved.transcoder_hw_accel,
+        transcoder_max_concurrent: saved.transcoder_max_concurrent,
+        transcoder_max_cpu_concurrent: saved.transcoder_max_cpu_concurrent,
         transcoder_quality_ceiling_kbps:
-          ceiling === "" ? null : Number(ceiling),
-        transcoder_encoder_preset: encoderPreset,
-        transcoder_hw_strictness: hwStrictness,
-        transcoder_background_preset: backgroundPreset,
-        transcoder_max_background_concurrent: maxBackgroundConcurrent,
-        job_workers: jobWorkers,
-        transcoder_hdr_tonemap_enabled: tonemapEnabled,
-        transcoder_hdr_tonemap_algo: tonemapAlgo,
-        transcoder_burn_ass_subtitles: burnAssSubtitles,
-        transcoder_two_pass_loudnorm: twoPassLoudnorm,
-        transcoder_hevc_encoding_mode: hevcMode,
-        transcoder_gpu_device: gpuDevice,
+          saved.transcoder_quality_ceiling_kbps ?? null,
+        transcoder_encoder_preset: saved.transcoder_encoder_preset,
+        transcoder_hw_strictness: saved.transcoder_hw_strictness,
+        transcoder_background_preset: saved.transcoder_background_preset,
+        transcoder_max_background_concurrent:
+          saved.transcoder_max_background_concurrent,
+        job_workers: saved.job_workers,
+        transcoder_hdr_tonemap_enabled: saved.transcoder_hdr_tonemap_enabled,
+        transcoder_hdr_tonemap_algo: saved.transcoder_hdr_tonemap_algo,
+        transcoder_burn_ass_subtitles: saved.transcoder_burn_ass_subtitles,
+        transcoder_two_pass_loudnorm: saved.transcoder_two_pass_loudnorm,
+        transcoder_hevc_encoding_mode: savedHevc,
+        transcoder_gpu_device: savedGpu,
       });
+      // Sync control state from server-accepted values so UI reflects what
+      // was actually stored (e.g. if the server clamped a numeric field).
+      setHwAccel(saved.transcoder_hw_accel);
+      setMaxConcurrent(saved.transcoder_max_concurrent);
+      setMaxCpuConcurrent(saved.transcoder_max_cpu_concurrent);
+      setCeiling(saved.transcoder_quality_ceiling_kbps ?? "");
+      setEncoderPreset(saved.transcoder_encoder_preset);
+      setHwStrictness(saved.transcoder_hw_strictness);
+      setBackgroundPreset(saved.transcoder_background_preset);
+      setMaxBackgroundConcurrent(saved.transcoder_max_background_concurrent);
+      setJobWorkers(saved.job_workers);
+      setTonemapEnabled(saved.transcoder_hdr_tonemap_enabled);
+      setTonemapAlgo(saved.transcoder_hdr_tonemap_algo);
+      setBurnAssSubtitles(saved.transcoder_burn_ass_subtitles);
+      setTwoPassLoudnorm(saved.transcoder_two_pass_loudnorm);
+      setHevcMode(savedHevc);
+      setGpuDevice(savedGpu);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -965,6 +993,7 @@ export function AdminTranscoderClient({
               type="button"
               className="cf-btn cf-ghost cf-sm"
               onClick={discardChanges}
+              disabled={saving}
             >
               Discard
             </button>
@@ -972,8 +1001,9 @@ export function AdminTranscoderClient({
               type="button"
               className="cf-btn cf-primary cf-sm"
               onClick={saveSettings}
+              disabled={saving}
             >
-              Save changes
+              {saving ? "Saving…" : "Save changes"}
             </button>
           </div>
         </div>

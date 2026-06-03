@@ -64,6 +64,21 @@ pub fn admin_limiter() -> Arc<IpLimiter> {
     Arc::new(RateLimiter::keyed(quota))
 }
 
+/// Per-IP limiter for the Plex OAuth **poll** endpoint. This is a device-
+/// flow poll a legitimate client hits roughly once a second while the user
+/// authorizes the PIN, so it can't share the tight `auth_limiter` bucket
+/// (that would 429 a normal login). 120/min with a burst of 20 sustains
+/// ~1 poll/sec (refill is 2/sec) with headroom for a couple of concurrent
+/// flows, while still capping an unauthenticated client from using poll as
+/// an unbounded compute sink. PIN *creation* (`/auth/plex/start`) stays on
+/// the strict `auth_limiter` since that's the cache-growth / Plex-quota
+/// abuse vector.
+pub fn plex_poll_limiter() -> Arc<IpLimiter> {
+    let quota =
+        Quota::per_minute(NonZeroU32::new(120).unwrap()).allow_burst(NonZeroU32::new(20).unwrap());
+    Arc::new(RateLimiter::keyed(quota))
+}
+
 /// Per-email password-reset limiter: 3 requests / hour per address with
 /// burst of 1. Tight on purpose — a legitimate human resets at most a
 /// couple of times per hour even when troubleshooting; an attacker
@@ -131,6 +146,13 @@ fn rate_limited_response(message: &str, retry_after_s: u64) -> Response {
 // Per-identity attempt tracker (for login lockouts).
 // ---------------------------------------------------------------------------
 
+/// Maximum number of distinct keys the tracker will hold at once.
+/// Exceeding this limit triggers a sweep of expired entries before any
+/// new key is admitted, and if the map is still full the new entry is
+/// silently dropped (fail-open). This caps memory at roughly 100k * ~80B
+/// ≈ 8 MB for the worst-case synthetic-username flood across many IPs.
+const MAX_TRACKER_ENTRIES: usize = 100_000;
+
 /// Tracks failed attempts against a specific key (typically a username
 /// normalized to lowercase). Used by the login handler — NOT exposed
 /// as a middleware because the handler needs to record success/failure
@@ -169,6 +191,20 @@ impl AttemptTracker {
 
     pub async fn record_failure(&self, key: &str) {
         let mut guard = self.inner.write().await;
+        // If we're at the size cap and this key isn't already tracked,
+        // sweep expired entries first to reclaim space from old lockouts.
+        // If still full after the sweep, drop the new entry (fail-open)
+        // rather than growing the map unboundedly under a synthetic-username
+        // flood across many IPs.
+        if guard.len() >= MAX_TRACKER_ENTRIES && !guard.contains_key(key) {
+            let now = Instant::now();
+            guard.retain(|_, v| {
+                v.locked_until.map_or(true, |until| until > now)
+            });
+            if guard.len() >= MAX_TRACKER_ENTRIES {
+                return;
+            }
+        }
         let entry = guard.entry(key.to_owned()).or_insert(AttemptState {
             failures: 0,
             locked_until: None,

@@ -10,7 +10,8 @@ import { formatDateTime } from "@/lib/format";
 
 export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[] }) {
   const [sessions, setSessions] = useState(initial);
-  const [busy, setBusy] = useState(false);
+  // Track which session id is currently being revoked (null = idle).
+  const [busyId, setBusyId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [askRevoke, setAskRevoke] = useState<AdminSessionSummary | null>(null);
   // Wall-clock at the time of the most recent fetch. Captured
@@ -31,7 +32,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
   }
 
   async function revoke(id: number) {
-    setBusy(true);
+    setBusyId(id);
     setError(null);
     try {
       await adminApi.sessions.revoke(id);
@@ -39,7 +40,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      setBusyId(null);
     }
   }
 
@@ -113,8 +114,11 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
             </thead>
             <tbody>
               {sessions.map((s) => {
-                const expiring =
-                  nowMs > 0 && s.expires_at - nowMs < 7 * 86_400_000;
+                const expired = nowMs > 0 && s.expires_at < nowMs;
+                const expiringSoon =
+                  !expired &&
+                  nowMs > 0 &&
+                  s.expires_at - nowMs < 7 * 86_400_000;
                 return (
                   <tr key={s.id}>
                     <td style={{ whiteSpace: "nowrap", fontWeight: 600 }}>
@@ -139,7 +143,11 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
                       {formatDateTime(s.last_seen_at)}
                     </td>
                     <td style={{ whiteSpace: "nowrap" }}>
-                      {expiring ? (
+                      {expired ? (
+                        <span className="cf-pill cf-err">
+                          {formatDateTime(s.expires_at)}
+                        </span>
+                      ) : expiringSoon ? (
                         <span className="cf-pill cf-warn">
                           {formatDateTime(s.expires_at)}
                         </span>
@@ -152,7 +160,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
                     <td className="cf-num">
                       <button
                         type="button"
-                        disabled={busy}
+                        disabled={busyId === s.id}
                         onClick={() => setAskRevoke(s)}
                         className="cf-btn cf-ghost cf-tiny"
                       >
@@ -180,7 +188,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
           }
           confirmLabel="Revoke session"
           destructive
-          busy={busy}
+          busy={busyId !== null}
           onConfirm={async () => {
             const target = askRevoke;
             await revoke(target.id);

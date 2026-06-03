@@ -94,6 +94,9 @@ export function SettingsLibrariesClient({ initial }: Props) {
     try {
       await librariesApi.delete(id);
       setMessage(`Removed "${name}".`);
+      // Close any panels that were open for the now-deleted library.
+      if (accessForId === id) setAccessForId(null);
+      if (scansForId === id) { setScansForId(null); setScans([]); }
       await refresh();
     } catch (e) {
       setMessage(

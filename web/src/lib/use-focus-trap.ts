@@ -15,7 +15,7 @@
 /// HotkeysOverlay, etc.) can adopt the same behaviour without
 /// duplicating the keyboard plumbing.
 
-import { useEffect, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 
 const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])';
@@ -48,6 +48,11 @@ export function useFocusTrap(
     restoreFocus = true,
     autoFocusFirst = true,
   } = options;
+  // Keep a ref to the latest onClose so the effect (which runs once)
+  // always calls the current callback even when the parent re-renders
+  // with a new function identity (e.g. inline arrow functions).
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; });
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const container = containerRef.current;
@@ -58,7 +63,7 @@ export function useFocusTrap(
 
     function onKey(e: KeyboardEvent) {
       if (closeOnEscape && e.key === "Escape") {
-        onClose?.();
+        onCloseRef.current?.();
         return;
       }
       if (e.key !== "Tab") return;

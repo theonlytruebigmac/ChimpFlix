@@ -287,9 +287,15 @@ pub async fn download(
         .await
         .map_err(|_| ApiError::NotFoundResource("backup"))?;
     let size = meta.len();
-    let file = fs::File::open(&path)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
+    let file = fs::File::open(&path).await.map_err(|e| {
+        // TOCTOU: the file may have been deleted (concurrent delete, or the
+        // 60-second cleanup task) between `metadata()` above and here.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::NotFoundResource("backup")
+        } else {
+            ApiError::Internal(e.into())
+        }
+    })?;
     let stream = ReaderStream::new(file);
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -320,9 +326,15 @@ pub async fn delete(
     if !path.exists() {
         return Err(ApiError::NotFoundResource("backup"));
     }
-    fs::remove_file(&path)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
+    fs::remove_file(&path).await.map_err(|e| {
+        // TOCTOU: another request may have deleted the file between
+        // the `exists()` check above and here — return 404 instead of 500.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::NotFoundResource("backup")
+        } else {
+            ApiError::Internal(e.into())
+        }
+    })?;
 
     let user_agent = headers
         .get(USER_AGENT)
@@ -504,9 +516,15 @@ pub async fn cancel_restore(
     if !staged.exists() {
         return Err(ApiError::NotFoundResource("backup"));
     }
-    fs::remove_file(&staged)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
+    fs::remove_file(&staged).await.map_err(|e| {
+        // TOCTOU: another concurrent cancel-restore may have already
+        // removed the file — return 404 instead of 500.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::NotFoundResource("backup")
+        } else {
+            ApiError::Internal(e.into())
+        }
+    })?;
 
     let user_agent = headers
         .get(USER_AGENT)

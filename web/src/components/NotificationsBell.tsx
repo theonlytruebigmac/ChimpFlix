@@ -26,6 +26,10 @@ export function NotificationsBell() {
   // during render (which is impure under strict mode).
   const [openedAtMs, setOpenedAtMs] = useState<number>(0);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  // Guards all async handlers against setState-after-unmount (same
+  // pattern as the `cancelled` flag used in the polling useEffect below).
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,16 +74,20 @@ export function NotificationsBell() {
   async function openAndLoad() {
     setOpen(true);
     setOpenedAtMs(Date.now());
-    if (items === null) {
+    // `!loading` prevents a second concurrent fetch when the popover is
+    // toggled open/closed/open quickly before the first request resolves.
+    if (items === null && !loading) {
       setLoading(true);
       try {
         const res = await authApi.notifications.list();
+        if (!mountedRef.current) return;
         setItems(res.notifications);
         setUnread(res.unread);
       } catch {
+        if (!mountedRef.current) return;
         setItems([]);
       } finally {
-        setLoading(false);
+        if (mountedRef.current) setLoading(false);
       }
     }
   }
@@ -87,6 +95,7 @@ export function NotificationsBell() {
   async function markAll() {
     try {
       await authApi.notifications.markAllRead();
+      if (!mountedRef.current) return;
       setItems((prev) =>
         prev?.map((n) => (n.read_at ? n : { ...n, read_at: Date.now() })) ??
         prev,
@@ -106,14 +115,18 @@ export function NotificationsBell() {
     try {
       await authApi.notifications.clearAll();
     } catch {
-      // Restore on failure so the user knows it didn't take.
-      setItems(prev);
+      // Restore on failure so the user knows it didn't take. Use a
+      // functional update so any concurrent markOne/markAll changes
+      // that arrived during the await aren't silently discarded.
+      if (mountedRef.current)
+        setItems((current) => (current !== null && current.length === 0 ? prev : current));
     }
   }
 
   async function markOne(id: number) {
     try {
       await authApi.notifications.markRead(id);
+      if (!mountedRef.current) return;
       setItems((prev) =>
         prev?.map((n) =>
           n.id === id && !n.read_at ? { ...n, read_at: Date.now() } : n,

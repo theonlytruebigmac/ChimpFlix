@@ -19,6 +19,7 @@ use crate::auth::OwnerAuth;
 use crate::state::AppState;
 
 const MAX_BULK_ITEMS: usize = 500;
+const TAG_NAME_MAX: usize = 100;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BulkRefreshRequest {
@@ -100,6 +101,11 @@ pub async fn add_tag(
     if trimmed.is_empty() {
         return Err(ApiError::validation("tag_name is empty"));
     }
+    if trimmed.chars().count() > TAG_NAME_MAX {
+        return Err(ApiError::validation(format!(
+            "tag_name exceeds {TAG_NAME_MAX} characters"
+        )));
+    }
     let mut ok = 0usize;
     let mut errors: Vec<BulkError> = Vec::new();
     for id in &req.item_ids {
@@ -133,6 +139,11 @@ pub async fn remove_tag(
     let trimmed = req.tag_name.trim().to_string();
     if trimmed.is_empty() {
         return Err(ApiError::validation("tag_name is empty"));
+    }
+    if trimmed.chars().count() > TAG_NAME_MAX {
+        return Err(ApiError::validation(format!(
+            "tag_name exceeds {TAG_NAME_MAX} characters"
+        )));
     }
     let mut ok = 0usize;
     let mut errors: Vec<BulkError> = Vec::new();

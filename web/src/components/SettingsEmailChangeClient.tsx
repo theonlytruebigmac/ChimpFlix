@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   auth as authApi,
@@ -12,12 +12,23 @@ interface Props {
   initial: User;
 }
 
+/// Exported wrapper — provides the required Suspense boundary so that the
+/// inner component can safely call useSearchParams() without opting the
+/// whole route segment out of static rendering (Next.js App Router rule).
+export function SettingsEmailChangeClient({ initial }: Props) {
+  return (
+    <Suspense fallback={null}>
+      <SettingsEmailChangeInner initial={initial} />
+    </Suspense>
+  );
+}
+
 /// Email change goes through a verification round-trip:
 ///   1. User enters new email + current password
 ///   2. Server emails a token to the NEW address
 ///   3. User clicks link → lands back here with ?verify_email=<token>
 ///   4. We POST it to /auth/me/email/confirm → user.email updates
-export function SettingsEmailChangeClient({ initial }: Props) {
+function SettingsEmailChangeInner({ initial }: Props) {
   const router = useRouter();
   const search = useSearchParams();
   const tokenFromQuery = (search.get("verify_email") ?? "").trim();

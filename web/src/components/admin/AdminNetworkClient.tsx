@@ -100,6 +100,16 @@ export function AdminNetworkClient({ initial }: { initial: NetworkSettings }) {
 
   async function save() {
     if (busy || dirtyCount === 0) return;
+    // Guard numeric fields — Number('') is 0, which bypasses the HTML min
+    // attribute (advisory only on type="number" with onClick-driven saves).
+    if (!Number.isFinite(reaperMs) || reaperMs < 5000) {
+      setError("Reaper threshold must be at least 5000 ms");
+      return;
+    }
+    if (!Number.isFinite(remoteCap) || remoteCap < 0) {
+      setError("Max remote streams must be 0 or greater");
+      return;
+    }
     setBusy(true);
     setError(null);
     setSaved(false);

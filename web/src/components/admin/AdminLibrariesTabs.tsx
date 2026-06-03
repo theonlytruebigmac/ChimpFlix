@@ -43,7 +43,7 @@ export function AdminLibrariesTabs({
 
   return (
     <>
-      <div className="cf-tabs" role="tablist">
+      <div className="cf-tabs" role="tablist" aria-label="Libraries">
         {TABS.map((t) => (
           <button
             key={t.id}

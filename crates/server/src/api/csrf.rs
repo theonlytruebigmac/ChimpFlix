@@ -10,11 +10,12 @@
 //!
 //! Policy (mutating methods only — POST/PUT/PATCH/DELETE):
 //!   1. **Auth endpoints** (`/auth/login`, `/auth/setup`, `/auth/register`,
-//!      `/auth/password-reset/*`, `/auth/2fa/login`) ALWAYS require a
-//!      same-origin Origin/Referer — these are unauthenticated by design
-//!      (no session cookie yet), and the audit flagged that the "no
-//!      cookie = skip" shortcut lets a malicious site log a victim into
-//!      an attacker-controlled account ("login CSRF").
+//!      `/auth/password-reset/*`, `/auth/2fa/login`, `/auth/plex/start`,
+//!      `/auth/plex/poll`) ALWAYS require a same-origin Origin/Referer —
+//!      these are unauthenticated by design (no session cookie yet), and
+//!      the audit flagged that the "no cookie = skip" shortcut lets a
+//!      malicious site log a victim into an attacker-controlled account
+//!      ("login CSRF").
 //!   2. For all other mutating routes:
 //!        - If no session cookie is present, skip (nothing to forge).
 //!        - If `Origin` is present, it MUST match the server's
@@ -41,6 +42,11 @@ use chimpflix_library::queries;
 /// session-establishing endpoints; a successful CSRF here logs the
 /// victim into the attacker's account or triggers a password reset on
 /// the attacker's chosen address.
+///
+/// NOTE: do NOT add authenticated endpoints here — strict paths also
+/// skip the double-submit CSRF token check (they have no companion
+/// cookie yet). Authenticated mutating routes receive the full
+/// token check automatically once a session cookie is present.
 const STRICT_CSRF_PATHS: &[&str] = &[
     "/api/v1/auth/login",
     "/api/v1/auth/setup",
@@ -48,8 +54,11 @@ const STRICT_CSRF_PATHS: &[&str] = &[
     "/api/v1/auth/password-reset/request",
     "/api/v1/auth/password-reset/confirm",
     "/api/v1/auth/2fa/login",
-    "/api/v1/auth/me/email/request-change",
-    "/api/v1/auth/me/email/confirm",
+    // Plex SSO: unauthenticated session-establishing endpoints. Without
+    // strict enforcement the "no session cookie = skip" shortcut would
+    // bypass all CSRF checks, enabling login-CSRF via Plex OAuth.
+    "/api/v1/auth/plex/start",
+    "/api/v1/auth/plex/poll",
 ];
 
 /// Path suffixes that skip the double-submit CSRF *token* check (but

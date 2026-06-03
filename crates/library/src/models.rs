@@ -794,6 +794,11 @@ pub struct Item {
     pub tagline: Option<String>,
     pub duration_ms: Option<i64>,
     pub rating_audience: Option<f64>,
+    /// Content/age rating (e.g. `PG-13`, `TV-MA`). Free-text from the
+    /// metadata provider or operator edit. Returned in GET responses so the
+    /// Edit Metadata dialog can pre-populate it; also drives the kids-safe
+    /// library filter.
+    pub rating_age: Option<String>,
     pub tmdb_id: Option<i64>,
     pub imdb_id: Option<String>,
     pub tvdb_id: Option<i64>,
@@ -837,6 +842,13 @@ impl Item {
             tagline: row.try_get("tagline")?,
             duration_ms: row.try_get("duration_ms")?,
             rating_audience: row.try_get("rating_audience")?,
+            // Defensive: not every Item-building SELECT lists `rating_age`
+            // explicitly (most use `i.*`); a missing column reads as None
+            // rather than erroring the whole row.
+            rating_age: row
+                .try_get::<Option<String>, _>("rating_age")
+                .ok()
+                .flatten(),
             tmdb_id: row.try_get("tmdb_id")?,
             imdb_id: row.try_get("imdb_id")?,
             tvdb_id: row.try_get::<Option<i64>, _>("tvdb_id").ok().flatten(),

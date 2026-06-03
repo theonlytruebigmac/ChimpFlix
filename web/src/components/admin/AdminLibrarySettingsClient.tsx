@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   admin as adminApi,
   type ServerSettings,
@@ -177,6 +177,13 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
   const [saving, setSaving] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
 
+  // Clear the "Saved." flash after 2.5 s; cleanup cancels if we unmount early.
+  useEffect(() => {
+    if (!savedFlash) return;
+    const id = window.setTimeout(() => setSavedFlash(false), 2500);
+    return () => window.clearTimeout(id);
+  }, [savedFlash]);
+
   const dirtyFields: Record<string, boolean> = {
     "Auto-scan": scanAuto !== baseline.scan_automatically,
     "Watcher polling":
@@ -265,7 +272,6 @@ export function AdminLibrarySettingsClient({ settings }: Props) {
         recently_added_days: recentlyAddedDays,
       });
       setSavedFlash(true);
-      window.setTimeout(() => setSavedFlash(false), 2500);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

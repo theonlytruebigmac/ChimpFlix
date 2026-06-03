@@ -48,8 +48,11 @@ export function SettingsTwoFactorClient() {
   // See SettingsProfileClient for rationale — track the auto-clear
   // timer so it can be cancelled on unmount.
   const messageTimerRef = useRef<number | null>(null);
+  // Guard setStage/setError in refresh() against firing after unmount.
+  const aliveRef = useRef(true);
   useEffect(() => {
     return () => {
+      aliveRef.current = false;
       if (messageTimerRef.current !== null) {
         window.clearTimeout(messageTimerRef.current);
         messageTimerRef.current = null;
@@ -60,9 +63,9 @@ export function SettingsTwoFactorClient() {
   async function refresh() {
     try {
       const status = await authApi.twoFactor.status();
-      setStage({ kind: "idle", status });
+      if (aliveRef.current) setStage({ kind: "idle", status });
     } catch (e) {
-      setError(parseError(e));
+      if (aliveRef.current) setError(parseError(e));
     }
   }
 
@@ -411,17 +414,8 @@ export function SettingsTwoFactorClient() {
 }
 
 function StatusLine({ status }: { status: TotpStatusResponse }) {
-  if (status.enforcement === "disabled") {
-    return (
-      <div className="cf-banner cf-info">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <circle cx="12" cy="12" r="9" />
-          <path d="M12 8v.5M12 11v5" />
-        </svg>
-        <div>2FA enrollment is disabled by the server administrator.</div>
-      </div>
-    );
-  }
+  // Check verified first: an already-enrolled user should always see their real
+  // "Active" state even if the admin has since disabled new enrollments.
   if (status.verified) {
     const low = status.unused_recovery_codes <= 2;
     return (
@@ -441,6 +435,18 @@ function StatusLine({ status }: { status: TotpStatusResponse }) {
           {status.unused_recovery_codes === 1 ? "code" : "codes"} remaining.
           {low && " Regenerate soon."}
         </div>
+      </div>
+    );
+  }
+  // Unenrolled user — show the enrollment-disabled banner before the enroll form.
+  if (status.enforcement === "disabled") {
+    return (
+      <div className="cf-banner cf-info">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 8v.5M12 11v5" />
+        </svg>
+        <div>2FA enrollment is disabled by the server administrator.</div>
       </div>
     );
   }

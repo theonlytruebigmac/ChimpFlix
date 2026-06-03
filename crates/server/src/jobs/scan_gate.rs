@@ -119,9 +119,20 @@ pub struct ScanGateGuard {
 impl Drop for ScanGateGuard {
     fn drop(&mut self) {
         let gate = Arc::clone(&self.gate);
-        tokio::spawn(async move {
-            gate.release().await;
-        });
+        // Guard against drop outside a tokio runtime (e.g. sync tests or
+        // post-shutdown cleanup). If no runtime is live, skip the release
+        // rather than panic; the counter will be stale but the process is
+        // typically exiting or the gate is about to be re-created anyway.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                gate.release().await;
+            });
+        } else {
+            tracing::warn!(
+                "ScanGateGuard dropped outside a tokio runtime; \
+                 gate counter was not decremented"
+            );
+        }
     }
 }
 

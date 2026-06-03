@@ -24,11 +24,23 @@ const OS_BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
 const OS_API_KEY_HEADER: &str = "Api-Key";
 
 /// Credentials triple packed into the vault slot's value field.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct OpenSubtitlesCreds {
     pub api_key: String,
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for OpenSubtitlesCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact sensitive fields to prevent accidental exposure via
+        // tracing, panic messages, or log-shipped JSON.
+        f.debug_struct("OpenSubtitlesCreds")
+            .field("api_key", &"***")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 impl OpenSubtitlesCreds {
@@ -150,7 +162,11 @@ impl OpenSubtitlesClient {
             );
             bail!("OpenSubtitles search returned {status}");
         }
-        let raw: SearchResponse = resp.json().await.context("parse OpenSubtitles JSON")?;
+        // Bounded read: cap the response body so a hostile/huge response
+        // can't blow up memory. Mirrors AniList/TVMaze/OMDb.
+        let raw: SearchResponse =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "OpenSubtitles search")
+                .await?;
         Ok(raw
             .data
             .into_iter()
@@ -173,31 +189,50 @@ impl OpenSubtitlesClient {
     /// Two-stage download: ask /download for a one-time link, then HTTP
     /// GET it. The link expires quickly so we don't bother caching.
     pub async fn download(&self, file_id: i64) -> Result<Vec<u8>> {
-        let token = self.token().await?;
         let url = format!("{}/download", self.base_url);
         let body = serde_json::json!({ "file_id": file_id });
-        let resp = self
-            .http
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        if status.as_u16() == 401 {
-            // Stale token; drop and retry once.
-            let mut guard = self.token.lock().await;
-            *guard = None;
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "OpenSubtitles /download returned {status}: {}",
-                body.chars().take(200).collect::<String>()
-            );
-        }
-        let link: DownloadResponse = resp.json().await.context("parse download response")?;
+
+        // Retry once on 401: clear the stale cached token and re-login before
+        // the second attempt. `attempt` caps retries so we don't loop forever.
+        let mut attempt = 0u8;
+        let link: DownloadResponse = loop {
+            let token = self.token().await?;
+            let resp = self
+                .http
+                .post(&url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("POST {url}"))?;
+            let status = resp.status();
+            if status.as_u16() == 401 && attempt == 0 {
+                // Stale token; clear it and retry once with a fresh login.
+                let mut guard = self.token.lock().await;
+                *guard = None;
+                drop(guard);
+                attempt += 1;
+                continue;
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                bail!(
+                    "OpenSubtitles /download returned {status}: {}",
+                    body.chars().take(200).collect::<String>()
+                );
+            }
+            break crate::http::bounded_json(
+                resp,
+                crate::http::DEFAULT_METADATA_BYTES,
+                "OpenSubtitles download",
+            )
+            .await?;
+        };
+        // Guard against a poisoned /download response pointing at an internal
+        // address (SSRF via DNS hijack / compromised API). Require https and
+        // restrict the host to known OpenSubtitles CDN domains.
+        validate_download_link(&link.link)
+            .with_context(|| format!("untrusted download link `{}`", link.link))?;
         let dl = self
             .http
             .get(&link.link)
@@ -284,11 +319,46 @@ impl OpenSubtitlesClient {
                 body.chars().take(200).collect::<String>()
             );
         }
-        let parsed: LoginResponse = resp.json().await.context("parse login response")?;
+        let parsed: LoginResponse =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "OpenSubtitles login")
+                .await?;
         parsed
             .token
             .ok_or_else(|| anyhow!("OpenSubtitles login returned no token"))
     }
+}
+
+/// Validate that a `/download` response link is safe to follow.
+///
+/// Accepts only `https://` URLs whose host is a suffix-match against
+/// the known OpenSubtitles delivery domains. Rejects `http://`,
+/// `file://`, IP literals, and any host not in the allowlist so that
+/// a DNS-hijacked or MITM'd API response cannot redirect us to an
+/// internal endpoint.
+fn validate_download_link(raw: &str) -> Result<()> {
+    let url = reqwest::Url::parse(raw).context("invalid url")?;
+    if url.scheme() != "https" {
+        bail!(
+            "scheme `{}` is not allowed; expected https",
+            url.scheme()
+        );
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("url has no host"))?;
+    // Reject bare IP literals — they bypass hostname allowlisting.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        bail!("IP literal `{host}` is not an allowed download host");
+    }
+    // Known delivery domains for OpenSubtitles (API + CDN).
+    const ALLOWED_SUFFIXES: &[&str] = &[".opensubtitles.com", ".opensubtitles.org"];
+    if !ALLOWED_SUFFIXES
+        .iter()
+        .any(|suffix| host == suffix.trim_start_matches('.') || host.ends_with(suffix))
+    {
+        bail!("host `{host}` is not in the OpenSubtitles download allowlist");
+    }
+    Ok(())
 }
 
 /// Best-effort heuristic that the payload is a text subtitle in one

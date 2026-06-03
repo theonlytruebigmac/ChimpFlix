@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { auth as authApi, type User } from "@/lib/chimpflix-api";
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -198,6 +198,11 @@ export function SettingsNotificationsClient({
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Cancel any pending "clear saved banner" timer on unmount to avoid a
+  // state update on an unmounted component.
+  const savedTimerRef = useRef<number | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current); }, []);
+
   const setKind = (id: string, patch: Partial<KindPref>) =>
     setKinds((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
 
@@ -224,7 +229,8 @@ export function SettingsNotificationsClient({
         timezone,
       });
       setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
+      if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current);
+      savedTimerRef.current = window.setTimeout(() => { savedTimerRef.current = null; setSaved(false); }, 2500);
     } catch (e) {
       setError(
         e instanceof Error ? e.message : "Couldn't save notification preferences.",

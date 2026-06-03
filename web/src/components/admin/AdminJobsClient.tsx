@@ -161,6 +161,9 @@ export function AdminJobsClient({
         offset: (page - 1) * pageSize,
       }),
     ]);
+    // Guard against setting state after the component unmounts (e.g. the
+    // user navigates away while a mutation is still in flight).
+    if (!aliveRef.current) return;
     setState({
       summary,
       jobs: list.jobs,

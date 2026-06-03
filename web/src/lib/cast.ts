@@ -89,7 +89,13 @@ function configureCastContext(framework: any): boolean {
 export function loadCastSdk(): Promise<boolean> {
   if (typeof window === "undefined") return Promise.resolve(false);
   const w = window as CastWindow;
-  if (castSdkLoad) return castSdkLoad;
+  if (castSdkLoad) {
+    // If the promise resolved false but the framework is now present (slow cold
+    // load that finished after our 15 s timeout), reset so the next caller
+    // retries rather than getting a permanently-stale false.
+    if (castFramework()) castSdkLoad = null;
+    else return castSdkLoad;
+  }
   castSdkLoad = new Promise<boolean>((resolve) => {
     // Hard ceiling on how long we'll wait for the SDK to phone home.
     // On Android Chrome installed as a standalone PWA, the SDK script

@@ -64,7 +64,13 @@ pub async fn serve_file(
         .ok_or(ApiError::NotFound)?;
     let bytes = tokio::fs::read(&row.file_path)
         .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::NotFound
+            } else {
+                ApiError::Internal(e.into())
+            }
+        })?;
 
     let lower = row.file_path.to_ascii_lowercase();
     let body_bytes = if lower.ends_with(".srt") {
@@ -74,10 +80,19 @@ pub async fn serve_file(
         bytes
     };
 
+    // ASS/SSA files are not WebVTT; give them their own MIME type so a JS
+    // renderer can distinguish the format rather than getting a mislabelled
+    // text/vtt payload.
+    let content_type = if lower.ends_with(".ass") || lower.ends_with(".ssa") {
+        "text/x-ssa; charset=utf-8"
+    } else {
+        "text/vtt; charset=utf-8"
+    };
+
     Ok((
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "public, max-age=31536000"),
         ],
         Body::from(body_bytes),
@@ -94,7 +109,11 @@ fn srt_to_vtt(srt: &str) -> String {
     let mut out = String::with_capacity(srt.len() + 16);
     out.push_str("WEBVTT\n\n");
     for line in srt.lines() {
-        if line.contains("-->") {
+        // Only treat a line as a timestamp line if it starts with a digit.
+        // This prevents corrupting cue-text that happens to contain '-->'.
+        let is_timestamp = line.trim_start().as_bytes().first().map_or(false, |b| b.is_ascii_digit())
+            && line.contains("-->");
+        if is_timestamp {
             out.push_str(&line.replace(',', "."));
         } else {
             out.push_str(line);
@@ -122,5 +141,16 @@ mod tests {
         let srt = "1\n00:00:01,000 --> 00:00:02,500\nHello, world.\n";
         let vtt = srt_to_vtt(srt);
         assert!(vtt.contains("Hello, world."));
+    }
+
+    #[test]
+    fn cue_text_containing_arrow_is_not_corrupted() {
+        // A cue-text line that happens to contain '-->' must not have its
+        // commas replaced, since it is not a timestamp line.
+        let srt = "1\n00:00:01,000 --> 00:00:02,500\nGo to Edit --> Preferences, then save.\n";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.contains("Go to Edit --> Preferences, then save."));
+        // The actual timestamp line should still be converted.
+        assert!(vtt.contains("00:00:01.000 --> 00:00:02.500"));
     }
 }

@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::http::header::USER_AGENT;
 use chimpflix_library::{NewAuditEntry, queries};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
@@ -305,7 +306,7 @@ pub async fn test(
             payload_json: req
                 .send_to
                 .as_deref()
-                .map(|addr| format!(r#"{{"send_to":"{addr}"}}"#)),
+                .map(|addr| serde_json::to_string(&json!({"send_to": addr})).unwrap_or_default()),
             ip: None,
             user_agent,
         },

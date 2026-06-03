@@ -49,9 +49,11 @@ export function AdminTasksTabs({
           return (
             <button
               key={t.id}
+              id={`tab-${t.id}`}
               type="button"
               role="tab"
               aria-selected={on}
+              aria-controls={`panel-${t.id}`}
               onClick={() => select(t.id)}
               className={`cf-tab${on ? " cf-on" : ""}`}
             >
@@ -63,10 +65,29 @@ export function AdminTasksTabs({
           );
         })}
       </div>
-      {tab === "overview" && overview}
-      {tab === "queue" && queue}
-      {tab === "activity" && activity}
-      {tab === "flow" && flow}
+      {/* Each panel satisfies the WAI-ARIA Tabs pattern: role, stable id, and
+          labelledby pointing back at its controlling tab button. Only the
+          active panel is mounted (one poller at a time). */}
+      {tab === "overview" && (
+        <div role="tabpanel" id="panel-overview" aria-labelledby="tab-overview">
+          {overview}
+        </div>
+      )}
+      {tab === "queue" && (
+        <div role="tabpanel" id="panel-queue" aria-labelledby="tab-queue">
+          {queue}
+        </div>
+      )}
+      {tab === "activity" && (
+        <div role="tabpanel" id="panel-activity" aria-labelledby="tab-activity">
+          {activity}
+        </div>
+      )}
+      {tab === "flow" && (
+        <div role="tabpanel" id="panel-flow" aria-labelledby="tab-flow">
+          {flow}
+        </div>
+      )}
     </div>
   );
 }

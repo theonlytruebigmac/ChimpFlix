@@ -21,6 +21,51 @@ fn user_agent_from(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Library-access gate for play-state **writes**.
+///
+/// The read endpoints (`on_deck`, `history`) already filter by
+/// `user_library_filter`; the write endpoints must enforce the same
+/// boundary or any signed-in user could scrobble / mark-watched /
+/// position-update an item in a library they hold no grant to (IDOR).
+///
+/// `allowed` is the user's accessible-library set, resolved once per
+/// request: `None` means the user is unrestricted (owner) and bypasses
+/// the check. For everyone else we resolve the target's owning library
+/// (`item_or_show_id` is an item or show id; `episode_id` walks
+/// episode→season→show→library) and require it to be in the set.
+///
+/// Returns `Ok(false)` when the target is missing or out of scope; callers
+/// surface that as 404 (not 403) so the endpoint never confirms the
+/// existence of items in libraries the user can't see.
+async fn target_allowed(
+    state: &AppState,
+    allowed: &Option<Vec<i64>>,
+    item_or_show_id: Option<i64>,
+    episode_id: Option<i64>,
+) -> Result<bool, ApiError> {
+    let Some(allowed) = allowed else {
+        return Ok(true);
+    };
+    let lib = if let Some(id) = item_or_show_id {
+        queries::item_library_id(&state.pool, id)
+            .await
+            .map_err(ApiError::Internal)?
+    } else if let Some(id) = episode_id {
+        queries::episode_library_id(&state.pool, id)
+            .await
+            .map_err(ApiError::Internal)?
+    } else {
+        None
+    };
+    Ok(matches!(lib, Some(l) if allowed.contains(&l)))
+}
+
+/// Maximum number of play-state updates accepted in a single POST request.
+/// The player emits a handful of position ticks per session; 100 is
+/// generous while still bounding the SQLite write-transaction length.
+/// See `HistoryQuery` for the analogous read-side page-size cap (200).
+const MAX_BATCH_UPDATES: usize = 100;
+
 pub async fn update(
     State(state): State<AppState>,
     user: AuthUser,
@@ -28,6 +73,11 @@ pub async fn update(
 ) -> Result<StatusCode, ApiError> {
     if batch.updates.is_empty() {
         return Err(ApiError::validation("updates must not be empty"));
+    }
+    if batch.updates.len() > MAX_BATCH_UPDATES {
+        return Err(ApiError::validation(format!(
+            "updates exceeds maximum batch size of {MAX_BATCH_UPDATES}",
+        )));
     }
     for (i, u) in batch.updates.iter().enumerate() {
         match (u.item_id, u.episode_id) {
@@ -42,6 +92,19 @@ pub async fn update(
                 )));
             }
             _ => {}
+        }
+    }
+    // IDOR guard: every target in the batch must live in a library this
+    // user can access. Resolve the access set once; owners (None) skip
+    // the per-update lookups entirely.
+    let allowed = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    if allowed.is_some() {
+        for u in &batch.updates {
+            if !target_allowed(&state, &allowed, u.item_id, u.episode_id).await? {
+                return Err(ApiError::NotFound);
+            }
         }
     }
     queries::apply_play_state_batch(&state.pool, user.id, batch).await?;
@@ -82,22 +145,48 @@ pub async fn set_watched(
         ));
     }
 
+    // IDOR guard — the target (item, episode, or whole show) must be in a
+    // library this user can access before we write any watched state.
+    let allowed = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    if !target_allowed(&state, &allowed, req.item_id.or(req.show_id), req.episode_id).await? {
+        return Err(ApiError::NotFound);
+    }
+
     if let Some(show_id) = req.show_id {
         let episode_ids =
             queries::set_all_episodes_watched_for_show(&state.pool, user.id, show_id, req.watched)
                 .await?;
-        // Fan out Trakt pushes — one per episode. Each call is
-        // already fire-and-forget; spawning N concurrent tasks is
-        // fine for typical season/show sizes. Same shape for the
-        // un-watch path; Trakt's /sync/history/remove accepts the
-        // same episode coordinates.
-        for ep_id in episode_ids {
-            if req.watched {
-                push_watched_to_trakt(state.clone(), user.id, None, Some(ep_id));
-            } else {
-                push_unwatched_to_trakt(state.clone(), user.id, None, Some(ep_id));
+        // Push Trakt updates for every episode in a single coordinating task
+        // that processes them serially. Spawning one task per episode is
+        // unsafe for long-running shows (500+ episodes) — it fires 500+
+        // simultaneous outbound HTTPS connections, risking Trakt 429 storms
+        // and exhausting the reqwest pool. A serial loop inside one task
+        // keeps the outbound rate at ≤1 in-flight request at a time with no
+        // Trakt-visible burst.
+        let state_c = state.clone();
+        let user_id = user.id;
+        let watched = req.watched;
+        tokio::spawn(async move {
+            for ep_id in episode_ids {
+                if watched {
+                    let Some(event) =
+                        build_history_event(&state_c, None, Some(ep_id)).await
+                    else {
+                        continue;
+                    };
+                    trakt_sync::push_history_event(&state_c, user_id, event).await;
+                } else {
+                    let Some(event) =
+                        build_history_event(&state_c, None, Some(ep_id)).await
+                    else {
+                        continue;
+                    };
+                    trakt_sync::remove_history_event(&state_c, user_id, event).await;
+                }
             }
-        }
+        });
         // Nudge this user's other tabs/devices to re-fetch (Continue
         // Watching membership just changed for a whole show).
         state
@@ -147,6 +236,13 @@ pub async fn scrobble(
         return Err(ApiError::validation(
             "scrobble must not have both item_id and episode_id",
         ));
+    }
+    // IDOR guard — only scrobble targets in the user's accessible libraries.
+    let allowed = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    if !target_allowed(&state, &allowed, req.item_id, req.episode_id).await? {
+        return Err(ApiError::NotFound);
     }
     queries::scrobble(&state.pool, user.id, req.item_id, req.episode_id).await?;
     // Same fire-and-forget Trakt push as set_watched — scrobble is
@@ -214,6 +310,15 @@ pub async fn event(
         return Err(ApiError::validation(
             "event must not have both item_id and episode_id",
         ));
+    }
+    // IDOR guard — even though this path is fire-and-forget for stats, it
+    // accepts arbitrary item_id/episode_id, so gate it on library access
+    // before recording an engagement event for an out-of-scope item.
+    let allowed = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    if !target_allowed(&state, &allowed, req.item_id, req.episode_id).await? {
+        return Err(ApiError::NotFound);
     }
     let pool = state.pool.clone();
     let user_id = user.id;

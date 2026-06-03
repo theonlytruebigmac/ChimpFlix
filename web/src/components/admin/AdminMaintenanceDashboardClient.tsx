@@ -139,10 +139,10 @@ function PurgeAllCard() {
       >
         {result && (
           <StatGrid>
-            <Stat label="Files" value={result.files_purged} emphasis />
-            <Stat label="Episodes" value={result.episodes_purged} emphasis />
-            <Stat label="Seasons" value={result.seasons_purged} emphasis />
-            <Stat label="Items" value={result.items_purged} emphasis />
+            <Stat label="Files" value={result.files_purged} emphasis={result.files_purged > 0} />
+            <Stat label="Episodes" value={result.episodes_purged} emphasis={result.episodes_purged > 0} />
+            <Stat label="Seasons" value={result.seasons_purged} emphasis={result.seasons_purged > 0} />
+            <Stat label="Items" value={result.items_purged} emphasis={result.items_purged > 0} />
           </StatGrid>
         )}
       </Card>

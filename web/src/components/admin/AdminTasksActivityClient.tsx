@@ -76,8 +76,26 @@ export function AdminTasksActivityClient({
 
   const refresh = useCallback(async () => {
     try {
-      setActivity(await adminApi.tasks.activity());
+      const [activityRes, settingsRes] = await Promise.all([
+        adminApi.tasks.activity(),
+        adminApi.settings.get(),
+      ]);
+      setActivity(activityRes);
       setNowMs(Date.now());
+      // Re-sync capBaseline from the server on each poll tick so that a
+      // concurrent admin save in another session is reflected here. Skip
+      // the update when the operator has unsaved local edits (dirty > 0)
+      // to avoid silently discarding in-progress changes.
+      setCapBaseline((prevBaseline) => {
+        setCapOverrides((prevOverrides) => {
+          if (countDirtyOverrides(prevBaseline, prevOverrides) > 0) {
+            return prevOverrides; // leave in-progress edits alone
+          }
+          const fresh = parseOverrides(settingsRes.settings.job_kind_concurrency);
+          return fresh;
+        });
+        return parseOverrides(settingsRes.settings.job_kind_concurrency);
+      });
       setError(null);
     } catch (e) {
       setError(friendlyErrorMessage(e));

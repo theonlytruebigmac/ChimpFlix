@@ -421,6 +421,7 @@ function LibraryDrawer({
         // best-effort refresh
       }
       setAskPurge(null);
+      void refreshStats(); // sync orphan count / health pill after purge
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

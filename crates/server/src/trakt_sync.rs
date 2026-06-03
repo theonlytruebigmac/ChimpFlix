@@ -144,11 +144,12 @@ where
 }
 
 /// Detect a Trakt 401 in an error chain. The metadata client's
-/// `api_error` returns a custom 401 message; `is_unauthorized_error`
-/// matches that and any chained context above it.
+/// `api_error` returns "… returned 401 —" for UNAUTHORIZED responses;
+/// match that specific phrase to avoid false-positives on error bodies
+/// or IDs that incidentally contain the digit sequence "401".
 fn is_unauthorized_error(err: &anyhow::Error) -> bool {
     let chain = format!("{err:#}");
-    chain.contains("401") || chain.contains("returned 401")
+    chain.contains("returned 401")
 }
 
 /// Push a single watched event to Trakt for every linked user (used by

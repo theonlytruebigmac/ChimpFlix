@@ -1,6 +1,5 @@
 import { admin as adminApi } from "@/lib/chimpflix-api";
 import { AdminStatsClient } from "@/components/admin/AdminStatsClient";
-import { requireAdmin } from "@/lib/chimpflix-server";
 
 // Force-dynamic so the rendered HTML reflects the latest events even
 // across full page refreshes — the client polls now-playing on top of
@@ -12,7 +11,7 @@ export const dynamic = "force-dynamic";
 /// per-day/per-hour histograms). Recorded automatically from every stream
 /// start; nothing to enable. (Was /settings/admin/status/stats.)
 export default async function AdminActivityPage() {
-  await requireAdmin("/settings/admin/activity");
+  // Auth gate: requireOwner is enforced by the parent admin layout.
   // SSR the initial 30-day snapshot in parallel so first paint shows the
   // hero numbers + activity rows + charts without a hydrate round-trip.
   const [

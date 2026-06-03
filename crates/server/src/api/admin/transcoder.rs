@@ -148,6 +148,11 @@ pub async fn update_preset(
     headers: HeaderMap,
     Json(input): Json<TranscoderPresetUpdate>,
 ) -> Result<Json<PresetResponse>, ApiError> {
+    if let Some(n) = input.name.as_deref() {
+        if n.trim().is_empty() {
+            return Err(ApiError::validation("name is required"));
+        }
+    }
     if let Some(b) = input.max_video_bitrate_kbps {
         if !(0..=200_000).contains(&b) {
             return Err(ApiError::validation(
@@ -159,6 +164,14 @@ pub async fn update_preset(
         if !(0..=4320).contains(&h) {
             return Err(ApiError::validation("max_height must be 0..=4320"));
         }
+    }
+    if let Some(b) = input.audio_bitrate_kbps {
+        if !(0..=512).contains(&b) {
+            return Err(ApiError::validation("audio_bitrate_kbps must be 0..=512"));
+        }
+    }
+    if let Some(codec) = input.audio_codec.as_deref() {
+        validate_audio_codec(codec)?;
     }
     let preset = queries::update_transcoder_preset(&state.pool, id, input.clone())
         .await
@@ -184,6 +197,21 @@ pub async fn delete_preset(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Allowlisted `-c:a` values passed verbatim to ffmpeg. Any value outside
+/// this set causes ffmpeg to exit non-zero, silently failing every encode
+/// job queued against that preset.
+fn validate_audio_codec(codec: &str) -> Result<(), ApiError> {
+    if !matches!(
+        codec,
+        "aac" | "opus" | "mp3" | "ac3" | "eac3" | "flac" | "copy"
+    ) {
+        return Err(ApiError::validation(
+            "audio_codec must be one of: aac, opus, mp3, ac3, eac3, flac, copy",
+        ));
+    }
+    Ok(())
+}
+
 fn validate(input: &NewTranscoderPreset) -> Result<(), ApiError> {
     if input.name.trim().is_empty() {
         return Err(ApiError::validation("name is required"));
@@ -199,6 +227,7 @@ fn validate(input: &NewTranscoderPreset) -> Result<(), ApiError> {
     if !(0..=512).contains(&input.audio_bitrate_kbps) {
         return Err(ApiError::validation("audio_bitrate_kbps must be 0..=512"));
     }
+    validate_audio_codec(&input.audio_codec)?;
     Ok(())
 }
 

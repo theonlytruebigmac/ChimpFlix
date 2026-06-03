@@ -64,6 +64,20 @@ pub async fn notify_admins(
         }
     };
 
+    // Build the mailer once before the fan-out — avoids a vault decrypt +
+    // SMTP handshake per owner. None = SMTP not configured; skip email for
+    // all recipients rather than rebuilding on every iteration.
+    let mailer = {
+        let settings = state.settings.read().await.clone();
+        match Mailer::from_settings(&settings, &state.pool, &state.vault).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Mailer::from_settings during notify_admins");
+                None
+            }
+        }
+    };
+
     // Per-owner: load the user, apply their notification prefs (per-kind
     // mute + quiet hours), then insert the bell row and/or send email. We
     // DO NOT short-circuit on the first failure — one owner's missing email
@@ -86,7 +100,9 @@ pub async fn notify_admins(
             warn!(error = %format!("{e:#}"), owner_id, kind, "insert_notification");
         }
         if delivery.email {
-            send_email(state, &user, subject, body_text, body_html).await;
+            if let Some(m) = &mailer {
+                send_email(m, &user, subject, body_text, body_html).await;
+            }
         }
         if delivery.discord {
             send_discord(state, &user, kind, subject, body_text).await;
@@ -119,6 +135,17 @@ pub async fn notify_users(
             return;
         }
     };
+    // Build the mailer once before the fan-out (same rationale as notify_admins).
+    let mailer = {
+        let settings = state.settings.read().await.clone();
+        match Mailer::from_settings(&settings, &state.pool, &state.vault).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Mailer::from_settings during notify_users");
+                None
+            }
+        }
+    };
     let now = chimpflix_common::now_ms();
     let mut seen = std::collections::HashSet::new();
     for &user_id in user_ids {
@@ -141,7 +168,9 @@ pub async fn notify_users(
             warn!(error = %format!("{e:#}"), user_id, kind, "insert_notification");
         }
         if delivery.email {
-            send_email(state, &user, subject, body_text, body_html).await;
+            if let Some(m) = &mailer {
+                send_email(m, &user, subject, body_text, body_html).await;
+            }
         }
         if delivery.discord {
             send_discord(state, &user, kind, subject, body_text).await;
@@ -275,7 +304,7 @@ fn local_minutes_of_day(tz: &str, now_ms: i64) -> i64 {
 }
 
 async fn send_email(
-    state: &AppState,
+    mailer: &Mailer,
     user: &User,
     subject: &str,
     body_text: &str,
@@ -283,15 +312,6 @@ async fn send_email(
 ) {
     let Some(addr) = user.email.as_deref() else {
         return;
-    };
-    let settings = state.settings.read().await.clone();
-    let mailer = match Mailer::from_settings(&settings, &state.pool, &state.vault).await {
-        Ok(Some(m)) => m,
-        Ok(None) => return, // SMTP not configured — silent skip
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "Mailer::from_settings during notify");
-            return;
-        }
     };
     if let Err(e) = mailer
         .send(OutgoingMessage {

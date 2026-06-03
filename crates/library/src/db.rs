@@ -348,7 +348,27 @@ async fn pre_migration_snapshot(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dest = backup_dir.join(format!("chimpflix-pre-{stamp}-v{applied}-to-v{embedded_max}.db"));
-    tokio::fs::copy(db_path, &dest).await?;
+
+    // Use `VACUUM INTO` instead of a raw file copy: in WAL mode the main
+    // database file may lag behind the WAL by many frames.  `VACUUM INTO`
+    // reads the current consistent snapshot (including uncheckpointed WAL
+    // frames) and writes a single, self-contained SQLite file — no sidecar
+    // needed and no torn-state risk.
+    let src_url = format!("sqlite://{}?mode=ro", db_path.display());
+    let vacuum_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(SqliteConnectOptions::from_str(&src_url)?)
+        .await
+        .context("open source DB for pre-migration VACUUM INTO")?;
+    let dest_str = dest.to_string_lossy().into_owned();
+    sqlx::query("VACUUM INTO ?")
+        .bind(&dest_str)
+        .execute(&vacuum_pool)
+        .await
+        .context("VACUUM INTO pre-migration snapshot")?;
+    vacuum_pool.close().await;
+
     info!(
         from = %db_path.display(),
         to = %dest.display(),

@@ -9,13 +9,19 @@ use axum::response::Response;
 use chimpflix_library::{NewAuditEntry, ServerSettingsUpdate, queries};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 
 use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
 use crate::auth::{AuthUser, OwnerAuth};
 use crate::state::AppState;
 
-const MAX_PREROLL_BYTES: usize = 200 * 1024 * 1024; // 200 MiB
+/// Max accepted pre-roll upload size. The pre-roll upload route is mounted
+/// with its own `RequestBodyLimitLayer(MAX_PREROLL_BYTES)` in
+/// `api::router`, OUTSIDE the global 16 MiB request-body cap — otherwise
+/// that global cap would reject anything over 16 MiB before this handler's
+/// own check ever ran, making this limit unreachable.
+pub const MAX_PREROLL_BYTES: usize = 200 * 1024 * 1024; // 200 MiB
 const PREROLL_DIR: &str = "preroll";
 
 #[derive(Debug, Serialize)]
@@ -63,9 +69,9 @@ pub async fn upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<PrerollStatus>, ApiError> {
-    let mut bytes: Option<Vec<u8>> = None;
+    let mut written: Option<u64> = None;
     let mut ext: Option<&'static str> = None;
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| ApiError::validation(format!("multipart error: {e}")))?
@@ -83,44 +89,76 @@ pub async fn upload(
                 }
                 None => return Err(ApiError::validation("missing content-type")),
             };
-            let data = field
-                .bytes()
+            let resolved_ext = ext.expect("ext set just above");
+
+            let dir = state.data_dir.join(PREROLL_DIR);
+            tokio::fs::create_dir_all(&dir)
                 .await
-                .map_err(|e| ApiError::validation(format!("read field: {e}")))?;
-            if data.len() > MAX_PREROLL_BYTES {
-                return Err(ApiError::validation(format!(
-                    "pre-roll must be ≤ {MAX_PREROLL_BYTES} bytes"
-                )));
+                .map_err(|e| ApiError::Internal(e.into()))?;
+            let filename = format!("preroll.{resolved_ext}");
+            let final_path = dir.join(&filename);
+            // Write to a per-extension temp file first, then rename into
+            // place atomically.  This avoids the race where two concurrent
+            // uploads (e.g. mp4 + webm) both complete the sibling-wipe loop,
+            // then both write their files, leaving an orphaned extension that
+            // is never cleaned up until the next upload.
+            let tmp_path = dir.join(format!("preroll.{resolved_ext}.tmp"));
+
+            let mut f = tokio::fs::File::create(&tmp_path)
+                .await
+                .map_err(|e| ApiError::Internal(e.into()))?;
+
+            // Stream field chunk-by-chunk so peak RSS stays at ~one chunk
+            // size (~64 KiB) rather than the full file size.
+            let mut total: usize = 0;
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| ApiError::validation(format!("read field: {e}")))?
+            {
+                total += chunk.len();
+                if total > MAX_PREROLL_BYTES {
+                    // Delete the partial temp file before rejecting.
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(ApiError::validation(format!(
+                        "pre-roll must be ≤ {MAX_PREROLL_BYTES} bytes"
+                    )));
+                }
+                f.write_all(&chunk)
+                    .await
+                    .map_err(|e| ApiError::Internal(e.into()))?;
             }
-            bytes = Some(data.to_vec());
+            f.flush().await.ok();
+            drop(f);
+
+            // Atomic rename: the new file is fully written before it
+            // becomes visible under the canonical name, so readers
+            // (serve_blob) never see a partial file.
+            tokio::fs::rename(&tmp_path, &final_path)
+                .await
+                .map_err(|e| ApiError::Internal(e.into()))?;
+
+            // Wipe sibling extensions *after* the rename so a switch from
+            // .mp4 to .webm doesn't leave a stale file.  Doing this post-
+            // rename means a concurrent upload of a different extension
+            // loses its file here rather than leaving an orphan.
+            for prev_ext in ["mp4", "webm", "mkv"] {
+                if prev_ext == resolved_ext {
+                    continue;
+                }
+                let prev = dir.join(format!("preroll.{prev_ext}"));
+                if prev.exists() {
+                    let _ = tokio::fs::remove_file(&prev).await;
+                }
+            }
+
+            written = Some(total as u64);
             break;
         }
     }
-    let bytes = bytes.ok_or_else(|| ApiError::validation("missing `file` field"))?;
-    let ext = ext.expect("ext set alongside bytes above");
-
-    let dir = state.data_dir.join(PREROLL_DIR);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    // Wipe sibling extensions before writing so a switch from .mp4 to
-    // .webm doesn't leave a stale file the next get_status fingers as
-    // configured.
-    for prev_ext in ["mp4", "webm", "mkv"] {
-        let prev = dir.join(format!("preroll.{prev_ext}"));
-        if prev.exists() {
-            let _ = tokio::fs::remove_file(&prev).await;
-        }
-    }
+    let size_bytes = written.ok_or_else(|| ApiError::validation("missing `file` field"))?;
+    let ext = ext.expect("ext set alongside written above");
     let filename = format!("preroll.{ext}");
-    let path = dir.join(&filename);
-    let mut f = tokio::fs::File::create(&path)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    f.write_all(&bytes)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    f.flush().await.ok();
 
     let updated = queries::update_server_settings(
         &state.pool,
@@ -143,7 +181,7 @@ pub async fn upload(
             "/api/v1/preroll/blob?v={}",
             chimpflix_common::now_ms()
         )),
-        size_bytes: Some(bytes.len() as u64),
+        size_bytes: Some(size_bytes),
         volume: updated.preroll_volume,
     }))
 }
@@ -194,15 +232,22 @@ pub async fn serve_blob(
         Some("mkv") => "video/x-matroska",
         _ => "application/octet-stream",
     };
-    let bytes = tokio::fs::read(&path)
+    // Open and stream the file rather than reading it fully into heap;
+    // a 200 MiB pre-roll would otherwise allocate the whole file per request.
+    let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let stream = ReaderStream::new(file);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
         .header(header::CACHE_CONTROL, "public, max-age=3600")
-        .header(header::CONTENT_LENGTH, bytes.len().to_string())
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, meta.len().to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(Body::from_stream(stream))
         .map_err(|e| ApiError::Internal(e.into()))
 }
 

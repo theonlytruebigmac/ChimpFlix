@@ -44,7 +44,8 @@ export function AdminDashboardClient({ initial }: Props) {
   const [data, setData] = useState<DashboardResponse>(initial);
   const [tasks, setTasks] = useState<ScheduledTask[] | null>(null);
   const [secrets, setSecrets] = useState<SecretSlotView[] | null>(null);
-  const [fetching, setFetching] = useState(false);
+  // Track in-flight stop requests per session so only that row's button is disabled.
+  const [stoppingIds, setStoppingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
   // Tasks + secrets are fetched separately from the dashboard payload
@@ -177,7 +178,7 @@ export function AdminDashboardClient({ initial }: Props) {
   }, []);
 
   async function stopSession(id: string) {
-    setFetching(true);
+    setStoppingIds((prev) => new Set(prev).add(id));
     try {
       await adminApi.stopSession(id);
       const next = await adminApi.dashboard();
@@ -185,7 +186,11 @@ export function AdminDashboardClient({ initial }: Props) {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setFetching(false);
+      setStoppingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
@@ -441,10 +446,10 @@ export function AdminDashboardClient({ initial }: Props) {
                         <button
                           type="button"
                           className="cf-btn cf-ghost cf-tiny"
-                          disabled={fetching}
+                          disabled={stoppingIds.has(s.id)}
                           onClick={() => stopSession(s.id)}
                         >
-                          {fetching ? "…" : "Stop"}
+                          {stoppingIds.has(s.id) ? "…" : "Stop"}
                         </button>
                       </td>
                     </tr>

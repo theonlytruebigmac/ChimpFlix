@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   auth as authApi,
   ChimpFlixApiError,
@@ -9,11 +10,12 @@ import {
 import { ConfirmDialog } from "./ConfirmDialog";
 
 export function SettingsSessionsClient() {
+  const router = useRouter();
   const [sessions, setSessions] = useState<MySessionEntry[] | null>(null);
   const [busy, setBusy] = useState<number | "all" | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [askRevokeOne, setAskRevokeOne] = useState<{ id: number; label: string } | null>(null);
+  const [askRevokeOne, setAskRevokeOne] = useState<{ id: number; label: string; current: boolean } | null>(null);
   const [askRevokeOthers, setAskRevokeOthers] = useState(false);
 
   useEffect(() => {
@@ -30,19 +32,25 @@ export function SettingsSessionsClient() {
     }
   }
 
-  function revokeOne(id: number, label: string) {
-    setAskRevokeOne({ id, label });
+  function revokeOne(id: number, label: string, current: boolean) {
+    setAskRevokeOne({ id, label, current });
   }
 
   async function confirmRevokeOne() {
     if (!askRevokeOne) return;
-    const { id, label } = askRevokeOne;
+    const { id, label, current: isCurrent } = askRevokeOne;
     setAskRevokeOne(null);
     setBusy(id);
     setError(null);
     setMessage(null);
     try {
       await authApi.revokeMySession(id);
+      if (isCurrent) {
+        // Current session was just invalidated — redirect to login instead of
+        // calling refresh() with a now-dead cookie (which would yield a 401).
+        router.push("/login");
+        return;
+      }
       setMessage(`Signed out ${label}.`);
       await refresh();
     } catch (e) {
@@ -153,7 +161,7 @@ export function SettingsSessionsClient() {
                         type="button"
                         className="cf-btn cf-ghost cf-tiny"
                         onClick={() =>
-                          revokeOne(s.id, s.current ? "this device" : label)
+                          revokeOne(s.id, s.current ? "this device" : label, s.current)
                         }
                         disabled={busy === s.id}
                       >

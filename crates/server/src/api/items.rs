@@ -189,6 +189,14 @@ pub async fn library_top(
         LibraryKind::Anime => ("show", "mal_ranking"),
     };
     let acc = access(&state, &user).await?;
+    // Prevent library-id enumeration: treat an inaccessible library the same
+    // as a non-existent one so callers can't distinguish the two via status
+    // codes. Owners (acc = None) bypass this check.
+    if let Some(ref allowed) = acc {
+        if !allowed.contains(&library_id) {
+            return Err(ApiError::NotFound);
+        }
+    }
     let rows = queries::list_library_top(
         &state.pool,
         library_id,
@@ -724,6 +732,17 @@ pub async fn apply_tmdb_poster(
         "jpg"
     };
 
+    // SECURITY: pipe through sanitize_image for the same protections that
+    // upload_image_impl applies — strips EXIF/XMP/IPTC metadata, rejects
+    // decompression-bomb images, and re-encodes to pixel-only output.
+    let target_format = match ext {
+        "png"  => image::ImageFormat::Png,
+        "webp" => image::ImageFormat::WebP,
+        _      => image::ImageFormat::Jpeg,
+    };
+    let (bytes, ext) = sanitize_image(&bytes, target_format)
+        .map_err(|e| ApiError::validation(format!("image sanitize failed: {e}")))?;
+
     let dir = state.data_dir.join(POSTER_DIR);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -734,22 +753,33 @@ pub async fn apply_tmdb_poster(
             let _ = tokio::fs::remove_file(&prev).await;
         }
     }
+    // Write to a `.tmp` sibling first; only promote to the final path once
+    // the DB row update succeeds, so a DB failure doesn't leave an orphaned
+    // file under the permanent path (mirrors upload_image_impl).
     let path = dir.join(format!("{id}.{ext}"));
-    let mut f = tokio::fs::File::create(&path)
+    let tmp_path = dir.join(format!("{id}.{ext}.tmp"));
+    let mut f = tokio::fs::File::create(&tmp_path)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     f.write_all(&bytes)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     f.flush().await.ok();
+    drop(f);
 
     let blob_url = format!(
         "/api/v1/items/{id}/poster/blob?v={}",
         chimpflix_common::now_ms()
     );
-    queries::replace_primary_image(&state.pool, id, "poster", "local", &blob_url)
+    if let Err(e) =
+        queries::replace_primary_image(&state.pool, id, "poster", "local", &blob_url).await
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(ApiError::Internal(e));
+    }
+    tokio::fs::rename(&tmp_path, &path)
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| ApiError::Internal(e.into()))?;
 
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
@@ -769,6 +799,11 @@ pub async fn patch_item(
         return Err(ApiError::Forbidden);
     }
     let acc = access(&state, &user).await?;
+    // Verify existence before mutating — apply_item_edit silently matches
+    // 0 rows for a non-existent id (consistent with patch_credits).
+    queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
+        .await?
+        .ok_or(ApiError::NotFound)?;
     queries::apply_item_edit(&state.pool, id, &edit).await?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
@@ -1066,10 +1101,10 @@ pub async fn report_issue(
             "message is too long (max {REPORT_ISSUE_MAX_BYTES} bytes)",
         )));
     }
-    // We deliberately don't run the access filter here — any authed user
-    // can report on any item they have a ratingKey for. The reporter's
-    // identity is stamped on the payload so admins can follow up; the
-    // notification body never trusts client-supplied subject lines.
+    // Access-filtered the same as every browse surface — a user can only
+    // report on items in libraries they can see. The reporter's identity is
+    // stamped on the payload so admins can follow up; the notification body
+    // never trusts client-supplied subject lines.
     let acc = access(&state, &user).await?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?

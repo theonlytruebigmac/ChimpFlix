@@ -343,11 +343,11 @@ pub struct PurgeResponse {
 /// for a single library — e.g., after manually verifying their
 /// removed files are gone for good.
 ///
-/// NOTE: the underlying query is currently instance-wide, not per-
-/// library — purge sweeps every expired row regardless of library.
-/// Returning per-library counts here would require a more targeted
-/// purge; for now the response is the global count, scoped only by
-/// the cutoff the caller asked for.
+/// The purge is scoped to `library_id`: only soft-deleted rows whose
+/// media file belongs to this library (and that are past the cutoff)
+/// are hard-deleted, so triggering it on one library never touches
+/// another library's removed content. The returned counts reflect
+/// just this library.
 pub async fn purge_library(
     State(state): State<AppState>,
     _owner: OwnerAuth,
@@ -359,7 +359,7 @@ pub async fn purge_library(
         .ok_or(ApiError::NotFound)?;
     let grace_days = q.grace_days.unwrap_or(7).max(0);
     let cutoff_ms = chimpflix_common::now_ms() - grace_days * 86_400_000;
-    let report = queries::purge_removed_media_files(&state.pool, cutoff_ms)
+    let report = queries::purge_removed_media_files_for_library(&state.pool, library_id, cutoff_ms)
         .await
         .map_err(ApiError::Internal)?;
     evict_subtitle_caches(state.transcoder.cache_root(), &report.purged_paths).await;

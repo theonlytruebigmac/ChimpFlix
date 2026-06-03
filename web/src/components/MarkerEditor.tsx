@@ -127,6 +127,18 @@ export function MarkerEditor({
     setError(null);
     setSavedAt(null);
     try {
+      // Guard against empty / non-numeric time inputs. parseFloat("") is
+      // NaN, which flows through Math.max/round and JSON.stringify coerces
+      // to null — the server then gets {start_ms: null, end_ms: null}.
+      // Reject with a clear message instead of sending a bad payload.
+      const hasBadTime = drafts.some(
+        (d) =>
+          !Number.isFinite(parseFloat(d.startSec)) ||
+          !Number.isFinite(parseFloat(d.endSec)),
+      );
+      if (hasBadTime) {
+        throw new Error("Every marker needs a numeric start and end time.");
+      }
       const payload: ManualMarkerInput[] = drafts.map((d) => {
         const start = Math.max(0, Math.round(parseFloat(d.startSec) * 1000));
         const end = Math.max(start + 1, Math.round(parseFloat(d.endSec) * 1000));

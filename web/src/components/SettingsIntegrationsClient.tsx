@@ -39,6 +39,13 @@ export function SettingsIntegrationsClient() {
   const [discordBusy, setDiscordBusy] = useState(false);
   const [discordError, setDiscordError] = useState<string | null>(null);
   const pollTimer = useRef<number | null>(null);
+  // Current polling interval in ms. Stored in a ref so poll() can read and
+  // update it without a stale closure (RFC 8628 §3.5 slow_down handling).
+  const intervalMsRef = useRef<number>(5000);
+  // Guards against concurrent overlapping poll() calls. `busy` state is
+  // stale inside the setInterval closure (captured at startLink's render
+  // cycle), so a ref is used for reliable in-flight deduplication.
+  const pollInFlightRef = useRef(false);
   // True while this component is mounted. The poll() callback runs on
   // a Trakt-suggested interval (~5s) and lives across many awaits; if
   // the user navigates away mid-poll, the late-arriving response
@@ -136,6 +143,7 @@ export function SettingsIntegrationsClient() {
       const s = await traktApi.linkStart();
       setPending(s);
       const interval = Math.max(2, s.interval) * 1000;
+      intervalMsRef.current = interval;
       pollTimer.current = window.setInterval(() => poll(), interval);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -145,7 +153,11 @@ export function SettingsIntegrationsClient() {
   }
 
   async function poll() {
-    if (busy === "poll") return;
+    // Use a ref rather than `busy` state: the setInterval callback captures
+    // a stale closure where `busy` is always null, so the state guard never
+    // fires. The ref is set synchronously before the first await.
+    if (pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
     setBusy("poll");
     try {
       const result = await traktApi.linkPoll();
@@ -167,7 +179,16 @@ export function SettingsIntegrationsClient() {
           );
           break;
         case "pending":
+          break;
         case "slow_down":
+          // RFC 8628 §3.5: increase the polling interval by 5 s and restart
+          // the timer at the new rate to avoid continued rate-limiting.
+          stopPolling();
+          intervalMsRef.current += 5000;
+          pollTimer.current = window.setInterval(
+            () => poll(),
+            intervalMsRef.current,
+          );
           break;
       }
     } catch (e) {
@@ -176,6 +197,7 @@ export function SettingsIntegrationsClient() {
       setPending(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      pollInFlightRef.current = false;
       if (aliveRef.current) setBusy(null);
     }
   }

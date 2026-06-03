@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 /// In-app replacement for `window.confirm`. Portal-rendered so it
-/// escapes any transformed ancestor (TitleModalShell, etc.), focus-traps
-/// on the primary action, closes on Escape, and supports destructive
+/// escapes any transformed ancestor (TitleModalShell, etc.),
+/// auto-focuses the primary action, Tab-trapped within the dialog,
+/// closes on Escape, and supports destructive
 /// styling for delete/merge/sign-out flows where the confirm button
 /// should look dangerous.
 ///
@@ -65,7 +67,18 @@ export function ConfirmDialog({
   onConfirm: () => void | Promise<void>;
   onCancel: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const confirmRef = useRef<HTMLButtonElement | null>(null);
+  // Unique per-instance ID so multiple ConfirmDialogs in the DOM at the
+  // same time don't produce duplicate id= / aria-labelledby= values.
+  const titleId = `${useId()}-confirm-dialog-title`;
+
+  // Trap Tab/Shift-Tab within the dialog so keyboard users can't
+  // navigate into the obscured page beneath. autoFocusFirst is off
+  // because we manually focus the confirm button below (cancel comes
+  // first in DOM order but confirm is the intentional default action).
+  // closeOnEscape is off so the Escape effect below can guard on `busy`.
+  useFocusTrap(dialogRef, { autoFocusFirst: false, closeOnEscape: false });
 
   // Focus the confirm button on mount so Enter activates it. We focus
   // confirm (not cancel) because the operator opened the dialog
@@ -92,15 +105,16 @@ export function ConfirmDialog({
       onClick={busy ? undefined : onCancel}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
+        aria-labelledby={titleId}
         className="zf-modal-in w-full max-w-md overflow-hidden rounded-lg border border-white/10 bg-(--color-surface) shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 pt-5 pb-2">
           <h2
-            id="confirm-dialog-title"
+            id={titleId}
             className="text-base font-semibold text-white"
           >
             {title}

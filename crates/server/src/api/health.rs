@@ -1,7 +1,7 @@
 //! Health and server-info endpoints.
 
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -14,11 +14,15 @@ use sqlx::{Executor, Row};
 use crate::api::error::ApiError;
 use crate::state::AppState;
 
-static START: OnceLock<Instant> = OnceLock::new();
+/// Cached result of the last ffmpeg `-version` probe and the time it was
+/// recorded. The outer `OnceLock` initialises lazily on the first `/ready`
+/// call; after that a fresh probe is only issued when the cached value is
+/// older than `FFMPEG_CACHE_TTL`. This prevents every unauthenticated
+/// `/ready` request from forking a new process.
+static FFMPEG_CACHE: OnceLock<Mutex<(CheckStatus, Instant)>> = OnceLock::new();
 
-fn started_at() -> Instant {
-    *START.get_or_init(Instant::now)
-}
+/// Re-probe ffmpeg at most once per this interval.
+const FFMPEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -35,10 +39,11 @@ pub struct HealthResponse {
 /// serving real traffic," use `/ready` instead. The docker-compose
 /// healthcheck points at `/ready`; upstream load balancers that
 /// expect a sub-millisecond response can stay on `/health`.
-pub async fn health() -> Json<HealthResponse> {
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let uptime_s = ((chimpflix_common::now_ms() - state.started_at_ms) / 1000).max(0) as u64;
     Json(HealthResponse {
         status: "ok",
-        uptime_s: started_at().elapsed().as_secs(),
+        uptime_s,
     })
 }
 
@@ -57,7 +62,7 @@ pub struct ReadyChecks {
     pub library_paths: CheckStatus,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Ok,
@@ -87,9 +92,10 @@ pub async fn ready(State(state): State<AppState>) -> Response {
 
     let any_failed =
         database.is_failed() || ffmpeg.is_failed() || vault.is_failed() || library_paths.is_failed();
+    let uptime_s = ((chimpflix_common::now_ms() - state.started_at_ms) / 1000).max(0) as u64;
     let body = ReadyResponse {
         status: if any_failed { "failed" } else { "ok" },
-        uptime_s: started_at().elapsed().as_secs(),
+        uptime_s,
         checks: ReadyChecks {
             database,
             ffmpeg,
@@ -106,15 +112,37 @@ pub async fn ready(State(state): State<AppState>) -> Response {
 }
 
 async fn check_database(state: &AppState) -> CheckStatus {
+    // Opaque detail: raw SQLite error text is not surfaced to unauthenticated
+    // callers — it can reveal schema names, file paths, or lock state.
     match state.pool.execute("SELECT 1").await {
         Ok(_) => CheckStatus::Ok,
-        Err(e) => CheckStatus::Failed {
-            detail: format!("SELECT 1 against pool failed: {e}"),
+        Err(_) => CheckStatus::Failed {
+            detail: "database ping failed".to_string(),
         },
     }
 }
 
 async fn check_ffmpeg(state: &AppState) -> CheckStatus {
+    // Check whether the cached result is still fresh (within TTL).
+    let cache = FFMPEG_CACHE.get_or_init(|| {
+        // Initialise with a zero-age failed sentinel so the first call
+        // always runs the real probe.
+        Mutex::new((
+            CheckStatus::Failed {
+                detail: "not yet probed".to_string(),
+            },
+            Instant::now() - FFMPEG_CACHE_TTL - Duration::from_secs(1),
+        ))
+    });
+
+    {
+        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.1.elapsed() < FFMPEG_CACHE_TTL {
+            return guard.0.clone();
+        }
+    }
+
+    // Cache is stale — run the real probe and store the result.
     let bin = state.ffmpeg.ffmpeg.clone();
     let result = tokio::process::Command::new(&bin)
         .arg("-version")
@@ -123,15 +151,22 @@ async fn check_ffmpeg(state: &AppState) -> CheckStatus {
         .stdin(std::process::Stdio::null())
         .output()
         .await;
-    match result {
+    // Opaque detail: do not include the binary path or OS error text in
+    // the unauthenticated response — those strings are visible to any
+    // caller and aid reconnaissance.
+    let status = match result {
         Ok(out) if out.status.success() => CheckStatus::Ok,
-        Ok(out) => CheckStatus::Failed {
-            detail: format!("`{bin} -version` exited with {:?}", out.status.code()),
+        Ok(_) => CheckStatus::Failed {
+            detail: "ffmpeg exited with a non-zero status".to_string(),
         },
-        Err(e) => CheckStatus::Failed {
-            detail: format!("could not spawn `{bin} -version`: {e}"),
+        Err(_) => CheckStatus::Failed {
+            detail: "could not probe ffmpeg".to_string(),
         },
-    }
+    };
+
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = (status.clone(), Instant::now());
+    status
 }
 
 /// Stat every configured library path. If any one is missing or
@@ -147,9 +182,10 @@ async fn check_library_paths(state: &AppState) -> CheckStatus {
         .await
     {
         Ok(r) => r,
-        Err(e) => {
+        // Opaque: do not forward raw SQLite errors to unauthenticated callers.
+        Err(_) => {
             return CheckStatus::Failed {
-                detail: format!("could not list library_paths: {e}"),
+                detail: "could not query library paths".to_string(),
             };
         }
     };
@@ -158,7 +194,7 @@ async fn check_library_paths(state: &AppState) -> CheckStatus {
             detail: "no library paths configured yet".to_string(),
         };
     }
-    let mut missing: Vec<String> = Vec::new();
+    let mut missing_count: usize = 0;
     for row in &rows {
         let path: String = match row.try_get("path") {
             Ok(p) => p,
@@ -166,38 +202,36 @@ async fn check_library_paths(state: &AppState) -> CheckStatus {
         };
         // `tokio::fs::metadata` follows symlinks (the operator may
         // have mounted under `/mnt` and symlinked into `/data`). A
-        // missing or unreadable target counts as failed; the error
-        // message goes back to the operator so they can fix it.
+        // missing or unreadable target counts as failed.
+        // Opaque count only — filesystem paths and OS error text are
+        // not included in the unauthenticated response.
         match tokio::fs::metadata(&path).await {
             Ok(m) if m.is_dir() => {}
-            Ok(_) => missing.push(format!("{path} (not a directory)")),
-            Err(e) => missing.push(format!("{path} ({e})")),
+            _ => missing_count += 1,
         }
     }
-    if missing.is_empty() {
+    if missing_count == 0 {
         CheckStatus::Ok
     } else {
         CheckStatus::Failed {
-            detail: format!(
-                "{} library path(s) unreachable: {}",
-                missing.len(),
-                missing.join("; "),
-            ),
+            detail: format!("{missing_count} library path(s) unreachable"),
         }
     }
 }
 
 async fn check_vault(state: &AppState) -> CheckStatus {
+    // Opaque details: vault row IDs, decryption error messages, and
+    // query errors must not be forwarded to unauthenticated callers.
     match queries::vault_self_test(&state.pool, &state.vault).await {
         Ok(queries::VaultSelfTest::Ok { .. }) => CheckStatus::Ok,
         Ok(queries::VaultSelfTest::NoEncryptedRows) => CheckStatus::Degraded {
             detail: "no encrypted rows yet (fresh install or pre-credentials boot)".to_string(),
         },
-        Ok(queries::VaultSelfTest::Mismatch { sampled, error }) => CheckStatus::Failed {
-            detail: format!("sample row {sampled} did not decrypt: {error}"),
+        Ok(queries::VaultSelfTest::Mismatch { .. }) => CheckStatus::Failed {
+            detail: "vault decrypt self-test failed".to_string(),
         },
-        Err(e) => CheckStatus::Failed {
-            detail: format!("vault self-test query failed: {e:#}"),
+        Err(_) => CheckStatus::Failed {
+            detail: "vault self-test query failed".to_string(),
         },
     }
 }

@@ -91,7 +91,9 @@ pub async fn track(
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
+        // Collapse all unmatched paths (bot scans, stray 404s) into one
+        // sentinel bucket so the HashMap cardinality stays bounded.
+        .unwrap_or_else(|| "<unmatched>".to_string());
     let method = req.method().to_string();
     let response = next.run(req).await;
     let status = response.status();

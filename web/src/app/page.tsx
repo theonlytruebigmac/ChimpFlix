@@ -514,11 +514,17 @@ async function Top10TrendingRail({
     // ranks are global TMDB popularity; once we intersect with the
     // local library we'd see gaps (3, 4, 5, 7, …) — Netflix shows a
     // clean 1, 2, 3 sequence, and relative order is what matters.
-    const seen = new Set<number>();
+    const seenIds = new Set<number>();
+    const seenTmdb = new Set<number>();
     const unique = res.items.filter((it) => {
-      if (it.tmdb_id == null) return true;
-      if (seen.has(it.tmdb_id)) return false;
-      seen.add(it.tmdb_id);
+      // Always dedupe by DB id so two library rows for the same local
+      // title (tmdb_id == null) don't both appear in the Top-10 rail.
+      if (seenIds.has(it.id)) return false;
+      seenIds.add(it.id);
+      if (it.tmdb_id != null) {
+        if (seenTmdb.has(it.tmdb_id)) return false;
+        seenTmdb.add(it.tmdb_id);
+      }
       return true;
     });
     entries = unique.map(({ rank: _rank, ...item }, idx) => ({

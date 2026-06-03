@@ -90,10 +90,10 @@ impl MalClient {
             let snippet: String = body.chars().take(200).collect();
             anyhow::bail!("MyAnimeList ranking: http {} {snippet}", status.as_u16());
         }
-        let parsed: RankingResponse = resp
-            .json()
-            .await
-            .context("MyAnimeList ranking: decode body")?;
+        // Use the bounded streaming helper (4 MiB cap) instead of the
+        // unbounded .json() to prevent an oversized response from exhausting RAM.
+        let parsed: RankingResponse =
+            crate::http::bounded_json(resp, crate::http::DEFAULT_METADATA_BYTES, "MyAnimeList ranking: decode body").await?;
         Ok(parsed
             .data
             .into_iter()

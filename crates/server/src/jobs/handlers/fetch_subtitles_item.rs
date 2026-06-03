@@ -113,7 +113,7 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         .bind(item_id)
         .fetch_all(&state.pool)
         .await
-        .unwrap_or_default();
+        .context("list episodes for subtitle fetch")?;
         for ep in &eps {
             let episode_id: i64 = ep.try_get("id").unwrap_or(0);
             let season: i32 = ep.try_get("season").unwrap_or(0);

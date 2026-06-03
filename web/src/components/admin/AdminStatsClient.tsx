@@ -449,13 +449,15 @@ export function AdminStatsClient({
           ) : (
             <table className="cf-table">
               <tbody>
-                {topPlatforms.map((p) => {
-                  const total = topPlatforms.reduce((a, x) => a + x.starts, 0);
-                  const pct = total === 0 ? 0 : Math.round((p.starts / total) * 100);
-                  return (
-                    <BarRow key={p.platform} label={p.platform} pct={pct} />
-                  );
-                })}
+                {(() => {
+                  const platformTotal = topPlatforms.reduce((a, x) => a + x.starts, 0);
+                  return topPlatforms.map((p) => {
+                    const pct = platformTotal === 0 ? 0 : Math.round((p.starts / platformTotal) * 100);
+                    return (
+                      <BarRow key={p.platform} label={p.platform} pct={pct} />
+                    );
+                  });
+                })()}
               </tbody>
             </table>
           )}
@@ -771,7 +773,7 @@ function HourChart({ buckets }: { buckets: StatsHourBucket[] }) {
         className="cf-flex cf-between cf-faint"
         style={{ fontSize: 10, marginTop: 6, padding: "0 2px" }}
       >
-        {[0, 6, 12, 18, 23].map((h) => (
+        {[0, 6, 12, 18].map((h) => (
           <span key={h}>{String(h).padStart(2, "0")}:00</span>
         ))}
       </div>
@@ -908,6 +910,7 @@ function UserDrillIn({
     <div
       role="dialog"
       aria-modal="true"
+      aria-labelledby="user-drill-title"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -936,7 +939,7 @@ function UserDrillIn({
       >
         <div className="cf-drawer-head">
           <div style={{ flex: 1 }}>
-            <div className="cf-ttl">{label}</div>
+            <div id="user-drill-title" className="cf-ttl">{label}</div>
             <div className="cf-sub">Most recent 100 events</div>
           </div>
           <button
@@ -1125,19 +1128,23 @@ function DecisionPill({ decision }: { decision: "direct" | "transcode" }) {
   );
 }
 
-/// The now-playing stream tag — direct play / remux / transcode, colored
+/// The now-playing stream tag — remux / direct play / HW transcode, colored
 /// by treatment to match the mockup's per-row stream tag.
+/// Mirrors streamTag() in AdminDashboardClient.tsx:
+///   both-copy → Remux; software encoder → Direct play; otherwise HW transcode.
 function TreatmentTag({ session: s }: { session: NowPlayingSession }) {
-  const reencode =
-    s.video_treatment === "reencode" || s.audio_treatment === "reencode";
-  if (!reencode) {
+  const isRemux =
+    s.video_treatment === "copy" && s.audio_treatment === "copy";
+  const isSoftware = s.encoder.toLowerCase().includes("software");
+  if (isRemux) {
+    return <span className="cf-tag">Remux</span>;
+  }
+  if (isSoftware) {
     return <span className="cf-tag">Direct play</span>;
   }
-  const label =
-    s.video_treatment === "copy" ? "Remux" : "HW transcode";
   return (
     <span className="cf-tag" style={{ borderColor: "var(--info-soft)", color: "var(--info)" }}>
-      {label}
+      HW transcode
     </span>
   );
 }

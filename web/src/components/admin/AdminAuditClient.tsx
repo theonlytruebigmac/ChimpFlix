@@ -196,7 +196,8 @@ export function AdminAuditClient({ initial }: Props) {
             : "No admin actions recorded yet."}
         </div>
       ) : (
-        <table className="cf-table">
+        // dim the table while a new page loads so stale rows read as in-flight
+        <table className="cf-table" style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.15s" }}>
           <thead>
             <tr>
               <th>When</th>

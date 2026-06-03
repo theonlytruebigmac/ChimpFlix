@@ -290,7 +290,7 @@ pub async fn test_reachability(
         {
             Ok(client) => {
                 let started = Instant::now();
-                match client.get(&target).send().await {
+                match client.head(&target).send().await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         let ok = status == 200;

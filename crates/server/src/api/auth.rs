@@ -263,7 +263,11 @@ pub async fn login(
         return Err(invalid_credentials());
     }
     let user = user_opt.expect("ok=true requires a user");
-    state.login_attempts.record_success(&attempt_key).await;
+    // record_success is deferred to after all deny-gates (locked-account,
+    // totp_enforcement) so a session-holder who knows the correct password
+    // for a locked account cannot repeatedly clear the lockout counter by
+    // hammering login — the counter is only cleared once a session is
+    // actually issued.
 
     // Account-lock gate. Checked AFTER the password verify (above) so a
     // locked username can't be enumerated by the pre-credential path —
@@ -401,6 +405,10 @@ pub async fn login(
         })
         .into_response());
     }
+
+    // All deny-gates passed — clear the failure counter now that a
+    // session is actually being issued.
+    state.login_attempts.record_success(&attempt_key).await;
 
     let ip_str = ip.to_string();
     if let Err(e) = queries::record_user_login(&state.pool, user.id, Some(ip_str.as_str())).await {
@@ -709,12 +717,26 @@ pub async fn change_password(
         ));
     }
 
+    // Per-user rate-limit on the argon2 verify path. A session-holder
+    // who supplies the wrong current_password repeatedly can otherwise
+    // consume ~200ms of CPU per attempt indefinitely. Reuse the
+    // login_attempts tracker with a prefixed key so the counter is
+    // separate from the login lockout.
+    let cp_key = format!("cp:{}", user.id);
+    if let Some(wait) = state.login_attempts.check(&cp_key).await {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many failed attempts; try again in {}s",
+            wait.as_secs().max(1)
+        )));
+    }
+
     // Re-verify current password.
     let record = queries::find_user_with_secret_by_username(&state.pool, &user.username)
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::Unauthorized)?;
     if !password::verify(&input.current_password, &record.password_hash) {
+        state.login_attempts.record_failure(&cp_key).await;
         audit_auth(
             &state,
             "auth.password_change.failure",
@@ -727,6 +749,7 @@ pub async fn change_password(
         .await;
         return Err(ApiError::Unauthorized);
     }
+    state.login_attempts.record_success(&cp_key).await;
 
     let new_hash = password::hash(&input.new_password).map_err(ApiError::Internal)?;
     queries::update_user_password(&state.pool, user.id, &new_hash)
@@ -916,11 +939,22 @@ pub async fn delete_me(
         return Err(ApiError::validation("current password is required"));
     }
 
+    // Per-user rate-limit on the argon2 verify path — same primitive as
+    // change_password above, keyed by "dm:{user_id}".
+    let dm_key = format!("dm:{}", user.id);
+    if let Some(wait) = state.login_attempts.check(&dm_key).await {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many failed attempts; try again in {}s",
+            wait.as_secs().max(1)
+        )));
+    }
+
     let record = queries::find_user_with_secret_by_username(&state.pool, &user.username)
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::Unauthorized)?;
     if !password::verify(&input.current_password, &record.password_hash) {
+        state.login_attempts.record_failure(&dm_key).await;
         audit_auth(
             &state,
             "auth.delete_me.failure",
@@ -1233,9 +1267,20 @@ pub async fn register(
     })?;
 
     if let Some((code_hash, _)) = invite.as_ref() {
-        queries::consume_invite(&state.pool, code_hash, user.id)
-            .await
-            .map_err(ApiError::Internal)?;
+        // consume_invite is atomic (CAS WHERE consumed_by IS NULL). If it
+        // fails — either a concurrent redemption of the same code won the
+        // race, or the invite expired between the check above and now —
+        // roll back by deleting the user we just created so no orphaned,
+        // unverified account is left in the database.
+        if let Err(e) = queries::consume_invite(&state.pool, code_hash, user.id).await {
+            if let Err(del_err) = queries::delete_user(&state.pool, user.id).await {
+                warn!(
+                    user_id = user.id,
+                    "consume_invite failed AND cleanup delete failed: {del_err:#}"
+                );
+            }
+            return Err(ApiError::Internal(e));
+        }
     }
 
     // Fan out a notification to every owner. Fire-and-forget — won't
@@ -1256,23 +1301,51 @@ pub async fn list_invites(
     State(state): State<AppState>,
     _owner: OwnerAuth,
 ) -> Result<Json<InvitesListResponse>, ApiError> {
+    use sqlx::Row;
+    use std::collections::HashMap;
+
     let invites = queries::list_invites(&state.pool)
         .await
         .map_err(ApiError::Internal)?;
-    let mut entries = Vec::with_capacity(invites.len());
-    for invite in invites {
-        let library_ids = queries::invite_library_ids(&state.pool, invite.id)
-            .await
-            .map_err(ApiError::Internal)?;
-        let group_ids = queries::invite_group_ids(&state.pool, invite.id)
-            .await
-            .map_err(ApiError::Internal)?;
-        entries.push(InviteListEntry {
-            invite,
-            library_ids,
-            group_ids,
-        });
+
+    // Bulk-fetch all invite_libraries + invite_groups in two queries
+    // instead of 2N per-invite queries, then join in Rust.
+    let lib_rows = sqlx::query(
+        "SELECT invite_id, library_id FROM invite_libraries ORDER BY invite_id, library_id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let grp_rows = sqlx::query(
+        "SELECT invite_id, group_id FROM invite_groups ORDER BY invite_id, group_id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let mut lib_map: HashMap<i64, Vec<i64>> = HashMap::new();
+    for row in &lib_rows {
+        let iid: i64 = row.try_get("invite_id").map_err(|e| ApiError::Internal(e.into()))?;
+        let lid: i64 = row.try_get("library_id").map_err(|e| ApiError::Internal(e.into()))?;
+        lib_map.entry(iid).or_default().push(lid);
     }
+    let mut grp_map: HashMap<i64, Vec<i64>> = HashMap::new();
+    for row in &grp_rows {
+        let iid: i64 = row.try_get("invite_id").map_err(|e| ApiError::Internal(e.into()))?;
+        let gid: i64 = row.try_get("group_id").map_err(|e| ApiError::Internal(e.into()))?;
+        grp_map.entry(iid).or_default().push(gid);
+    }
+
+    let entries = invites
+        .into_iter()
+        .map(|invite| {
+            let library_ids = lib_map.remove(&invite.id).unwrap_or_default();
+            let group_ids = grp_map.remove(&invite.id).unwrap_or_default();
+            InviteListEntry { invite, library_ids, group_ids }
+        })
+        .collect();
+
     Ok(Json(InvitesListResponse { invites: entries }))
 }
 
@@ -1526,13 +1599,26 @@ pub async fn request_email_change(
     if input.password.is_empty() {
         return Err(ApiError::validation("password is required"));
     }
+
+    // Per-user rate-limit on the argon2 verify path — same primitive as
+    // change_password, keyed by "ec:{user_id}".
+    let ec_key = format!("ec:{}", user.id);
+    if let Some(wait) = state.login_attempts.check(&ec_key).await {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many failed attempts; try again in {}s",
+            wait.as_secs().max(1)
+        )));
+    }
+
     let record = queries::find_user_with_secret_by_username(&state.pool, &user.username)
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::Unauthorized)?;
     if !password::verify(&input.password, &record.password_hash) {
+        state.login_attempts.record_failure(&ec_key).await;
         return Err(ApiError::Unauthorized);
     }
+    state.login_attempts.record_success(&ec_key).await;
     if record.user.email.as_deref() == Some(new_email.as_str()) {
         return Err(ApiError::validation(
             "new email is the same as the current one",
@@ -2238,6 +2324,36 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Validate that a candidate origin string is safe to persist as `public_url`.
+/// Accepts only `http://` or `https://` origins with no path, query, or
+/// fragment components, and caps the total length to 253 characters (max DNS
+/// hostname length + scheme + "://"). Returns `None` when the value fails
+/// validation so the caller silently skips seeding rather than 500-ing.
+fn validate_setup_origin(candidate: &str) -> Option<&str> {
+    // Length cap: scheme (8) + hostname (253) + margin for port = 270
+    if candidate.len() > 270 {
+        return None;
+    }
+    // Must start with http:// or https://
+    let after_scheme = if candidate.starts_with("https://") {
+        8usize
+    } else if candidate.starts_with("http://") {
+        7usize
+    } else {
+        return None;
+    };
+    let authority = &candidate[after_scheme..];
+    // No path, query, or fragment components allowed
+    if authority.contains('/') || authority.contains('?') || authority.contains('#') {
+        return None;
+    }
+    // Must have at least one character of host
+    if authority.is_empty() {
+        return None;
+    }
+    Some(candidate)
+}
+
 fn setup_origin_from_headers(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers
         .get(axum::http::header::ORIGIN)
@@ -2245,7 +2361,10 @@ fn setup_origin_from_headers(headers: &HeaderMap) -> Option<String> {
     {
         let trimmed = v.trim();
         if !trimmed.is_empty() && trimmed != "null" {
-            return Some(trimmed.to_string());
+            // Validate before accepting; silently discard malformed values.
+            if let Some(valid) = validate_setup_origin(trimmed) {
+                return Some(valid.to_string());
+            }
         }
     }
     let referer = headers
@@ -2254,11 +2373,13 @@ fn setup_origin_from_headers(headers: &HeaderMap) -> Option<String> {
     let after_scheme = referer.find("://")?;
     let rest = &referer[after_scheme + 3..];
     let host_end = rest.find('/').unwrap_or(rest.len());
-    Some(format!(
+    let candidate = format!(
         "{}{}",
         &referer[..after_scheme + 3],
         &rest[..host_end]
-    ))
+    );
+    // Validate the origin reconstructed from Referer.
+    validate_setup_origin(&candidate.clone()).map(|_| candidate)
 }
 
 fn validate_username(name: &str) -> Result<(), ApiError> {

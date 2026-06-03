@@ -85,6 +85,13 @@ pub async fn update(
         validate_description(desc)?;
     }
 
+    // Normalise name to its trimmed form so the stored value matches what
+    // validate_name() checked — mirrors the create() handler's normalisation.
+    let input = ManualCollectionUpdate {
+        name: input.name.as_deref().map(str::trim).map(str::to_owned),
+        ..input
+    };
+
     let ok = queries::update_manual_collection(&state.pool, id, input.clone())
         .await
         .map_err(ApiError::Internal)?;
@@ -506,9 +513,12 @@ async fn upload_art(
             ..Default::default()
         },
     };
-    queries::update_manual_collection(&state.pool, id, patch)
-        .await
-        .map_err(ApiError::Internal)?;
+    if let Err(e) = queries::update_manual_collection(&state.pool, id, patch).await {
+        // DB update failed after the file was already written; clean up the
+        // orphaned file so disk and DB stay consistent.
+        tokio::fs::remove_file(&path).await.ok();
+        return Err(ApiError::Internal(e));
+    }
 
     audit(&state, actor.id, &headers, kind.action(), id, &()).await;
     Ok(StatusCode::NO_CONTENT)

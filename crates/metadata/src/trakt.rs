@@ -828,6 +828,13 @@ impl TraktClient {
         // history, but a firm stop against a runaway loop / unbounded memory.
         const MAX_PAGES: u32 = 200;
 
+        // Max retries per page for 429 responses. Trakt's docs say they
+        // set Retry-After; we honour it and double a floor for servers that
+        // don't, capped at 120 s so a bad actor can't park us indefinitely.
+        const MAX_429_RETRIES: u32 = 3;
+        const MIN_RETRY_AFTER_S: u64 = 5;
+        const MAX_RETRY_AFTER_S: u64 = 120;
+
         let mut all: Vec<HistoryEntry> = Vec::new();
         let mut page: u32 = 1;
         loop {
@@ -836,15 +843,65 @@ impl TraktClient {
                 url.push_str("&start_at=");
                 url.push_str(&urlencode(s));
             }
-            let resp = self
-                .http
-                .get(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
-                .send()
-                .await
-                .with_context(|| format!("GET {url}"))?;
+
+            // Retry the same page on 429; break out (returning partial
+            // results) on any other non-success so the caller can advance
+            // the sync cursor over what we already fetched.
+            let mut backoff_floor = MIN_RETRY_AFTER_S;
+            let resp = 'retry: {
+                for attempt in 0..MAX_429_RETRIES {
+                    let resp = self
+                        .http
+                        .get(&url)
+                        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                        .send()
+                        .await
+                        .with_context(|| format!("GET {url}"))?;
+                    if resp.status().as_u16() == 429 && attempt + 1 < MAX_429_RETRIES {
+                        let header_wait = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let wait_s = header_wait.max(backoff_floor).min(MAX_RETRY_AFTER_S);
+                        warn!(
+                            wait_s,
+                            header_wait,
+                            page,
+                            attempt = attempt + 1,
+                            "Trakt history rate-limited (429); sleeping then retrying page"
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait_s)).await;
+                        // Double the floor so a server returning Retry-After:0
+                        // still backs off geometrically.
+                        backoff_floor = (backoff_floor * 2).min(MAX_RETRY_AFTER_S);
+                        continue;
+                    }
+                    break 'retry resp;
+                }
+                // All retries exhausted — fall through to the non-success
+                // handler below by re-issuing one final request.
+                self.http
+                    .get(&url)
+                    .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                    .send()
+                    .await
+                    .with_context(|| format!("GET {url}"))?
+            };
+
             if !resp.status().is_success() {
-                return Err(api_error("GET /sync/history", resp).await);
+                // Return whatever we accumulated so far. The caller
+                // (pull_user_history) records `all` before updating the
+                // sync cursor, so partial progress is not lost.
+                warn!(
+                    status = %resp.status(),
+                    page,
+                    fetched = all.len(),
+                    "Trakt history fetch failed mid-pagination; returning partial results"
+                );
+                let _ = resp.text().await; // consume body to free the connection
+                return Ok(all);
             }
             // Read the total-page-count header BEFORE the body is consumed.
             let page_count = resp

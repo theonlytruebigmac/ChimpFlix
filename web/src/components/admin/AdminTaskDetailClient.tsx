@@ -7,7 +7,7 @@
 /// Backed by `/admin/tasks/kind/{name}` with 5s polling for the live
 /// counters.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 
 import {
@@ -58,6 +58,15 @@ export function AdminTaskDetailClient({ initial, initialNowMs }: Props) {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  // Stored so we can cancel the toast on unmount (avoids setState on
+  // an unmounted component if the user navigates away before it fires).
+  const savedNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (savedNoticeTimer.current != null) clearTimeout(savedNoticeTimer.current);
+    };
+  }, []);
 
   // Capture the kind name once at mount so polling doesn't tear down +
   // recreate the interval each time `detail` updates.
@@ -210,7 +219,8 @@ export function AdminTaskDetailClient({ initial, initialNowMs }: Props) {
             setNowMs(Date.now());
             setSavedNotice("Schedule saved.");
             setError(null);
-            window.setTimeout(() => setSavedNotice(null), TOAST_DISMISS_SHORT_MS);
+            if (savedNoticeTimer.current != null) clearTimeout(savedNoticeTimer.current);
+            savedNoticeTimer.current = setTimeout(() => setSavedNotice(null), TOAST_DISMISS_SHORT_MS);
           }}
           onError={(msg) => {
             setError(msg);
@@ -747,8 +757,8 @@ function RecentRunsCard({ runs }: { runs: ActivityRecentRun[] }) {
           </tr>
         </thead>
         <tbody>
-          {runs.map((r, i) => (
-            <tr key={i}>
+          {runs.map((r) => (
+            <tr key={r.finished_at_ms}>
               <td>{toIsoDateTime(r.finished_at_ms)}</td>
               <td className="cf-mono">{formatDurationMs(r.duration_ms)}</td>
               <td>

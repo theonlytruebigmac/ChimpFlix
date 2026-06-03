@@ -131,8 +131,29 @@ pub async fn test_fire(
         // matching mask-targeted event would route through filters; here
         // we want a direct deliver. Issue a hand-rolled request matching
         // the production format.
+        //
+        // SSRF guard: this direct-fire path must apply the same outbound
+        // vetting as the production dispatcher (webhooks.rs::attempt_once).
+        // Otherwise an owner could point a webhook at loopback /
+        // 169.254.169.254 and use "Test fire" to exfiltrate the response
+        // into webhook_deliveries. Vet the URL, and suppress redirects so
+        // a 3xx can't bounce us past the check.
+        if let Err(reason) = crate::ssrf::ensure_safe_outbound_url(&hook.url).await {
+            let _ = queries::record_webhook_attempt(
+                &st.pool,
+                delivery_id,
+                None,
+                None,
+                Some(&format!("ssrf-blocked: {reason}")),
+                false,
+                None,
+            )
+            .await;
+            return;
+        }
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build();
         let Ok(client) = client else { return };
         let sig = hook
@@ -151,7 +172,12 @@ pub async fn test_fire(
         match req.send().await {
             Ok(resp) => {
                 let code = resp.status().as_u16() as i64;
-                let body = resp.text().await.ok();
+                // Cap body at 1024 chars, matching the production dispatcher.
+                let body = resp
+                    .text()
+                    .await
+                    .ok()
+                    .map(|s| s.chars().take(1024).collect::<String>());
                 let _ = queries::record_webhook_attempt(
                     &st.pool,
                     delivery_id,
@@ -199,6 +225,12 @@ pub async fn list_deliveries(
     Path(id): Path<i64>,
     Query(params): Query<DeliveriesParams>,
 ) -> Result<Json<DeliveriesResponse>, ApiError> {
+    // Verify the webhook exists before querying deliveries so unknown IDs
+    // return 404 instead of 200 with empty results.
+    queries::get_webhook(&state.pool, &state.vault, id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
     let deliveries = queries::list_webhook_deliveries(&state.pool, id, limit, offset)

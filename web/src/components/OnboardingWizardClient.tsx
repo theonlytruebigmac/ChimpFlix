@@ -519,24 +519,27 @@ function MetadataStep({
     // resolved call means the key actually works.
     const nextResults: Record<string, string> = {};
     const saved: string[] = [];
-    for (const s of filled) {
-      const value = (values[s.slot] ?? "").trim();
-      try {
-        await adminApi.secrets.set(s.slot, value);
-        nextResults[s.slot] = "ok";
-        saved.push(s.slot);
-      } catch (e) {
-        nextResults[s.slot] = friendlyErrorMessage(e);
+    try {
+      for (const s of filled) {
+        const value = (values[s.slot] ?? "").trim();
+        try {
+          await adminApi.secrets.set(s.slot, value);
+          nextResults[s.slot] = "ok";
+          saved.push(s.slot);
+        } catch (e) {
+          nextResults[s.slot] = friendlyErrorMessage(e);
+        }
       }
-    }
-    setResults(nextResults);
-    setBusy(false);
-    // Advance only when every key the operator entered validated. If any
-    // failed, stay on the step so they can fix or clear the bad one.
-    if (filled.every((s) => nextResults[s.slot] === "ok")) {
-      onSaved(saved);
-    } else {
-      onError("Some keys didn't validate — fix or clear them, then continue.");
+      setResults(nextResults);
+      // Advance only when every key the operator entered validated. If any
+      // failed, stay on the step so they can fix or clear the bad one.
+      if (filled.every((s) => nextResults[s.slot] === "ok")) {
+        onSaved(saved);
+      } else {
+        onError("Some keys didn't validate — fix or clear them, then continue.");
+      }
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -735,8 +738,13 @@ function ScanProgressCard({
         if (cancelled) return;
         // Newest first — the API returns them ordered by created_at
         // desc, so [0] is the scan we just kicked off.
-        setScan(scans[0] ?? null);
+        const s = scans[0] ?? null;
+        setScan(s);
         setError(null);
+        // Stop polling once the scan has reached a terminal state.
+        if (s && (s.status === "succeeded" || s.status === "failed" || s.status === "canceled")) {
+          window.clearInterval(id);
+        }
       } catch (e) {
         if (cancelled) return;
         setError(friendlyErrorMessage(e));
@@ -919,13 +927,15 @@ function Field({
   label: string;
   children: React.ReactNode;
 }) {
+  // Wrap children inside <label> so clicking the label text focuses the input
+  // (implicit label association — satisfies WCAG 1.3.1).
   return (
-    <div>
-      <label className="mb-1.5 block text-[12px] font-medium text-white/75">
+    <label className="block">
+      <span className="mb-1.5 block text-[12px] font-medium text-white/75">
         {label}
-      </label>
+      </span>
       {children}
-    </div>
+    </label>
   );
 }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import {
@@ -269,6 +269,7 @@ function HealthDrillIn({
   tile: CounterTile;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [rows, setRows] = useState<LibraryHealthItemRow[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
   const [offset, setOffset] = useState(0);
@@ -316,6 +317,12 @@ function HealthDrillIn({
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Move focus into the dialog on mount so keyboard/screen-reader users
+  // don't land at an invisible location outside the portal.
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
   if (typeof document === "undefined") return null;
 
   const loaded = rows?.length ?? 0;
@@ -323,8 +330,11 @@ function HealthDrillIn({
 
   return createPortal(
     <div
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
+      aria-labelledby="health-drill-title"
+      tabIndex={-1}
       className="fixed inset-0 z-60 flex items-center justify-center bg-black/70 p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -333,7 +343,7 @@ function HealthDrillIn({
       <div className="flex max-h-[85vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-white/15 bg-(--color-surface) shadow-2xl">
         <div className="flex items-baseline justify-between gap-3 border-b border-white/10 px-6 py-4">
           <div>
-            <h2 className="text-lg font-semibold">{tile.label}</h2>
+            <h2 id="health-drill-title" className="text-lg font-semibold">{tile.label}</h2>
             <p className="mt-0.5 text-xs text-white/55">
               {total == null ? (
                 <LoadingPlaceholder variant="inline" />

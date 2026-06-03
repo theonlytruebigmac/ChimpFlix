@@ -2968,7 +2968,8 @@ pub async fn list_media_files_in_library(
          LEFT JOIN episodes e ON e.id = mf.episode_id
          LEFT JOIN seasons s ON s.id = e.season_id
          LEFT JOIN items shows ON shows.id = s.show_id
-         WHERE i.library_id = ? OR shows.library_id = ?",
+         WHERE (i.library_id = ? OR shows.library_id = ?)
+           AND mf.removed_at IS NULL",
     )
     .bind(library_id)
     .bind(library_id)
@@ -3429,9 +3430,12 @@ pub async fn create_email_change_token(
     let now = now_ms();
     // Wipe any in-flight token for this user so they only have one
     // outstanding at a time — avoids "which link do I click" confusion.
+    // Both statements are inside a transaction so two concurrent requests
+    // from the same user cannot each INSERT their own live token.
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM email_change_tokens WHERE user_id = ?")
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     let row = sqlx::query(
         "INSERT INTO email_change_tokens
@@ -3444,9 +3448,11 @@ pub async fn create_email_change_token(
     .bind(code_hash)
     .bind(now)
     .bind(expires_at)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(row.try_get("id")?)
+    let id = row.try_get("id")?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// Look up an active token. Returns (token_id, user_id, new_email).
@@ -4828,18 +4834,24 @@ pub async fn create_access_group(pool: &SqlitePool, input: NewAccessGroup) -> Re
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let now = now_ms();
-    sqlx::query(
+    // Use a single connection so the follow-up SELECT sees the INSERT
+    // even under WAL mode, and use RETURNING id so the fetch is keyed
+    // on the stable id rather than the name.
+    let mut conn = pool.acquire().await?;
+    let id: i64 = sqlx::query(
         "INSERT INTO access_groups (name, description, created_at, updated_at)
-         VALUES (?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?)
+         RETURNING id",
     )
     .bind(&name)
     .bind(description.as_deref())
     .bind(now)
     .bind(now)
-    .execute(pool)
-    .await?;
-    let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.name = ?");
-    let row = sqlx::query(&sql).bind(&name).fetch_one(pool).await?;
+    .fetch_one(&mut *conn)
+    .await?
+    .try_get("id")?;
+    let sql = format!("{ACCESS_GROUP_LIST_SQL} WHERE g.id = ?");
+    let row = sqlx::query(&sql).bind(id).fetch_one(&mut *conn).await?;
     AccessGroup::from_row_with_counts(&row)
 }
 
@@ -5898,10 +5910,16 @@ async fn list_user_show_premieres(pool: &SqlitePool, user_id: i64) -> Result<Vec
              JOIN seasons s ON s.show_id = usm.show_id
              WHERE s.season_number > usm.max_season
                AND NOT EXISTS (
+                   -- Only exclude a season the user has meaningfully started:
+                   -- a zero-progress scrub-hint row should not suppress the
+                   -- premiere (mirrors the 'done' definition from
+                   -- list_user_next_episode_in_show).
                    SELECT 1
                    FROM episodes e3
                    JOIN play_state ps3 ON ps3.episode_id = e3.id
-                   WHERE e3.season_id = s.id AND ps3.user_id = ?
+                   WHERE e3.season_id = s.id
+                     AND ps3.user_id = ?
+                     AND (ps3.watched = 1 OR ps3.position_ms > 0)
                )
              GROUP BY usm.show_id
          )
@@ -5944,10 +5962,18 @@ async fn list_user_show_premieres(pool: &SqlitePool, user_id: i64) -> Result<Vec
 // Scanner upserts
 // ---------------------------------------------------------------------------
 
-/// Map of path → last-known `mtime_ms` for every media file currently
-/// associated with this library (via either `item_id` or
+/// Map of path → last-known `mtime_ms` for every **active** media file
+/// currently associated with this library (via either `item_id` or
 /// `episode_id → season → show_id → items.library_id`). Used by the
 /// scanner to skip unchanged files.
+///
+/// Soft-deleted rows (`removed_at` set) are deliberately excluded: if a
+/// removed file returns to disk with an unchanged mtime, the scanner's
+/// unchanged-mtime fast-path would otherwise skip it and never call
+/// `upsert_media_file` — the only place that clears `removed_at` — so the
+/// file would stay permanently soft-deleted (invisible everywhere).
+/// Excluding it here makes `existing.get()` return `None`, bypassing the
+/// fast-path and re-upserting the row (which sets `removed_at = NULL`).
 pub async fn existing_media_files(
     pool: &SqlitePool,
     library_id: i64,
@@ -5959,7 +5985,8 @@ pub async fn existing_media_files(
          LEFT JOIN episodes ep ON mf.episode_id = ep.id
          LEFT JOIN seasons s ON ep.season_id = s.id
          LEFT JOIN items i_show ON s.show_id = i_show.id
-         WHERE i_movie.library_id = ?1 OR i_show.library_id = ?1",
+         WHERE (i_movie.library_id = ?1 OR i_show.library_id = ?1)
+           AND mf.removed_at IS NULL",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -6163,16 +6190,18 @@ pub async fn purge_removed_media_files_for_library(
                 JOIN items sh ON sh.id = s.show_id
                 WHERE sh.library_id = ?2))";
 
+    // Collect paths and DELETE inside the same transaction so the set of
+    // paths returned exactly matches the rows removed (no TOCTOU gap).
+    let mut tx = pool.begin().await?;
     let path_rows = sqlx::query_scalar::<_, String>(&format!(
         "SELECT path FROM media_files WHERE {MEMBERSHIP}"
     ))
     .bind(older_than_ms)
     .bind(library_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     report.purged_paths = path_rows;
 
-    let mut tx = pool.begin().await?;
     let r = sqlx::query(&format!("DELETE FROM media_files WHERE {MEMBERSHIP}"))
         .bind(older_than_ms)
         .bind(library_id)
@@ -6784,6 +6813,12 @@ pub async fn move_episode_to_season(
 
     let target_season_id = upsert_season(pool, show_id, target_season_number).await?;
 
+    // Wrap the slot-check + UPDATE in a transaction so two concurrent scan
+    // workers targeting the same (target_season, target_episode) slot can't
+    // both read the SELECT as empty and then race to UPDATE, which would
+    // produce a UNIQUE(season_id, episode_number) violation on the second write.
+    let mut tx = pool.begin().await?;
+
     // Refuse the move if a different episode already occupies the
     // target slot. Updating into it would either UNIQUE-violate or
     // overwrite another scan's row.
@@ -6793,7 +6828,7 @@ pub async fn move_episode_to_season(
     .bind(target_season_id)
     .bind(target_episode_number)
     .bind(episode_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if existing.is_some() {
         return Ok(false);
@@ -6809,8 +6844,9 @@ pub async fn move_episode_to_season(
     .bind(target_episode_number)
     .bind(now)
     .bind(episode_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -6897,6 +6933,10 @@ pub async fn heal_filename_derived_episode_titles(pool: &SqlitePool) -> Result<u
 
     let mut healed = 0u64;
     let now = now_ms();
+    // Wrap all updates in one transaction: makes the heal pass atomic
+    // on restart (either all rows are healed or none are) and reduces
+    // fsync overhead to a single commit on startup.
+    let mut tx = pool.begin().await?;
     for row in candidates {
         let id: i64 = row.try_get("id")?;
         let title: String = row.try_get("title").unwrap_or_default();
@@ -6915,10 +6955,11 @@ pub async fn heal_filename_derived_episode_titles(pool: &SqlitePool) -> Result<u
         .bind(&sanitized)
         .bind(now)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
         healed += res.rows_affected();
     }
+    tx.commit().await?;
     Ok(healed)
 }
 
@@ -8219,17 +8260,18 @@ pub async fn list_items_in_collection(
     }
 
     let lib_filter = library_filter_sql("i.library_id", accessible);
+    let active_files = has_active_files_clause();
     let sql = if kind == "manual" {
         format!(
             "{ITEM_SELECT}
              INNER JOIN collection_items ci ON ci.item_id = i.id
-             WHERE ci.collection_id = ? AND {lib_filter}
+             WHERE ci.collection_id = ? AND {active_files} AND {lib_filter}
              ORDER BY ci.sort_order ASC, ci.added_at ASC"
         )
     } else {
         format!(
             "{ITEM_SELECT}
-             WHERE i.collection_id = ? AND {lib_filter}
+             WHERE i.collection_id = ? AND {active_files} AND {lib_filter}
              ORDER BY i.year IS NULL, i.year ASC, i.sort_title COLLATE NOCASE ASC"
         )
     };
@@ -8265,11 +8307,12 @@ async fn list_items_via_smart_rule(
     let rule: SmartRule = serde_json::from_str(rule_json)?;
     let compiled = compile_to_sql(&rule)?;
     let lib_filter = library_filter_sql("i.library_id", accessible);
+    let active_files = has_active_files_clause();
     let joins = compiled.joins.join("\n");
     let sql = format!(
         "{ITEM_SELECT}
          {joins}
-         WHERE {} AND {lib_filter}
+         WHERE {} AND {active_files} AND {lib_filter}
          GROUP BY i.id
          ORDER BY i.sort_title COLLATE NOCASE ASC
          LIMIT 500",
@@ -8501,16 +8544,19 @@ pub async fn add_items_to_manual_collection(
         return Ok(0);
     }
     let now = now_ms();
+    // Begin the transaction before reading MAX(sort_order) so two
+    // concurrent calls cannot both read the same max and then collide
+    // on sort_order during their respective INSERTs.
+    let mut tx = pool.begin().await?;
     let max_row = sqlx::query(
         "SELECT COALESCE(MAX(sort_order), -1) AS max_so
          FROM collection_items WHERE collection_id = ?",
     )
     .bind(collection_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     let mut next: i64 = max_row.try_get::<i64, _>("max_so")? + 1;
     let mut inserted: u64 = 0;
-    let mut tx = pool.begin().await?;
     for &iid in item_ids {
         let res = sqlx::query(
             "INSERT OR IGNORE INTO collection_items
@@ -8952,7 +8998,7 @@ async fn store_image_if_missing(
 /// caller can wire credits to it. Skipped fields stay NULL — we don't have
 /// per-person locks (yet) since the UI doesn't surface them.
 async fn upsert_person_by_tmdb(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     tmdb_id: i64,
     name: &str,
     profile_path: Option<&str>,
@@ -8972,7 +9018,7 @@ async fn upsert_person_by_tmdb(
     .bind(tmdb_id)
     .bind(&profile_url)
     .bind(known_for_department)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(row.try_get("id")?)
 }
@@ -9005,13 +9051,66 @@ pub async fn apply_item_credits_for_source(
         return Ok(());
     }
     for credit in people {
-        let person_id: i64 = {
-            let row = sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+        // Dedup people to avoid unbounded table growth across scans.
+        // When the agent supplies a TMDB person id (external_id parseable
+        // as i64), use ON CONFLICT(tmdb_id) to upsert the canonical row.
+        // For name-only credits, SELECT-or-INSERT by name so we reuse any
+        // existing same-named row rather than appending a fresh duplicate.
+        let person_id: i64 = if let Some(ext) = credit.external_id.as_deref() {
+            if let Ok(tmdb_id) = ext.parse::<i64>() {
+                let row = sqlx::query(
+                    "INSERT INTO people (name, tmdb_id, photo_url) VALUES (?, ?, ?)
+                     ON CONFLICT(tmdb_id) DO UPDATE SET
+                        name = excluded.name,
+                        photo_url = COALESCE(excluded.photo_url, people.photo_url)
+                     RETURNING id",
+                )
+                .bind(&credit.name)
+                .bind(tmdb_id)
+                .bind(credit.profile_url.as_deref())
+                .fetch_one(&mut *tx)
+                .await?;
+                row.try_get("id")?
+            } else {
+                // Non-numeric external_id (e.g. TVDB slug): fall back to
+                // name-based dedup until a per-source unique index lands.
+                let existing: Option<i64> =
+                    sqlx::query_scalar("SELECT id FROM people WHERE name = ? COLLATE NOCASE")
+                        .bind(&credit.name)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if let Some(id) = existing {
+                    id
+                } else {
+                    let row = sqlx::query(
+                        "INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id",
+                    )
+                    .bind(&credit.name)
+                    .bind(credit.profile_url.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    row.try_get("id")?
+                }
+            }
+        } else {
+            // No external_id: dedupe by name within this transaction.
+            let existing: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM people WHERE name = ? COLLATE NOCASE")
+                    .bind(&credit.name)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(id) = existing {
+                id
+            } else {
+                let row = sqlx::query(
+                    "INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id",
+                )
                 .bind(&credit.name)
                 .bind(credit.profile_url.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
-            row.try_get("id")?
+                row.try_get("id")?
+            }
         };
         let role_kind = match credit.role.as_str() {
             "actor" => "cast",
@@ -9077,31 +9176,61 @@ pub async fn apply_episode_credits_for_source(
         .await?;
 
     for credit in people {
-        // Upsert the person. People are deduped within a source by
-        // external_id; across sources they're separate rows for now
-        // (later cleanup can merge by canonical name). This keeps
-        // each agent's people graph independent so a TVDB rescan
-        // doesn't accidentally mutate TMDB-attributed rows.
+        // Dedup people to avoid unbounded table growth. Mirrors the logic
+        // in apply_item_credits_for_source: TMDB numeric external_id →
+        // ON CONFLICT(tmdb_id) upsert; other/absent id → name-based dedup.
         let person_id: i64 = if let Some(ext) = credit.external_id.as_deref() {
-            // people table doesn't currently have a (source, external_id)
-            // unique constraint — fall through to a plain insert and
-            // accept that two scans may insert duplicate rows for the
-            // same external_id. The cleanup pass tracked in Slice 9
-            // will introduce that constraint.
-            let _ = ext;
-            let row = sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+            if let Ok(tmdb_id) = ext.parse::<i64>() {
+                let row = sqlx::query(
+                    "INSERT INTO people (name, tmdb_id, photo_url) VALUES (?, ?, ?)
+                     ON CONFLICT(tmdb_id) DO UPDATE SET
+                        name = excluded.name,
+                        photo_url = COALESCE(excluded.photo_url, people.photo_url)
+                     RETURNING id",
+                )
                 .bind(&credit.name)
+                .bind(tmdb_id)
                 .bind(credit.profile_url.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
-            row.try_get("id")?
+                row.try_get("id")?
+            } else {
+                let existing: Option<i64> =
+                    sqlx::query_scalar("SELECT id FROM people WHERE name = ? COLLATE NOCASE")
+                        .bind(&credit.name)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if let Some(id) = existing {
+                    id
+                } else {
+                    let row = sqlx::query(
+                        "INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id",
+                    )
+                    .bind(&credit.name)
+                    .bind(credit.profile_url.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    row.try_get("id")?
+                }
+            }
         } else {
-            let row = sqlx::query("INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id")
+            let existing: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM people WHERE name = ? COLLATE NOCASE")
+                    .bind(&credit.name)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(id) = existing {
+                id
+            } else {
+                let row = sqlx::query(
+                    "INSERT INTO people (name, photo_url) VALUES (?, ?) RETURNING id",
+                )
                 .bind(&credit.name)
                 .bind(credit.profile_url.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
-            row.try_get("id")?
+                row.try_get("id")?
+            }
         };
 
         let role_kind = match credit.role.as_str() {
@@ -9142,25 +9271,34 @@ pub async fn apply_item_credits(
     // column landed in phase 74 with a default of 'tmdb' for existing
     // rows, so this DELETE catches both legacy untagged rows AND new
     // TMDB writes from this function below.
+    // Delete the existing TMDB rows and re-insert the new cast/crew in a
+    // SINGLE transaction. Previously the DELETE was committed on its own
+    // and the inserts ran afterwards on the pool, which (a) exposed a
+    // window where readers saw zero credits and (b) left the item with
+    // partial/zero credits if any insert failed mid-loop. Wrapping the
+    // whole replace makes it atomic.
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM item_credits WHERE item_id = ? AND source = 'tmdb'")
         .bind(item_id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
-
     for member in &credits.cast {
-        insert_credit_cast(pool, item_id, member).await?;
+        insert_credit_cast(&mut tx, item_id, member).await?;
     }
     for (idx, member) in credits.crew.iter().enumerate() {
-        insert_credit_crew(pool, item_id, member, idx as i64).await?;
+        insert_credit_crew(&mut tx, item_id, member, idx as i64).await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
-async fn insert_credit_cast(pool: &SqlitePool, item_id: i64, m: &TmdbCastMember) -> Result<()> {
+async fn insert_credit_cast(
+    conn: &mut sqlx::SqliteConnection,
+    item_id: i64,
+    m: &TmdbCastMember,
+) -> Result<()> {
     let person_id = upsert_person_by_tmdb(
-        pool,
+        &mut *conn,
         m.tmdb_person_id,
         &m.name,
         m.profile_path.as_deref(),
@@ -9176,19 +9314,19 @@ async fn insert_credit_cast(pool: &SqlitePool, item_id: i64, m: &TmdbCastMember)
     .bind(person_id)
     .bind(m.character.as_deref())
     .bind(m.order as i64)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 async fn insert_credit_crew(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     item_id: i64,
     m: &TmdbCrewMember,
     sort_order: i64,
 ) -> Result<()> {
     let person_id = upsert_person_by_tmdb(
-        pool,
+        &mut *conn,
         m.tmdb_person_id,
         &m.name,
         m.profile_path.as_deref(),
@@ -9211,7 +9349,7 @@ async fn insert_credit_crew(
     .bind(role_kind)
     .bind(&m.job)
     .bind(sort_order)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -9358,6 +9496,10 @@ pub async fn apply_item_edit(pool: &SqlitePool, item_id: i64, edit: &ItemEdit) -
     let now = now_ms();
     let mut locked = fetch_locked_fields(pool, item_id).await?;
 
+    // Wrap all writes in a single transaction so a mid-edit error doesn't
+    // leave the item in a partially-updated state.
+    let mut tx = pool.begin().await?;
+
     // Helper: write a column if the patch includes it, and add the field
     // name to `locked` so future enrichment skips it.
     macro_rules! apply {
@@ -9370,7 +9512,7 @@ pub async fn apply_item_edit(pool: &SqlitePool, item_id: i64, edit: &ItemEdit) -
                 .bind(v)
                 .bind(now)
                 .bind(item_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
                 if !locked.iter().any(|s| s == $field) {
                     locked.push($field.to_string());
@@ -9384,7 +9526,7 @@ pub async fn apply_item_edit(pool: &SqlitePool, item_id: i64, edit: &ItemEdit) -
             .bind(make_sort_title(t))
             .bind(now)
             .bind(item_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         if !locked.iter().any(|s| s == "sort_title") {
             locked.push("sort_title".to_string());
@@ -9395,7 +9537,7 @@ pub async fn apply_item_edit(pool: &SqlitePool, item_id: i64, edit: &ItemEdit) -
             .bind(t)
             .bind(now)
             .bind(item_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         if !locked.iter().any(|s| s == "sort_title") {
             locked.push("sort_title".to_string());
@@ -9416,8 +9558,9 @@ pub async fn apply_item_edit(pool: &SqlitePool, item_id: i64, edit: &ItemEdit) -
         .bind(serialized)
         .bind(now)
         .bind(item_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -10113,47 +10256,40 @@ pub async fn mark_job_failed_with_class(
 ) -> Result<bool> {
     crate::db::with_busy_retry(|| async {
         let now = now_ms();
-        let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await?;
-        let attempts: i64 = row.try_get("attempts")?;
-        let max_attempts: i64 = row.try_get("max_attempts")?;
         let force_terminal = matches!(error_class, Some("external_auth") | Some("permanent"));
-        let went_terminal = force_terminal || attempts >= max_attempts;
-        if went_terminal {
-            sqlx::query(
-                "UPDATE jobs
-                 SET status      = 'dead',
-                     locked_at   = NULL,
-                     finished_at = ?,
-                     last_error  = ?,
-                     error_class = ?
-                 WHERE id = ?",
-            )
-            .bind(now)
-            .bind(error)
-            .bind(error_class)
-            .bind(job_id)
-            .execute(pool)
-            .await?;
-        } else {
-            sqlx::query(
-                "UPDATE jobs
-                 SET status      = 'failed',
-                     locked_at   = NULL,
-                     run_after   = ?,
-                     last_error  = ?,
-                     error_class = ?
-                 WHERE id = ?",
-            )
-            .bind(now + backoff_ms)
-            .bind(error)
-            .bind(error_class)
-            .bind(job_id)
-            .execute(pool)
-            .await?;
-        }
+        // Single UPDATE avoids the TOCTOU race between the read and write:
+        // two concurrent workers on the same job_id both resolve terminal/
+        // retryable from the same atomic read-modify-write rather than
+        // from a separate SELECT that could be stale by update time.
+        // RETURNING status tells us which branch was taken without a
+        // second round-trip.
+        let row = sqlx::query(
+            "UPDATE jobs
+             SET status      = CASE WHEN (? OR attempts >= max_attempts)
+                                    THEN 'dead' ELSE 'failed' END,
+                 locked_at   = NULL,
+                 finished_at = CASE WHEN (? OR attempts >= max_attempts)
+                                    THEN ? ELSE finished_at END,
+                 run_after   = CASE WHEN (? OR attempts >= max_attempts)
+                                    THEN run_after ELSE ? END,
+                 last_error  = ?,
+                 error_class = ?
+             WHERE id = ?
+             RETURNING status",
+        )
+        .bind(force_terminal) // CASE condition (terminal branch)
+        .bind(force_terminal) // CASE condition (finished_at)
+        .bind(now)            // finished_at value when terminal
+        .bind(force_terminal) // CASE condition (run_after)
+        .bind(now + backoff_ms) // run_after value when retryable
+        .bind(error)
+        .bind(error_class)
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+        let went_terminal = row
+            .map(|r| r.try_get::<String, _>("status").unwrap_or_default() == "dead")
+            .unwrap_or(false);
         Ok(went_terminal)
     })
     .await
@@ -10648,11 +10784,15 @@ pub async fn set_all_episodes_watched_for_show(
         let duration_ms: Option<i64> = r.try_get("duration_ms").ok().flatten();
         let position_ms = if watched { duration_ms.unwrap_or(0) } else { 0 };
         sqlx::query(
+            // Include max_position_ms so the progress bar reflects watched
+            // state; mirrors mark_library_watched which sets max_position_ms
+            // = position_ms on INSERT and updates it on conflict.
             "INSERT INTO play_state
-                (user_id, episode_id, position_ms, duration_ms, watched, view_count, last_played_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_id, episode_id, position_ms, max_position_ms, duration_ms, watched, view_count, last_played_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(user_id, episode_id) WHERE episode_id IS NOT NULL DO UPDATE SET
                 position_ms = excluded.position_ms,
+                max_position_ms = excluded.max_position_ms,
                 duration_ms = COALESCE(excluded.duration_ms, play_state.duration_ms),
                 watched = excluded.watched,
                 view_count = play_state.view_count + ?,
@@ -10661,6 +10801,7 @@ pub async fn set_all_episodes_watched_for_show(
         .bind(user_id)
         .bind(id)
         .bind(position_ms)
+        .bind(position_ms) // max_position_ms = position_ms (full when watched)
         .bind(duration_ms)
         .bind(watched as i64)
         .bind(view_count_delta)
@@ -10907,9 +11048,12 @@ fn looks_filename_derived(title: &str) -> bool {
     // whitespace *after* the dash and the capitalized-token shape.
     // A real title like "Mockingjay - Part 1" is preserved because the
     // dash is followed by whitespace.
+    // Require the token to be at least 4 chars so common hyphenated
+    // proper-name suffixes ("Man" in Spider-Man, "Men" in X-Men) are
+    // not mis-classified as release groups.
     if let Some(last_dash) = trimmed.rfind('-') {
         let after = &trimmed[last_dash + 1..];
-        if !after.is_empty() && !after.contains(char::is_whitespace) {
+        if after.chars().count() >= 4 && !after.contains(char::is_whitespace) {
             let first = after.chars().next().unwrap();
             if first.is_ascii_uppercase() || first.is_ascii_digit() {
                 return true;
@@ -10964,6 +11108,16 @@ mod looks_filename_derived_tests {
         // "The Hunger Games: Mockingjay - Part 1" should NOT be filtered:
         // there's whitespace before the dash → not a release tag.
         assert!(!looks_filename_derived("Mockingjay - Part 1"));
+    }
+
+    #[test]
+    fn accepts_hyphenated_proper_nouns() {
+        // Short suffix (< 4 chars): Spider-Man, X-Men should not be mis-classified.
+        assert!(!looks_filename_derived("Spider-Man"));
+        assert!(!looks_filename_derived("X-Men"));
+        // Still catches real release-group tokens (>= 4 chars).
+        assert!(looks_filename_derived("Barrier Day -Kits"));
+        assert!(looks_filename_derived("The First Bloom-Hubs"));
     }
 }
 
@@ -11027,10 +11181,14 @@ pub async fn apply_episode_data(
 
     if mode.overwrites() {
         sqlx::query(
+            // Primary mode: new value wins when non-NULL (COALESCE(?, col)).
+            // duration_ms and air_date previously used the fill-nulls order
+            // (COALESCE(col, ?)), preventing a primary agent from correcting
+            // a stale runtime or air date — fixed to match the other columns.
             "UPDATE episodes SET
                 summary = COALESCE(?, summary),
-                duration_ms = COALESCE(duration_ms, ?),
-                air_date = COALESCE(air_date, ?),
+                duration_ms = COALESCE(?, duration_ms),
+                air_date = COALESCE(?, air_date),
                 tmdb_id = COALESCE(?, tmdb_id),
                 tvdb_id = COALESCE(?, tvdb_id),
                 updated_at = ?
@@ -11096,7 +11254,10 @@ pub async fn apply_episode_metadata(
     let air_date_ms = meta.air_date.as_deref().and_then(parse_air_date_to_ms);
     sqlx::query(
         "UPDATE episodes SET
-            title = ?,
+            -- Honor per-field lock: skip title overwrite if 'title' is in
+            -- locked_fields (same guard as apply_movie_metadata).
+            title = CASE WHEN instr(locked_fields, '\"title\"') > 0
+                         THEN title ELSE ? END,
             summary = ?,
             duration_ms = COALESCE(duration_ms, ?),
             air_date = COALESCE(air_date, ?),
@@ -11269,17 +11430,19 @@ pub async fn library_stats(pool: &SqlitePool) -> Result<Vec<LibraryStats>> {
             .await
             .unwrap_or(0);
         let row = sqlx::query(
+            // Mirror the filter in single_library_stats: exclude soft-deleted
+            // files so file_count and total_bytes match what the user can play.
             "SELECT COUNT(*) AS c, COALESCE(SUM(size_bytes), 0) AS b
              FROM media_files mf
              JOIN items i ON i.id = mf.item_id
-             WHERE i.library_id = ?
+             WHERE i.library_id = ? AND mf.removed_at IS NULL
              UNION ALL
              SELECT COUNT(*) AS c, COALESCE(SUM(size_bytes), 0) AS b
              FROM media_files mf
              JOIN episodes e ON e.id = mf.episode_id
              JOIN seasons s  ON s.id = e.season_id
              JOIN items   i  ON i.id = s.show_id
-             WHERE i.library_id = ?",
+             WHERE i.library_id = ? AND mf.removed_at IS NULL",
         )
         .bind(id)
         .bind(id)
@@ -12844,11 +13007,14 @@ pub async fn claim_due_tasks(pool: &SqlitePool, now: i64) -> Result<Vec<Schedule
 
 pub async fn mark_task_running(pool: &SqlitePool, task_id: i64, started_at: i64) -> Result<i64> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE scheduled_tasks SET last_status = 'running', last_run_at = ? WHERE id = ?")
-        .bind(started_at)
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE scheduled_tasks SET last_status = 'running', last_run_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(started_at)
+    .bind(started_at)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
     let run_id: i64 = sqlx::query(
         "INSERT INTO task_runs (task_id, started_at, status) VALUES (?, ?, 'running')
          RETURNING id",
@@ -12890,12 +13056,56 @@ pub async fn mark_task_finished(
          SET last_status = ?,
              last_error = ?,
              last_duration_ms = ?,
-             next_run_at = ?
+             next_run_at = ?,
+             updated_at = ?
          WHERE id = ?",
     )
     .bind(status)
     .bind(error)
     .bind(duration_ms)
+    .bind(next_run_at)
+    .bind(finished_at)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Recover a task whose handler PANICKED mid-run.
+///
+/// `claim_due_tasks` already flipped `last_status` to `'running'`, and the
+/// panic skipped the normal `mark_task_finished`, so without this the task
+/// stays `'running'` forever — and `claim_due_tasks` filters out running
+/// rows, so it is excluded from every future tick until a restart triggers
+/// `mark_interrupted_tasks`. This flips it back to `'failed'`, records the
+/// panic, closes any still-open run row (we don't carry the `run_id` across
+/// the panic boundary, so we target by `task_id` + `status='running'`), and
+/// pushes `next_run_at` out by a backoff so a reliably-panicking task can't
+/// hammer the worker in a tight crash loop.
+pub async fn mark_task_panicked(
+    pool: &SqlitePool,
+    task_id: i64,
+    finished_at: i64,
+    next_run_at: i64,
+    message: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE task_runs SET finished_at = ?, status = 'failed', error = ?
+         WHERE task_id = ? AND status = 'running'",
+    )
+    .bind(finished_at)
+    .bind(message)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE scheduled_tasks
+         SET last_status = 'failed', last_error = ?, next_run_at = ?
+         WHERE id = ?",
+    )
+    .bind(message)
     .bind(next_run_at)
     .bind(task_id)
     .execute(&mut *tx)
@@ -13168,7 +13378,8 @@ pub async fn backfill_trakt_tokens(
                  access_token_nonce = COALESCE(?, access_token_nonce),
                  refresh_token_enc = COALESCE(?, refresh_token_enc),
                  refresh_token_nonce = COALESCE(?, refresh_token_nonce)
-             WHERE user_id = ?",
+             WHERE user_id = ?
+               AND (access_token IS NOT NULL OR refresh_token IS NOT NULL)",
         )
         .bind(access_blob.as_ref().map(|b| b.value.clone()))
         .bind(access_blob.as_ref().and_then(|b| b.nonce.clone()))
@@ -13966,10 +14177,16 @@ pub async fn ensure_plex_client_identifier(pool: &SqlitePool) -> Result<String> 
         bytes[8], bytes[9],
         bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     );
-    sqlx::query("UPDATE server_settings SET plex_client_identifier = ?")
-        .bind(&id)
-        .execute(pool)
-        .await?;
+    // Only write when the column is still NULL: prevents a concurrent
+    // caller from overwriting a UUID that was already committed by another
+    // in-flight request (the first write wins, last-writer-wins race avoided).
+    sqlx::query(
+        "UPDATE server_settings SET plex_client_identifier = ?
+         WHERE plex_client_identifier IS NULL OR plex_client_identifier = ''",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await?;
     Ok(id)
 }
 
@@ -14193,6 +14410,10 @@ pub async fn add_tag_to_item(pool: &SqlitePool, item_id: i64, name: &str) -> Res
     if trimmed.is_empty() {
         anyhow::bail!("tag name must not be empty");
     }
+    // Wrap both statements in a transaction so a concurrent GC delete in
+    // remove_tag_from_item cannot drop the newly-upserted tag row between
+    // the INSERT into tags and the INSERT into item_tags.
+    let mut tx = pool.begin().await?;
     // Upsert the tag, then bind to the item. The COLLATE NOCASE unique
     // index dedupes case-only variants ("Rewatch" vs "rewatch").
     let id: i64 = sqlx::query(
@@ -14201,14 +14422,15 @@ pub async fn add_tag_to_item(pool: &SqlitePool, item_id: i64, name: &str) -> Res
          RETURNING id",
     )
     .bind(trimmed)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
     sqlx::query("INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?, ?)")
         .bind(item_id)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(Tag {
         id,
         name: trimmed.to_string(),
@@ -15139,7 +15361,7 @@ pub async fn list_playback_activity(
                 pe.item_id, pe.episode_id,
                 COALESCE(
                     i.title,
-                    show.title || ' — ' || ep.title
+                    COALESCE(show.title, '') || ' — ' || COALESCE(ep.title, '')
                 ) AS title
          FROM playback_events pe
          JOIN users u ON u.id = pe.user_id
@@ -15489,8 +15711,10 @@ pub async fn plays_per_day(pool: &SqlitePool, days: i64) -> Result<Vec<StatsDail
     }
     // Walk forward `days` days from the start of the window so empty
     // days show as zero rather than dropping out of the series.
-    let mut out = Vec::with_capacity(days as usize);
-    for n in 0..days {
+    // Use `0..=days` (inclusive) so today's bucket (n = days) is
+    // emitted; `0..days` excluded it while the SQL still fetched today.
+    let mut out = Vec::with_capacity(days as usize + 1);
+    for n in 0..=days {
         let bucket_ms = since_ms_value + n * 86_400_000;
         let day = format_yyyymmdd_utc(bucket_ms);
         let (starts, completions) = found.get(&day).copied().unwrap_or((0, 0));
@@ -16231,6 +16455,45 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(still_watched, 1);
+    }
+
+    /// Locking an account must take effect immediately: the admin
+    /// `set_locked` handler flips `users.locked` AND tears down the
+    /// target's live sessions so access ends now, not at the next
+    /// session expiry. This guards the DB contract that handler relies
+    /// on (the extractor additionally re-checks `locked` per request).
+    #[tokio::test]
+    async fn locking_user_revokes_existing_sessions() {
+        let pool = migrated_pool().await;
+        let user = create_user(&pool, "mallory", "hash", UserRole::User, None, None)
+            .await
+            .unwrap();
+        assert!(!user.locked, "freshly created user starts unlocked");
+
+        // User has a live session before the lock.
+        let nonce = [7u8; 32];
+        let sid = create_session(&pool, user.id, &nonce, now_ms() + 86_400_000, None, None)
+            .await
+            .unwrap();
+        assert!(
+            find_session(&pool, sid).await.unwrap().is_some(),
+            "session exists before lock"
+        );
+
+        // Lock flips the flag...
+        let locked = set_user_locked(&pool, user.id, true)
+            .await
+            .unwrap()
+            .expect("user exists");
+        assert!(locked.locked, "set_user_locked(true) returns locked user");
+
+        // ...and revoking sessions tears the row down.
+        let removed = delete_user_sessions(&pool, user.id).await.unwrap();
+        assert_eq!(removed, 1, "the live session is revoked");
+        assert!(
+            find_session(&pool, sid).await.unwrap().is_none(),
+            "session gone after lock+revoke — access ends immediately"
+        );
     }
 
     async fn test_pool() -> SqlitePool {

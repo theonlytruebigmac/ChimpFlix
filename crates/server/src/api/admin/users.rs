@@ -233,7 +233,9 @@ pub struct PasswordResetResponse {
 
 pub async fn send_password_reset(
     State(state): State<AppState>,
-    AdminAuth(actor): AdminAuth,
+    // Gated to Owners only — Admins must not be able to send password-reset
+    // emails to peer-Admin accounts (would disrupt their session/inbox).
+    OwnerAuth(actor): OwnerAuth,
     Extension(EffectiveClientIp(ip)): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
@@ -268,6 +270,16 @@ pub async fn send_password_reset(
             ),
         }));
     };
+
+    // Apply the same per-email throttle as the self-service path (3/hr per
+    // address) so a compromised admin session can't email-bomb a user.
+    let email_key = email.to_ascii_lowercase();
+    if state.reset_email_limiter.check_key(&email_key).is_err() {
+        return Ok(Json(PasswordResetResponse {
+            ok: false,
+            message: "Too many reset emails sent to this address recently — wait an hour and retry.".into(),
+        }));
+    }
 
     // Generate token + hash, persist hash only. Mirrors the self-service
     // path so consume_password_reset accepts either origin.
@@ -461,6 +473,17 @@ async fn set_locked(
         .await
         .map_err(|e| ApiError::validation(format!("{e:#}")))?
         .ok_or(ApiError::NotFound)?;
+    // Locking disables the account *now*: revoke any sessions the target
+    // already holds so access ends immediately rather than at the next
+    // session expiry. The extractor also re-checks `locked` on every
+    // request (defense in depth), but tearing the rows down keeps the
+    // session table honest and frees the user's slots. Unlock has no
+    // sessions to clean up.
+    if locked {
+        queries::delete_user_sessions(&state.pool, user_id)
+            .await
+            .map_err(ApiError::Internal)?;
+    }
     let action = if locked {
         "user.lock"
     } else {

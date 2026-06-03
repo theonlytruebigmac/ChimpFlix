@@ -82,44 +82,25 @@ pub fn compile_to_sql(rule: &SmartRule) -> Result<CompiledRule> {
 
     let mut clauses: Vec<String> = Vec::new();
     let mut bindings: Vec<Bind> = Vec::new();
-    let mut joins: Vec<&'static str> = Vec::new();
-    let mut needs_tags_join = false;
-    let mut needs_genres_join = false;
 
     for cond in &rule.conditions {
-        let clause = compile_condition(
-            cond,
-            &mut bindings,
-            &mut needs_tags_join,
-            &mut needs_genres_join,
-        )?;
+        let clause = compile_condition(cond, &mut bindings)?;
         clauses.push(clause);
     }
-    if needs_tags_join {
-        joins.push(
-            "LEFT JOIN item_tags _it ON _it.item_id = i.id \
-             LEFT JOIN tags _t ON _t.id = _it.tag_id",
-        );
-    }
-    if needs_genres_join {
-        // genre is stored as a JSON array on items.genres — no join
-        // required; the LIKE-on-JSON in compile_condition handles it.
-    }
 
+    // No shared joins: `tag` conditions compile to self-contained EXISTS
+    // subqueries (see the `tag` arm) and `genre` to a JSON LIKE, so the
+    // outer query never needs a JOIN. Kept as a field for the query
+    // builder's API, but always empty now.
     let where_clause = format!("({})", clauses.join(&format!(" {combinator} ")));
     Ok(CompiledRule {
         where_clause,
-        joins,
+        joins: Vec::new(),
         bindings,
     })
 }
 
-fn compile_condition(
-    cond: &Condition,
-    bindings: &mut Vec<Bind>,
-    needs_tags_join: &mut bool,
-    _needs_genres_join: &mut bool,
-) -> Result<String> {
+fn compile_condition(cond: &Condition, bindings: &mut Vec<Bind>) -> Result<String> {
     let field = cond.field.as_str();
     let op = cond.op.as_str();
     match field {
@@ -209,10 +190,17 @@ fn compile_condition(
         }
         "tag" => {
             require_op(op, &["contains"])?;
-            *needs_tags_join = true;
             let v = expect_string(&cond.value)?;
             bindings.push(Bind::Text(v));
-            Ok("_t.name = ? COLLATE NOCASE".to_string())
+            // Per-condition EXISTS rather than a shared LEFT JOIN. A join
+            // yields one row per (item, tag) pair, so two tag conditions
+            // under AND become `_t.name = 'X' AND _t.name = 'Y'` on a
+            // single row — never true — silently returning zero items.
+            // EXISTS has no fan-out and composes correctly under AND/OR.
+            Ok("EXISTS (SELECT 1 FROM item_tags _it \
+                JOIN tags _t ON _t.id = _it.tag_id \
+                WHERE _it.item_id = i.id AND _t.name = ? COLLATE NOCASE)"
+                .to_string())
         }
         "added_at" => {
             require_op(op, &["lt", "le", "gt", "ge", "between"])?;
@@ -274,7 +262,11 @@ fn expect_range_int(v: &serde_json::Value) -> Result<(i64, i64)> {
     if arr.len() != 2 {
         return Err(anyhow!("between value must be exactly two elements"));
     }
-    Ok((expect_int(&arr[0])?, expect_int(&arr[1])?))
+    let (lo, hi) = (expect_int(&arr[0])?, expect_int(&arr[1])?);
+    if lo > hi {
+        return Err(anyhow!("between range is inverted: lo ({lo}) > hi ({hi})"));
+    }
+    Ok((lo, hi))
 }
 
 fn expect_range_real(v: &serde_json::Value) -> Result<(f64, f64)> {
@@ -284,7 +276,14 @@ fn expect_range_real(v: &serde_json::Value) -> Result<(f64, f64)> {
     if arr.len() != 2 {
         return Err(anyhow!("between value must be exactly two elements"));
     }
-    Ok((expect_real(&arr[0])?, expect_real(&arr[1])?))
+    let (lo, hi) = (expect_real(&arr[0])?, expect_real(&arr[1])?);
+    if !lo.is_finite() || !hi.is_finite() {
+        return Err(anyhow!("between range values must be finite"));
+    }
+    if lo > hi {
+        return Err(anyhow!("between range is inverted: lo ({lo}) > hi ({hi})"));
+    }
+    Ok((lo, hi))
 }
 
 fn expect_int_list(v: &serde_json::Value) -> Result<Vec<i64>> {

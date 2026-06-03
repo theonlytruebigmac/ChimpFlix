@@ -262,13 +262,13 @@ pub async fn export(
 /// straight from client request headers, so a value like `=HYPERLINK(...)`
 /// or `=cmd|...` would execute when an operator opens the export in
 /// Excel/Sheets. Prefix any field that begins with a formula-trigger char
-/// (`=`, `+`, `-`, `@`, tab, CR) with a single quote so it renders as text.
+/// (`=`, `+`, `-`, `@`, tab, CR, LF) with a single quote so it renders as text.
 fn csv_field(s: &str) -> String {
     let guarded;
     let s: &str = if s
         .chars()
         .next()
-        .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'))
+        .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r' | '\n'))
     {
         guarded = format!("'{s}");
         &guarded

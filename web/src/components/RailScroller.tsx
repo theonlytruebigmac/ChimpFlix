@@ -74,8 +74,26 @@ export function RailScroller({
     el.scrollBy({ left: dir * perPage * stride, behavior: "smooth" });
   }, []);
 
+  // Keyboard paging: when focus is anywhere inside the rail (e.g. a card
+  // button is focused while tabbing), Left/Right page the rail like the
+  // arrows do. Events bubble up from the focused descendant. We swallow
+  // the default (which would scroll the whole page) only for the two keys
+  // we handle, so vertical scrolling with Up/Down is untouched.
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        page(1);
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        page(-1);
+      }
+    },
+    [page],
+  );
+
   return (
-    <div className="group/rail relative">
+    <div className="group/rail relative" onKeyDown={onKeyDown}>
       <ul ref={ref} className={className}>
         {children}
       </ul>
@@ -94,12 +112,25 @@ function RailArrow({
 }) {
   // Full class strings per side — Tailwind only emits classes it can find
   // as complete literals, so these can't be interpolated.
+  //
+  // Hitbox correctness (this used to be a flaky target):
+  //  - `z-[60]` sits ABOVE a hovered card (cards raise to z-50 and scale to
+  //    125%). Previously the arrow was z-10, so a zoomed neighbouring card
+  //    stacked on top of it and ate the click — and because the zoom has a
+  //    200ms delay, whether the click landed depended on timing. The arrow
+  //    now always wins its strip.
+  //  - `pointer-events-none` at rest means the invisible strip never steals
+  //    clicks from the edge card; it flips to `pointer-events-auto` only
+  //    once the row is hovered (or the button is keyboard-focused), exactly
+  //    when the arrow is actually visible and intended to be clickable.
+  //  - The whole `w-14` strip is the target (not just the small circle), so
+  //    there's a generous, full-poster-height area to land on.
   const base =
-    "absolute top-2 bottom-12 z-10 hidden w-12 items-center justify-center text-white/90 opacity-0 transition-opacity duration-200 hover:text-white focus-visible:opacity-100 focus-visible:outline-none group-hover/rail:opacity-100 md:flex";
+    "absolute top-2 bottom-12 z-[60] hidden w-14 items-center justify-center text-white/90 opacity-0 pointer-events-none transition-opacity duration-200 hover:text-white focus-visible:opacity-100 focus-visible:pointer-events-auto focus-visible:outline-none group-hover/rail:opacity-100 group-hover/rail:pointer-events-auto md:flex";
   const sided =
     dir === "left"
-      ? `${base} left-0 bg-linear-to-r from-black/70 to-transparent`
-      : `${base} right-0 bg-linear-to-l from-black/70 to-transparent`;
+      ? `${base} left-0 justify-start bg-linear-to-r from-black/75 to-transparent`
+      : `${base} right-0 justify-end bg-linear-to-l from-black/75 to-transparent`;
   return (
     <button
       type="button"
@@ -107,10 +138,10 @@ function RailArrow({
       onClick={onClick}
       className={sided}
     >
-      <span className="flex h-9 w-9 items-center justify-center rounded-full bg-black/50 backdrop-blur-sm">
+      <span className="m-1 flex h-10 w-10 items-center justify-center rounded-full bg-black/60 shadow-lg ring-1 ring-white/10 backdrop-blur-sm transition-transform duration-150 hover:scale-110">
         <svg
-          width="22"
-          height="22"
+          width="24"
+          height="24"
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"

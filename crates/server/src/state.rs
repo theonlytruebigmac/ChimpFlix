@@ -221,6 +221,15 @@ pub struct AppState {
     /// token is about to expire — that produces duplicate refreshes,
     /// each minting a new token pair, and a last-writer-wins upsert
     /// that can lose a valid refresh_token.
+    ///
+    /// Growth is bounded: at most one `Arc<Mutex<()>>` (≈ 24 bytes)
+    /// per Trakt-linked user, and entries persist until restart even
+    /// after a user unlinks Trakt. For typical deployments (tens to
+    /// low hundreds of users) this is negligible; if explicit pruning
+    /// is ever wanted, add `state.trakt_refresh_locks.write().await
+    /// .remove(&user_id)` to the Trakt unlink handler
+    /// (`api::trakt::unlink`) and the user-delete handler
+    /// (`api::auth::delete_user`).
     pub trakt_refresh_locks: Arc<RwLock<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
     /// Live, in-memory per-kind counters and recent-run ring
     /// buffer. Used by the admin activity screen to render

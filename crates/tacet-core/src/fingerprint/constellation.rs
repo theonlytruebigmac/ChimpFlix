@@ -52,6 +52,11 @@ pub fn build_fingerprint(
 
     // For each anchor peak, pair with the next `fan_out` peaks
     // within the target time window
+    // The hash field is only 12 bits wide (see compute_hash layout), so deltas
+    // above 0xFFF alias.  Cap the effective limit so the guard and the cast are
+    // both safe regardless of what the operator configured.
+    let max_delta = (config.max_target_delta as u32).min(0xFFF);
+
     for (i, anchor) in peaks.iter().enumerate() {
         let mut paired = 0;
 
@@ -63,13 +68,14 @@ pub fn build_fingerprint(
             let time_delta = target.frame.saturating_sub(anchor.frame);
 
             // Target must be ahead in time but within the max delta
-            if time_delta == 0 || time_delta > config.max_target_delta as u32 {
-                if time_delta > config.max_target_delta as u32 {
+            if time_delta == 0 || time_delta > max_delta {
+                if time_delta > max_delta {
                     break; // Peaks are sorted by frame, so no more valid targets
                 }
                 continue;
             }
 
+            // time_delta <= max_delta <= 0xFFF (4095), so the u16 cast is lossless
             let hash = compute_hash(anchor.bin, target.bin, time_delta as u16);
 
             hashes.push(FpHash {

@@ -101,6 +101,10 @@ export function SeasonEpisodes({
   // exactly matching what the server emitted.
   const [nowMs, setNowMs] = useState<number | null>(null);
   useEffect(() => {
+    // Post-hydration clock read — deliberately client-only so SSR and the
+    // first client render agree (avoids a hydration mismatch). Same pattern
+    // as Card.tsx.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNowMs(Date.now());
   }, []);
 
@@ -351,11 +355,10 @@ export function SeasonEpisodes({
       ),
     );
     try {
-      await Promise.all(
-        ids.map((id) =>
-          playStateApi.setWatched({ episode_id: id, watched: target }),
-        ),
-      );
+      // Sequential loop to avoid issuing N parallel POST requests for large seasons.
+      for (const id of ids) {
+        await playStateApi.setWatched({ episode_id: id, watched: target });
+      }
       onWatchStatsChange?.();
       setConfirmation(
         target

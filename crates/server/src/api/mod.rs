@@ -83,6 +83,14 @@ pub fn router(state: AppState) -> Router {
             "/auth/password-reset/confirm",
             post(auth::confirm_password_reset),
         )
+        // Plex OAuth PIN *creation*. Unauthenticated and creates a Plex
+        // PIN + an in-memory cache entry per call, so without a limiter a
+        // caller can drain Plex's per-client_identifier PIN quota (denying
+        // logins server-wide) and grow the pin cache. Shares the strict
+        // auth bucket; one PIN per login attempt is well under 10/min.
+        // (The matching `/auth/plex/poll` is throttled separately with a
+        // looser limiter so device-flow polling isn't broken.)
+        .route("/auth/plex/start", post(auth_plex::start))
         // Tight per-route body cap on the auth surface. Every payload
         // here is a few hundred bytes at most (username + password +
         // a 64-char token); 16 KiB leaves room for inflated JSON and
@@ -102,6 +110,23 @@ pub fn router(state: AppState) -> Router {
         ))
         .route_layer(middleware::from_fn_with_state(
             auth_lim.clone(),
+            rate_limit::enforce,
+        ));
+
+    // Plex device-flow poll lives on its own, looser per-IP limiter so a
+    // legitimate ~1-poll/sec flow isn't throttled by the strict auth
+    // bucket, while still capping unauthenticated abuse. See
+    // `rate_limit::plex_poll_limiter`.
+    let plex_poll_lim = rate_limit::plex_poll_limiter();
+    let limited_poll = Router::new()
+        .route("/auth/plex/poll", post(auth_plex::poll))
+        .layer(RequestBodyLimitLayer::new(AUTH_BODY_LIMIT_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            plex_poll_lim,
             rate_limit::enforce,
         ));
 
@@ -217,12 +242,11 @@ pub fn router(state: AppState) -> Router {
             "/items/{id}/tags/{tag_id}",
             axum::routing::delete(tags::remove_from_item),
         )
-        // Plex OAuth: PIN-based device flow. Same start+poll pair
-        // covers login, invite-bearing signup, and linking from
-        // Settings → Account. See `auth_plex::StartInput` for intent
-        // dispatch.
-        .route("/auth/plex/start", post(auth_plex::start))
-        .route("/auth/plex/poll", post(auth_plex::poll))
+        // Plex OAuth: PIN-based device flow. `start` (PIN creation) and
+        // `poll` (device-flow polling) are rate-limited and live in the
+        // `limited_auth` / `limited_poll` routers below; the link
+        // management routes here require an authenticated session.
+        // See `auth_plex::StartInput` for intent dispatch.
         .route(
             "/auth/plex/link",
             get(auth_plex::list_links).delete(auth_plex::unlink),
@@ -359,14 +383,9 @@ pub fn router(state: AppState) -> Router {
             "/admin/smart-collections/{id}/rule",
             axum::routing::put(admin::collections::update_smart_rule),
         )
-        // Pre-roll video (operator-uploaded; plays before each session)
-        .route(
-            "/admin/preroll",
-            get(admin::preroll::get_status)
-                .post(admin::preroll::upload)
-                .delete(admin::preroll::clear),
-        )
-        .route("/preroll/blob", get(admin::preroll::serve_blob))
+        // Pre-roll video routes are mounted separately (see `preroll`
+        // router below) so the upload route can carry a larger body limit
+        // than the global 16 MiB cap.
         // Bulk item operations
         .route(
             "/admin/items/bulk/refresh-metadata",
@@ -658,6 +677,32 @@ pub fn router(state: AppState) -> Router {
         // WebSocket
         .route("/ws", get(ws::handler));
 
+    // Pre-roll routes carry their own, larger body limit. They are merged
+    // AFTER `v1`'s global 16 MiB limit is applied (see below), so the
+    // upload route can accept up to `MAX_PREROLL_BYTES`. The global cap is
+    // applied to `v1` here rather than at the top-level router so this
+    // merge can sit outside it; the other top-level routes (health / ready
+    // / metrics) are bodyless GETs that don't need a request-body cap.
+    let preroll = Router::new()
+        .route(
+            "/admin/preroll",
+            get(admin::preroll::get_status)
+                .post(admin::preroll::upload)
+                .delete(admin::preroll::clear),
+        )
+        .route("/preroll/blob", get(admin::preroll::serve_blob))
+        .layer(RequestBodyLimitLayer::new(
+            admin::preroll::MAX_PREROLL_BYTES,
+        ));
+    let v1 = v1
+        // Global request-body cap for the normal API surface. Applied
+        // before the merges below so neither the larger-limit pre-roll
+        // routes nor the already-tightly-capped auth routes inherit it.
+        .layer(RequestBodyLimitLayer::new(DEFAULT_BODY_LIMIT_BYTES))
+        .merge(preroll)
+        .merge(limited_auth)
+        .merge(limited_poll);
+
     let metrics_registry = state.http_metrics.clone();
     Router::new()
         .route("/health", get(health::health))
@@ -666,7 +711,7 @@ pub fn router(state: AppState) -> Router {
         // expected to gate it at the reverse proxy. See WEEK 1 #10
         // in `docs/PUBLIC_RELEASE_HARDENING.md`.
         .route("/metrics", get(metrics::metrics))
-        .nest("/api/v1", v1.merge(limited_auth))
+        .nest("/api/v1", v1)
         // Per-route HTTP request count + latency tracking. Outer
         // layer so every route (health / ready / metrics / API)
         // contributes; the metrics endpoint itself shows up as
@@ -675,9 +720,6 @@ pub fn router(state: AppState) -> Router {
             metrics_registry,
             http_metrics::track,
         ))
-        // Cap JSON body size for safety; multipart routes set their own
-        // per-handler limits via Multipart's `max_length`.
-        .layer(RequestBodyLimitLayer::new(DEFAULT_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), csrf::layer))
         // Client-IP resolution runs before csrf + rate-limit + auth so
         // those layers all read from the same authoritative

@@ -24,7 +24,7 @@ export function AdminWebhooksClient({ initial }: { initial: WebhooksListResponse
   const [nowMs, setNowMs] = useState(0);
   useEffect(() => {
     setNowMs(Date.now());
-  }, [webhooks]);
+  }, []); // mount-only: re-stamping on every refresh collapses relative times to "0s ago"
 
   async function refresh() {
     try {
@@ -208,6 +208,9 @@ function WebhookRow({
     }
   })();
   const [expanded, setExpanded] = useState(false);
+  // Ref mirrors `expanded` so the 600ms post-test timer callback reads the
+  // live value instead of the stale closure value from when test() was called.
+  const expandedRef = useRef(false);
   const [name, setName] = useState(webhook.name);
   const [url, setUrl] = useState(webhook.url);
   const [secret, setSecret] = useState(webhook.secret ?? "");
@@ -274,12 +277,22 @@ function WebhookRow({
         window.clearTimeout(testRefreshTimerRef.current);
       }
       testRefreshTimerRef.current = window.setTimeout(async () => {
-        testRefreshTimerRef.current = null;
-        if (expanded) {
-          const r = await adminApi.webhooks.listDeliveries(webhook.id, 20);
-          setDeliveries(r.deliveries);
+        // The timer callback runs OUTSIDE the surrounding try/catch, so a
+        // rejected listDeliveries here would be an unhandled rejection and
+        // setBusy(false) would never run — leaving the row's buttons
+        // permanently disabled. Own try/finally guarantees the busy lock
+        // and the timer ref are always released.
+        try {
+          if (expandedRef.current) {
+            const r = await adminApi.webhooks.listDeliveries(webhook.id, 20);
+            setDeliveries(r.deliveries);
+          }
+        } catch (e) {
+          onError(e instanceof Error ? e.message : String(e));
+        } finally {
+          testRefreshTimerRef.current = null;
+          setBusy(false);
         }
-        setBusy(false);
       }, 600);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
@@ -345,8 +358,10 @@ function WebhookRow({
             type="button"
             className="cf-btn cf-ghost cf-tiny"
             onClick={() => {
-              setExpanded((v) => !v);
-              if (!expanded) loadDeliveries();
+              const next = !expanded;
+              expandedRef.current = next;
+              setExpanded(next);
+              if (next) loadDeliveries();
             }}
           >
             {expanded ? "Close" : "Edit"}

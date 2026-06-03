@@ -19,8 +19,15 @@
 
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+/// Monotonically-increasing counter used to give each decoder smoke-test
+/// temp file a unique name within the process. Eliminates path collisions
+/// when two concurrent `detect_capabilities` calls (boot + admin reprobe)
+/// probe the same (hwaccel, codec) pair simultaneously.
+static PROBE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use tracing::{debug, warn};
 
@@ -340,9 +347,11 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
     };
 
     // Make a tiny test bitstream: 1-frame 64x64 black clip, ~kilobytes.
+    // Use a per-call monotonic counter (not PID) so concurrent calls from
+    // the boot probe and an admin reprobe don't share the same path.
     let tmp = std::env::temp_dir().join(format!(
         "chimpflix_dec_probe_{hwaccel}_{codec}_{}.dat",
-        std::process::id()
+        PROBE_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = tokio::fs::remove_file(&tmp).await;
 
@@ -353,8 +362,16 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
         .args(["-vf", "format=yuv420p"])
         .args(["-c:v", encoder, "-frames:v", "1", "-f", container])
         .arg(&tmp);
+    // libaom-av1's first encode is notoriously slow (5–30 s for initial
+    // model load + allocation), so give it a much longer budget than
+    // the standard smoke timeout to avoid falsely marking AV1 HW decode
+    // as unavailable on GPUs that support it (e.g. NVDEC Ampere+).
+    let enc_timeout = match codec {
+        "av1" => Duration::from_secs(60),
+        _ => SMOKE_TIMEOUT,
+    };
     let enc_ok = matches!(
-        tokio::time::timeout(SMOKE_TIMEOUT, enc_cmd.output()).await,
+        tokio::time::timeout(enc_timeout, enc_cmd.output()).await,
         Ok(Ok(out)) if out.status.success()
     );
     if !enc_ok {

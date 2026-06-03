@@ -134,6 +134,8 @@ export function SettingsInvitesClient() {
       await refresh();
       setAskRevokeId(null);
     } catch {
+      // Close the dialog so the error banner is not hidden behind the overlay.
+      setAskRevokeId(null);
       setError("Failed to revoke.");
     } finally {
       setRevokeBusy(false);

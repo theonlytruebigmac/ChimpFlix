@@ -84,6 +84,10 @@ export function AdminUsersUnifiedClient({
         setSessions(s.sessions);
         setMatrix(m.entries);
         setNowMs(Date.now());
+        // Clear any error from a previous failed fetch so an
+        // empty-but-successful response shows "No users yet." not
+        // the stale error text.
+        setMessage(null);
       } catch (e) {
         if (cancelled) return;
         if (e instanceof ChimpFlixApiError && e.status === 403) {
@@ -727,7 +731,9 @@ function ProfileTab({
               if (next !== user.role) onSetRole(next);
             }}
           >
-            <option value="owner">Owner</option>
+            {/* Owners can assign any role; admins can only assign roles
+                at or below their own tier (admin/user), not escalate to owner. */}
+            {currentUserRole === "owner" && <option value="owner">Owner</option>}
             <option value="admin">Admin</option>
             <option value="user">User</option>
           </select>
@@ -987,14 +993,27 @@ function AccessTab({
       // The /admin/access-matrix PUT is a per-library FULL replace of every
       // direct grant. So for each library this user's level changed, we
       // resend the COMPLETE direct-grant set: every OTHER user's current
-      // direct level (from the full matrix) plus this user's new level.
-      // Owners are force-kept at full server-side regardless. Only touched
-      // libraries are included so we don't needlessly rewrite the rest.
+      // direct level plus this user's new level. Owners are force-kept at
+      // full server-side regardless. Only touched libraries are included so
+      // we don't needlessly rewrite the rest.
       const changed = libs.filter(
         (l) => (levels.get(l.library_id) ?? "none") !== l.level,
       );
+      // Re-fetch the matrix immediately before building the payload. The
+      // `fullMatrix` prop is a snapshot from page load; if another admin
+      // changed a sibling user's grant in the meantime, replaying the stale
+      // snapshot in this full-replace PUT would silently revert their
+      // change. Using fresh siblings narrows that window to this request.
+      // If the refetch fails, fall back to the snapshot rather than sending
+      // an empty sibling set (which would wipe everyone else's grants).
+      let freshEntries: AccessMatrixEntry[];
+      try {
+        freshEntries = (await adminApi.access.get()).entries;
+      } catch {
+        freshEntries = fullMatrix;
+      }
       const payload = changed.map((l) => {
-        const others = fullMatrix
+        const others = freshEntries
           .filter(
             (e) =>
               e.library_id === l.library_id &&
@@ -1199,7 +1218,10 @@ function AuditTab({
 }) {
   const [entries, setEntries] = useState<AuditLogEntry[] | null>(null);
   const [total, setTotal] = useState(0);
+  // "Load more" bumps this by 20 and re-fetches from offset 0 (expand-window
+  // approach). Cap at 200 to prevent an unbounded single query on busy accounts.
   const [pageSize, setPageSize] = useState(20);
+  const MAX_PAGE_SIZE = 200;
   const [error, setError] = useState<string | null>(null);
   // Wall-clock captured at fetch time, used for relative "5m ago"
   // labels. Stays 0 until after mount (set alongside the fetched
@@ -1264,10 +1286,10 @@ function AuditTab({
           <AuditRow key={e.id} entry={e} nowMs={nowMs} />
         ))}
       </div>
-      {entries.length < total && (
+      {entries.length < total && pageSize < MAX_PAGE_SIZE && (
         <button
           type="button"
-          onClick={() => setPageSize((s) => s + 20)}
+          onClick={() => setPageSize((s) => Math.min(s + 20, MAX_PAGE_SIZE))}
           className="cf-btn cf-sm"
           style={{ marginTop: 8, width: "100%", justifyContent: "center" }}
         >

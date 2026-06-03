@@ -140,10 +140,12 @@ pub fn classify(err: &anyhow::Error) -> ErrorClass {
 ///   - `http {code}` / `http/{code}`
 ///   - `status {code}` / `status: {code}` / `status_code: {code}`
 ///   - `({code} ...)` — common reqwest Display format
-///   - ` {code}:` — leading-space delimited (matches "OMDb 429:")
+///   - ` {code}:` — leading-space + colon (matches "OMDb 429:")
 ///
 /// Critically does NOT match a raw three-digit string in arbitrary
-/// context (file path, item id, ffmpeg time offset).
+/// context (file path, item id, ffmpeg time offset). The former
+/// ` {code} ` space-padded pattern was removed because it
+/// false-positives on filenames like "Episode 429 HD.mkv".
 fn has_http_status(chain: &str, code: u16) -> bool {
     let needle = code.to_string();
     let n = &needle;
@@ -157,7 +159,6 @@ fn has_http_status(chain: &str, code: u16) -> bool {
         || chain.contains(&format!("status code: {n}"))
         || chain.contains(&format!("({n} "))
         || chain.contains(&format!(" {n}:"))
-        || chain.contains(&format!(" {n} "))
 }
 
 fn error_chain_lower(err: &anyhow::Error) -> String {
@@ -260,6 +261,16 @@ mod tests {
             classify(&make("internal error code 12942: something else")),
             ErrorClass::Transient,
             "embedded digits should not be rate-limited"
+        );
+        // Space-padded pattern ` 429 ` would have matched "Episode 429 HD"
+        // (space before and space after); now correctly dead-letters as
+        // Permanent via "no such file" instead of retrying as ExternalRateLimit.
+        assert_eq!(
+            classify(&make(
+                "file /movies/Episode 429 HD.mkv: no such file or directory"
+            )),
+            ErrorClass::Permanent,
+            "file path with '429 HD' (space on both sides) should not be rate-limited"
         );
     }
 

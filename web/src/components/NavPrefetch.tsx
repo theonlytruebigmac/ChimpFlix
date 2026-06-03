@@ -30,21 +30,18 @@ export function NavPrefetch() {
       }).cancelIdleCallback ?? window.clearTimeout;
 
     const handles: number[] = [];
-    PREFETCH_ROUTES.forEach((route, i) => {
-      // Stagger the kicks so we don't queue 5 prefetch requests in the same
-      // idle slice — gives the browser room to keep first paint snappy.
-      const h = ric(() => {
-        try {
-          router.prefetch(route);
-        } catch {
-          // ignore — prefetch is best-effort
-        }
-        // Schedule the next route on a fresh idle callback.
-        if (i < PREFETCH_ROUTES.length - 1) {
-          handles.push(ric(() => router.prefetch(PREFETCH_ROUTES[i + 1])));
-        }
-      });
-      handles.push(h);
+    // Each route gets its own idle callback so they don't all compete in one
+    // idle slice — gives the browser room to keep first paint snappy.
+    PREFETCH_ROUTES.forEach((route) => {
+      handles.push(
+        ric(() => {
+          try {
+            router.prefetch(route);
+          } catch {
+            // ignore — prefetch is best-effort
+          }
+        }),
+      );
     });
 
     return () => {

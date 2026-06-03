@@ -180,25 +180,35 @@ pub async fn get(
             .unwrap_or_else(|| format!("Library {lib_id}"));
         paths.push((label, path));
     }
-    // Deduplicate by underlying mountpoint so two libraries on the same
-    // filesystem don't double-count disk space. The cheap proxy is the
-    // statvfs result tuple (total, free) — we only emit one row per such
-    // pair, picking the friendliest label.
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut disks = Vec::with_capacity(paths.len());
-    for (label, path) in paths {
-        if let Some((total, used)) = statvfs_usage(&path) {
-            let key = (total, used);
-            if seen.insert(key) {
-                disks.push(DiskUsage {
-                    path,
-                    label,
-                    total_bytes: total,
-                    used_bytes: used,
-                });
+    // Deduplicate by underlying filesystem id so two libraries on the same
+    // physical volume don't double-count disk space. We use f_fsid from
+    // statvfs (a kernel-assigned per-filesystem identifier) rather than the
+    // (total, used) tuple, which would falsely coalesce two different volumes
+    // that happen to be equally sized and equally full at query time.
+    //
+    // statvfs_usage() invokes Path::exists() + libc::statvfs(), both
+    // blocking syscalls that can stall for 10–100 ms on NFS/CIFS/Docker
+    // volumes. Offload the entire loop to a dedicated blocking thread so
+    // the async executor worker is not held during the I/O wait.
+    let disks = tokio::task::spawn_blocking(move || {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut disks = Vec::with_capacity(paths.len());
+        for (label, path) in paths {
+            if let Some((total, used, fsid)) = statvfs_usage(&path) {
+                if seen.insert(fsid) {
+                    disks.push(DiskUsage {
+                        path,
+                        label,
+                        total_bytes: total,
+                        used_bytes: used,
+                    });
+                }
             }
         }
-    }
+        disks
+    })
+    .await
+    .unwrap_or_default();
 
     Ok(Json(DashboardResponse {
         server: ServerStatus {
@@ -216,15 +226,17 @@ pub async fn get(
     }))
 }
 
-/// Returns `(total_bytes, used_bytes)` for the filesystem hosting `path`,
-/// or `None` if the path is not statvfs-able. Implemented with a direct
-/// libc call to avoid pulling in `nix` / `sysinfo` for one syscall.
+/// Returns `(total_bytes, used_bytes, fsid)` for the filesystem hosting
+/// `path`, or `None` if the path is not statvfs-able. `fsid` is the
+/// kernel-assigned filesystem identifier (`f_fsid`) used for deduplication.
+/// Implemented with a direct libc call to avoid pulling in `nix` / `sysinfo`
+/// for one syscall.
 // `libc::statvfs`'s fields are `c_ulong`, which is already u64 on
 // x86_64 Linux/macOS but u32 on 32-bit targets. The `as u64` casts
 // are intentional cross-platform widening — clippy reads them as
 // redundant on the CI host arch.
 #[allow(clippy::unnecessary_cast)]
-pub fn statvfs_usage(path: &str) -> Option<(u64, u64)> {
+pub fn statvfs_usage(path: &str) -> Option<(u64, u64, u64)> {
     if !StdPath::new(path).exists() {
         return None;
     }
@@ -238,5 +250,6 @@ pub fn statvfs_usage(path: &str) -> Option<(u64, u64)> {
     let block_size = stat.f_frsize as u64;
     let total = stat.f_blocks as u64 * block_size;
     let free = stat.f_bavail as u64 * block_size;
-    Some((total, total.saturating_sub(free)))
+    let fsid = stat.f_fsid as u64;
+    Some((total, total.saturating_sub(free), fsid))
 }
