@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChimpFlix · Calendar redesign mockups</title>
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --bg-2: #111114;
+    --surface: #16161a;
+    --surface-2: #1d1d22;
+    --surface-3: #26262d;
+    --line: rgba(255, 255, 255, 0.08);
+    --line-strong: rgba(255, 255, 255, 0.16);
+    --text: #f4f4f6;
+    --muted: #9a9aa4;
+    --muted-2: #6c6c76;
+    --accent: #e50914;
+    --accent-soft: rgba(229, 9, 20, 0.15);
+    --today: #ffce4f;
+    --radius: 12px;
+    --shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 70% -10%, #17171c 0%, var(--bg) 55%) fixed;
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding-bottom: 80px;
+  }
+  a { color: inherit; text-decoration: none; }
+
+  /* ---------- top chrome ---------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 30;
+    display: flex; align-items: center; gap: 28px;
+    padding: 14px 40px;
+    background: rgba(10, 10, 11, 0.82);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { color: var(--accent); font-weight: 900; letter-spacing: 0.02em; font-size: 20px; }
+  .nav { display: flex; gap: 22px; font-size: 14px; color: var(--muted); }
+  .nav .active { color: var(--text); font-weight: 600; }
+  .topbar .spacer { flex: 1; }
+  .avatar { width: 28px; height: 28px; border-radius: 50%; background: linear-gradient(135deg,#7c4dff,#e50914); }
+
+  /* ---------- design switcher ---------- */
+  .switcher-wrap {
+    display: flex; flex-direction: column; gap: 6px; align-items: center;
+    padding: 26px 40px 8px;
+  }
+  .switcher {
+    display: inline-flex; gap: 4px; padding: 5px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 999px;
+  }
+  .switcher button {
+    appearance: none; border: 0; cursor: pointer;
+    padding: 9px 20px; border-radius: 999px; font-size: 13.5px; font-weight: 600;
+    color: var(--muted); background: transparent; transition: 0.18s;
+  }
+  .switcher button:hover { color: var(--text); }
+  .switcher button.active { background: var(--accent); color: #fff; }
+  .switcher-hint { color: var(--muted-2); font-size: 12.5px; }
+
+  .stage { padding: 18px 40px 40px; max-width: 1320px; margin: 0 auto; }
+  .panel { display: none; }
+  .panel.active { display: block; animation: fade 0.35s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .page-head { margin: 8px 0 26px; }
+  .eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: 0.18em; text-transform: uppercase; }
+  .page-head h1 { margin: 6px 0 4px; font-size: 34px; font-weight: 800; letter-spacing: -0.02em; }
+  .page-head p { margin: 0; color: var(--muted); font-size: 14px; }
+
+  .design-note {
+    margin: 0 0 22px; padding: 12px 16px; border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--line);
+    color: var(--muted); font-size: 13px;
+  }
+  .design-note b { color: var(--text); }
+
+  /* ---------- shared art tiles ---------- */
+  .art {
+    position: relative; border-radius: 10px; overflow: hidden;
+    background: #222; display: flex; align-items: flex-end;
+    aspect-ratio: 16 / 9;
+  }
+  .art .label {
+    position: relative; z-index: 2; width: 100%; padding: 10px 12px;
+    background: linear-gradient(to top, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.0) 100%);
+  }
+  .art .show { font-size: 13.5px; font-weight: 700; line-height: 1.25;
+    display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+  .art .ep { font-size: 11.5px; color: #d6d6da; margin-top: 1px;
+    display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+  .badge {
+    position: absolute; left: 0; top: 9px; z-index: 3;
+    background: var(--accent); color: #fff; font-size: 9.5px; font-weight: 800;
+    letter-spacing: 0.06em; text-transform: uppercase; padding: 4px 8px; border-radius: 0 4px 4px 0;
+  }
+  .badge.finale { background: #ad2cff; }
+  .when {
+    margin-top: 2px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--accent);
+  }
+
+  /* =========================================================
+     DESIGN 1 — AGENDA TIMELINE
+     ========================================================= */
+  .agenda-day { display: grid; grid-template-columns: 116px 1fr; gap: 28px; padding: 22px 0; border-top: 1px solid var(--line); }
+  .agenda-day:first-of-type { border-top: 0; }
+  .daycol { position: sticky; top: 76px; align-self: start; }
+  .daychip {
+    display: inline-flex; flex-direction: column; align-items: center; gap: 2px;
+    padding: 12px 0; width: 84px; border-radius: 14px;
+    background: var(--surface); border: 1px solid var(--line);
+  }
+  .daychip .dow { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .daychip .dnum { font-size: 30px; font-weight: 800; line-height: 1; }
+  .daychip .mon { font-size: 10.5px; color: var(--muted-2); text-transform: uppercase; letter-spacing: 0.08em; }
+  .daychip.today { background: var(--accent-soft); border-color: rgba(229,9,20,0.45); }
+  .daychip.today .dow, .daychip.today .dnum { color: #fff; }
+  .daychip.today .dow { color: var(--accent); }
+  .daychip.past { opacity: 0.55; }
+  .rel { display: block; margin-top: 9px; text-align: center; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); width: 84px; }
+  .rel.today { color: var(--accent); }
+  .agenda-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); gap: 16px; }
+  .agenda-grid .art { transition: transform 0.16s, box-shadow 0.16s; cursor: pointer; }
+  .agenda-grid .art:hover { transform: translateY(-3px); box-shadow: var(--shadow); }
+  .count-pill { font-size: 11px; color: var(--muted-2); margin-left: 6px; font-weight: 600; }
+
+  /* =========================================================
+     DESIGN 2 — WEEK BOARD
+     ========================================================= */
+  .weekbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+  .weeknav { display: flex; align-items: center; gap: 12px; }
+  .weeknav button {
+    appearance: none; border: 1px solid var(--line); background: var(--surface); color: var(--text);
+    width: 34px; height: 34px; border-radius: 9px; cursor: pointer; font-size: 16px;
+  }
+  .weeknav button:hover { background: var(--surface-2); }
+  .weekrange { font-size: 16px; font-weight: 700; }
+  .seg { display: inline-flex; gap: 3px; padding: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: 999px; }
+  .seg button { appearance: none; border: 0; background: transparent; color: var(--muted); padding: 6px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  .seg button.active { background: var(--surface-3); color: #fff; }
+  .board { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; }
+  .col { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; min-height: 360px; overflow: hidden; }
+  .col.today { border-color: rgba(229,9,20,0.5); box-shadow: 0 0 0 1px rgba(229,9,20,0.25); }
+  .col.past { opacity: 0.6; }
+  .colhead { padding: 11px 12px; text-align: center; border-bottom: 1px solid var(--line); background: var(--surface-2); }
+  .colhead .dow { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  .colhead .dnum { font-size: 20px; font-weight: 800; margin-top: 2px; }
+  .col.today .colhead { background: var(--accent-soft); }
+  .col.today .colhead .dnum, .col.today .colhead .dow { color: #fff; }
+  .col.today .colhead .dow { color: var(--accent); }
+  .colbody { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .mini { display: flex; gap: 9px; padding: 7px; border-radius: 9px; background: var(--surface-2); cursor: pointer; transition: background 0.15s; }
+  .mini:hover { background: var(--surface-3); }
+  .mini .thumb { width: 46px; height: 46px; flex: none; border-radius: 7px; overflow: hidden; }
+  .mini .meta { min-width: 0; }
+  .mini .show { font-size: 12px; font-weight: 700; line-height: 1.2;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .mini .ep { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  .col .empty { padding: 18px 8px; text-align: center; color: var(--muted-2); font-size: 11px; }
+
+  /* =========================================================
+     DESIGN 3 — TODAY SPOTLIGHT + UP NEXT
+     ========================================================= */
+  .spot-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+  .spot-head h2 { margin: 0; font-size: 22px; font-weight: 800; }
+  .spot-head .date { color: var(--muted); font-size: 13px; }
+  .spotlight { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; margin-bottom: 38px; }
+  .spotlight .art { aspect-ratio: 16 / 9; box-shadow: var(--shadow); cursor: pointer; transition: transform 0.16s; }
+  .spotlight .art:hover { transform: scale(1.02); }
+  .spotlight .art .show { font-size: 16px; }
+  .spotlight .art .ep { font-size: 13px; }
+  .spot-empty {
+    grid-column: 1 / -1; padding: 30px; border-radius: 12px; border: 1px dashed var(--line-strong);
+    text-align: center; color: var(--muted);
+  }
+  .upnext h3 { font-size: 14px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 14px; }
+  .feed-day { display: grid; grid-template-columns: 92px 1fr; gap: 20px; padding: 14px 0; border-top: 1px solid var(--line); }
+  .feed-day .when-col { position: sticky; top: 76px; align-self: start; }
+  .feed-day .when-col .rel { text-align: left; width: auto; margin: 0; font-size: 12px; }
+  .feed-day .when-col .sub { font-size: 11px; color: var(--muted-2); margin-top: 2px; }
+  .feed-rows { display: flex; flex-direction: column; gap: 8px; }
+  .feed-row { display: flex; align-items: center; gap: 14px; padding: 8px 10px; border-radius: 10px; cursor: pointer; transition: background 0.15s; }
+  .feed-row:hover { background: var(--surface); }
+  .feed-row .thumb { width: 84px; height: 48px; border-radius: 7px; overflow: hidden; flex: none; }
+  .feed-row .show { font-size: 14px; font-weight: 700; }
+  .feed-row .ep { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .feed-row .tag { margin-left: auto; font-size: 10px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 4px 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); }
+  .feed-row .tag.finale { background: rgba(173,44,255,0.18); color: #d9a6ff; }
+  .feed-row .tag.premiere { background: var(--accent-soft); color: #ff8b8b; }
+
+  .legend { margin-top: 30px; color: var(--muted-2); font-size: 12px; display: flex; gap: 18px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">CHIMPFLIX</div>
+    <nav class="nav">
+      <span>Home</span><span>Anime</span><span>Movies</span><span>Shows</span>
+      <span>New &amp; Popular</span><span class="active">Calendar</span><span>My List</span>
+    </nav>
+    <div class="spacer"></div>
+    <div class="avatar"></div>
+  </div>
+
+  <div class="switcher-wrap">
+    <div class="switcher">
+      <button data-tab="agenda" class="active">Agenda Timeline</button>
+      <button data-tab="board">Week Board</button>
+      <button data-tab="spotlight">Today Spotlight</button>
+    </div>
+    <div class="switcher-hint">Three directions for the same data — click to compare. All labels reflect the timezone fix (no more phantom "Yesterday").</div>
+  </div>
+
+  <div class="stage">
+
+    <!-- ============ DESIGN 1: AGENDA TIMELINE ============ -->
+    <section class="panel active" id="agenda">
+      <div class="page-head">
+        <div class="eyebrow">Coming Up</div>
+        <h1>Calendar</h1>
+        <p>Upcoming episodes from your libraries, by air date.</p>
+      </div>
+      <div class="design-note">
+        <b>Agenda Timeline.</b> Evolution of today's layout — a sticky date spine on the left
+        (weekday · day-number · month, with <b style="color:var(--today)">TODAY</b> highlighted and past days dimmed),
+        episode cards wrapping on the right. Best fit for sparse weekly anime schedules; reads top-to-bottom like a feed.
+      </div>
+
+      <!-- Yesterday -->
+      <div class="agenda-day">
+        <div class="daycol">
+          <div class="daychip past"><span class="dow">Mon</span><span class="dnum">2</span><span class="mon">Jun</span></div>
+          <span class="rel">Yesterday</span>
+        </div>
+        <div class="agenda-grid">
+          <a class="art" style="background:linear-gradient(135deg,#3a4a6b,#1c2436)"><span class="badge finale">Finale</span><div class="label"><div class="show">Classroom of the Elite</div><div class="ep">S4 · E13 — Obscured By the Rain</div></div></a>
+          <a class="art" style="background:linear-gradient(135deg,#6b3a52,#36202c)"><div class="label"><div class="show">Gals Can't Be Kind to Otaku!?</div><div class="ep">S1 · E9</div></div></a>
+        </div>
+      </div>
+
+      <!-- Today -->
+      <div class="agenda-day">
+        <div class="daycol">
+          <div class="daychip today"><span class="dow">Tue</span><span class="dnum">3</span><span class="mon">Jun</span></div>
+          <span class="rel today">Today</span>
+        </div>
+        <div class="agenda-grid">
+          <a class="art" style="background:linear-gradient(135deg,#2f5a6b,#162b34)"><div class="label"><div class="show">Re:ZERO -Starting Life in Another World-</div><div class="ep">S4 · E9</div></div></a>
+          <a class="art" style="background:linear-gradient(135deg,#3f6b3a,#1f3420)"><div class="label"><div class="show">Reborn as a Vending Machine, I Now Wander…</div><div class="ep">S3 · E10 — I Am a Field Without Equal</div></div></a>
+        </div>
+      </div>
+
+      <!-- Tomorrow -->
+      <div class="agenda-day">
+        <div class="daycol">
+          <div class="daychip"><span class="dow">Wed</span><span class="dnum">4</span><span class="mon">Jun</span></div>
+          <span class="rel">Tomorrow</span>
+        </div>
+        <div class="agenda-grid">
+          <a class="art" style="background:linear-gradient(135deg,#6b5a3a,#342c1f)"><div class="label"><div class="show">The Angel Next Door Spoils Me Rotten</div><div class="ep">S2 · E10</div></div></a>
+          <a class="art" style="background:linear-gradient(135deg,#3a3f6b,#1f2234)"><div class="label"><div class="show">That Time I Got Reincarnated as a Slime</div><div class="ep">S4 · E9</div></div></a>
+        </div>
+      </div>
+
+      <!-- Friday -->
+      <div class="agenda-day">
+        <div class="daycol">
+          <div class="daychip"><span class="dow">Fri</span><span class="dnum">6</span><span class="mon">Jun</span></div>
+          <span class="rel">Friday</span>
+        </div>
+        <div class="agenda-grid">
+          <a class="art" style="background:linear-gradient(135deg,#6b3a3a,#341f1f)"><div class="label"><div class="show">Rent-a-Girlfriend</div><div class="ep">S5 · E9 — Bra and Girlfriend</div></div></a>
+          <a class="art" style="background:linear-gradient(135deg,#3a6b66,#1f3433)"><div class="label"><div class="show">The Strongest Job Is Apparently Not a Hero…</div><div class="ep">S1 · E10 — I Cannot Answer That Kind of Question</div></div></a>
+          <a class="art" style="background:linear-gradient(135deg,#5a3a6b,#2c1f34)"><span class="badge">Premiere</span><div class="label"><div class="show">Yowayowa Sensei</div><div class="ep">S1 · E9</div></div></a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ DESIGN 2: WEEK BOARD ============ -->
+    <section class="panel" id="board">
+      <div class="page-head">
+        <div class="eyebrow">Coming Up</div>
+        <h1>Calendar</h1>
+        <p>Upcoming episodes from your libraries, by air date.</p>
+      </div>
+      <div class="design-note">
+        <b>Week Board.</b> A true 7-column week grid (Sonarr / Trakt style) with prev/next week paging and a
+        month toggle. Today's column is outlined in red, past days dimmed. Strongest at-a-glance overview when you
+        track many weekly shows; each cell is a compact poster + show + episode chip.
+      </div>
+
+      <div class="weekbar">
+        <div class="weeknav">
+          <button>‹</button>
+          <span class="weekrange">Jun 1 – 7, 2026</span>
+          <button>›</button>
+        </div>
+        <div class="seg"><button class="active">Week</button><button>Month</button></div>
+      </div>
+
+      <div class="board">
+        <div class="col past"><div class="colhead"><div class="dow">Sun</div><div class="dnum">1</div></div><div class="colbody"><div class="empty">—</div></div></div>
+        <div class="col past">
+          <div class="colhead"><div class="dow">Mon</div><div class="dnum">2</div></div>
+          <div class="colbody">
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#3a4a6b,#1c2436)"></div><div class="meta"><div class="show">Classroom of the Elite</div><div class="ep">S4 · E13</div></div></div>
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#6b3a52,#36202c)"></div><div class="meta"><div class="show">Gals Can't Be Kind to Otaku!?</div><div class="ep">S1 · E9</div></div></div>
+          </div>
+        </div>
+        <div class="col today">
+          <div class="colhead"><div class="dow">Tue</div><div class="dnum">3</div></div>
+          <div class="colbody">
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#2f5a6b,#162b34)"></div><div class="meta"><div class="show">Re:ZERO</div><div class="ep">S4 · E9</div></div></div>
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#3f6b3a,#1f3420)"></div><div class="meta"><div class="show">Reborn as a Vending Machine</div><div class="ep">S3 · E10</div></div></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="colhead"><div class="dow">Wed</div><div class="dnum">4</div></div>
+          <div class="colbody">
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#6b5a3a,#342c1f)"></div><div class="meta"><div class="show">The Angel Next Door…</div><div class="ep">S2 · E10</div></div></div>
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#3a3f6b,#1f2234)"></div><div class="meta"><div class="show">…Reincarnated as a Slime</div><div class="ep">S4 · E9</div></div></div>
+          </div>
+        </div>
+        <div class="col"><div class="colhead"><div class="dow">Thu</div><div class="dnum">5</div></div><div class="colbody"><div class="empty">Nothing airing</div></div></div>
+        <div class="col">
+          <div class="colhead"><div class="dow">Fri</div><div class="dnum">6</div></div>
+          <div class="colbody">
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#6b3a3a,#341f1f)"></div><div class="meta"><div class="show">Rent-a-Girlfriend</div><div class="ep">S5 · E9</div></div></div>
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#3a6b66,#1f3433)"></div><div class="meta"><div class="show">The Strongest Job…</div><div class="ep">S1 · E10</div></div></div>
+            <div class="mini"><div class="thumb" style="background:linear-gradient(135deg,#5a3a6b,#2c1f34)"></div><div class="meta"><div class="show">Yowayowa Sensei</div><div class="ep">S1 · E9</div></div></div>
+          </div>
+        </div>
+        <div class="col"><div class="colhead"><div class="dow">Sat</div><div class="dnum">7</div></div><div class="colbody"><div class="empty">Nothing airing</div></div></div>
+      </div>
+    </section>
+
+    <!-- ============ DESIGN 3: TODAY SPOTLIGHT ============ -->
+    <section class="panel" id="spotlight">
+      <div class="page-head">
+        <div class="eyebrow">Coming Up</div>
+        <h1>Calendar</h1>
+        <p>Upcoming episodes from your libraries, by air date.</p>
+      </div>
+      <div class="design-note">
+        <b>Today Spotlight + Up Next.</b> Big landscape cards for <b>what airs today</b> at the top (or a friendly
+        empty state when nothing's out), then a tight, scannable "Up Next" agenda list below with date pills and
+        Finale / Premiere tags. Puts the freshest releases front-and-center.
+      </div>
+
+      <div class="spot-head"><h2>Today</h2><span class="date">Tuesday, June 3</span></div>
+      <div class="spotlight">
+        <a class="art" style="background:linear-gradient(135deg,#2f5a6b,#0e1a20)"><div class="label"><div class="show">Re:ZERO -Starting Life in Another World-</div><div class="ep">S4 · E9</div></div></a>
+        <a class="art" style="background:linear-gradient(135deg,#3f6b3a,#101a0f)"><div class="label"><div class="show">Reborn as a Vending Machine, I Now Wander…</div><div class="ep">S3 · E10 — I Am a Field Without Equal</div></div></a>
+      </div>
+
+      <div class="upnext">
+        <h3>Up Next</h3>
+
+        <div class="feed-day">
+          <div class="when-col"><span class="rel">Tomorrow</span><div class="sub">Wed, Jun 4</div></div>
+          <div class="feed-rows">
+            <a class="feed-row"><div class="thumb" style="background:linear-gradient(135deg,#6b5a3a,#342c1f)"></div><div><div class="show">The Angel Next Door Spoils Me Rotten</div><div class="ep">S2 · E10</div></div><span class="tag finale">Finale</span></a>
+            <a class="feed-row"><div class="thumb" style="background:linear-gradient(135deg,#3a3f6b,#1f2234)"></div><div><div class="show">That Time I Got Reincarnated as a Slime</div><div class="ep">S4 · E9</div></div></a>
+          </div>
+        </div>
+
+        <div class="feed-day">
+          <div class="when-col"><span class="rel">Friday</span><div class="sub">Jun 6</div></div>
+          <div class="feed-rows">
+            <a class="feed-row"><div class="thumb" style="background:linear-gradient(135deg,#6b3a3a,#341f1f)"></div><div><div class="show">Rent-a-Girlfriend</div><div class="ep">S5 · E9 — Bra and Girlfriend</div></div></a>
+            <a class="feed-row"><div class="thumb" style="background:linear-gradient(135deg,#3a6b66,#1f3433)"></div><div><div class="show">The Strongest Job Is Apparently Not a Hero or a Sage</div><div class="ep">S1 · E10</div></div></a>
+            <a class="feed-row"><div class="thumb" style="background:linear-gradient(135deg,#5a3a6b,#2c1f34)"></div><div><div class="show">Yowayowa Sensei</div><div class="ep">S1 · E9</div></div><span class="tag premiere">Premiere</span></a>
+          </div>
+        </div>
+
+        <div class="feed-day">
+          <div class="when-col"><span class="rel">Next week</span><div class="sub">Tue, Jun 10</div></div>
+          <div class="feed-rows">
+            <a class="feed-row"><div class="thumb" style="background:linear-gradient(135deg,#2f5a6b,#162b34)"></div><div><div class="show">Re:ZERO -Starting Life in Another World-</div><div class="ep">S4 · E10</div></div></a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="legend">
+      <span><span class="dot" style="background:var(--accent)"></span> Today / accent</span>
+      <span><span class="dot" style="background:#ad2cff"></span> Finale</span>
+      <span><span class="dot" style="background:var(--accent-soft)"></span> Premiere</span>
+      <span><span class="dot" style="background:var(--muted-2)"></span> Past (dimmed)</span>
+    </div>
+  </div>
+
+  <script>
+    const tabs = document.querySelectorAll('.switcher button');
+    const panels = document.querySelectorAll('.panel');
+    tabs.forEach((b) => b.addEventListener('click', () => {
+      tabs.forEach((x) => x.classList.toggle('active', x === b));
+      const id = b.dataset.tab;
+      panels.forEach((p) => p.classList.toggle('active', p.id === id));
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }));
+  </script>
+</body>
+</html>

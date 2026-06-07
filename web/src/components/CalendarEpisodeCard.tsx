@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { plexImage } from "@/lib/image";
 import { relativeDayLabel } from "@/lib/relative-time";
+import { CalendarAvailability } from "@/components/CalendarAvailability";
 import type { CalendarEpisode } from "@/lib/chimpflix-api";
 
 /// "S1 · E9 — Title" style episode line. Season/episode numbers are shown
@@ -54,7 +55,10 @@ export function CalendarEpisodeCard({
       href={`/watch/${episode.showId}`}
       aria-label={`${episode.showTitle} — ${episodeLine(episode)}`}
       className={
-        "group relative block overflow-hidden rounded-md bg-(--color-surface) transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent " +
+        // `transform-gpu` + will-change + hidden backface promote the card to
+        // its own GPU layer up-front, so animating `scale` doesn't show thin
+        // compositor seams ("white lines") through the rounded, clipped image.
+        "group relative block overflow-hidden rounded-md bg-(--color-surface) transition-transform backface-hidden transform-gpu will-change-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent " +
         className
       }
     >
@@ -67,7 +71,7 @@ export function CalendarEpisodeCard({
             width={480}
             height={270}
             loading="lazy"
-            className="block h-full w-full object-cover"
+            className="block h-full w-full object-cover backface-hidden transform-gpu"
           />
         )}
       </div>
@@ -83,11 +87,17 @@ export function CalendarEpisodeCard({
         <div className="line-clamp-1 text-xs text-neutral-300">
           {episodeLine(episode)}
         </div>
-        {showWhen && (
-          <div className="text-[11px] font-medium uppercase tracking-wide text-accent">
-            {when}
-          </div>
-        )}
+        <div className="mt-1 flex items-center gap-2">
+          {showWhen && (
+            <span className="text-[11px] font-medium uppercase tracking-wide text-accent">
+              {when}
+            </span>
+          )}
+          <CalendarAvailability
+            hasFile={episode.hasFile}
+            className={showWhen ? "ml-auto" : ""}
+          />
+        </div>
       </div>
     </Link>
   );

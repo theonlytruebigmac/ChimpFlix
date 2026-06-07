@@ -227,6 +227,13 @@ pub struct CalendarQuery {
     /// Window size in days ahead of now. Defaults to 35 (~5 weeks).
     #[serde(default)]
     pub days: Option<i64>,
+    /// Days of look-back *before* today to include, so a surface can show
+    /// recently-aired episodes for context. Defaults to 0 (today + upcoming
+    /// only — what the home "Coming Up" rail wants). The /calendar page passes
+    /// 1 so it leads with "Yesterday". Clamped server-side. Ignored when
+    /// explicit `from`/`to` are supplied.
+    #[serde(default)]
+    pub lookback_days: Option<i64>,
     /// Explicit window start, epoch milliseconds.
     #[serde(default)]
     pub from: Option<i64>,
@@ -259,18 +266,21 @@ pub async fn calendar(
     Query(q): Query<CalendarQuery>,
 ) -> Result<Json<CalendarResponse>, ApiError> {
     let now = chimpflix_common::now_ms();
-    // Default window: from the START OF TODAY (UTC) through `days_ahead` —
-    // NO look-back, so both the "Coming Up" rail and the calendar page show
-    // today + upcoming only (no already-aired episodes). `air_date` is stored
-    // as midnight-UTC of the air day, so flooring `from` to the current UTC
-    // day still includes anything airing today. Explicit ?from/?to overrides
-    // (e.g. a future "scroll back through the week" view).
+    // Default window: from the START OF TODAY (UTC), minus an optional
+    // `lookback_days`, through `days_ahead`. With the default 0 look-back the
+    // window is today + upcoming only (the "Coming Up" rail — no already-aired
+    // episodes); the /calendar page passes lookback_days=1 so it leads with a
+    // "Yesterday" section. `air_date` is stored as midnight-UTC of the air day,
+    // so flooring `from` to a UTC day boundary includes everything airing that
+    // day. Explicit ?from/?to overrides (e.g. a "scroll back through the week"
+    // view).
     let (from_ms, to_ms) = match (q.from, q.to) {
         (Some(from), Some(to)) if to >= from => (from, to),
         _ => {
             let days_ahead = q.days.unwrap_or(CALENDAR_DEFAULT_DAYS_AHEAD).clamp(1, 365);
+            let lookback = q.lookback_days.unwrap_or(0).clamp(0, 30);
             let day_start = now - now.rem_euclid(DAY_MS);
-            (day_start, day_start + days_ahead * DAY_MS)
+            (day_start - lookback * DAY_MS, day_start + days_ahead * DAY_MS)
         }
     };
     let limit = q.limit.unwrap_or(200).clamp(1, 500);

@@ -1328,6 +1328,11 @@ export interface CalendarEpisode {
   maxEpisodeNumber: number;
   isFinale: boolean;
   isPremiere: boolean;
+  /// True when the episode already has a downloaded (live) file; false for a
+  /// placeholder the metadata agent materialized for its air date but that
+  /// isn't downloaded yet. Drives the "Available" vs "Not yet" affordance —
+  /// an episode airing "today" may not have a file until later in the day.
+  hasFile: boolean;
   /// Episode still, if scanned.
   stillPath: string | null;
   /// Parent show poster / backdrop.
@@ -3089,12 +3094,15 @@ export const items = {
   /// Locally-known upcoming/recent episodes whose air date falls in the
   /// requested window — the LOCAL-data complement to the Trakt coming-soon
   /// rail. Honors the same per-library visibility + kids-safe rules as
-  /// browse. Either pass `days` (window ahead of now, with a small
-  /// look-back so "this week" shows) or an explicit `from`/`to` epoch-ms
-  /// window. Pass `library_ids` to honor the user's visibility prefs.
+  /// browse. Pass `days` (window ahead of now) and optionally
+  /// `lookback_days` (days of already-aired context before today — the rail
+  /// uses 0, the /calendar page uses 1 to lead with "Yesterday"), or an
+  /// explicit `from`/`to` epoch-ms window. Pass `library_ids` to honor the
+  /// user's visibility prefs.
   calendar: (
     opts: {
       days?: number;
+      lookback_days?: number;
       from?: number;
       to?: number;
       limit?: number;

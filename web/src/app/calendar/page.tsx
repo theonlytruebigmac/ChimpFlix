@@ -34,8 +34,16 @@ export default async function CalendarPage() {
   if (visibleLibIds.length > 0) {
     try {
       const res = await itemsApi.calendar({
-        days: 35,
-        limit: 300,
+        // ~6.5 weeks forward plus a week of look-back: enough to populate the
+        // current week/month (so the Week + Month views aren't half-empty at
+        // the start of the period) without the air_date-asc + LIMIT cap
+        // truncating the upcoming episodes that matter. The Spotlight view
+        // self-limits what it shows from this window (today + ~5 weeks ahead,
+        // yesterday only for "Recently aired"). The home "Coming Up" rail uses
+        // its own narrow, upcoming-only fetch.
+        days: 45,
+        lookback_days: 7,
+        limit: 400,
         library_ids: visibleLibIds,
       });
       episodes = res.episodes;

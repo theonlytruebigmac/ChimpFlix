@@ -39,27 +39,32 @@ export function formatRelativeFuture(targetMs: number, nowMs: number): string {
 /// "Weekday, Mon D" form further out ("Saturday, Jun 6"). Used by the local
 /// calendar surfaces (the home "Coming up" rail + /calendar page).
 ///
-/// Both arguments are epoch milliseconds. The day comparison is done in the
-/// caller's LOCAL timezone (the calendar groups by the browser's local day),
-/// so `targetMs` — which the backend stores at midnight UTC — is bucketed by
-/// the local date it falls on, same as the grouping logic. `nowMs` is passed
-/// explicitly for the same purity/consistency reasons as the formatters
-/// above (snapshot once at fetch time, thread through props).
+/// Both arguments are epoch milliseconds. `targetMs` is an air date, which the
+/// backend stores at midnight UTC and treats as a plain calendar date (TMDB /
+/// TVDB give air dates with no time-of-day). We therefore read it back via its
+/// UTC components — see `calendarDayDelta` — so a viewer west of UTC doesn't
+/// see every air date slip a day earlier. `nowMs` is passed explicitly for the
+/// same purity/consistency reasons as the formatters above (snapshot once at
+/// fetch time, thread through props).
 export function relativeDayLabel(targetMs: number, nowMs: number): string {
-  const dayDelta = localDayDelta(targetMs, nowMs);
+  const dayDelta = calendarDayDelta(targetMs, nowMs);
   if (dayDelta === 0) return "Today";
   if (dayDelta === 1) return "Tomorrow";
   if (dayDelta === -1) return "Yesterday";
   const d = new Date(targetMs);
+  // Render the weekday/date from the air date's UTC components for the same
+  // reason as the delta — the stored midnight-UTC instant *is* the calendar
+  // date, so formatting it in local time would name the wrong day west of UTC.
   // Inside the next week, the weekday alone is unambiguous ("Saturday").
   if (dayDelta > 1 && dayDelta < 7) {
-    return d.toLocaleDateString(undefined, { weekday: "long" });
+    return d.toLocaleDateString(undefined, { weekday: "long", timeZone: "UTC" });
   }
   // Otherwise (further out, or in the past) qualify with the date.
   return d.toLocaleDateString(undefined, {
     weekday: "long",
     month: "short",
     day: "numeric",
+    timeZone: "UTC",
   });
 }
 
@@ -69,8 +74,8 @@ export function relativeDayLabel(targetMs: number, nowMs: number): string {
 /// has already aired (or airs today-or-earlier by less than a day) — callers
 /// fall back to their normal display (e.g. the runtime chip) in that case.
 ///
-/// Buckets, by LOCAL calendar-day delta (so "Tomorrow" is correct across a
-/// midnight boundary regardless of the wall-clock time-of-day):
+/// Buckets, by calendar-day delta (so "Tomorrow" is correct across a midnight
+/// boundary regardless of the wall-clock time-of-day):
 ///
 ///   * 0 days   → "Today"
 ///   * 1 day    → "Tomorrow"
@@ -81,12 +86,13 @@ export function relativeDayLabel(targetMs: number, nowMs: number): string {
 ///   * 28+      → "In N weeks"  (floor(delta / 7))
 ///
 /// Both args are epoch milliseconds; `nowMs` is threaded explicitly for the
-/// same purity/consistency reasons as the other helpers in this module.
+/// same purity/consistency reasons as the other helpers in this module. See
+/// `calendarDayDelta` for why the air date is read in UTC.
 export function upcomingAirLabel(
   targetMs: number,
   nowMs: number,
 ): string | null {
-  const dayDelta = localDayDelta(targetMs, nowMs);
+  const dayDelta = calendarDayDelta(targetMs, nowMs);
   if (dayDelta < 0) return null; // already aired
   if (dayDelta === 0) return "Today";
   if (dayDelta === 1) return "Tomorrow";
@@ -97,27 +103,55 @@ export function upcomingAirLabel(
   return `In ${Math.floor(dayDelta / 7)} weeks`;
 }
 
-/// Whole-day difference between two instants in the LOCAL timezone, i.e.
-/// `localMidnight(target) - localMidnight(now)` measured in days. Anchoring
-/// each instant to its local midnight before subtracting means DST shifts and
-/// the wall-clock time-of-day never bleed into the day count.
-function localDayDelta(targetMs: number, nowMs: number): number {
+/// Whole-day difference between an episode's air date and "now", measured in
+/// calendar days *as the viewer experiences them*.
+///
+/// The subtlety: `air_date` is stored at midnight UTC but represents a plain
+/// calendar date (the day the episode airs, no real time-of-day), whereas
+/// `nowMs` is a genuine instant. So we recover the air date from `targetMs`'s
+/// UTC components (the stored date, undistorted by the viewer's offset) and
+/// compare it against the viewer's LOCAL calendar date. Both triples are
+/// anchored to UTC midnight purely to get a DST-free whole-day count.
+///
+/// Doing the target in local time instead — the old behavior — made every air
+/// date slip a day earlier for viewers west of UTC: an episode airing "Jun 3"
+/// (midnight UTC) rendered as the evening of Jun 2 locally, so "today" showed
+/// up as "Yesterday" and the calendar's Today bucket sat empty.
+///
+/// Exported so calendar surfaces can classify a day group as past / today /
+/// upcoming (delta < 0 / === 0 / > 0) with the same logic the labels use.
+export function calendarDayDelta(targetMs: number, nowMs: number): number {
   const t = new Date(targetMs);
   const n = new Date(nowMs);
-  const tMid = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
-  const nMid = new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime();
+  const tMid = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate());
+  const nMid = Date.UTC(n.getFullYear(), n.getMonth(), n.getDate());
   return Math.round((tMid - nMid) / 86_400_000);
 }
 
-/// Local-day bucket key for grouping episodes by calendar day — a stable
-/// "YYYY-MM-DD" string in the browser's local timezone. Two instants on the
-/// same local day produce the same key regardless of time-of-day.
-export function localDayKey(targetMs: number): string {
+/// Day-bucket key for grouping episodes by air *date* — a stable "YYYY-MM-DD"
+/// built from the timestamp's UTC components, since `air_date` is a
+/// midnight-UTC calendar date. Grouping on local components would slip the
+/// bucket a day for viewers west of UTC, the same drift `calendarDayDelta`
+/// avoids; this keeps the bucket and its heading on the same day.
+export function airDayKey(targetMs: number): string {
   const d = new Date(targetMs);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+/// Short absolute air date for the secondary line under a relative heading —
+/// "Wed, Jun 4". Formatted from the air date's UTC components (timeZone: "UTC")
+/// for the same plain-calendar-date reason as `relativeDayLabel`; rendering it
+/// in local time would name the wrong day west of UTC.
+export function airDateShort(targetMs: number): string {
+  return new Date(targetMs).toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
 }
 
 /// Format a duration in milliseconds. Independent of nowMs.

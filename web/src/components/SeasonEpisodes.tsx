@@ -497,12 +497,17 @@ export function SeasonEpisodes({
           // post-mount nowMs snapshot so the locale/timezone-dependent
           // toLocaleDateString output can't differ between the SSR pass and
           // the client's first paint (which would flag a hydration mismatch).
+          // `airDate` is stored at midnight UTC as a plain calendar date, so
+          // it's formatted in UTC — formatting in local time would name the
+          // wrong day (Jun 2 for a Jun 3 air date) for viewers west of UTC,
+          // the same slip the calendar surfaces avoid (see relative-time.ts).
           const airDateStr =
             isPlaceholder && ep.airDate != null && nowMs != null
               ? new Date(ep.airDate).toLocaleDateString(undefined, {
                   month: "short",
                   day: "numeric",
                   year: "numeric",
+                  timeZone: "UTC",
                 })
               : null;
           // Season premiere = episode 1 (series premiere too if it's
