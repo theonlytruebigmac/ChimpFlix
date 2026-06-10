@@ -3121,6 +3121,17 @@ export const items = {
     apiFetch<{ queued: number }>(`/items/${id}/detect-markers`, {
       method: "POST",
     }),
+  /// Owner-only: enqueue an OpenSubtitles fetch for this title. For a
+  /// show the background job fans out to every downloaded episode.
+  /// `configured: false` means OpenSubtitles credentials aren't set;
+  /// `language` echoes the resolved target (owner default → server
+  /// metadata language → "en"). Fetched tracks appear in the player
+  /// automatically once the job runs.
+  fetchSubtitles: (id: number) =>
+    apiFetch<{ queued: number; configured: boolean; language: string }>(
+      `/items/${id}/fetch-subtitles`,
+      { method: "POST" },
+    ),
   // ─── Per-media-file marker editor (owner-only) ─────────────────────────
   /// Read every marker (auto + manual) on a media file. The full row
   /// shape (with id + source) is used by the operator editor; the
@@ -3228,6 +3239,14 @@ export const seasons = {
 
 export const episodes = {
   get: (id: number) => apiFetch<EpisodeDetail>(`/episodes/${id}`),
+  /// Owner-only: fetch a single episode's subtitle from OpenSubtitles
+  /// inline. `added` is 1 on a fresh download, 0 on a miss / already
+  /// present; `configured: false` means credentials aren't set.
+  fetchSubtitles: (id: number) =>
+    apiFetch<{ added: number; configured: boolean; language: string }>(
+      `/episodes/${id}/fetch-subtitles`,
+      { method: "POST" },
+    ),
   /// Hard-delete this episode's media file. If it was the last
   /// episode of its season, the season is purged too; if last
   /// season, the show is purged. Owner-gated + library-gated on the

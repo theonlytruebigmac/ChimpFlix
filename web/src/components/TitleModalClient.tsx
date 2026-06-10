@@ -1422,6 +1422,7 @@ function AdminActions({
   const [showMarkerEditor, setShowMarkerEditor] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [detectingMarkers, setDetectingMarkers] = useState(false);
+  const [fetchingSubtitles, setFetchingSubtitles] = useState(false);
   /// Brief one-shot toast for fire-and-forget admin actions
   /// (currently the marker-detect kickoff). The backend returns 202
   /// with "queued: N" and runs the work in the background, so the
@@ -1533,6 +1534,36 @@ function AdminActions({
     }
   }
 
+  async function fetchSubtitles() {
+    if (fetchingSubtitles) return;
+    setFetchingSubtitles(true);
+    setOpen(false);
+    try {
+      const { queued, configured, language } = await itemsApi.fetchSubtitles(
+        detail.id,
+      );
+      if (!configured) {
+        showActionToast(
+          "OpenSubtitles isn't set up — add credentials in Settings → Credentials.",
+        );
+      } else {
+        showActionToast(
+          queued === 0
+            ? "Subtitle fetch already queued — check back shortly."
+            : `Fetching ${language.toUpperCase()} subtitles in the background…`,
+        );
+      }
+    } catch (e) {
+      showActionToast(
+        e instanceof Error
+          ? `Couldn't fetch subtitles: ${e.message}`
+          : "Couldn't fetch subtitles. Try again.",
+      );
+    } finally {
+      setFetchingSubtitles(false);
+    }
+  }
+
   function onDeleted(report: { items_purged: number }) {
     // If the cascade swept the item itself, no point in keeping the
     // modal open against a now-dead id — pop the URL back to the
@@ -1620,6 +1651,13 @@ function AdminActions({
             icon: WaveIcon,
             disabled: detectingMarkers,
             onClick: detectMarkers,
+          },
+          {
+            kind: "item",
+            label: fetchingSubtitles ? "Fetching subtitles…" : "Fetch subtitles",
+            icon: SubtitlesIcon,
+            disabled: fetchingSubtitles,
+            onClick: fetchSubtitles,
           },
           // Owner-only marker editor. Disabled for shows (the editor
           // is per-media-file; surfacing it on the show item would
@@ -2248,6 +2286,15 @@ const RefreshIcon = () => (
 const WaveIcon = () => (
   <IconBase>
     <path d="M2 12h2l3-9 4 18 3-12 3 6 2-3h3" />
+  </IconBase>
+);
+const SubtitlesIcon = () => (
+  <IconBase>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="M7 15h4" />
+    <path d="M15 15h2" />
+    <path d="M7 11h2" />
+    <path d="M13 11h4" />
   </IconBase>
 );
 const FolderPlusIcon = () => (

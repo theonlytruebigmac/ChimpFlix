@@ -78,6 +78,15 @@ export function SeasonEpisodes({
   } | null>(null);
   const [editLoadingId, setEditLoadingId] = useState<number | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
+  // Per-episode subtitle fetch (owner-only). `subFetchingId` is the
+  // episode whose fetch is in flight; `subResult` carries a transient
+  // outcome ("Added EN subtitle" / "No subtitle found") shown on that
+  // row's button for a few seconds before reverting to the idle label.
+  const [subFetchingId, setSubFetchingId] = useState<number | null>(null);
+  const [subResult, setSubResult] = useState<{
+    id: number;
+    msg: string;
+  } | null>(null);
   // Monotonic request id + alive flag. Used to drop stale responses
   // — a rapid user double-click on different seasons used to race
   // the two fetches and whichever resolved last won, even if it was
@@ -334,6 +343,13 @@ export function SeasonEpisodes({
     const t = window.setTimeout(() => setConfirmation(null), TOAST_DISMISS_MS);
     return () => window.clearTimeout(t);
   }, [confirmation]);
+  // Clear the transient per-row subtitle-fetch result after the toast
+  // window so the button reverts to "Fetch subtitles".
+  useEffect(() => {
+    if (!subResult) return;
+    const t = window.setTimeout(() => setSubResult(null), TOAST_DISMISS_MS);
+    return () => window.clearTimeout(t);
+  }, [subResult]);
   async function bulkToggleSeason() {
     // Placeholder episodes (no file) can't be watched, so they're excluded
     // from both the "are they all watched?" check and the set of ids we
@@ -392,6 +408,32 @@ export function SeasonEpisodes({
       setEditError(e instanceof Error ? e.message : String(e));
     } finally {
       setEditLoadingId(null);
+    }
+  }
+
+  // Per-episode "Fetch subtitles" (owner only). Runs the OpenSubtitles
+  // lookup inline and reports the outcome on the row's button. The
+  // fetched track is registered server-side and shows up in the player's
+  // subtitle picker on the next play — no client refresh needed here.
+  async function fetchEpisodeSubtitles(episodeId: number) {
+    if (subFetchingId != null) return;
+    setSubFetchingId(episodeId);
+    setSubResult(null);
+    try {
+      const { added, configured, language } =
+        await episodesApi.fetchSubtitles(episodeId);
+      const msg = !configured
+        ? "OpenSubtitles not set up"
+        : added > 0
+          ? `Added ${language.toUpperCase()} subtitle`
+          : "No subtitle found";
+      setSubResult({ id: episodeId, msg });
+      setConfirmation(msg);
+    } catch {
+      setSubResult({ id: episodeId, msg: "Couldn't fetch" });
+      setConfirmation("Couldn't fetch subtitles. Try again.");
+    } finally {
+      setSubFetchingId(null);
     }
   }
 
@@ -706,6 +748,30 @@ export function SeasonEpisodes({
                             : "Edit markers"}
                         </button>
                       )}
+                      {isOwner &&
+                        (() => {
+                          const id = ratingKeyToEpisodeId(ep.ratingKey);
+                          const busy = subFetchingId === id;
+                          const label = busy
+                            ? "Fetching subtitles…"
+                            : subResult?.id === id
+                              ? subResult.msg
+                              : "Fetch subtitles";
+                          return (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                if (id != null) void fetchEpisodeSubtitles(id);
+                              }}
+                              disabled={busy}
+                              className="inline-flex items-center gap-1.5 rounded border border-white/15 px-2 py-0.5 text-[11px] text-white/75 transition-colors hover:border-white/30 hover:text-white disabled:opacity-50"
+                            >
+                              {label}
+                            </button>
+                          );
+                        })()}
                     </div>
                   )}
                 </div>

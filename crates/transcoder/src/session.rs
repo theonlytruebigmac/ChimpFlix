@@ -2813,26 +2813,180 @@ fn shift_webvtt_timestamps(body: &str, shift_seconds: f64) -> String {
 /// non-effect dialogue layer of the ASS source, but that requires
 /// understanding the source's layer/style hierarchy and isn't
 /// possible at the WebVTT level.
-fn strip_ass_overrides(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
+/// Clean the ASS leftovers that ffmpeg's WebVTT muxer leaves in cue
+/// bodies, so anime typesetting doesn't render as garbage:
+///
+///   * strip `{\...}` override blocks (positioning, colour, karaoke);
+///   * drop text emitted while ASS **drawing mode** is active — `{\p1}`
+///     (or higher) switches the renderer into vector-drawing and the
+///     "text" that follows is a path of `m`/`l`/`b` coordinates (used
+///     to redraw on-screen signs). The muxer keeps the brace blocks
+///     *and* the bare path, so without this the path leaks on screen as
+///     a wall of numbers like `m 7.48 42.16 l -0.06 19.99 b ...`;
+///   * remove cues left empty by the above so no blank cue box renders.
+///
+/// `\p0` and a bare `\p` reset drawing mode; `\pos(...)` / `\pbo` start
+/// with `\p` but must NOT be mistaken for it (they continue with a
+/// letter). Normal dialogue cues — which carry no `\p<digit>` tag — are
+/// only stripped of override blocks, exactly as before.
+///
+/// Public so the server can run the same pass over externally-fetched
+/// subtitles (OpenSubtitles can return ASS), keeping one source of
+/// truth for the sanitization rules.
+pub fn sanitize_ass_webvtt(body: &str) -> String {
+    // Operate per cue (cues are separated by blank lines) so an
+    // unclosed `{\p1}` can't bleed its drawing state into the following
+    // cue, and so a cue whose only content was a drawing path can be
+    // dropped whole. The leading `WEBVTT` header block passes through
+    // untouched.
+    let mut blocks: Vec<String> = Vec::new();
+    for (i, block) in split_into_blocks(body).into_iter().enumerate() {
+        if i == 0 && block.trim_start().starts_with("WEBVTT") {
+            blocks.push(block);
+            continue;
+        }
+        if let Some(cleaned) = clean_cue_block(&block) {
+            blocks.push(cleaned);
+        }
+        // else: the cue was drawing-only / empty → drop it entirely.
+    }
+    let mut out = blocks.join("\n\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Split a WebVTT body into blocks delimited by blank lines, discarding
+/// the blank separators. The first block is the header; the rest are
+/// cues. Rejoining the kept blocks with `\n\n` reconstructs a valid
+/// document.
+fn split_into_blocks(body: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                blocks.push(cur.join("\n"));
+                cur.clear();
+            }
+        } else {
+            cur.push(line);
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur.join("\n"));
+    }
+    blocks
+}
+
+/// Clean one cue block. Returns `None` when nothing readable survives
+/// (drawing-only or empty cue) so the caller drops it. Lines up to and
+/// including the `-->` timestamp line are preserved verbatim; only the
+/// text lines after it are sanitized.
+fn clean_cue_block(block: &str) -> Option<String> {
+    let lines: Vec<&str> = block.lines().collect();
+    let Some(ts_idx) = lines.iter().position(|l| l.contains("-->")) else {
+        // No timestamp line — not a cue we recognise; pass through.
+        return Some(block.to_string());
+    };
+
+    // Drawing mode is per-cue: reset at the start, then carried across
+    // this cue's (possibly multi-line, via `\N`) text.
+    let mut drawing = false;
+    let mut text: Vec<String> = lines[ts_idx + 1..]
+        .iter()
+        .map(|line| clean_cue_text_line(line, &mut drawing))
+        .collect();
+    // Trim trailing blank lines the cleaning may have produced.
+    while text.last().is_some_and(|l| l.trim().is_empty()) {
+        text.pop();
+    }
+    if text.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+
+    let mut out: Vec<String> = lines[..=ts_idx].iter().map(|s| s.to_string()).collect();
+    out.extend(text);
+    Some(out.join("\n"))
+}
+
+/// Strip `{\...}` override blocks from one cue-text line and drop any
+/// text while ASS drawing mode is active. `drawing` carries the mode
+/// across the lines of a multi-line cue.
+fn clean_cue_text_line(line: &str, drawing: &mut bool) -> String {
+    let mut out = String::with_capacity(line.len());
     let mut depth = 0u32;
-    for ch in body.chars() {
+    let mut block_buf = String::new();
+    for ch in line.chars() {
         match ch {
             '{' => {
                 depth = depth.saturating_add(1);
+                if depth == 1 {
+                    block_buf.clear();
+                }
             }
             '}' if depth > 0 => {
                 depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(level) = parse_drawing_level(&block_buf) {
+                        *drawing = level >= 1;
+                    }
+                }
             }
-            _ if depth == 0 => {
-                out.push(ch);
-            }
-            _ => {
-                // Inside an override block; drop.
-            }
+            _ if depth > 0 => block_buf.push(ch),
+            // Outside any override block: drop drawing-path text, keep
+            // real dialogue.
+            _ if *drawing => {}
+            _ => out.push(ch),
         }
     }
     out
+}
+
+/// Inspect an ASS override block for a drawing-mode tag (`\p<n>`).
+/// Returns `Some(n)` for the last such tag (n ≥ 1 = drawing on, 0 =
+/// off), or `None` when the block has no drawing tag at all (state
+/// unchanged). Crucially distinguishes `\p1` (drawing) from `\pos` /
+/// `\pbo` (position / baseline — `\p` followed by a letter), which must
+/// not toggle drawing mode.
+fn parse_drawing_level(block: &str) -> Option<u32> {
+    let bytes = block.as_bytes();
+    let mut result = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1].eq_ignore_ascii_case(&b'p') {
+            let after = i + 2;
+            match bytes.get(after) {
+                Some(d) if d.is_ascii_digit() => {
+                    let mut j = after;
+                    let mut n: u32 = 0;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        n = n.saturating_mul(10).saturating_add(u32::from(bytes[j] - b'0'));
+                        j += 1;
+                    }
+                    result = Some(n);
+                    i = j;
+                    continue;
+                }
+                // `\pos`, `\pbo`, … — a letter follows, so this isn't a
+                // drawing tag. Leave the running state untouched.
+                Some(d) if d.is_ascii_alphabetic() => {
+                    i = after;
+                    continue;
+                }
+                // Bare `\p` (followed by `\`, `}`, space, or end) resets
+                // drawing mode to level 0.
+                _ => {
+                    result = Some(0);
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    result
 }
 
 /// Insert (or replace) the HLS `X-TIMESTAMP-MAP` header right
@@ -2967,10 +3121,12 @@ async fn extract_webvtt_sidecar(
         raw_vtt
     };
 
-    // Drop ASS override codes the WebVTT muxer left in the cue
-    // bodies. Anime karaoke / typesetting cues otherwise render
-    // as a wall of "{\an5\c&HFFFFFF&\pos(...)\t(...)}" garbage.
-    let shifted = strip_ass_overrides(&shifted);
+    // Clean ASS leftovers the WebVTT muxer left in the cue bodies:
+    // override codes ("{\an5\c&HFFFFFF&\pos(...)}"), and — the worse
+    // offender — vector-drawing paths from sign typesetting ("{\p1}m
+    // 7.48 42.16 l ...{\p0}"), which otherwise render as a wall of
+    // numbers. Drawing-only cues are dropped entirely.
+    let shifted = sanitize_ass_webvtt(&shifted);
 
     // Inject an HLS X-TIMESTAMP-MAP header as belt-and-suspenders
     // alignment. Even with our cue shift, some HLS.js versions /
@@ -3261,7 +3417,81 @@ mod signal {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoudnessTarget, TonemapConfig, build_loudnorm_filter};
+    use super::{
+        LoudnessTarget, TonemapConfig, build_loudnorm_filter, parse_drawing_level,
+        sanitize_ass_webvtt,
+    };
+
+    #[test]
+    fn parse_drawing_level_distinguishes_p_from_pos() {
+        assert_eq!(parse_drawing_level("\\p1"), Some(1));
+        assert_eq!(parse_drawing_level("\\p0"), Some(0));
+        assert_eq!(parse_drawing_level("\\an7\\p1"), Some(1));
+        // \pos / \pbo are NOT drawing tags — must not toggle the mode.
+        assert_eq!(parse_drawing_level("\\pos(100,200)"), None);
+        assert_eq!(parse_drawing_level("\\pbo-5"), None);
+        assert_eq!(parse_drawing_level("\\an5\\c&HFFFFFF&"), None);
+        // Bare \p resets to 0; last tag wins.
+        assert_eq!(parse_drawing_level("\\p"), Some(0));
+        assert_eq!(parse_drawing_level("\\p1\\pos(0,0)\\p0"), Some(0));
+    }
+
+    #[test]
+    fn sanitize_strips_override_blocks_but_keeps_dialogue() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{\\an8}Hello there\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Hello there"), "{out:?}");
+        assert!(!out.contains("an8"), "override block leaked: {out:?}");
+        assert!(out.starts_with("WEBVTT"));
+    }
+
+    #[test]
+    fn sanitize_drops_drawing_path_cue_entirely() {
+        // The exact shape from the Café Terrace sign: a drawing event
+        // whose "text" is a vector path. The whole cue must vanish.
+        let vtt = "WEBVTT\n\n\
+            00:01:11.000 --> 00:01:14.000\n\
+            {\\p1}m 7.48 42.16 l -0.06 19.99 0.85 9.93 99.83 15.87 108.28 40.1{\\p0}\n\n\
+            00:01:11.000 --> 00:01:14.000\nOpening Soon\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Opening Soon"), "real sub dropped: {out:?}");
+        assert!(!out.contains("42.16"), "drawing path leaked: {out:?}");
+        assert!(!out.contains("\\p1"));
+        // Only the real cue's timestamp line should remain (one "-->").
+        assert_eq!(out.matches("-->").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn sanitize_drawing_without_close_does_not_eat_next_cue() {
+        // A `{\p1}` with no matching `{\p0}` — drawing mode must reset
+        // at the cue boundary so the following dialogue survives.
+        let vtt = "WEBVTT\n\n\
+            00:00:01.000 --> 00:00:02.000\n{\\p1}m 0 0 l 10 0 10 10\n\n\
+            00:00:03.000 --> 00:00:04.000\nReal dialogue here\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Real dialogue here"), "{out:?}");
+        assert!(!out.contains("l 10 0"), "{out:?}");
+        assert_eq!(out.matches("-->").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn sanitize_keeps_positioned_dialogue() {
+        // `\pos` text must survive — it's a normal positioned line, not
+        // a drawing.
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{\\pos(960,540)}Subtitle text\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Subtitle text"), "{out:?}");
+        assert!(!out.contains("pos"), "{out:?}");
+    }
+
+    #[test]
+    fn sanitize_leaves_plain_vtt_dialogue_intact() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nJust a line\n\n00:00:03.000 --> 00:00:04.000\nAnother line\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Just a line"));
+        assert!(out.contains("Another line"));
+        assert_eq!(out.matches("-->").count(), 2);
+    }
 
     #[test]
     fn loudnorm_filter_without_measurement_is_single_pass() {

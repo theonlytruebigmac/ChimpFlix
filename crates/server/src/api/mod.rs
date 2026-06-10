@@ -288,6 +288,14 @@ pub fn router(state: AppState) -> Router {
             "/episodes/{id}/external-subtitles",
             get(subtitles::list_for_episode),
         )
+        // On-demand OpenSubtitles fetch triggers (owner-only). Item-level
+        // enqueues the durable fan-out job; episode-level runs inline for
+        // an immediate per-row result.
+        .route("/items/{id}/fetch-subtitles", post(subtitles::fetch_for_item))
+        .route(
+            "/episodes/{id}/fetch-subtitles",
+            post(subtitles::fetch_for_episode),
+        )
         .route("/external-subtitles/{id}/file", get(subtitles::serve_file))
         .route(
             "/items/{id}/credits",

@@ -34,7 +34,8 @@ pub use rlimit::apply_session_limits;
 pub use session::{
     AudioTreatment, ContainerFormat, HLS_SEGMENT_DURATION_S, LoudnessTarget, Session,
     SessionSnapshot, SubExtractionStatus, TonemapConfig, TranscodeManager, VideoTreatment,
-    WebVttSidecar, evict_text_subs_cache, is_text_subtitle_codec, scan_prewarm_text_subs,
+    WebVttSidecar, evict_text_subs_cache, is_text_subtitle_codec, sanitize_ass_webvtt,
+    scan_prewarm_text_subs,
 };
 
 #[derive(Debug, Clone)]

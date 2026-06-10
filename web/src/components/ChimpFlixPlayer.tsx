@@ -1782,10 +1782,37 @@ export function ChimpFlixPlayer({
               const WARMUP_TARGET_SEC = 30;
               const WARMUP_TIMEOUT_MS = 45000;
               let started = false;
+              // Subtitle-readiness gate. When the user has a subtitle
+              // selected it arrives as an HLS subtitle rendition whose
+              // WebVTT sidecar the server extracts on demand — instant on
+              // a cache hit, a few seconds for an episode, longer for a
+              // big remux. Hold the first frame until hls.js has parsed
+              // that sidecar so playback doesn't start subtitle-less and
+              // then pop the text in a beat later. For a normal episode
+              // the sidecar is ready well before the 30s buffer target,
+              // so this adds no delay; the WARMUP_TIMEOUT_MS safety cap
+              // means a pathologically slow extraction falls through to
+              // play rather than hanging the start forever.
+              const expectsSubs = !!(
+                hls.subtitleTracks && hls.subtitleTracks.length > 0
+              );
+              let subsReady = !expectsSubs;
+              // Belt-and-suspenders for the cache-hit race where the
+              // sidecar was parsed before our listener attached: any text
+              // track carrying cues means subs are already in hand.
+              const subsHaveCues = (): boolean => {
+                const tts = video.textTracks;
+                for (let i = 0; i < tts.length; i++) {
+                  const c = tts[i].cues;
+                  if (c && c.length > 0) return true;
+                }
+                return false;
+              };
               const start = () => {
                 if (started) return;
                 started = true;
                 hls.off(HlsModule.Events.FRAG_BUFFERED, onFrag);
+                hls.off(HlsModule.Events.SUBTITLE_FRAG_PROCESSED, onSubFrag);
                 if (warmupSafetyTimer !== null) {
                   window.clearTimeout(warmupSafetyTimer);
                   warmupSafetyTimer = null;
@@ -1811,16 +1838,26 @@ export function ChimpFlixPlayer({
                 }
                 return 0;
               };
-              const onFrag = () => {
-                if (video.buffered.length === 0) return;
-                if (
-                  aheadFromCurrent() >= WARMUP_TARGET_SEC &&
-                  video.readyState >= 3 /* HAVE_FUTURE_DATA */
-                ) {
-                  start();
-                }
+              const bufferReady = (): boolean =>
+                video.buffered.length > 0 &&
+                aheadFromCurrent() >= WARMUP_TARGET_SEC &&
+                video.readyState >= 3; /* HAVE_FUTURE_DATA */
+              // Start once BOTH the forward buffer and (if applicable) the
+              // subtitle sidecar are ready. Called from every fragment-
+              // buffered tick and when the sidecar finishes parsing.
+              const maybeStart = () => {
+                if (!subsReady && !subsHaveCues()) return;
+                if (bufferReady()) start();
+              };
+              const onFrag = () => maybeStart();
+              const onSubFrag = () => {
+                subsReady = true;
+                maybeStart();
               };
               hls.on(HlsModule.Events.FRAG_BUFFERED, onFrag);
+              if (expectsSubs && HlsModule.Events.SUBTITLE_FRAG_PROCESSED) {
+                hls.on(HlsModule.Events.SUBTITLE_FRAG_PROCESSED, onSubFrag);
+              }
               warmupSafetyTimer = window.setTimeout(start, WARMUP_TIMEOUT_MS);
             });
             // Fatal-error recovery: HLS.js docs recommend trying
