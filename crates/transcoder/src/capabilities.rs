@@ -29,7 +29,7 @@ use std::time::Duration;
 /// probe the same (hwaccel, codec) pair simultaneously.
 static PROBE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::FfmpegConfig;
 
@@ -404,10 +404,11 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
 }
 
 /// Run a one-frame smoke encode for every candidate and keep only
-/// the ones that exit zero. Each failure logs a `warn!` with the
-/// encoder name so the operator can see which encoder ffmpeg
-/// advertised but couldn't actually start (the libcuda.so missing /
-/// VAAPI render node missing / Intel iHD driver missing cases).
+/// the ones that exit zero. Each failure logs at `debug!` with the
+/// encoder name (it's expected pruning of encoders ffmpeg advertises
+/// but the host can't actually start — libcuda.so missing / VAAPI
+/// render node missing / Intel iHD driver missing); the surviving set
+/// is reported at `info!` by the caller.
 async fn filter_to_working(cfg: &FfmpegConfig, candidates: Vec<String>) -> Vec<String> {
     let mut working = Vec::with_capacity(candidates.len());
     for enc in candidates {
@@ -415,10 +416,17 @@ async fn filter_to_working(cfg: &FfmpegConfig, candidates: Vec<String>) -> Vec<S
             debug!(encoder = %enc, "encoder smoke test ok");
             working.push(enc);
         } else {
-            warn!(
+            // Expected on most hosts: ffmpeg advertises encoders for hardware
+            // that isn't present (e.g. VAAPI/QSV/V4L2 on an NVIDIA-only box,
+            // where the VAAPI smoke test can't open /dev/dri/renderD128). This
+            // is benign pruning, not a problem — logged at debug so it doesn't
+            // spam WARN once per boot. The surviving set is reported at info
+            // by the caller, so a genuinely-missing expected encoder (e.g. no
+            // NVENC) is still visible as an empty/short capability list.
+            debug!(
                 encoder = %enc,
-                "hardware encoder advertised by ffmpeg but failed smoke test \
-                 (likely missing driver / device); dropping from capability list"
+                "encoder advertised by ffmpeg but failed smoke test \
+                 (missing driver / device); dropping from capability list"
             );
         }
     }

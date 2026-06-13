@@ -3711,13 +3711,20 @@ pub fn hash_session_nonce(nonce: &[u8; 32]) -> [u8; 32] {
 }
 
 pub async fn touch_session(pool: &SqlitePool, id: i64) -> Result<()> {
-    let now = now_ms();
-    sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE id = ?")
-        .bind(now)
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    // Serialise through the single-writer gate (see `db::with_write_gate`):
+    // this fires on the auth hot path, so under contention many of these used
+    // to pile up holding pool connections. The caller (auth extractor) also
+    // debounces so it rarely fires; the gate caps the rest. Leaf write.
+    crate::db::with_write_gate(|| async {
+        let now = now_ms();
+        sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    })
+    .await
 }
 
 pub async fn delete_session(pool: &SqlitePool, id: i64) -> Result<()> {
@@ -5504,39 +5511,50 @@ pub async fn apply_play_state_batch(
     user_id: i64,
     batch: PlayStateBatch,
 ) -> Result<()> {
-    let now = now_ms();
-    let mut tx = pool.begin().await?;
-    for update in batch.updates {
-        match (update.item_id, update.episode_id) {
-            (Some(item_id), None) => {
-                upsert_play_state_movie_tx(
-                    &mut tx,
-                    user_id,
-                    item_id,
-                    update.position_ms,
-                    update.duration_ms,
-                    update.watched.unwrap_or(false),
-                    now,
-                )
-                .await?;
+    // Serialise the play-state write transaction through the single-writer
+    // gate (see `db::with_write_gate`). Play ticks fire frequently per active
+    // viewer; under a scan convoy these used to stack as blocked pool
+    // connections. Gating collapses concurrent play-state writers to one and
+    // keeps the rest waiting in memory rather than on a pool slot. Leaf write
+    // (the inner `upsert_play_state_*_tx` helpers run on the tx, not the gate).
+    crate::db::with_write_gate(|| async move {
+        let now = now_ms();
+        let mut tx = pool.begin().await?;
+        for update in batch.updates {
+            match (update.item_id, update.episode_id) {
+                (Some(item_id), None) => {
+                    upsert_play_state_movie_tx(
+                        &mut tx,
+                        user_id,
+                        item_id,
+                        update.position_ms,
+                        update.duration_ms,
+                        update.watched.unwrap_or(false),
+                        now,
+                    )
+                    .await?;
+                }
+                (None, Some(episode_id)) => {
+                    upsert_play_state_episode_tx(
+                        &mut tx,
+                        user_id,
+                        episode_id,
+                        update.position_ms,
+                        update.duration_ms,
+                        update.watched.unwrap_or(false),
+                        now,
+                    )
+                    .await?;
+                }
+                _ => anyhow::bail!(
+                    "play state update must have exactly one of item_id or episode_id"
+                ),
             }
-            (None, Some(episode_id)) => {
-                upsert_play_state_episode_tx(
-                    &mut tx,
-                    user_id,
-                    episode_id,
-                    update.position_ms,
-                    update.duration_ms,
-                    update.watched.unwrap_or(false),
-                    now,
-                )
-                .await?;
-            }
-            _ => anyhow::bail!("play state update must have exactly one of item_id or episode_id"),
         }
-    }
-    tx.commit().await?;
-    Ok(())
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 async fn upsert_play_state_movie_tx<'a>(
@@ -10248,25 +10266,46 @@ pub async fn enqueue_jobs_for_files_batched(
 /// Order: priority DESC, id ASC (FIFO at the same priority).
 pub async fn claim_next_job(pool: &SqlitePool) -> Result<Option<JobRow>> {
     let now = now_ms();
-    let row = sqlx::query(
-        "UPDATE jobs
-         SET status     = 'running',
-             attempts   = attempts + 1,
-             locked_at  = ?,
-             started_at = COALESCE(started_at, ?)
-         WHERE id = (
-             SELECT id FROM jobs
-             WHERE (status = 'queued' OR status = 'failed')
-               AND run_after <= ?
-             ORDER BY priority DESC, id ASC
-             LIMIT 1
-         )
-         RETURNING *",
+    // Cheap read-only pre-check (WAL reads never take the write lock). The
+    // common case is an empty queue; 4 workers polling every 500ms used to
+    // fire the UPDATE below — a WRITE that acquires the WAL writer — on every
+    // empty poll (238 slow-statement WARNs in the 2026-06-13 window, 189 of
+    // them claiming nothing). Skip the write entirely when nothing is
+    // claimable so empty polls don't contend for the writer.
+    let claimable: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM jobs \
+            WHERE (status = 'queued' OR status = 'failed') AND run_after <= ?)",
     )
     .bind(now)
-    .bind(now)
-    .bind(now)
-    .fetch_optional(pool)
+    .fetch_one(pool)
+    .await?;
+    if !claimable {
+        return Ok(None);
+    }
+    // Serialise the claim UPDATE through the single-writer gate. Leaf write.
+    let row = crate::db::with_write_gate(|| async move {
+        let row = sqlx::query(
+            "UPDATE jobs
+             SET status     = 'running',
+                 attempts   = attempts + 1,
+                 locked_at  = ?,
+                 started_at = COALESCE(started_at, ?)
+             WHERE id = (
+                 SELECT id FROM jobs
+                 WHERE (status = 'queued' OR status = 'failed')
+                   AND run_after <= ?
+                 ORDER BY priority DESC, id ASC
+                 LIMIT 1
+             )
+             RETURNING *",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
+    })
     .await?;
     row.map(|r| JobRow::from_row(&r)).transpose()
 }
@@ -10333,6 +10372,22 @@ pub async fn claim_next_job_excluding_kinds(
     let placeholders = std::iter::repeat_n("?", exclude_kinds.len())
         .collect::<Vec<_>>()
         .join(",");
+    // Cheap read-only pre-check with the SAME kind filter (see claim_next_job)
+    // so an all-saturated / empty queue doesn't take the WAL writer on every
+    // 500ms poll.
+    let exists_sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM jobs \
+            WHERE (status = 'queued' OR status = 'failed') \
+              AND run_after <= ? AND kind NOT IN ({placeholders}))"
+    );
+    let mut eq = sqlx::query(&exists_sql).bind(now);
+    for k in exclude_kinds {
+        eq = eq.bind(k);
+    }
+    let claimable: bool = eq.fetch_one(pool).await?.try_get(0)?;
+    if !claimable {
+        return Ok(None);
+    }
     let sql = format!(
         "UPDATE jobs
          SET status     = 'running',
@@ -10349,11 +10404,16 @@ pub async fn claim_next_job_excluding_kinds(
          )
          RETURNING *",
     );
-    let mut q = sqlx::query(&sql).bind(now).bind(now).bind(now);
-    for k in exclude_kinds {
-        q = q.bind(k);
-    }
-    let row = q.fetch_optional(pool).await?;
+    // Serialise the claim UPDATE through the single-writer gate. Leaf write.
+    let row = crate::db::with_write_gate(|| async move {
+        let mut q = sqlx::query(&sql).bind(now).bind(now).bind(now);
+        for k in exclude_kinds {
+            q = q.bind(k);
+        }
+        let row = q.fetch_optional(pool).await?;
+        Ok(row)
+    })
+    .await?;
     row.map(|r| JobRow::from_row(&r)).transpose()
 }
 

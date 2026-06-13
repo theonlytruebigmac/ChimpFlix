@@ -1,9 +1,10 @@
 //! Request extractors that resolve a session cookie into the current
 //! user (or 401 the request).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::FromRequestParts;
 use axum::http::header::COOKIE;
@@ -36,6 +37,42 @@ static BYPASS_CIDR_CACHE: LazyLock<RwLock<(String, Vec<IpNet>)>> =
 /// notice if their bypass CIDR is wider than they intended.
 static NETWORK_BYPASS_LOGGED: LazyLock<RwLock<HashSet<IpAddr>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Debounce window for the per-request `last_seen_at` session touch. The
+/// touch only feeds the 14-day idle-session sweep, so minute-granularity
+/// staleness is harmless — but writing it on EVERY authenticated request was
+/// a top source of WAL-writer contention (186 slow-statement WARNs in the
+/// 2026-06-13 wedge). One write per session per minute is plenty.
+const SESSION_TOUCH_DEBOUNCE: Duration = Duration::from_secs(60);
+
+/// Last instant each session's `last_seen_at` was written (process-local).
+/// Bounded opportunistically in [`should_touch_session`].
+static SESSION_TOUCH_SEEN: LazyLock<Mutex<HashMap<i64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// True if `sid` is due for a `last_seen_at` write (not touched within
+/// [`SESSION_TOUCH_DEBOUNCE`]); records the decision instant when it returns
+/// true so the next request inside the window skips the write entirely.
+fn should_touch_session(sid: i64) -> bool {
+    let now = Instant::now();
+    // Recover from a poisoned lock rather than propagate a panic onto the
+    // auth hot path — a stale debounce map is harmless.
+    let mut seen = SESSION_TOUCH_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&last) = seen.get(&sid) {
+        if now.duration_since(last) < SESSION_TOUCH_DEBOUNCE {
+            return false;
+        }
+    }
+    seen.insert(sid, now);
+    // The map only needs entries within the debounce window; under churn
+    // (many short-lived sessions) drop stale ones so it can't grow unbounded.
+    if seen.len() > 4096 {
+        seen.retain(|_, &mut t| now.duration_since(t) < SESSION_TOUCH_DEBOUNCE);
+    }
+    true
+}
 
 /// Sentinel session id used by the network-bypass path. The bypass
 /// fakes an AuthUser without a real DB-backed session row; this
@@ -198,12 +235,16 @@ impl FromRequestParts<AppState> for AuthUser {
             return Err(ApiError::Unauthorized);
         }
 
-        // Best-effort: update last_seen_at without blocking the request.
-        let pool = state.pool.clone();
-        let sid = session.id;
-        tokio::spawn(async move {
-            let _ = queries::touch_session(&pool, sid).await;
-        });
+        // Best-effort: bump last_seen_at without blocking the request,
+        // debounced to ~once/minute per session (see should_touch_session) so
+        // the auth hot path stops hammering the single WAL writer.
+        if should_touch_session(session.id) {
+            let pool = state.pool.clone();
+            let sid = session.id;
+            tokio::spawn(async move {
+                let _ = queries::touch_session(&pool, sid).await;
+            });
+        }
 
         Ok(AuthUser {
             id: user.id,

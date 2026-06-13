@@ -63,6 +63,14 @@ pub mod scan_gate;
 /// idle server isn't waking up 10x/sec for nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Per-worker stagger applied when the library-scan gate releases. The gate
+/// pauses all workers during a scan, then clears for every worker at once —
+/// so they'd otherwise stampede `claim_next_job` and their handlers' writes
+/// onto the single WAL writer the instant the scan finishes (the post-scan
+/// write convoy in the 2026-06-13 logs). Worker N waits N × this before
+/// resuming, ramping the writer load back up instead of spiking it.
+const SCAN_RESUME_STAGGER: Duration = Duration::from_millis(250);
+
 /// Heartbeat cadence — long enough not to spam the DB, short
 /// enough that a job running close to the lease TTL gets its
 /// timestamp refreshed comfortably before reclaim would consider
@@ -420,6 +428,9 @@ async fn worker_loop(
         // We also select on count_rx so a pool shrink during a scan
         // is observed immediately rather than waiting for the gate
         // to clear first.
+        // Note whether we actually park behind a scan this iteration, so the
+        // staggered-resume cost below is only paid on the gate-release path.
+        let parked_behind_scan = *scan_exclusive_rx.borrow();
         while *scan_exclusive_rx.borrow() {
             tokio::select! {
                 res = scan_exclusive_rx.changed() => {
@@ -434,6 +445,20 @@ async fn worker_loop(
                     }
                     // Re-check self-exit in case pool was shrunk.
                     if worker_id >= *count_rx.borrow() {
+                        info!(worker = worker_id, "job worker draining (pool shrunk)");
+                        return;
+                    }
+                }
+            }
+        }
+        // Staggered resume after the scan gate just released (see
+        // SCAN_RESUME_STAGGER): spread the workers' return so they don't all
+        // hit the WAL writer at once. Worker 0 resumes immediately.
+        if parked_behind_scan && worker_id > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(SCAN_RESUME_STAGGER * worker_id as u32) => {}
+                res = count_rx.changed() => {
+                    if res.is_err() || worker_id >= *count_rx.borrow() {
                         info!(worker = worker_id, "job worker draining (pool shrunk)");
                         return;
                     }
