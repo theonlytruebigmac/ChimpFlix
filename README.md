@@ -1,15 +1,41 @@
 # ChimpFlix
 
-A self-hosted, open-source media server with a Netflix-style web UI.
-Apache 2.0 licensed.
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/backend-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Next.js](https://img.shields.io/badge/frontend-Next.js%2015-black.svg)](https://nextjs.org/)
+[![SQLite](https://img.shields.io/badge/database-SQLite-blue.svg)](https://www.sqlite.org/)
+[![Docker](https://img.shields.io/badge/deploy-Docker-2496ED.svg)](https://www.docker.com/)
 
-> **Status: v0.1 feature-complete (2026-05-18).** All four MVP pillars
-> (library scan, direct-play + watch state, HLS transcoding, multi-user
-> auth) are wired up and running. Four phases of Plex-parity work have
-> shipped on top of that, plus HEVC + GPU pinning, smart collections,
-> pre-roll stings, two-pass loudnorm, and a Netflix-style admin
-> surface. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
-> current shape.
+**A self-hosted, open-source media server with a Netflix-style web UI.**
+
+Stream your personal movie and TV library from any device. Zero analytics,
+zero phone-home, zero third-party JavaScript. Everything stays on your box.
+
+> **Status: v0.1 feature-complete.** Library scan, direct-play, HLS
+> transcoding (including HEVC + GPU acceleration), multi-user auth, smart
+> collections, Trakt sync, Google Cast, and a full Netflix-style admin
+> surface are all shipped. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+> for the full picture.
+
+---
+
+## Screenshots
+
+| Home — discovery rails | Movie detail |
+|---|---|
+| ![Home screen with Continue Watching, Top 10, and genre rails](docs/screenshots/home.png) | ![Movie detail page with cast and similar titles](docs/screenshots/movie-detail.png) |
+
+| Library browser | Admin dashboard |
+|---|---|
+| ![Library grid view](docs/screenshots/library.png) | ![Admin dashboard with library health metrics](docs/screenshots/admin.png) |
+
+| Search | Calendar |
+|---|---|
+| ![Full-text search results](docs/screenshots/search.png) | ![Episode calendar view](docs/screenshots/calendar.png) |
+
+> **Try it yourself:** `bash scripts/demo/setup.sh` — see [docs/DEMO.md](docs/DEMO.md) for details.
+
+---
 
 ## What ChimpFlix is (and is not)
 
@@ -191,6 +217,8 @@ checklist before exposing the server publicly.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system shape, crate
   boundaries, process model, request lifecycles.
 - [docs/SCHEMA.md](docs/SCHEMA.md) — SQLite schema for v0.1.
+- [docs/DEMO.md](docs/DEMO.md) — run an isolated demo instance with sample
+  data in one command (no personal library required).
 - [docs/API.md](docs/API.md) — REST endpoints and WebSocket event catalog.
 - [docs/cast-receiver.md](docs/cast-receiver.md) — Google Cast custom
   receiver setup: App ID registration, test-device registration, and

@@ -1,0 +1,98 @@
+# ChimpFlix demo stack — completely isolated from any production deployment.
+#
+# Uses ./data-demo/ (a separate SQLite database), ports 8081 (server) and
+# 3001 (web), and no media mount so it never touches your personal library.
+# See scripts/demo/setup.sh and docs/DEMO.md for the full walkthrough.
+#
+# Quick start:
+#   cp .env.demo .env.demo.local          # optional: add API keys for real artwork
+#   docker compose -f docker-compose.demo.yml up -d --build
+#   bash scripts/demo/setup.sh            # creates owner + seeds demo data
+#   open http://localhost:3001
+
+# Explicit project name keeps this stack separate from the default-named
+# production project. Without this, `docker compose -f docker-compose.yml up`
+# and `docker compose -f docker-compose.demo.yml up` would fight over the
+# same project name and tear each other's containers down.
+name: chimpflix-demo
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: server
+    image: chimpflix-server:demo
+    container_name: chimpflix-demo-server
+    restart: "no"
+    env_file:
+      - path: ./.env.demo.local
+        required: false
+      - path: ./.env.demo
+        required: false
+    environment:
+      TZ: America/New_York
+      BIND_ADDR: 0.0.0.0:8080
+      DATA_DIR: /data
+      RUST_LOG: info,sqlx=warn
+      # No TMDB key = no live artwork refreshes.
+      # Add TMDB_API_KEY to .env.demo.local to enable metadata refresh.
+    volumes:
+      - ./data-demo:/data
+      # tmpfs mount so the library path health-check sees /media/* directories
+      # even though there are no real video files. The seed SQL plants
+      # library paths under /media/movies, /media/shows, /media/anime.
+      # Demo has no real media files — library paths will be empty dirs
+      # inside the data volume. The server still starts correctly.
+      - ./data-demo/media/movies:/media/movies
+      - ./data-demo/media/shows:/media/shows
+      - ./data-demo/media/anime:/media/anime
+    ports:
+      - "8081:8080"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    healthcheck:
+      # Use /health (process-alive check) not /api/v1/ready (deep check)
+      # so empty demo library paths don't prevent the web container from starting.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: web
+      args:
+        CHIMPFLIX_API_URL: http://server:8080
+        NEXT_PUBLIC_BRAND_NAME: ChimpFlix
+        NEXT_PUBLIC_BRAND_NAME_UPPER: ""
+        APP_PUBLIC_ORIGIN: ""
+        NEXT_PUBLIC_CAST_RECEIVER_APP_ID: ""
+    image: chimpflix-web:demo
+    container_name: chimpflix-demo-web
+    restart: "no"
+    depends_on:
+      server:
+        condition: service_healthy
+    env_file:
+      - path: ./.env.demo.local
+        required: false
+      - path: ./.env.demo
+        required: false
+    environment:
+      CHIMPFLIX_API_URL: http://server:8080
+      TZ: America/New_York
+    ports:
+      - "3001:3000"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256

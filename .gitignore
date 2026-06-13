@@ -23,6 +23,11 @@ next-env.d.ts
 /.app-state/
 .app-admin-token
 
+# Demo runtime data (DB + media stubs created by scripts/demo/setup.sh)
+/data-demo/
+# Demo-local env overrides (operator API keys — never commit)
+.env.demo.local
+
 # Editor / IDE
 .vscode/
 .idea/
