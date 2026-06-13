@@ -819,6 +819,7 @@ async fn process_file(
                 &sort_title,
                 year,
                 auto_matched,
+                Some(mtime_ms),
             )
             .await?;
             // Movie hints drive TMDB enrichment. Skip enriching
@@ -849,6 +850,7 @@ async fn process_file(
                 &show_sort_title,
                 show_year,
                 auto_matched,
+                Some(mtime_ms),
             )
             .await?;
             let season_id = queries::upsert_season(pool, show_id, season).await?;
@@ -859,6 +861,7 @@ async fn process_file(
                 episode,
                 &fallback_title,
                 absolute_number,
+                Some(mtime_ms),
             )
             .await?;
 

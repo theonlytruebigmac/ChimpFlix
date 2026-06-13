@@ -1865,7 +1865,8 @@ pub async fn list_trending_in_library(
     //   3. ps.last_played_at DESC (per-user; nudges things this viewer
     //      has actually engaged with)
     //   4. i.added_at DESC (final fallback so the slots fill predictably
-    //      with whatever was last imported)
+    //      with the most recently acquired titles — added_at tracks the
+    //      earliest file mtime, not scan time, since phase 109)
     // Rank is returned as the row position (1..N) rather than tc.rank,
     // since fallback items have no tc.rank and the frontend renumbers
     // anyway.
@@ -4387,6 +4388,153 @@ pub async fn list_upcoming_episodes(
         .collect()
 }
 
+/// One row per show: its most-recently-added *downloaded* episode, but only
+/// when that episode landed meaningfully later than the show first entered
+/// the library — i.e. a genuine new episode of a show you already had, not
+/// part of the show's initial import.
+///
+/// This rail exists precisely because `items.added_at` is MIN-converged to a
+/// show's earliest episode (see [`upsert_item_with_match`] / [`upsert_episode`]):
+/// a new episode never raises the show's `added_at`, so an ongoing show can't
+/// resurface in the `added_at`-sorted "Recently Added" rail. This query keys
+/// off the *episode's* own `added_at` instead.
+///
+/// Selection per show (via `ROW_NUMBER` partitioned by show):
+///   * non-placeholder episodes with at least one live (non-removed) file,
+///   * keep the newest by `added_at` (rn = 1),
+///   * keep it only if `added_at > show.added_at + NEW_EPISODE_GRACE_MS` (drops
+///     the initial import, whose episodes share the show's add window) AND
+///     `added_at >= since_ms` (the recency window).
+///
+/// Visibility + kids-safe mirror [`list_upcoming_episodes`]. Ordered newest
+/// first; `limit` clamped.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentEpisode {
+    pub episode_id: i64,
+    pub show_id: i64,
+    pub show_title: String,
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub episode_title: Option<String>,
+    /// Epoch ms the episode's earliest file was acquired (the rail's sort key).
+    pub added_at: i64,
+    pub duration_ms: Option<i64>,
+    /// Episode still (images.kind = 'thumb'), if scanned.
+    pub still_path: Option<String>,
+    /// Parent show poster / backdrop (images keyed on the show item).
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+}
+
+/// An episode must land more than this long after the show's own `added_at`
+/// to count as a genuine "new episode" rather than initial-import noise. One
+/// day comfortably clears a multi-hour first scan of a back catalogue while
+/// still catching a same-week episode drop.
+const NEW_EPISODE_GRACE_MS: i64 = 86_400_000;
+
+pub async fn list_recently_added_episodes(
+    pool: &SqlitePool,
+    user_id: i64,
+    accessible: Option<&[i64]>,
+    since_ms: i64,
+    limit: i64,
+    kids_safe: bool,
+) -> Result<Vec<RecentEpisode>> {
+    // `user_id` kept for call-convention uniformity; access is already
+    // resolved into `accessible` (same as `list_upcoming_episodes`).
+    let _ = user_id;
+    let lib_filter = library_filter_sql("sh.library_id", accessible);
+    // Kids-safe inlined as a literal (no bind), same as `list_upcoming_episodes`.
+    let kids_clause = if kids_safe {
+        format!(
+            " AND (sh.rating_age IS NULL OR TRIM(sh.rating_age) = '' \
+              OR UPPER(TRIM(sh.rating_age)) IN ({}))",
+            crate::models::KIDS_SAFE_CERTS
+                .iter()
+                .map(|c| format!("'{}'", c.trim().to_uppercase().replace('\'', "")))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    } else {
+        String::new()
+    };
+    let limit = limit.clamp(1, 200);
+    // Rank each show's downloaded, non-placeholder episodes by acquisition
+    // time, keep the newest per show, then gate on the grace + recency
+    // windows. The image lookups live in the outer projection so they only
+    // run for the surviving rows.
+    let sql = format!(
+        "WITH ranked AS (
+            SELECT e.id              AS episode_id,
+                   s.show_id         AS show_id,
+                   sh.id             AS sh_id,
+                   sh.title          AS show_title,
+                   sh.added_at       AS show_added_at,
+                   s.season_number   AS season_number,
+                   e.episode_number  AS episode_number,
+                   e.title           AS episode_title,
+                   e.added_at        AS added_at,
+                   e.duration_ms     AS duration_ms,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.show_id
+                       ORDER BY e.added_at DESC, e.id DESC
+                   ) AS rn
+              FROM episodes e
+              JOIN seasons s  ON s.id = e.season_id
+              JOIN items   sh ON sh.id = s.show_id
+             WHERE e.is_placeholder = 0
+               AND EXISTS (SELECT 1 FROM media_files mf
+                            WHERE mf.episode_id = e.id AND mf.removed_at IS NULL)
+               AND {lib_filter}{kids_clause}
+        )
+        SELECT episode_id, show_id, show_title, season_number, episode_number,
+               episode_title, added_at, duration_ms,
+               (SELECT source_url FROM images
+                  WHERE episode_id = ranked.episode_id AND kind = 'thumb'
+                  ORDER BY is_primary DESC, id ASC LIMIT 1) AS still_path,
+               (SELECT source_url FROM images
+                  WHERE item_id = ranked.sh_id AND kind = 'poster'
+                  ORDER BY is_primary DESC, id ASC LIMIT 1) AS poster_path,
+               (SELECT source_url FROM images
+                  WHERE item_id = ranked.sh_id AND kind = 'backdrop'
+                  ORDER BY is_primary DESC, id ASC LIMIT 1) AS backdrop_path
+          FROM ranked
+         WHERE rn = 1
+           AND added_at > show_added_at + ?
+           AND added_at >= ?
+         ORDER BY added_at DESC, show_title COLLATE NOCASE ASC
+         LIMIT ?"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(NEW_EPISODE_GRACE_MS)
+        .bind(since_ms)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|r| {
+            // Synthetic "Episode N" placeholders normalize to None; let the
+            // renderer decide — same convention as `list_upcoming_episodes`.
+            let et: String = r.try_get("episode_title")?;
+            let episode_title = if et.trim().is_empty() { None } else { Some(et) };
+            Ok(RecentEpisode {
+                episode_id: r.try_get("episode_id")?,
+                show_id: r.try_get("show_id")?,
+                show_title: r.try_get("show_title")?,
+                season_number: r.try_get("season_number")?,
+                episode_number: r.try_get("episode_number")?,
+                episode_title,
+                added_at: r.try_get("added_at")?,
+                duration_ms: r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+                still_path: r.try_get::<Option<String>, _>("still_path").ok().flatten(),
+                poster_path: r.try_get::<Option<String>, _>("poster_path").ok().flatten(),
+                backdrop_path: r.try_get::<Option<String>, _>("backdrop_path").ok().flatten(),
+            })
+        })
+        .collect()
+}
+
 /// User IDs that currently have access to `library_id` — the inverse of
 /// [`user_library_filter`]. UNION of:
 ///   * every owner (implicit full access; `user_library_filter` returns
@@ -6719,13 +6867,21 @@ pub async fn upsert_item(
     sort_title: &str,
     year: Option<i32>,
 ) -> Result<i64> {
-    upsert_item_with_match(pool, library_id, kind, title, sort_title, year, true).await
+    upsert_item_with_match(pool, library_id, kind, title, sort_title, year, true, None).await
 }
 
 /// Same as [`upsert_item`] but lets the caller flag a row as
 /// `auto_matched = false`. Used by the scanner when the parser
 /// couldn't extract a confident title — the file still becomes
 /// visible/playable, just with the "unmatched" affordance in the UI.
+///
+/// `added_at_hint_ms` seeds `added_at` on first insert (the scanner
+/// passes the backing file's mtime). Without it an initial bulk scan
+/// stamps the whole library with one wall-clock instant and the
+/// Recently Added rail degenerates into directory-walk order. The
+/// hint is clamped to now so a bogus future mtime can't pin an item
+/// to the top of the rail; existing rows never change.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_item_with_match(
     pool: &SqlitePool,
     library_id: i64,
@@ -6734,14 +6890,25 @@ pub async fn upsert_item_with_match(
     sort_title: &str,
     year: Option<i32>,
     auto_matched: bool,
+    added_at_hint_ms: Option<i64>,
 ) -> Result<i64> {
     let now = now_ms();
+    let added_at = added_at_hint_ms
+        .filter(|&m| m > 0)
+        .map_or(now, |m| m.min(now));
     let row = sqlx::query(
         "INSERT INTO items (library_id, kind, title, sort_title, year, auto_matched, added_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(library_id, kind, sort_title) DO UPDATE SET
              title = excluded.title,
              year = COALESCE(items.year, excluded.year),
+             -- Converge on the EARLIEST acquisition evidence: every
+             -- episode upsert re-offers its file's mtime, so a show
+             -- settles at the min across all walked files regardless
+             -- of walk order (same definition as the phase-109
+             -- backfill). Hint-less callers offer now, which can
+             -- never undercut the stored value.
+             added_at = MIN(items.added_at, excluded.added_at),
              updated_at = excluded.updated_at
          RETURNING id",
     )
@@ -6751,7 +6918,7 @@ pub async fn upsert_item_with_match(
     .bind(sort_title)
     .bind(year)
     .bind(i64::from(auto_matched))
-    .bind(now)
+    .bind(added_at)
     .bind(now)
     .fetch_one(pool)
     .await?;
@@ -6983,14 +7150,23 @@ pub async fn heal_blank_image_rows(pool: &SqlitePool) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
+/// `added_at_hint_ms` carries the backing file's mtime; see
+/// [`upsert_item_with_match`] for the rationale. It seeds `added_at`
+/// on first insert and on placeholder promotion (a placeholder row is
+/// created when the agent knows the episode exists but no file does,
+/// so its `added_at` predates the actual download).
 pub async fn upsert_episode(
     pool: &SqlitePool,
     season_id: i64,
     episode_number: i32,
     title: &str,
     absolute_number: Option<i32>,
+    added_at_hint_ms: Option<i64>,
 ) -> Result<i64> {
     let now = now_ms();
+    let added_at = added_at_hint_ms
+        .filter(|&m| m > 0)
+        .map_or(now, |m| m.min(now));
     // The CASE preserves a metadata-derived title across rescans
     // (we don't want a TMDB / AniList title to revert to the parser's
     // filename stem just because the file was re-seen) BUT must allow
@@ -7020,8 +7196,18 @@ pub async fn upsert_episode(
          ON CONFLICT(season_id, episode_number) DO UPDATE SET
              -- A file is being attached to this slot, so it is a real
              -- episode now — promote any placeholder row to non-placeholder
-             -- so the orphan purge treats it normally going forward.
+             -- so the orphan purge treats it normally going forward. A
+             -- promoted placeholder takes the incoming added_at outright:
+             -- the row predates the download, and \"date added\" should mean
+             -- when the file arrived, not when the agent learned the
+             -- episode exists. Real episodes converge on the earliest
+             -- file mtime (multi-version episodes, same rationale as the
+             -- items upsert above).
              is_placeholder = 0,
+             added_at = CASE
+                WHEN episodes.is_placeholder = 1 THEN excluded.added_at
+                ELSE MIN(episodes.added_at, excluded.added_at)
+             END,
              title = CASE
                 WHEN length(trim(episodes.title)) = 0
                   OR episodes.title LIKE 'Episode %'
@@ -7057,7 +7243,7 @@ pub async fn upsert_episode(
     .bind(episode_number)
     .bind(title)
     .bind(absolute_number)
-    .bind(now)
+    .bind(added_at)
     .bind(now)
     .fetch_one(pool)
     .await?;
@@ -10576,12 +10762,13 @@ async fn merge_items_inner(
                 season_number: i32,
                 episode_number: i32,
                 episode_title: String,
+                added_at: i64,
             }
             // Pull every source episode in one query — cheaper than
             // walking seasons one at a time, and the result fits
             // comfortably in memory even for long-running shows.
             let source_eps: Vec<SourceEp> = sqlx::query_as(
-                "SELECT e.id AS episode_id, s.season_number, e.episode_number, e.title AS episode_title
+                "SELECT e.id AS episode_id, s.season_number, e.episode_number, e.title AS episode_title, e.added_at
                  FROM episodes e
                  JOIN seasons s ON e.season_id = s.id
                  WHERE s.show_id = ?",
@@ -10653,7 +10840,11 @@ async fn merge_items_inner(
                     .bind(target_season_id)
                     .bind(ep.episode_number)
                     .bind(&ep.episode_title)
-                    .bind(now)
+                    // The recreated row is the SAME episode the user has had
+                    // all along — carry the source's added_at instead of
+                    // stamping merge time, which would misdate it forever
+                    // (rescans preserve added_at for non-placeholder rows).
+                    .bind(ep.added_at.min(now))
                     .bind(now)
                     .fetch_one(&mut *conn)
                     .await?;
@@ -10676,6 +10867,20 @@ async fn merge_items_inner(
         }
         other => anyhow::bail!("unsupported kind {other:?}"),
     }
+
+    // The merged item has existed since the EARLIER of the two copies
+    // — the common merge case is a metadata rename that created a
+    // fresh duplicate of a long-held title, and keeping the target's
+    // (newer) stamp would rank it falsely high in Recently Added.
+    sqlx::query(
+        "UPDATE items
+         SET added_at = MIN(added_at, (SELECT added_at FROM items WHERE id = ?))
+         WHERE id = ?",
+    )
+    .bind(source_id)
+    .bind(target_id)
+    .execute(&mut *conn)
+    .await?;
 
     // Cascade-delete the source. Seasons → episodes go via ON DELETE
     // CASCADE; the media files we re-pointed above survive because
@@ -16478,6 +16683,112 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(still_watched, 1);
+    }
+
+    /// "New Episodes" rail contract: a fresh episode of a show you already had
+    /// surfaces (keyed on the *episode's* `added_at`), while the show's initial
+    /// import, brand-new shows, and not-yet-downloaded episodes do not. This is
+    /// exactly the gap "Recently Added" can't show — it sorts by the show's
+    /// MIN-converged `added_at`, which a new episode never raises.
+    #[tokio::test]
+    async fn recently_added_episodes_surfaces_new_not_initial_import() {
+        let pool = migrated_pool().await;
+        let now = 1_700_000_000_000i64;
+        let day = 86_400_000i64;
+        let hour = 3_600_000i64;
+
+        async fn add_show(pool: &SqlitePool, id: i64, title: &str, added_at: i64) -> i64 {
+            sqlx::query(
+                "INSERT INTO items (id, library_id, kind, title, sort_title, added_at, updated_at)
+                 VALUES (?, 1, 'show', ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .bind(added_at)
+            .bind(added_at)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query_scalar(
+                "INSERT INTO seasons (show_id, season_number) VALUES (?, 1) RETURNING id",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+        async fn add_ep(
+            pool: &SqlitePool,
+            season_id: i64,
+            n: i32,
+            added_at: i64,
+            placeholder: bool,
+            with_file: bool,
+        ) -> i64 {
+            let ep: i64 = sqlx::query_scalar(
+                "INSERT INTO episodes (season_id, episode_number, title, is_placeholder, added_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            )
+            .bind(season_id)
+            .bind(n)
+            .bind(format!("Ep {n}"))
+            .bind(placeholder as i64)
+            .bind(added_at)
+            .bind(added_at)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if with_file {
+                sqlx::query(
+                    "INSERT INTO media_files (episode_id, path, size_bytes, mtime_ms, scanned_at)
+                     VALUES (?, ?, 100, ?, ?)",
+                )
+                .bind(ep)
+                .bind(format!("/media/ep{ep}.mkv"))
+                .bind(added_at)
+                .bind(added_at)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ep
+        }
+
+        // Show A: old show (60d ago); ep1 initial import, ep2 a new episode 2h ago.
+        let a = add_show(&pool, 100, "Alpha Show", now - 60 * day).await;
+        add_ep(&pool, a, 1, now - 60 * day, false, true).await;
+        add_ep(&pool, a, 2, now - 2 * hour, false, true).await;
+
+        // Show B: brand-new show (1h ago); its only episode arrived with it.
+        let b = add_show(&pool, 200, "Bravo Show", now - hour).await;
+        add_ep(&pool, b, 1, now - hour, false, true).await;
+
+        // Show C: old show, new episode but NOT downloaded (placeholder, no file).
+        let c = add_show(&pool, 300, "Charlie Show", now - 90 * day).await;
+        add_ep(&pool, c, 1, now - 90 * day, false, true).await;
+        add_ep(&pool, c, 5, now - hour, true, false).await;
+
+        // Show D: old show with a genuine new episode 10d ago (older than A's).
+        let d = add_show(&pool, 400, "Delta Show", now - 90 * day).await;
+        add_ep(&pool, d, 1, now - 90 * day, false, true).await;
+        add_ep(&pool, d, 4, now - 10 * day, false, true).await;
+
+        let out = list_recently_added_episodes(&pool, 1, None, now - 30 * day, 20, false)
+            .await
+            .unwrap();
+
+        // A and D surface, newest-first; B (brand-new) and C (not downloaded) don't.
+        let shows: Vec<i64> = out.iter().map(|e| e.show_id).collect();
+        assert_eq!(
+            shows,
+            vec![100, 400],
+            "only genuine new episodes of existing shows, newest first"
+        );
+        // Show A surfaces its NEWEST episode (S01E02), not the initial-import ep1.
+        assert_eq!(out[0].season_number, 1);
+        assert_eq!(out[0].episode_number, 2);
+        assert_eq!(out[1].episode_number, 4);
     }
 
     /// Locking an account must take effect immediately: the admin

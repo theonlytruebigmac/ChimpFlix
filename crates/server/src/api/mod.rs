@@ -219,6 +219,10 @@ pub fn router(state: AppState) -> Router {
         .route("/items", get(items::list))
         .route("/items/trending", get(items::trending))
         .route("/calendar", get(items::calendar))
+        .route(
+            "/episodes/recently-added",
+            get(items::recently_added_episodes),
+        )
         .route("/items/{id}", get(items::get_one).patch(items::patch_item))
         .route(
             "/items/{id}/media",

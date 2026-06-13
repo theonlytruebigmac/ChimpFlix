@@ -1674,6 +1674,7 @@ pub struct HomeRailCatalogueEntry {
 pub const HOME_RAIL_CATALOGUE: &[HomeRailCatalogueEntry] = &[
     HomeRailCatalogueEntry { rail_id: "continue_watching", label: "Continue Watching" },
     HomeRailCatalogueEntry { rail_id: "recently_added", label: "Recently Added" },
+    HomeRailCatalogueEntry { rail_id: "new_episodes", label: "New Episodes" },
     HomeRailCatalogueEntry { rail_id: "coming_soon", label: "Coming Soon" },
     HomeRailCatalogueEntry { rail_id: "season_premieres", label: "New Seasons" },
     HomeRailCatalogueEntry { rail_id: "calendar", label: "Coming Up · Calendar" },

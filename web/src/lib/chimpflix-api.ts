@@ -158,6 +158,7 @@ export interface HomeRailPref {
 export const HOME_RAIL_CATALOGUE: readonly HomeRailCatalogueEntry[] = [
   { rail_id: "continue_watching", label: "Continue Watching" },
   { rail_id: "recently_added", label: "Recently Added" },
+  { rail_id: "new_episodes", label: "New Episodes" },
   { rail_id: "coming_soon", label: "Coming Soon" },
   { rail_id: "season_premieres", label: "New Seasons" },
   { rail_id: "calendar", label: "Coming Up · Calendar" },
@@ -1342,6 +1343,34 @@ export interface CalendarEpisode {
 
 export interface CalendarResponse {
   episodes: CalendarEpisode[];
+}
+
+/// A show's most-recently-added *new* episode — a fresh episode of a series
+/// the user already had, surfaced by the home "New Episodes" rail. The
+/// complement to "Recently Added", which is sorted by the show's
+/// first-acquisition date and so never resurfaces an ongoing series when a
+/// new episode lands. Field names are camelCase (the backend `RecentEpisode`
+/// is `#[serde(rename_all = "camelCase")]`). `addedAt` is epoch ms — when the
+/// episode's earliest file was acquired (the rail's sort key + "added X ago"
+/// label).
+export interface RecentEpisode {
+  episodeId: number;
+  showId: number;
+  showTitle: string;
+  seasonNumber: number;
+  episodeNumber: number;
+  episodeTitle: string | null;
+  addedAt: number;
+  durationMs: number | null;
+  /// Episode still, if scanned.
+  stillPath: string | null;
+  /// Parent show poster / backdrop.
+  posterPath: string | null;
+  backdropPath: string | null;
+}
+
+export interface RecentEpisodesResponse {
+  episodes: RecentEpisode[];
 }
 
 export type ScanStatus =
@@ -3110,6 +3139,22 @@ export const items = {
     } = {},
   ) =>
     apiFetch<CalendarResponse>("/calendar", {
+      query: opts as Record<string, QueryValue>,
+    }),
+  /// Shows that just gained a brand-new episode (a fresh episode of a series
+  /// the user already had) — the home "New Episodes" rail. Keyed off each
+  /// episode's own `added_at`, so it surfaces ongoing series that "Recently
+  /// Added" (sorted by the show's first-acquisition date) structurally can't.
+  /// `days` is the look-back window (default 30 server-side); `library_ids`
+  /// honors the user's visibility prefs.
+  recentlyAddedEpisodes: (
+    opts: {
+      days?: number;
+      limit?: number;
+      library_ids?: ReadonlyArray<number>;
+    } = {},
+  ) =>
+    apiFetch<RecentEpisodesResponse>("/episodes/recently-added", {
       query: opts as Record<string, QueryValue>,
     }),
   get: (id: number) => apiFetch<ItemDetail>(`/items/${id}`),

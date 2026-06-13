@@ -301,6 +301,56 @@ pub async fn calendar(
     Ok(Json(CalendarResponse { episodes }))
 }
 
+/// Query for `GET /api/v1/episodes/recently-added`.
+#[derive(Debug, Deserialize)]
+pub struct RecentEpisodesQuery {
+    /// How far back to look, in days. Defaults to 30; clamped server-side.
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// Cap on returned rows. Defaults to 30; clamped server-side.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Visible-library filter, same shape as `ItemFilter::library_ids`.
+    #[serde(default, deserialize_with = "chimpflix_library::deserialize_csv_i64s")]
+    pub library_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentEpisodesResponse {
+    pub episodes: Vec<queries::RecentEpisode>,
+}
+
+const RECENT_EPISODES_DEFAULT_DAYS: i64 = 30;
+
+/// `GET /api/v1/episodes/recently-added` — shows that just gained a brand-new
+/// episode (a fresh episode of a series the user already had), surfaced as the
+/// home "New Episodes" rail. The complement to "Recently Added", which sorts by
+/// the show's first-acquisition `added_at` and so never resurfaces an ongoing
+/// series when a new episode lands. Same per-library visibility + kids-safe
+/// rules as every other browse surface.
+pub async fn recently_added_episodes(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<RecentEpisodesQuery>,
+) -> Result<Json<RecentEpisodesResponse>, ApiError> {
+    let now = chimpflix_common::now_ms();
+    let days = q.days.unwrap_or(RECENT_EPISODES_DEFAULT_DAYS).clamp(1, 365);
+    let since_ms = now - days * DAY_MS;
+    let limit = q.limit.unwrap_or(30).clamp(1, 200);
+    let acc = access(&state, &user).await?;
+    let effective = restrict_access(acc, q.library_ids);
+    let episodes = queries::list_recently_added_episodes(
+        &state.pool,
+        user.id,
+        effective.as_deref(),
+        since_ms,
+        limit,
+        user.kids_safe,
+    )
+    .await?;
+    Ok(Json(RecentEpisodesResponse { episodes }))
+}
+
 pub async fn get_one(
     State(state): State<AppState>,
     user: AuthUser,

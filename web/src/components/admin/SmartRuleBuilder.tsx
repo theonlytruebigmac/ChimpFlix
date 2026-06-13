@@ -44,7 +44,7 @@ const FIELD_DEFS = {
     valueKind: "text" as const,
   },
   added_at: {
-    label: "Added at (ms)",
+    label: "Added at (epoch ms — file acquisition time)",
     ops: ["lt", "le", "gt", "ge", "between"] as const,
     valueKind: "int" as const,
   },

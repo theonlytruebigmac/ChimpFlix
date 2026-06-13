@@ -9,6 +9,7 @@ import {
 import { EmptyHomeClient } from "@/components/EmptyHomeClient";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
+import { NewEpisodesRail } from "@/components/NewEpisodesRail";
 import { Rail } from "@/components/Rail";
 import { RailErrorBoundary } from "@/components/RailErrorBoundary";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
@@ -24,6 +25,7 @@ import {
   prefs as prefsApi,
   trakt as traktApi,
   type Library,
+  type ListedItem,
 } from "@/lib/chimpflix-api";
 import { adaptItem, adaptOnDeck } from "@/lib/chimpflix-adapt";
 import { requireUser } from "@/lib/chimpflix-server";
@@ -32,6 +34,14 @@ import type { MediaItem } from "@/lib/chimpflix-types";
 const RAIL_PAGE_SIZE = 20;
 const MOVIE_GENRES = ["Action", "Comedy", "Drama"];
 const SHOW_GENRES = ["Drama", "Comedy", "Animation"];
+// Genre rails: tiles shown per rail, and how many we over-fetch so cross-rail
+// de-dup (a title claimed by an earlier rail is dropped from later ones) still
+// leaves each surviving rail full. Overlapping genres — especially anime,
+// where one title is Drama AND Comedy AND Animation — would otherwise repeat
+// the same handful of titles down the page.
+const GENRE_DISPLAY = 16;
+const GENRE_OVERFETCH = 48;
+const DAY_MS = 86_400_000;
 
 // Stable rail-id catalogue, in default top-to-bottom order. MUST stay in
 // sync with the backend `HOME_RAIL_CATALOGUE` (crates/library/src/models.rs)
@@ -42,6 +52,7 @@ const SHOW_GENRES = ["Drama", "Comedy", "Animation"];
 const HOME_RAIL_ORDER = [
   "continue_watching",
   "recently_added",
+  "new_episodes",
   "coming_soon",
   "season_premieres",
   "calendar",
@@ -231,6 +242,13 @@ export default async function Home() {
         </Suspense>
       </RailErrorBoundary>
     ),
+    new_episodes: (
+      <RailErrorBoundary key="new_episodes" label="NewEpisodes">
+        <Suspense fallback={null}>
+          <NewEpisodesRail visibleLibIds={visibleLibIds} />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
     coming_soon: (
       <RailErrorBoundary key="coming_soon" label="ComingSoon">
         <Suspense fallback={null}>
@@ -328,28 +346,30 @@ export default async function Home() {
       </Fragment>
     ),
     movie_genres: (
-      <Fragment key="movie_genres">
-        {firstMovieLib &&
-          MOVIE_GENRES.map((g) => (
-            <RailErrorBoundary key={`movie-genre-${g}`} label={`MovieGenre:${g}`}>
-              <Suspense fallback={null}>
-                <GenreRail libraryId={firstMovieLib.id} kind="movie" genre={g} />
-              </Suspense>
-            </RailErrorBoundary>
-          ))}
-      </Fragment>
+      <RailErrorBoundary key="movie_genres" label="MovieGenres">
+        <Suspense fallback={null}>
+          {firstMovieLib && (
+            <GenreRails
+              libraryId={firstMovieLib.id}
+              kind="movie"
+              genres={MOVIE_GENRES}
+            />
+          )}
+        </Suspense>
+      </RailErrorBoundary>
     ),
     show_genres: (
-      <Fragment key="show_genres">
-        {firstShowLib &&
-          SHOW_GENRES.map((g) => (
-            <RailErrorBoundary key={`show-genre-${g}`} label={`ShowGenre:${g}`}>
-              <Suspense fallback={null}>
-                <GenreRail libraryId={firstShowLib.id} kind="show" genre={g} />
-              </Suspense>
-            </RailErrorBoundary>
-          ))}
-      </Fragment>
+      <RailErrorBoundary key="show_genres" label="ShowGenres">
+        <Suspense fallback={null}>
+          {firstShowLib && (
+            <GenreRails
+              libraryId={firstShowLib.id}
+              kind="show"
+              genres={SHOW_GENRES}
+            />
+          )}
+        </Suspense>
+      </RailErrorBoundary>
     ),
   };
 
@@ -563,28 +583,87 @@ async function HomeCollectionsRail() {
   return <CollectionsRail collections={collections} />;
 }
 
-async function GenreRail({
+/// Distinct per-genre, per-day seed for the random sort. djb2 string hash of
+/// the genre XOR the day number, kept positive and inside i32 (the backend
+/// `random_seed` is an i64 used as `((id * seed) % 100000007)`, clamped
+/// `.max(1)`). Distinct per genre so two rails never mirror each other;
+/// rotates daily so the page feels fresh without reshuffling on every refresh
+/// (stable within a day → pagination-stable).
+function genreSeed(genre: string, daySeed: number): number {
+  let h = 5381;
+  for (let i = 0; i < genre.length; i++) {
+    h = ((h << 5) + h + genre.charCodeAt(i)) | 0;
+  }
+  return (Math.abs(h ^ daySeed) % 2147483647) || 1;
+}
+
+/// All genre rails for one library, fetched together so they can de-duplicate
+/// across each other. Each genre is shuffled with its own daily seed (so the
+/// rails don't all surface the same recently-added titles), then a greedy
+/// first-claim pass drops any title already shown in an earlier rail.
+///
+/// Renders as one streaming unit: the trade-off for cross-rail de-dup is that
+/// the genre block can't stream per-genre, so it deliberately sits below the
+/// independently-streamed Recently Added / New Episodes / library rails.
+async function GenreRails({
   libraryId,
   kind,
-  genre,
+  genres,
 }: {
   libraryId: number;
   kind: "movie" | "show";
-  genre: string;
+  genres: readonly string[];
 }) {
-  const res = await itemsApi.list({
-    library_id: libraryId,
-    kind,
-    genre,
-    page_size: 16,
+  // Server component renders once per request — the day-bucket snapshot is
+  // intentional (and only seeds the shuffle; it's never rendered as text, so
+  // there's no SSR/CSR mismatch to worry about).
+  // eslint-disable-next-line react-hooks/purity
+  const daySeed = Math.floor(Date.now() / DAY_MS);
+  const fetched = await Promise.all(
+    genres.map(async (genre) => {
+      try {
+        const res = await itemsApi.list({
+          library_id: libraryId,
+          kind,
+          genre,
+          sort: "random",
+          random_seed: genreSeed(genre, daySeed),
+          page_size: GENRE_OVERFETCH,
+        });
+        return { genre, items: res.items };
+      } catch {
+        return { genre, items: [] as ListedItem[] };
+      }
+    }),
+  );
+
+  // Cross-rail de-dup: claim each title for the first rail that wants it, in
+  // rail order, so an overlapping-genre title doesn't repeat down the page.
+  // Over-fetching above keeps later rails full despite the drops.
+  const claimed = new Set<number>();
+  const rails = fetched.map(({ genre, items }) => {
+    const picked: ListedItem[] = [];
+    for (const it of items) {
+      if (claimed.has(it.id)) continue;
+      claimed.add(it.id);
+      picked.push(it);
+      if (picked.length >= GENRE_DISPLAY) break;
+    }
+    return { genre, items: picked.map(adaptItem) };
   });
-  const items = res.items.map(adaptItem);
-  if (items.length < 4) return null;
+
   return (
-    <Rail
-      title={genre}
-      items={items}
-      href={`/genre/${encodeURIComponent(genre)}`}
-    />
+    <>
+      {rails.map(({ genre, items }) =>
+        items.length < 4 ? null : (
+          <Rail
+            key={`${kind}-genre-${genre}`}
+            title={genre}
+            items={items}
+            href={`/genre/${encodeURIComponent(genre)}`}
+          />
+        ),
+      )}
+    </>
   );
 }
