@@ -551,3 +551,178 @@ async fn library_top_dedupes_one_item_matching_multiple_ranked_rows() {
     );
     assert_eq!(rows[0].0, 1, "displayed rank is the row position (1-based)");
 }
+
+/// Phase 109 backfill semantics. The boot test above only proves the
+/// SQL executes on an EMPTY database — every UPDATE matches zero rows.
+/// This exercises the invariants against populated data, and matters
+/// because sqlx's checksum makes the migration file immutable once it
+/// has been applied anywhere: regressions must be caught before the
+/// first deploy, not after.
+///
+/// Invariants under test:
+///   * added_at only ever DECREASES (strict `<` guard) — a row whose
+///     files are all NEWER than its stamp is untouched.
+///   * soft-removed file rows count as acquisition evidence.
+///   * mtime_ms = 0 rows (stat() failed) are ignored.
+///   * rows without any files are untouched.
+///   * a show takes MIN(mtime) across all episodes' files (3-way join).
+///   * running the backfill twice changes nothing (idempotency).
+#[tokio::test]
+async fn phase109_backfill_added_at_from_file_mtime() {
+    let data_dir = fresh_data_dir();
+    let _cleanup = Cleanup(data_dir.clone());
+    let pool = db::open(&data_dir).await.expect("db::open succeeds");
+
+    const SCAN: i64 = 2_000_000; // the bulk-scan wall-clock stamp
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind, created_at, updated_at) \
+         VALUES (1, 'Mixed', 'movies', ?, ?)",
+    )
+    .bind(SCAN)
+    .bind(SCAN)
+    .execute(&pool)
+    .await
+    .expect("insert library");
+
+    // Movies covering each invariant. (id, title, file specs as
+    // (mtime, removed_at)). All items start stamped at SCAN.
+    // 1: plain old file            → drops to 500_000
+    // 2: only-newer file           → unchanged (strict <)
+    // 3: removed older + live new  → drops to 400_000 (removed counts)
+    // 4: only mtime_ms = 0 file    → unchanged (stat-failure sentinel)
+    // 5: no files at all           → unchanged
+    type FileSpec = (i64, Option<i64>);
+    let movies: [(i64, &str, &[FileSpec]); 5] = [
+        (1, "OldFile", &[(500_000, None)]),
+        (2, "NewerFileOnly", &[(3_000_000, None)]),
+        (3, "UpgradedKeepsHistory", &[(400_000, Some(SCAN)), (900_000, None)]),
+        (4, "StatFailed", &[(0, None)]),
+        (5, "NoFiles", &[]),
+    ];
+    for (id, title, files) in movies {
+        sqlx::query(
+            "INSERT INTO items (id, library_id, kind, title, sort_title, added_at, updated_at) \
+             VALUES (?, 1, 'movie', ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .bind(SCAN)
+        .bind(SCAN)
+        .execute(&pool)
+        .await
+        .expect("insert movie");
+        for (idx, (mtime, removed_at)) in files.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO media_files (item_id, path, size_bytes, mtime_ms, scanned_at, removed_at) \
+                 VALUES (?, ?, 1, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("/m/{id}/v{idx}.mkv"))
+            .bind(mtime)
+            .bind(SCAN)
+            .bind(removed_at)
+            .execute(&pool)
+            .await
+            .expect("insert movie file");
+        }
+    }
+
+    // One show, two episodes: files at 700_000 and 600_000. The show
+    // must land on the MIN across episodes (600_000) via the 3-way
+    // join; each episode takes its own file's mtime.
+    sqlx::query(
+        "INSERT INTO items (id, library_id, kind, title, sort_title, added_at, updated_at) \
+         VALUES (10, 1, 'show', 'Show', 'show', ?, ?)",
+    )
+    .bind(SCAN)
+    .bind(SCAN)
+    .execute(&pool)
+    .await
+    .expect("insert show");
+    sqlx::query("INSERT INTO seasons (id, show_id, season_number) VALUES (11, 10, 1)")
+        .execute(&pool)
+        .await
+        .expect("insert season");
+    for (ep_id, ep_no, mtime) in [(21_i64, 1_i64, 700_000_i64), (22, 2, 600_000)] {
+        sqlx::query(
+            "INSERT INTO episodes (id, season_id, episode_number, title, added_at, updated_at) \
+             VALUES (?, 11, ?, ?, ?, ?)",
+        )
+        .bind(ep_id)
+        .bind(ep_no)
+        .bind(format!("E{ep_no}"))
+        .bind(SCAN)
+        .bind(SCAN)
+        .execute(&pool)
+        .await
+        .expect("insert episode");
+        sqlx::query(
+            "INSERT INTO media_files (episode_id, path, size_bytes, mtime_ms, scanned_at) \
+             VALUES (?, ?, 1, ?, ?)",
+        )
+        .bind(ep_id)
+        .bind(format!("/s/e{ep_no}.mkv"))
+        .bind(mtime)
+        .bind(SCAN)
+        .execute(&pool)
+        .await
+        .expect("insert episode file");
+    }
+
+    // Execute the checked-in migration SQL against the populated DB —
+    // same read-from-disk pattern as the phase 36 test above, so future
+    // edits to the file are tested by these assertions.
+    let phase109_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .join("20260611000000_phase109_added_at_file_mtime.sql");
+    let phase109_sql =
+        std::fs::read_to_string(&phase109_path).expect("read phase 109 migration file");
+
+    async fn snapshot(pool: &SqlitePool) -> (Vec<(i64, i64)>, Vec<(i64, i64)>) {
+        let items: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT id, added_at FROM items ORDER BY id")
+                .fetch_all(pool)
+                .await
+                .expect("read items");
+        let eps: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT id, added_at FROM episodes ORDER BY id")
+                .fetch_all(pool)
+                .await
+                .expect("read episodes");
+        (items, eps)
+    }
+
+    sqlx::query(&phase109_sql)
+        .execute(&pool)
+        .await
+        .expect("apply phase 109 backfill to populated rows");
+
+    let (items, eps) = snapshot(&pool).await;
+    assert_eq!(
+        items,
+        vec![
+            (1, 500_000),  // old file wins
+            (2, SCAN),     // strictly-newer file must not raise or move it
+            (3, 400_000),  // soft-removed row is acquisition evidence
+            (4, SCAN),     // mtime 0 ignored
+            (5, SCAN),     // no files — untouched
+            (10, 600_000), // show = MIN across episode files
+        ],
+        "items backfill invariants",
+    );
+    assert_eq!(
+        eps,
+        vec![(21, 700_000), (22, 600_000)],
+        "episodes take their own file's mtime",
+    );
+
+    // Idempotency: a second run must be a no-op.
+    sqlx::query(&phase109_sql)
+        .execute(&pool)
+        .await
+        .expect("re-apply phase 109");
+    let again = snapshot(&pool).await;
+    assert_eq!(again, (items, eps), "second run must change nothing");
+}

@@ -28,6 +28,7 @@
 //! so a 10k-file scan becomes ~10 batches instead of 10k
 //! transactions.
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use chimpflix_library::ScanEvent;
@@ -37,6 +38,46 @@ use tracing::warn;
 use crate::jobs::handlers;
 use crate::state::AppState;
 use crate::tasks::is_kind_allowed;
+
+/// Minimum spacing between post-scan Trakt reconciles. A still-downloading
+/// library fires a scan completion every 1-3 min, and each one used to spawn
+/// a full 4-table-join reconcile (75× in the 2026-06-13 window, changing data
+/// only 3×). The reconcile is global + idempotent, so coalescing is safe — it
+/// just batches the work.
+const RECONCILE_COOLDOWN_MS: i64 = 5 * 60 * 1000;
+static RECONCILE_LAST_MS: AtomicI64 = AtomicI64::new(0);
+static RECONCILE_TRAILING: AtomicBool = AtomicBool::new(false);
+
+/// Debounced post-scan reconcile: run at most once per [`RECONCILE_COOLDOWN_MS`],
+/// but ALWAYS guarantee a trailing run after a burst so the last scans'
+/// newly-added episodes still get their watched-status reconciled (just up to
+/// one cooldown later, which is fine for background watch-status sync).
+fn maybe_reconcile_after_scan(state: AppState) {
+    let now = chimpflix_common::now_ms();
+    let last = RECONCILE_LAST_MS.load(Ordering::Relaxed);
+    if now - last >= RECONCILE_COOLDOWN_MS {
+        RECONCILE_LAST_MS.store(now, Ordering::Relaxed);
+        tokio::spawn(async move {
+            crate::trakt_sync::reconcile_all_linked_users(&state).await;
+        });
+        return;
+    }
+    // Within cooldown: schedule exactly one trailing reconcile for the end of
+    // the window. `compare_exchange` so concurrent completions don't each spawn
+    // one — the first wins, the rest fall through.
+    if RECONCILE_TRAILING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let wait_ms = (RECONCILE_COOLDOWN_MS - (now - last)).max(0) as u64;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            RECONCILE_LAST_MS.store(chimpflix_common::now_ms(), Ordering::Relaxed);
+            RECONCILE_TRAILING.store(false, Ordering::Release);
+            crate::trakt_sync::reconcile_all_linked_users(&state).await;
+        });
+    }
+}
 
 /// Flush every batch when this many events accumulate. Chosen so
 /// the resulting transaction has predictable size — at 1000 file
@@ -120,14 +161,45 @@ pub fn wrap_emitter_for_pipeline(
             // (no API calls) — this is how a freshly added library picks up
             // watch history that was pulled before it existed.
             ScanEvent::Completed {
+                job_id,
+                library_id,
                 files_added,
                 files_updated,
                 ..
             } => {
                 if files_added > 0 || files_updated > 0 {
+                    maybe_reconcile_after_scan(reconcile_state.clone());
+                }
+                // New-content notifications: only when the scan actually
+                // ADDED files (re-scans that merely update don't announce).
+                // The enqueue is a single cheap `enqueue_job_unique` — but
+                // we still `tokio::spawn` it so the emitter callback (which
+                // the scanner invokes inline) NEVER awaits a DB write. The
+                // job handler does all audience-resolution + fan-out off the
+                // scan path, and dedupes against the `notified_content`
+                // ledger so a re-persist of an existing title never repeats.
+                if files_added > 0 {
                     let st = reconcile_state.clone();
                     tokio::spawn(async move {
-                        crate::trakt_sync::reconcile_all_linked_users(&st).await;
+                        match handlers::notify_new_content::enqueue_for_scan(
+                            &st.pool, library_id, job_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                // A fan-out job for this library was already
+                                // queued (dedup) — fine, it'll resolve the
+                                // full unannounced set when it runs.
+                            }
+                            Err(e) => warn!(
+                                library_id,
+                                scan_job_id = job_id,
+                                error = %format!("{e:#}"),
+                                "enqueue notify_new_content failed; new content will be \
+                                 announced on the next scan that adds files"
+                            ),
+                        }
                     });
                 }
             }

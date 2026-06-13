@@ -1,14 +1,13 @@
 "use client";
 
-/// Activity screen (Screen 2 from `docs/pipelines/tasks-ui.html`).
-/// Live per-kind health table, recent-runs feed, and the dead-letter
-/// failure panel — all powered by `/admin/tasks/activity` with 5s
-/// polling. The hero strip mirrors what the overview screen shows
-/// but reads from the same `/summary` endpoint so a tab-switch is
-/// instant.
+/// Activity screen (Screen 2 from `docs/pipelines/tasks-ui.html`),
+/// styled in the console design language (`cf-*`) to match the
+/// redesign mockup: per-kind status cards up top, a "Recent runs"
+/// table, the per-kind concurrency editor, and the failed-jobs
+/// (dead-letter) panel. All powered by `/admin/tasks/activity` +
+/// `/summary` with 5s polling.
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
 
 import {
   admin as adminApi,
@@ -17,25 +16,15 @@ import {
   type ActivityKindHealth,
   type ActivityRecentRun,
   type TasksActivityResponse,
-  type TasksSummaryResponse,
 } from "@/lib/chimpflix-api";
 import {
   formatDurationMs,
   formatRelativeAgo,
 } from "@/lib/relative-time";
-import {
-  DEFAULT_PAGE_SIZE,
-  ErrorBanner,
-  HeroCard,
-  Pagination,
-  Pill,
-  SaveBar,
-  type PillTone,
-} from "./ui";
+import { DEFAULT_PAGE_SIZE, Pagination, SaveBar } from "./ui";
 
 interface Props {
   initialActivity: TasksActivityResponse;
-  initialSummary: TasksSummaryResponse;
   /// `Date.now()` snapshot from the server fetch (see
   /// AdminTasksOverviewClient for the SSR-hydration motivation).
   initialNowMs: number;
@@ -48,8 +37,7 @@ interface Props {
 const REFRESH_MS = 5_000;
 
 /// Parse the `job_kind_concurrency` JSON. Tolerates a missing /
-/// malformed payload by returning an empty map — the editor still
-/// renders, just with every kind showing its registry default.
+/// malformed payload by returning an empty map.
 function parseOverrides(raw: string): Record<string, number> {
   try {
     const parsed = JSON.parse(raw);
@@ -70,12 +58,10 @@ function parseOverrides(raw: string): Record<string, number> {
 
 export function AdminTasksActivityClient({
   initialActivity,
-  initialSummary,
   initialNowMs,
   initialKindConcurrency,
 }: Props) {
   const [activity, setActivity] = useState(initialActivity);
-  const [summary, setSummary] = useState(initialSummary);
   const [nowMs, setNowMs] = useState(initialNowMs);
   const [error, setError] = useState<string | null>(null);
   // Per-kind concurrency editor state. Baseline mirrors what's
@@ -90,13 +76,26 @@ export function AdminTasksActivityClient({
 
   const refresh = useCallback(async () => {
     try {
-      const [a, s] = await Promise.all([
+      const [activityRes, settingsRes] = await Promise.all([
         adminApi.tasks.activity(),
-        adminApi.tasks.summary(),
+        adminApi.settings.get(),
       ]);
-      setActivity(a);
-      setSummary(s);
+      setActivity(activityRes);
       setNowMs(Date.now());
+      // Re-sync capBaseline from the server on each poll tick so that a
+      // concurrent admin save in another session is reflected here. Skip
+      // the update when the operator has unsaved local edits (dirty > 0)
+      // to avoid silently discarding in-progress changes.
+      setCapBaseline((prevBaseline) => {
+        setCapOverrides((prevOverrides) => {
+          if (countDirtyOverrides(prevBaseline, prevOverrides) > 0) {
+            return prevOverrides; // leave in-progress edits alone
+          }
+          const fresh = parseOverrides(settingsRes.settings.job_kind_concurrency);
+          return fresh;
+        });
+        return parseOverrides(settingsRes.settings.job_kind_concurrency);
+      });
       setError(null);
     } catch (e) {
       setError(friendlyErrorMessage(e));
@@ -109,37 +108,34 @@ export function AdminTasksActivityClient({
   }, [refresh]);
 
   return (
-    <div className="space-y-6">
-      <ErrorBanner error={error} />
+    <div>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
 
-      <HeroStrip summary={summary} activity={activity} />
+      {/* ── per-kind status cards ─────────────────────────────────── */}
+      <PerKindCards rows={activity.per_kind} nowMs={nowMs} />
 
-      <div className="flex items-center justify-end gap-2 text-xs text-white/60">
-        <Link
-          href="/settings/admin/library/scheduled-tasks"
-          className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
-        >
-          ← Back to tasks
-        </Link>
-        <Link
-          href="/settings/admin/library/scheduled-tasks/queue"
-          className="rounded border border-white/15 px-2.5 py-1 transition-colors hover:bg-white/5"
-        >
-          Job queue
-        </Link>
-      </div>
+      {/* ── recent runs ───────────────────────────────────────────── */}
+      <RecentRunsCard runs={activity.recent_runs} nowMs={nowMs} />
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1.5fr_1fr]">
-        <PerKindHealthCard rows={activity.per_kind} />
-        <RecentRunsCard runs={activity.recent_runs} nowMs={nowMs} />
-      </div>
+      {/* ── per-kind health (richer production view) ──────────────── */}
+      <PerKindHealthCard rows={activity.per_kind} />
 
+      {/* ── per-kind concurrency editor ───────────────────────────── */}
       <ConcurrencyEditorCard
         rows={activity.per_kind}
         overrides={capOverrides}
         onChange={setCapOverrides}
       />
 
+      {/* ── dead letter / failed jobs ─────────────────────────────── */}
       <FailedJobsCard failed={activity.failed} nowMs={nowMs} />
 
       <SaveBar
@@ -147,10 +143,7 @@ export function AdminTasksActivityClient({
         summary="per-kind concurrency caps"
         onDiscard={() => setCapOverrides(capBaseline)}
         onSave={async () => {
-          // Send only kinds that diverge from the registry default,
-          // so the stored JSON stays small and a future registry
-          // bump to a higher default applies automatically. Build
-          // off `activity.per_kind` for the default lookup.
+          // Send only kinds that diverge from the registry default.
           const defaults: Record<string, number> = {};
           for (const r of activity.per_kind) {
             defaults[r.kind] = r.default_concurrency;
@@ -170,9 +163,7 @@ export function AdminTasksActivityClient({
 }
 
 /// Resolve the effective cap for a kind: explicit override wins,
-/// otherwise the registry default. The editor displays this number
-/// (vs the registry default in the hint) so the operator always
-/// sees the *active* value.
+/// otherwise the registry default.
 function effectiveCap(
   row: ActivityKindHealth,
   overrides: Record<string, number>,
@@ -180,10 +171,6 @@ function effectiveCap(
   return overrides[row.kind] ?? row.default_concurrency;
 }
 
-/// SaveBar dirty count = number of kinds whose effective value
-/// differs from the baseline. We only count kinds, not transitions
-/// (e.g. setting a value back to the default removes the key from
-/// the payload but still counts as a saved edit).
 function countDirtyOverrides(
   baseline: Record<string, number>,
   current: Record<string, number>,
@@ -196,246 +183,84 @@ function countDirtyOverrides(
   return n;
 }
 
-// ─── Hero strip ────────────────────────────────────────────────────────
+// ─── Per-kind status cards (mockup top row) ─────────────────────────────
 
-function HeroStrip({
-  summary,
-  activity,
-}: {
-  summary: TasksSummaryResponse;
-  activity: TasksActivityResponse;
-}) {
-  // Throughput is summed from the per-kind rows so the hero number
-  // matches the table below; safer than maintaining a parallel
-  // counter.
-  const throughput = activity.per_kind.reduce(
-    (acc, k) => acc + k.jobs_per_minute,
-    0,
-  );
-  return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-      <HeroCard
-        tone="info"
-        label="In-flight"
-        value={summary.running.toString()}
-        meta="across all kinds"
-      />
-      <HeroCard
-        tone="muted"
-        label="Queue depth"
-        value={summary.queued.toLocaleString()}
-        meta="pending"
-      />
-      <HeroCard
-        tone="ok"
-        label="Throughput"
-        value={throughput.toFixed(1)}
-        meta="jobs/min (process-life avg)"
-      />
-      <HeroCard
-        tone={summary.failed_24h > 0 ? "bad" : "muted"}
-        label="Failed last 24h"
-        value={summary.failed_24h.toString()}
-        meta={summary.failed_24h === 0 ? "—" : "see failure log below"}
-      />
-    </div>
-  );
-}
-
-// ─── Per-kind health ───────────────────────────────────────────────────
-
-function PerKindHealthCard({ rows }: { rows: ActivityKindHealth[] }) {
-  return (
-    <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-      <div className="flex items-baseline justify-between border-b border-white/8 px-4 py-3">
-        <div>
-          <div className="text-[13.5px] font-semibold text-white/95">
-            Per-kind health
-          </div>
-          <div className="text-xs text-white/55">
-            Live counters · p95 from in-memory ring (last 100 runs)
-          </div>
-        </div>
-      </div>
-      <div className="grid grid-cols-[1fr_70px_70px_70px_80px_90px_70px] border-b border-white/8 bg-white/3 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-[0.07em] text-white/55">
-        <span>Kind</span>
-        <span className="text-right">Queue</span>
-        <span className="text-right">In-flight</span>
-        <span className="text-right">Per min</span>
-        <span className="text-right">p95</span>
-        <span className="text-right">ETA</span>
-        <span className="text-right">Errors</span>
-      </div>
-      {rows.length === 0 ? (
-        <div className="px-4 py-6 text-center text-sm text-white/45">
-          No kinds active.
-        </div>
-      ) : (
-        rows.map((r) => <PerKindHealthRow key={r.kind} row={r} />)
-      )}
-    </div>
-  );
-}
-
-function PerKindHealthRow({ row }: { row: ActivityKindHealth }) {
-  return (
-    <div className="grid grid-cols-[1fr_70px_70px_70px_80px_90px_70px] items-center gap-2 border-b border-white/8 px-3 py-2 text-[12.5px] last:border-b-0">
-      <span className="min-w-0 truncate font-medium text-white/95">
-        {row.display_name}
-        <span className="ml-2 font-mono text-[10.5px] text-white/40">
-          {row.kind}
-        </span>
-      </span>
-      <span className="text-right font-mono tabular-nums text-white/65">
-        {row.queue_depth}
-      </span>
-      <span className="text-right font-mono tabular-nums text-white/65">
-        {row.in_flight}
-      </span>
-      <span className="text-right font-mono tabular-nums text-white/65">
-        {row.jobs_per_minute.toFixed(1)}
-      </span>
-      <span className="text-right font-mono tabular-nums text-white/65">
-        {row.p95_duration_ms == null
-          ? "—"
-          : formatDurationMs(row.p95_duration_ms)}
-      </span>
-      <span
-        className="text-right font-mono tabular-nums text-white/65"
-        title={
-          row.eta_seconds_remaining == null
-            ? row.queue_depth === 0
-              ? "Queue empty — nothing to drain."
-              : "Not enough run history yet to estimate (need 5+ successful runs)."
-            : `${row.queue_depth} queued × p95 ÷ effective concurrency. Coarse estimate; assumes current throughput.`
-        }
-      >
-        {formatEta(row.eta_seconds_remaining)}
-      </span>
-      <span
-        className={`text-right font-mono tabular-nums ${
-          row.recent_errors > 0 ? "text-red-300" : "text-white/40"
-        }`}
-      >
-        {row.recent_errors}
-      </span>
-    </div>
-  );
-}
-
-/// Render a wall-clock ETA as a short human label: "—" / "~12s" /
-/// "~4m" / "~2h 15m" / "~3d 4h". Deliberately coarse — the underlying
-/// estimate is queue × p95 with all the noise that implies, so
-/// minute-precision past an hour would be false confidence.
-function formatEta(seconds: number | null): string {
-  if (seconds == null) return "—";
-  if (seconds < 60) return `~${Math.max(1, Math.round(seconds))}s`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `~${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const mins = minutes % 60;
-  if (hours < 24) return mins === 0 ? `~${hours}h` : `~${hours}h ${mins}m`;
-  const days = Math.floor(hours / 24);
-  const hr = hours % 24;
-  return hr === 0 ? `~${days}d` : `~${days}d ${hr}h`;
-}
-
-// ─── Per-kind concurrency editor ───────────────────────────────────────
-
-function ConcurrencyEditorCard({
+/// Three-up grid of the busiest / most-interesting kinds, mirroring
+/// the mockup: a status pill (working / failing / idle) plus the live
+/// counters. Shows every active kind, not just three — the grid wraps.
+function PerKindCards({
   rows,
-  overrides,
-  onChange,
+  nowMs,
 }: {
   rows: ActivityKindHealth[];
-  overrides: Record<string, number>;
-  onChange: (next: Record<string, number>) => void;
+  nowMs: number;
 }) {
-  // Filter to registry-known kinds only — legacy custom-cron rows
-  // surface with default_concurrency=1 and aren't actually capped
-  // by `KindLimiter`. Surfacing them here would imply editability
-  // we can't honour at the worker layer.
-  const eligible = rows.filter((r) => r.default_concurrency >= 1);
-  if (eligible.length === 0) return null;
-
-  function setCapFor(kind: string, value: number, fallback: number) {
-    const next = { ...overrides };
-    // Setting to the registry default removes the key — keeps the
-    // stored JSON minimal. The SaveBar still flags this as a dirty
-    // change so the operator sees "reset" feedback.
-    if (value === fallback) {
-      delete next[kind];
-    } else {
-      next[kind] = value;
-    }
-    onChange(next);
-  }
-
+  // Surface kinds that are doing something (in-flight, queued, or
+  // recently erroring) first; fall back to all rows. Keeps the
+  // headline grid focused on what's live like the mockup.
+  const interesting = rows.filter(
+    (r) => r.in_flight > 0 || r.queue_depth > 0 || r.recent_errors > 0,
+  );
+  const shown = interesting.length > 0 ? interesting : rows;
+  if (shown.length === 0) return null;
   return (
-    <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-      <div className="border-b border-white/8 px-4 py-3">
-        <div className="text-[13.5px] font-semibold text-white/95">
-          Per-kind concurrency
-        </div>
-        <div className="text-xs text-white/55">
-          Raise the cap on a kind to let more of it run in parallel.
-          Defaults are conservative — bump CPU-heavy kinds (markers /
-          preview) on hefty boxes. Saved changes apply live; no
-          restart required.
-        </div>
-      </div>
-      <div className="grid grid-cols-[1fr_120px_90px] border-b border-white/8 bg-white/3 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-[0.07em] text-white/55">
-        <span>Kind</span>
-        <span className="text-right">Default</span>
-        <span className="text-right">Cap</span>
-      </div>
-      {eligible.map((r) => {
-        const value = effectiveCap(r, overrides);
-        const isOverride = overrides[r.kind] !== undefined;
-        return (
-          <div
-            key={r.kind}
-            className="grid grid-cols-[1fr_120px_90px] items-center gap-2 border-b border-white/8 px-3 py-2 text-[12.5px] last:border-b-0"
-          >
-            <span className="min-w-0 truncate font-medium text-white/95">
-              {r.display_name}
-              <span className="ml-2 font-mono text-[10.5px] text-white/40">
-                {r.kind}
-              </span>
-            </span>
-            <span className="text-right font-mono tabular-nums text-white/55">
-              {r.default_concurrency}
-              {isOverride && (
-                <span className="ml-2 text-[10px] uppercase tracking-wider text-amber-300/80">
-                  overridden
-                </span>
-              )}
-            </span>
-            <span className="flex justify-end">
-              <input
-                type="number"
-                min={1}
-                max={32}
-                value={value}
-                onChange={(e) => {
-                  const n = Math.max(
-                    1,
-                    Math.min(32, Number.parseInt(e.target.value, 10) || 1),
-                  );
-                  setCapFor(r.kind, n, r.default_concurrency);
-                }}
-                className="w-16 rounded border border-white/15 bg-black/20 px-2 py-1 text-right font-mono text-[12.5px] text-white/90 focus:border-accent focus:outline-none"
-                aria-label={`Concurrency cap for ${r.display_name}`}
-              />
-            </span>
-          </div>
-        );
-      })}
+    <div className="cf-grid cf-c3" style={{ marginBottom: 18 }}>
+      {shown.map((r) => (
+        <PerKindCard key={r.kind} row={r} nowMs={nowMs} />
+      ))}
     </div>
   );
 }
 
-// ─── Recent runs feed ──────────────────────────────────────────────────
+function PerKindCard({
+  row,
+  nowMs,
+}: {
+  row: ActivityKindHealth;
+  nowMs: number;
+}) {
+  void nowMs;
+  const failing = row.recent_errors > 0;
+  const working = row.in_flight > 0;
+  return (
+    <div className="cf-card" style={{ marginBottom: 0 }}>
+      <div className="cf-card-body cf-pad">
+        <div className="cf-flex cf-between">
+          <b>{row.kind}</b>
+          {failing ? (
+            <span className="cf-pill cf-err" style={{ padding: "1px 7px" }}>
+              <span className="cf-dot" />
+              failing
+            </span>
+          ) : working ? (
+            <span className="cf-pill cf-info" style={{ padding: "1px 7px" }}>
+              <span className="cf-dot" />
+              working
+            </span>
+          ) : (
+            <span className="cf-pill" style={{ padding: "1px 7px" }}>
+              <span className="cf-dot" style={{ background: "var(--ghost)" }} />
+              idle
+            </span>
+          )}
+        </div>
+        <div className="cf-muted" style={{ fontSize: 12, marginTop: 8 }}>
+          {row.queue_depth} queued · {row.in_flight} running
+          <br />
+          {failing
+            ? `${row.recent_errors} error${row.recent_errors === 1 ? "" : "s"} recently`
+            : `${row.jobs_per_minute.toFixed(1)} jobs/min · p95 ${
+                row.p95_duration_ms == null
+                  ? "—"
+                  : formatDurationMs(row.p95_duration_ms)
+              }`}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Recent runs (mockup table) ─────────────────────────────────────────
 
 function RecentRunsCard({
   runs,
@@ -444,51 +269,83 @@ function RecentRunsCard({
   runs: ActivityRecentRun[];
   nowMs: number;
 }) {
-  // Client-side pagination — the server already caps at 200 entries
-  // (the live ring buffer's natural upper bound) so we slice the
-  // visible chunk locally instead of round-tripping per page change.
-  // Newest entries are always at the top; pagination here is about
-  // scanning backward through the recent past, not jumping into
-  // historical archive (that lives in `task_kind_metrics_daily`).
+  // Client-side pagination — the server caps at 200 entries (the ring
+  // buffer's natural upper bound) so we slice the visible chunk locally.
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-  // Reset to page 1 if a refresh dropped the runs count below the
-  // current page's offset (rare — happens on process restart).
   const totalPages = Math.max(1, Math.ceil(runs.length / pageSize));
   const effectivePage = Math.min(page, totalPages);
   const start = (effectivePage - 1) * pageSize;
   const slice = runs.slice(start, start + pageSize);
 
   return (
-    <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-      <div className="flex items-baseline justify-between border-b border-white/8 px-4 py-3">
+    <div className="cf-card">
+      <div className="cf-card-head">
         <div>
-          <div className="text-[13.5px] font-semibold text-white/95">
-            Live feed
-          </div>
-          <div className="text-xs text-white/55">
-            Job completions, newest first
-          </div>
+          <div className="cf-ttl">Recent runs</div>
+          <div className="cf-sub">Job completions, newest first.</div>
         </div>
-        <Pill tone="ok" dot>
-          Live
-        </Pill>
+        <div className="cf-head-aside">
+          <span className="cf-pill cf-ok">
+            <span className="cf-dot" />
+            Live
+          </span>
+        </div>
       </div>
       {runs.length === 0 ? (
-        <div className="px-4 py-6 text-center text-sm text-white/45">
+        <div className="cf-card-body cf-pad cf-center cf-faint">
           No completed runs since process started.
         </div>
       ) : (
         <>
-          {slice.map((r) => (
-            <RecentRunRow
-              key={`${r.kind}-${r.finished_at_ms}`}
-              run={r}
-              nowMs={nowMs}
-            />
-          ))}
+          <table className="cf-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Kind</th>
+                <th>Duration</th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {slice.map((r) => (
+                <tr key={`${r.kind}-${r.finished_at_ms}`}>
+                  <td className="cf-faint">
+                    {formatRelativeAgo(r.finished_at_ms, nowMs)}
+                  </td>
+                  <td className="cf-mono">{r.kind}</td>
+                  <td className="cf-mono">{formatDurationMs(r.duration_ms)}</td>
+                  <td>
+                    {r.success ? (
+                      <span
+                        className="cf-pill cf-ok"
+                        style={{ padding: "1px 7px" }}
+                      >
+                        <span className="cf-dot" />
+                        ok
+                      </span>
+                    ) : (
+                      <span
+                        className={`cf-pill ${
+                          r.error_class === "external_rate_limit"
+                            ? "cf-warn"
+                            : "cf-err"
+                        }`}
+                        style={{ padding: "1px 7px" }}
+                      >
+                        <span className="cf-dot" />
+                        {r.error_class === "external_rate_limit"
+                          ? "rate-limited"
+                          : "failed"}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
           {runs.length > pageSize && (
-            <div className="border-t border-white/8 px-4 py-2">
+            <div className="cf-card-body" style={{ paddingBottom: 14 }}>
               <Pagination
                 page={effectivePage}
                 pageSize={pageSize}
@@ -508,40 +365,202 @@ function RecentRunsCard({
   );
 }
 
-function RecentRunRow({
-  run,
-  nowMs,
-}: {
-  run: ActivityRecentRun;
-  nowMs: number;
-}) {
-  const tone: PillTone = run.success
-    ? "ok"
-    : run.error_class === "external_rate_limit"
-      ? "warn"
-      : "bad";
+// ─── Per-kind health (richer production table) ──────────────────────────
+
+function PerKindHealthCard({ rows }: { rows: ActivityKindHealth[] }) {
   return (
-    <div className="grid grid-cols-[8px_1fr_auto] items-center gap-3 border-b border-white/8 px-4 py-2.5 text-[12.5px] last:border-b-0">
-      <span
-        aria-hidden
-        className={`block h-2 w-2 rounded-full ${dotClass(tone)}`}
-      />
-      <div className="min-w-0 truncate text-white/80">
-        <span className="font-semibold text-white/95">{run.kind}</span>{" "}
-        <span className="text-white/55">
-          {run.success
-            ? `done in ${formatDurationMs(run.duration_ms)}`
-            : `${run.error_class ?? "error"} after ${formatDurationMs(run.duration_ms)}`}
-        </span>
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">Per-kind health</div>
+          <div className="cf-sub">
+            Live counters · p95 from in-memory ring (last 100 runs).
+          </div>
+        </div>
       </div>
-      <span className="text-[11.5px] text-white/45">
-        {formatRelativeAgo(run.finished_at_ms, nowMs)}
-      </span>
+      {rows.length === 0 ? (
+        <div className="cf-card-body cf-pad cf-center cf-faint">
+          No kinds active.
+        </div>
+      ) : (
+        <table className="cf-table">
+          <thead>
+            <tr>
+              <th>Kind</th>
+              <th className="cf-num">Queue</th>
+              <th className="cf-num">In-flight</th>
+              <th className="cf-num">Per min</th>
+              <th className="cf-num">p95</th>
+              <th className="cf-num">ETA</th>
+              <th className="cf-num">Errors</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <PerKindHealthRow key={r.kind} row={r} />
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
 
-// ─── Failed jobs panel ─────────────────────────────────────────────────
+function PerKindHealthRow({ row }: { row: ActivityKindHealth }) {
+  return (
+    <tr>
+      <td>
+        {row.display_name}
+        <span
+          className="cf-mono cf-faint"
+          style={{ marginLeft: 8, fontSize: 11 }}
+        >
+          {row.kind}
+        </span>
+      </td>
+      <td className="cf-num cf-mono">{row.queue_depth}</td>
+      <td className="cf-num cf-mono">{row.in_flight}</td>
+      <td className="cf-num cf-mono">{row.jobs_per_minute.toFixed(1)}</td>
+      <td className="cf-num cf-mono">
+        {row.p95_duration_ms == null ? "—" : formatDurationMs(row.p95_duration_ms)}
+      </td>
+      <td
+        className="cf-num cf-mono"
+        title={
+          row.eta_seconds_remaining == null
+            ? row.queue_depth === 0
+              ? "Queue empty — nothing to drain."
+              : "Not enough run history yet to estimate (need 5+ successful runs)."
+            : `${row.queue_depth} queued × p95 ÷ effective concurrency. Coarse estimate; assumes current throughput.`
+        }
+      >
+        {formatEta(row.eta_seconds_remaining)}
+      </td>
+      <td
+        className="cf-num cf-mono"
+        style={{ color: row.recent_errors > 0 ? "#fca5a5" : undefined }}
+      >
+        {row.recent_errors}
+      </td>
+    </tr>
+  );
+}
+
+/// Render a wall-clock ETA as a short human label.
+function formatEta(seconds: number | null): string {
+  if (seconds == null) return "—";
+  if (seconds < 60) return `~${Math.max(1, Math.round(seconds))}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `~${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hours < 24) return mins === 0 ? `~${hours}h` : `~${hours}h ${mins}m`;
+  const days = Math.floor(hours / 24);
+  const hr = hours % 24;
+  return hr === 0 ? `~${days}d` : `~${days}d ${hr}h`;
+}
+
+// ─── Per-kind concurrency editor ────────────────────────────────────────
+
+function ConcurrencyEditorCard({
+  rows,
+  overrides,
+  onChange,
+}: {
+  rows: ActivityKindHealth[];
+  overrides: Record<string, number>;
+  onChange: (next: Record<string, number>) => void;
+}) {
+  // Filter to registry-known kinds only — legacy custom-cron rows
+  // surface with default_concurrency=1 and aren't actually capped
+  // by `KindLimiter`.
+  const eligible = rows.filter((r) => r.default_concurrency >= 1);
+  if (eligible.length === 0) return null;
+
+  function setCapFor(kind: string, value: number, fallback: number) {
+    const next = { ...overrides };
+    if (value === fallback) {
+      delete next[kind];
+    } else {
+      next[kind] = value;
+    }
+    onChange(next);
+  }
+
+  return (
+    <div className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">Per-kind concurrency</div>
+          <div className="cf-sub">
+            Raise the cap on a kind to let more of it run in parallel. Defaults
+            are conservative — bump CPU-heavy kinds (markers / preview) on hefty
+            boxes. Saved changes apply live; no restart required.
+          </div>
+        </div>
+      </div>
+      <table className="cf-table">
+        <thead>
+          <tr>
+            <th>Kind</th>
+            <th className="cf-num">Default</th>
+            <th className="cf-num">Cap</th>
+          </tr>
+        </thead>
+        <tbody>
+          {eligible.map((r) => {
+            const value = effectiveCap(r, overrides);
+            const isOverride = overrides[r.kind] !== undefined;
+            return (
+              <tr key={r.kind}>
+                <td>
+                  {r.display_name}
+                  <span
+                    className="cf-mono cf-faint"
+                    style={{ marginLeft: 8, fontSize: 11 }}
+                  >
+                    {r.kind}
+                  </span>
+                </td>
+                <td className="cf-num cf-mono">
+                  {r.default_concurrency}
+                  {isOverride && (
+                    <span
+                      className="cf-tag"
+                      style={{ marginLeft: 8, color: "var(--warn)" }}
+                    >
+                      overridden
+                    </span>
+                  )}
+                </td>
+                <td className="cf-num">
+                  <input
+                    type="number"
+                    min={1}
+                    max={32}
+                    value={value}
+                    onChange={(e) => {
+                      const n = Math.max(
+                        1,
+                        Math.min(32, Number.parseInt(e.target.value, 10) || 1),
+                      );
+                      setCapFor(r.kind, n, r.default_concurrency);
+                    }}
+                    className="cf-input"
+                    style={{ width: 72, textAlign: "right" }}
+                    aria-label={`Concurrency cap for ${r.display_name}`}
+                  />
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── Failed jobs / dead-letter panel ────────────────────────────────────
 
 function FailedJobsCard({
   failed,
@@ -552,75 +571,77 @@ function FailedJobsCard({
 }) {
   if (failed.length === 0) {
     return (
-      <div className="rounded-lg border border-white/10 bg-white/2 px-4 py-4 text-center text-sm text-white/55">
-        No failed jobs. Nothing to retry.
+      <div className="cf-card" style={{ marginBottom: 0 }}>
+        <div className="cf-card-body cf-pad cf-center cf-faint">
+          No failed jobs. Nothing to retry.
+        </div>
       </div>
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-      <div className="flex items-baseline justify-between border-b border-white/8 px-4 py-3">
+    <div className="cf-card" style={{ marginBottom: 0 }}>
+      <div className="cf-card-head">
         <div>
-          <div className="text-[13.5px] font-semibold text-white/95">
-            Failed jobs · last 50
-          </div>
-          <div className="text-xs text-white/55">
-            Dead-letter rows. Grouped by error class.
+          <div className="cf-ttl">Dead letter · last 50</div>
+          <div className="cf-sub">
+            Jobs that exhausted retries — resurrect from the Queue tab.
           </div>
         </div>
       </div>
-      {failed.map((j) => (
-        <FailedRow key={j.id} job={j} nowMs={nowMs} />
-      ))}
+      <table className="cf-table">
+        <thead>
+          <tr>
+            <th>Job</th>
+            <th>Kind</th>
+            <th>Error</th>
+            <th>When</th>
+          </tr>
+        </thead>
+        <tbody>
+          {failed.map((j) => (
+            <tr key={j.id}>
+              <td className="cf-mono">#{j.id}</td>
+              <td className="cf-mono">{j.kind}</td>
+              <td>
+                <div
+                  className="cf-mono"
+                  style={{ color: "#fca5a5", fontSize: 12 }}
+                >
+                  {j.last_error ?? "—"}
+                </div>
+                {j.error_class && (
+                  <span
+                    className={`cf-pill ${errorClassPillTone(j.error_class)}`}
+                    style={{ marginTop: 4, padding: "1px 7px" }}
+                  >
+                    <span className="cf-dot" />
+                    {prettyErrorClass(j.error_class)}
+                  </span>
+                )}
+              </td>
+              <td className="cf-faint">
+                {j.finished_at_ms
+                  ? formatRelativeAgo(j.finished_at_ms, nowMs)
+                  : "—"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function FailedRow({ job, nowMs }: { job: ActivityFailedJob; nowMs: number }) {
-  return (
-    <div className="grid grid-cols-[1fr_200px_180px] items-start gap-4 border-b border-white/8 px-4 py-3 last:border-b-0">
-      <div className="min-w-0">
-        <div className="text-[13px] font-semibold text-white/95">
-          {job.kind}
-          <span className="ml-2 font-mono text-[11px] text-white/40">
-            #{job.id}
-          </span>
-        </div>
-        {job.last_error && (
-          <div className="mt-0.5 truncate font-mono text-[11.5px] text-red-300/80">
-            {job.last_error}
-          </div>
-        )}
-      </div>
-      <div>
-        {job.error_class ? (
-          <Pill tone={errorClassTone(job.error_class)} dot>
-            {prettyErrorClass(job.error_class)}
-          </Pill>
-        ) : (
-          <Pill tone="muted">unknown</Pill>
-        )}
-      </div>
-      <div className="text-[11.5px] text-white/45">
-        {job.finished_at_ms
-          ? formatRelativeAgo(job.finished_at_ms, nowMs)
-          : "—"}
-      </div>
-    </div>
-  );
-}
-
-function errorClassTone(cls: string): PillTone {
+function errorClassPillTone(cls: string): string {
   switch (cls) {
     case "external_rate_limit":
-      return "warn";
+    case "timeout":
+      return "cf-warn";
     case "external_auth":
     case "permanent":
-      return "bad";
-    case "timeout":
-      return "warn";
+      return "cf-err";
     default:
-      return "muted";
+      return "";
   }
 }
 
@@ -638,24 +659,5 @@ function prettyErrorClass(cls: string): string {
       return "Transient";
     default:
       return cls;
-  }
-}
-
-// ─── Helpers ───────────────────────────────────────────────────────────
-
-function dotClass(tone: PillTone): string {
-  switch (tone) {
-    case "ok":
-      return "bg-emerald-400";
-    case "warn":
-      return "bg-amber-400";
-    case "bad":
-      return "bg-red-400";
-    case "info":
-      return "bg-blue-400";
-    case "accent":
-      return "bg-accent";
-    default:
-      return "bg-white/40";
   }
 }

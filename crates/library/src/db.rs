@@ -137,27 +137,34 @@ pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::R
     migrate_pool.close().await;
 
     // ── App pool: full concurrency, FK on ──────────────────────────
-    // `busy_timeout` lets SQLite poll for up to 30s before returning
+    // `busy_timeout` lets SQLite poll for up to this long before returning
     // SQLITE_BUSY when another connection holds the write lock — the
     // default of 0 surfaces as "database is locked" 500s on any
     // mid-transaction collision (e.g. the merge endpoint racing a
     // scanner upsert on a parallel connection).
     //
-    // 30s is generous on purpose. The original 5s was enough for
-    // light contention but lost under load — a library scan racing
-    // 8 active workers (markers + loudness + bootstrap) was hitting
-    // BUSY on inserts within seconds and the scanner would bail
-    // mid-run, half-populating the library. Bumping to 30s absorbs
-    // burst contention from the worker pool. Layer 2's
-    // `library_scan_exclusive` flag pauses workers during a fresh
-    // library scan so the 30s shouldn't ever actually elapse in
-    // practice — it's a safety net for the unexpected case (e.g.
-    // a workflow that holds an admin write open longer than usual).
+    // History: 5s lost under load (a scan racing 8 active workers bailed
+    // mid-run); we then over-corrected to 30s, which — stacked on sqlx's
+    // *default 30s acquire wait* (see the pool builder below, which had no
+    // explicit `acquire_timeout`) — meant a write blocked behind the single
+    // WAL writer could hold a pool connection for up to 60s and return
+    // `rows_affected=0` (the write LOST). Under a download-burst convoy this
+    // exhausted the 24-conn pool and wedged the server (2026-06-13 incident).
+    //
+    // 12s is the middle ground: long enough that the scanner's (un-retried)
+    // upserts don't bail when a fast single-row foreground write briefly
+    // holds the lock, but far below the old 60s stacked stall. The real
+    // anti-wedge levers are now (1) the explicit `acquire_timeout` on the
+    // pool below, which caps the waiter backlog, and (2) the `with_write_gate`
+    // serialization of the hot foreground writers (see below), which collapses
+    // concurrent foreground writers to one so the pool can't fill with
+    // connections all blocked on the same lock. Layer-2 `library_scan_exclusive`
+    // still pauses the worker pool during scans, so 12s is rarely approached.
     let mut opts = SqliteConnectOptions::from_str(&url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_secs(30))
+        .busy_timeout(std::time::Duration::from_secs(12))
         .foreign_keys(true);
     if let Some(mb) = cache_size_mb.filter(|n| *n > 0) {
         // Negative N = "N KiB of cache"; positive N = "N pages". We
@@ -175,8 +182,20 @@ pub async fn open_with(data_dir: &Path, cache_size_mb: Option<i64>) -> anyhow::R
     // deployment; going higher than this without profiling tends
     // to hurt SQLite write contention (the WAL serialises writes,
     // so more readers waiting on a writer doesn't help throughput).
+    // `acquire_timeout` caps how long a caller waits for a free pool
+    // connection. sqlx's default is 30s, which — stacked on the 12s
+    // `busy_timeout` above — let a write that couldn't get a slot hang the
+    // request for tens of seconds and let the waiter backlog snowball until
+    // the pool wedged (2026-06-13). A short 5s ceiling makes an exhausted
+    // pool fail FAST and shed load instead of accumulating blocked tasks; the
+    // `with_busy_retry` backoff (~5s over 8 attempts) absorbs genuine bursts.
+    // (The probe/vacuum pools already set a 10s acquire timeout — this brings
+    // the hot pool in line.) NOTE: do NOT raise max_connections to "fix"
+    // contention — SQLite serialises writes through one WAL writer, so more
+    // readers waiting on a writer doesn't help throughput.
     let pool = SqlitePoolOptions::new()
         .max_connections(24)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect_with(opts)
         .await
         .context("open library database")?;
@@ -258,6 +277,52 @@ where
     // Unreachable — the loop either returns Ok or returns the inner
     // Err on the final attempt. Kept for the compiler.
     unreachable!("with_busy_retry exited loop without returning")
+}
+
+// ---------------------------------------------------------------------------
+// Single-writer GATE
+// ---------------------------------------------------------------------------
+
+/// Process-global write gate: a single permit.
+///
+/// SQLite has exactly one WAL writer, so concurrent write transactions
+/// serialise on the file lock no matter what. The danger isn't the
+/// serialisation — it's that blocked writers hold a scarce POOL connection
+/// while they wait out `busy_timeout`, so a burst of concurrent writes can
+/// pin every connection in the 24-slot pool and wedge the whole server
+/// (2026-06-13 incident: a scan convoy + per-request session touches +
+/// play-state ticks all blocked at once → pool exhausted → manual restart).
+///
+/// Acquiring this in-memory permit BEFORE touching a pool connection moves the
+/// waiting OFF the pool: only one gated writer runs at a time, so the rest
+/// queue cheaply in memory instead of each holding a connection blocked on the
+/// SQLite lock. Reads never take the gate (WAL keeps reads non-blocking).
+///
+/// Scope: this serialises the high-volume FOREGROUND leaf writers (play-state
+/// batch, session touch, job claim). It is deliberately NOT threaded through
+/// the scanner's enrich writes — those are already kept off the worker pool by
+/// `library_scan_exclusive`, and routing every repo write through the gate
+/// would be a large, risky change for little marginal benefit here.
+static WRITE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Run `f` while holding the single global write permit. See [`WRITE_GATE`].
+///
+/// CONTRACT: wrap only LEAF write operations. Never call `with_write_gate`
+/// (directly or transitively) from inside another `with_write_gate` closure —
+/// the semaphore is not re-entrant, so a nested acquire self-deadlocks. The
+/// three current call sites (`apply_play_state_batch`, `touch_session`, the
+/// job-claim UPDATE) are all leaf writes that call no other gated write.
+pub async fn with_write_gate<F, Fut, T>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    // `acquire()` only errors if the semaphore is closed; we never close it.
+    let _permit = WRITE_GATE
+        .acquire()
+        .await
+        .expect("WRITE_GATE is never closed");
+    f().await
 }
 
 /// True when the error chain contains a SQLite BUSY (code 5) or
@@ -348,7 +413,27 @@ async fn pre_migration_snapshot(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dest = backup_dir.join(format!("chimpflix-pre-{stamp}-v{applied}-to-v{embedded_max}.db"));
-    tokio::fs::copy(db_path, &dest).await?;
+
+    // Use `VACUUM INTO` instead of a raw file copy: in WAL mode the main
+    // database file may lag behind the WAL by many frames.  `VACUUM INTO`
+    // reads the current consistent snapshot (including uncheckpointed WAL
+    // frames) and writes a single, self-contained SQLite file — no sidecar
+    // needed and no torn-state risk.
+    let src_url = format!("sqlite://{}?mode=ro", db_path.display());
+    let vacuum_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(SqliteConnectOptions::from_str(&src_url)?)
+        .await
+        .context("open source DB for pre-migration VACUUM INTO")?;
+    let dest_str = dest.to_string_lossy().into_owned();
+    sqlx::query("VACUUM INTO ?")
+        .bind(&dest_str)
+        .execute(&vacuum_pool)
+        .await
+        .context("VACUUM INTO pre-migration snapshot")?;
+    vacuum_pool.close().await;
+
     info!(
         from = %db_path.display(),
         to = %dest.display(),

@@ -15,9 +15,10 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chimpflix_library::queries;
-use chimpflix_library::{JobRow, JobStatus, JobSummary};
+use chimpflix_library::{JobRow, JobStatus, JobSummary, NewAuditEntry};
 use serde::{Deserialize, Serialize};
 
+use crate::api::admin::audit_log;
 use crate::api::error::ApiError;
 use crate::auth::OwnerAuth;
 use crate::state::AppState;
@@ -105,7 +106,7 @@ pub struct RequeueResponse {
 
 pub async fn requeue(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
     Path(job_id): Path<i64>,
 ) -> Result<(StatusCode, Json<RequeueResponse>), ApiError> {
     let requeued = queries::requeue_job(&state.pool, job_id)
@@ -114,6 +115,19 @@ pub async fn requeue(
     if !requeued {
         return Err(ApiError::NotFound);
     }
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "job.requeue".into(),
+            target_kind: Some("job".into()),
+            target_id: Some(job_id.to_string()),
+            payload_json: None,
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
     Ok((StatusCode::OK, Json(RequeueResponse { requeued: true })))
 }
 
@@ -124,7 +138,7 @@ pub async fn requeue(
 /// large library can enqueue tens of thousands of rows.
 pub async fn process_all_pending(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
 ) -> Result<(StatusCode, Json<crate::jobs::pipeline::SweepCounts>), ApiError> {
     // Acquire the bulk-write lock so two concurrent operator clicks
     // (or this + a library-delete cascade) don't race for the SQLite
@@ -140,7 +154,22 @@ pub async fn process_all_pending(
     let counts = crate::jobs::pipeline::enqueue_full_sweep(&state)
         .await
         .map_err(ApiError::Internal)?;
-    Ok((StatusCode::ACCEPTED, Json(counts)))
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "job.process_all_pending".into(),
+            target_kind: None,
+            target_id: None,
+            // Record the enqueued counts so the audit trail shows how
+            // much work was kicked off by the operator action.
+            payload_json: serde_json::to_string(&counts).ok(),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
+    Ok((StatusCode::OK, Json(counts)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,12 +190,33 @@ pub struct WipeResponse {
 /// stop because no more queued rows are eligible.
 pub async fn wipe_queued(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
     Query(q): Query<WipeQuery>,
 ) -> Result<Json<WipeResponse>, ApiError> {
     let removed = queries::wipe_queued_jobs(&state.pool, q.kind.as_deref())
         .await
         .map_err(ApiError::Internal)?;
+    // Log the kind filter (null = all kinds) and the deletion count so
+    // the audit trail captures both scope and impact of the wipe.
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "job.wipe_queued".into(),
+            target_kind: None,
+            target_id: None,
+            payload_json: Some(
+                serde_json::to_string(&serde_json::json!({
+                    "kind": q.kind,
+                    "removed": removed,
+                }))
+                .unwrap_or_default(),
+            ),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
     Ok(Json(WipeResponse { removed }))
 }
 
@@ -176,10 +226,23 @@ pub async fn wipe_queued(
 /// still respects the TTL, so those rows would otherwise linger).
 pub async fn clear_dead(
     State(state): State<AppState>,
-    _owner: OwnerAuth,
+    OwnerAuth(actor): OwnerAuth,
 ) -> Result<Json<WipeResponse>, ApiError> {
     let removed = queries::clear_dead_jobs(&state.pool)
         .await
         .map_err(ApiError::Internal)?;
+    audit_log(
+        &state,
+        NewAuditEntry {
+            actor_user_id: Some(actor.id),
+            action: "job.clear_dead".into(),
+            target_kind: None,
+            target_id: None,
+            payload_json: Some(format!(r#"{{"removed":{removed}}}"#)),
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await;
     Ok(Json(WipeResponse { removed }))
 }

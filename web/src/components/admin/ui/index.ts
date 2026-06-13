@@ -19,6 +19,16 @@ export { HeroCard } from "./HeroCard";
 export { FilterChip } from "./FilterChip";
 export { AdminTabBar, type AdminTab } from "./TabBar";
 export { ErrorBanner } from "./ErrorBanner";
+// New IA primitives (settings/admin redesign). Switch + Seg are form
+// controls; Tabs switches panels within a consolidated page; StatCard is the
+// dashboard metric tile; MasterDetail is the list+detail layout;
+// ContextSwitcher is the You/Server toggle in the sidebar.
+export { Switch } from "./Switch";
+export { Seg, type SegOption } from "./Seg";
+export { Tabs, type TabItem } from "./Tabs";
+export { StatCard, type StatTone } from "./StatCard";
+export { MasterDetail, MasterList, MasterPane } from "./MasterDetail";
+export { ContextSwitcher } from "./ContextSwitcher";
 // Pagination lives in the shared ui/ folder so user-facing grids
 // (/library/[id]/browse, /genre, /collection, /history) can reuse it
 // without dipping into the admin namespace. Re-exported here so

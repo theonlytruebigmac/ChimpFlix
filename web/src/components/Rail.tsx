@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { MediaItem } from "@/lib/chimpflix-types";
 import { Card } from "./Card";
 import { RailPrefetch } from "./RailPrefetch";
+import { RailScroller } from "./RailScroller";
 
 // Items most likely to be clicked from a given rail. We warm modal data for
 // these in browser idle time so the first click feels instant. 2 is a
@@ -82,16 +83,16 @@ export function Rail({
           rather than mid-card — feels closer to a native carousel.
           Disabled at md+ where there's no real swipe gesture and snap
           can interrupt mouse-wheel scrolling. */}
-      <ul className="-mx-1 flex snap-x snap-mandatory gap-1.5 overflow-x-auto px-1 pb-12 pt-2 scrollbar-none md:snap-none [&::-webkit-scrollbar]:hidden">
+      <RailScroller className="-mx-1 flex snap-x snap-mandatory touch-pan-x gap-1.5 overflow-x-auto overscroll-x-contain px-1 pb-6 pt-2 scrollbar-none md:snap-none md:pb-20 [&::-webkit-scrollbar]:hidden">
         {items.map((it) => (
           <li
             key={it.ratingKey}
-            className="snap-start flex-none [&:first-child_.card-scaler]:origin-left [&:last-child_.card-scaler]:origin-right"
+            className="snap-start flex-none [&:first-child_.card-scaler]:origin-top-left [&:last-child_.card-scaler]:origin-top-right"
           >
             <Card item={it} />
           </li>
         ))}
-      </ul>
+      </RailScroller>
       <RailPrefetch ratingKeys={prefetchKeys} />
     </section>
   );

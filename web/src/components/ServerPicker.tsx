@@ -40,6 +40,11 @@ export function ServerPicker({
     setSubmitting(true);
     setSubmitError(null);
     try {
+      // TODO: this route does not exist yet. Create
+      // web/src/app/api/auth/select-server/route.ts (Next.js App Router)
+      // that proxies the selection to the Rust backend, or add a
+      // corresponding endpoint on the backend and point the fetch there
+      // directly. Until then this component must not be rendered.
       const res = await fetch("/api/auth/select-server", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

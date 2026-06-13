@@ -24,6 +24,17 @@ pub struct TmdbUpstreamError {
     pub snippet: String,
 }
 
+/// Returned when TMDB responds with HTTP 429 Too Many Requests. Carries
+/// the `Retry-After` value parsed from the response header (or a
+/// reasonable default when the header is absent) so the retry loop in
+/// `get` can honour it.
+#[derive(Debug, thiserror::Error)]
+#[error("TMDB rate-limited (429) at {url}; retry after {retry_after_s}s")]
+struct TmdbRateLimitError {
+    url: String,
+    retry_after_s: u64,
+}
+
 #[derive(Clone)]
 pub struct TmdbClient {
     http: reqwest::Client,
@@ -397,7 +408,7 @@ impl TmdbClient {
                     .author_details
                     .as_ref()
                     .and_then(|d| d.avatar_path.clone())
-                    .map(|p| tmdb_avatar_url(&p));
+                    .and_then(|p| tmdb_avatar_url(&p));
                 TmdbReview {
                     source_id: r.id,
                     author: r.author,
@@ -541,25 +552,54 @@ impl TmdbClient {
         params: &[(&str, String)],
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        // One retry on transient failures (network error, 5xx, or
-        // 2xx with unparseable body). TMDB's CDN occasionally returns
-        // empty 200s under load; a single short retry recovers without
-        // hammering the API. We don't loop more than once because the
-        // caller (scanner, Fix Match) wraps this in a higher-level
-        // surface that the operator can re-trigger.
-        match self.get_once(&url, params).await {
-            Ok(v) => Ok(v),
-            Err(first) if is_retryable(&first) => {
-                warn!(
-                    %url,
-                    error = %format!("{first:#}"),
-                    "TMDB request failed, retrying once in 250ms",
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                self.get_once(&url, params).await
+        // Up to 3 attempts total:
+        //   • 429 rate-limit: sleep Retry-After (or 60 s default) then
+        //     retry. TMDB's rate-limit window is 1 s (40 req/10 s bucket);
+        //     a short sleep recovers without hammering the API further.
+        //   • Transient failures (network error, 5xx, empty 200): one
+        //     short retry at 250 ms. TMDB's CDN occasionally returns empty
+        //     200s under load.
+        // Callers (scanner, Fix Match) can re-trigger so we don't loop
+        // more than twice beyond the first attempt.
+        const MAX_ATTEMPTS: usize = 3;
+        // Min/max clamps mirror the AniList client so both respect the same
+        // operator-visible behaviour.
+        const MIN_RATE_LIMIT_WAIT_S: u64 = 5;
+        const MAX_RATE_LIMIT_WAIT_S: u64 = 120;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.get_once(&url, params).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.is::<TmdbRateLimitError>() && attempt + 1 < MAX_ATTEMPTS => {
+                    let wait_s = e
+                        .downcast_ref::<TmdbRateLimitError>()
+                        .map(|r| r.retry_after_s)
+                        .unwrap_or(60)
+                        .max(MIN_RATE_LIMIT_WAIT_S)
+                        .min(MAX_RATE_LIMIT_WAIT_S);
+                    warn!(
+                        %url,
+                        wait_s,
+                        attempt = attempt + 1,
+                        "TMDB rate-limited (429); sleeping then retrying",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_s)).await;
+                    last_err = Some(e);
+                }
+                Err(e) if is_retryable(&e) && attempt + 1 < MAX_ATTEMPTS => {
+                    warn!(
+                        %url,
+                        error = %format!("{e:#}"),
+                        "TMDB request failed, retrying once in 250ms",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("TMDB GET {url} failed after {MAX_ATTEMPTS} attempts")))
     }
 
     async fn get_once<T: for<'de> Deserialize<'de>>(
@@ -576,6 +616,17 @@ impl TmdbClient {
             .with_context(|| format!("GET {url}"))?;
 
         let status = resp.status();
+        // Extract Retry-After before consuming the response body — the
+        // header is only accessible on `resp` before `bounded_text` takes
+        // ownership. Default to 60 s when the header is absent or
+        // unparseable (TMDB sometimes omits it on soft-limit responses).
+        let retry_after_s: u64 = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+
         // Buffer the body once — needed for both error logging and
         // (on success) JSON parsing. `resp.json()` consumes the body
         // and gives no visibility into what TMDB actually sent when
@@ -592,6 +643,16 @@ impl TmdbClient {
         .await
         .with_context(|| format!("read TMDB body from {url}"))?;
 
+        if status.as_u16() == 429 {
+            // Surface as a typed error so the retry loop in `get` can
+            // sleep for the right duration instead of treating this as a
+            // hard failure.
+            warn!(%url, retry_after_s, "TMDB rate-limited (429); will retry after backoff");
+            return Err(anyhow::Error::new(TmdbRateLimitError {
+                url: url.to_string(),
+                retry_after_s,
+            }));
+        }
         if !status.is_success() {
             let snippet: String = body.chars().take(200).collect();
             warn!(%status, %url, body = %snippet, "TMDB error");
@@ -617,10 +678,11 @@ impl TmdbClient {
     }
 }
 
-/// Network errors and unparseable upstream bodies are worth a single
-/// retry. Non-2xx statuses are NOT retried because (a) 4xx is the
-/// caller's fault (bad query, bad id) and (b) repeat 5xx in quick
-/// succession would amplify load when TMDB is already struggling.
+/// Network errors and unparseable upstream bodies are worth a short
+/// retry. Non-2xx statuses other than 429 are NOT retried: 4xx (except
+/// rate-limit) is the caller's fault (bad query, bad id) and repeat 5xx
+/// in quick succession would amplify load when TMDB is already struggling.
+/// HTTP 429 is handled separately in `get` before this predicate is tested.
 fn is_retryable(err: &anyhow::Error) -> bool {
     if err.is::<TmdbUpstreamError>() {
         return true;
@@ -646,13 +708,25 @@ pub fn tmdb_image_url(path: &str, size: &str) -> String {
 /// `avatar_path = "/abc.jpg"`, which we feed through the regular image
 /// pipeline. Authors with a Gravatar return `avatar_path = "/https://..."` —
 /// the leading slash is bogus and the URL is already absolute. Detect that
-/// and return as-is.
-fn tmdb_avatar_url(path: &str) -> String {
+/// and return it only if the host is a known-safe origin; unknown absolute
+/// URLs are dropped (return `None`) to prevent client-side tracking via
+/// attacker-controlled image URLs.
+fn tmdb_avatar_url(path: &str) -> Option<String> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return trimmed.to_string();
+        // Only allow absolute URLs from TMDB / Gravatar origins.
+        let allowed = trimmed.starts_with("https://secure.gravatar.com/")
+            || trimmed.starts_with("https://www.gravatar.com/")
+            || trimmed.starts_with("https://gravatar.com/")
+            || trimmed.starts_with("https://www.themoviedb.org/")
+            || trimmed.starts_with("https://image.tmdb.org/");
+        return if allowed {
+            Some(trimmed.to_string())
+        } else {
+            None
+        };
     }
-    tmdb_image_url(path, "w185")
+    Some(tmdb_image_url(path, "w185"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1151,7 @@ fn pick_logo(logos: &[RawImage]) -> Option<String> {
 
 #[derive(Debug, Deserialize)]
 struct SimilarResults {
+    #[serde(default)]
     results: Vec<SimilarHit>,
 }
 
@@ -1087,6 +1162,7 @@ struct SimilarHit {
 
 #[derive(Debug, Deserialize)]
 struct RawVideos {
+    #[serde(default)]
     results: Vec<RawVideo>,
 }
 

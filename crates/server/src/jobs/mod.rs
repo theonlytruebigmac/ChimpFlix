@@ -63,6 +63,14 @@ pub mod scan_gate;
 /// idle server isn't waking up 10x/sec for nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Per-worker stagger applied when the library-scan gate releases. The gate
+/// pauses all workers during a scan, then clears for every worker at once —
+/// so they'd otherwise stampede `claim_next_job` and their handlers' writes
+/// onto the single WAL writer the instant the scan finishes (the post-scan
+/// write convoy in the 2026-06-13 logs). Worker N waits N × this before
+/// resuming, ramping the writer load back up instead of spiking it.
+const SCAN_RESUME_STAGGER: Duration = Duration::from_millis(250);
+
 /// Heartbeat cadence — long enough not to spam the DB, short
 /// enough that a job running close to the lease TTL gets its
 /// timestamp refreshed comfortably before reclaim would consider
@@ -267,6 +275,9 @@ pub fn build_router() -> JobRouter {
         .register(handlers::trakt_push_user_history::KIND, |s, p| {
             handlers::trakt_push_user_history::run(s, p)
         })
+        .register(handlers::notify_new_content::KIND, |s, p| {
+            handlers::notify_new_content::run(s, p)
+        })
         .build()
 }
 
@@ -414,10 +425,44 @@ async fn worker_loop(
         // worker started, then we re-check; once cleared, we fall
         // through to the claim path. Polled at watch's event
         // granularity (not a sleep loop) so wake-up is prompt.
+        // We also select on count_rx so a pool shrink during a scan
+        // is observed immediately rather than waiting for the gate
+        // to clear first.
+        // Note whether we actually park behind a scan this iteration, so the
+        // staggered-resume cost below is only paid on the gate-release path.
+        let parked_behind_scan = *scan_exclusive_rx.borrow();
         while *scan_exclusive_rx.borrow() {
-            if scan_exclusive_rx.changed().await.is_err() {
-                // Sender dropped — server shutting down; bow out.
-                return;
+            tokio::select! {
+                res = scan_exclusive_rx.changed() => {
+                    if res.is_err() {
+                        // Sender dropped — server shutting down; bow out.
+                        return;
+                    }
+                }
+                res = count_rx.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                    // Re-check self-exit in case pool was shrunk.
+                    if worker_id >= *count_rx.borrow() {
+                        info!(worker = worker_id, "job worker draining (pool shrunk)");
+                        return;
+                    }
+                }
+            }
+        }
+        // Staggered resume after the scan gate just released (see
+        // SCAN_RESUME_STAGGER): spread the workers' return so they don't all
+        // hit the WAL writer at once. Worker 0 resumes immediately.
+        if parked_behind_scan && worker_id > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(SCAN_RESUME_STAGGER * worker_id as u32) => {}
+                res = count_rx.changed() => {
+                    if res.is_err() || worker_id >= *count_rx.borrow() {
+                        info!(worker = worker_id, "job worker draining (pool shrunk)");
+                        return;
+                    }
+                }
             }
         }
         let saturated = limiter.saturated_kinds().await;
@@ -525,10 +570,45 @@ async fn worker_loop(
                     kind: kind.clone(),
                     progress_sink,
                 };
-                let result = progress::JobContext::scope(job_ctx, async {
-                    handler(state.clone(), payload).await
-                })
-                .await;
+                // Spawn the handler in its own task so a panic inside
+                // the handler does not kill this worker task. A panicking
+                // spawned task yields `Err(JoinError::is_panic())`;
+                // we convert that into a normal job failure below so the
+                // job row is transitioned out of `running` and the
+                // progress entry is cleaned up even on panic.
+                let handler_state = state.clone();
+                let join = tokio::task::spawn(async move {
+                    progress::JobContext::scope(job_ctx, async {
+                        handler(handler_state, payload).await
+                    })
+                    .await
+                });
+                // Flatten the JoinError (panic) into an anyhow::Error so
+                // the existing Ok/Err match below handles it uniformly.
+                let result: Result<()> = match join.await {
+                    Ok(inner) => inner,
+                    Err(join_err) => {
+                        // Extract a human-readable panic message if the
+                        // payload is a &str or String; fall back to a
+                        // generic label so the job row still records
+                        // something useful.
+                        let msg = if join_err.is_panic() {
+                            let payload = join_err.into_panic();
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|s| format!("handler panicked: {s}"))
+                                .or_else(|| {
+                                    payload
+                                        .downcast_ref::<String>()
+                                        .map(|s| format!("handler panicked: {s}"))
+                                })
+                                .unwrap_or_else(|| "handler panicked".to_string())
+                        } else {
+                            "handler task cancelled".to_string()
+                        };
+                        Err(anyhow::anyhow!(msg))
+                    }
+                };
                 state.job_progress.finish(job.id);
                 // Heartbeat is aborted by `_heartbeat`'s Drop on scope exit
                 // (covers both normal flow and handler panic).

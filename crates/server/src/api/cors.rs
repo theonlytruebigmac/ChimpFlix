@@ -25,7 +25,12 @@ use axum::response::Response;
 use crate::state::AppState;
 
 const PREFLIGHT_MAX_AGE_SECS: &str = "600";
-const DEFAULT_ALLOWED_HEADERS: &str = "content-type, authorization, x-requested-with";
+// x-csrf-token is required here: the CSRF middleware enforces the double-submit
+// cookie pattern by checking this header on mutating requests. Without it in
+// the preflight response, browsers block cross-origin requests before they
+// reach the CSRF check.
+const DEFAULT_ALLOWED_HEADERS: &str =
+    "content-type, authorization, x-requested-with, x-csrf-token";
 const DEFAULT_ALLOWED_METHODS: &str = "GET, POST, PATCH, PUT, DELETE, OPTIONS";
 
 pub async fn layer(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {

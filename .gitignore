@@ -1,5 +1,9 @@
 # Rust
 /target/
+# Stray rustc default output — `rustc foo.rs` run at the repo root (outside
+# cargo) emits these instead of using target/. Not build inputs; never commit.
+/rust_out
+/librust_out.rlib
 
 # Node / Next.js (covers both root and web/)
 node_modules/
@@ -18,6 +22,11 @@ next-env.d.ts
 /data/
 /.app-state/
 .app-admin-token
+
+# Demo runtime data (DB + media stubs created by scripts/demo/setup.sh)
+/data-demo/
+# Demo-local env overrides (operator API keys — never commit)
+.env.demo.local
 
 # Editor / IDE
 .vscode/

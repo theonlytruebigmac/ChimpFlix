@@ -103,7 +103,7 @@ export function Card({
       onMouseEnter={() => prefetchModalData(modalKey)}
       onFocus={() => prefetchModalData(modalKey)}
     >
-      <div className="card-scaler origin-center transition-transform duration-200 ease-out delay-200 group-hover:scale-125 group-has-focus-visible:scale-125">
+      <div className="card-scaler origin-top transition-transform duration-200 ease-out delay-200 group-hover:scale-110 group-has-focus-visible:scale-110">
         <div className="overflow-hidden rounded-md bg-(--color-surface) shadow-md group-hover:shadow-2xl group-has-focus-visible:shadow-2xl group-has-focus-visible:ring-2 group-has-focus-visible:ring-accent group-has-focus-visible:ring-offset-2 group-has-focus-visible:ring-offset-background">
           <button
             type="button"

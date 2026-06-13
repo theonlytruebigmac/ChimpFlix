@@ -22,7 +22,7 @@ const CHIPS: Array<{ label: string; href: string }> = [
 
 export function MoreToExploreChips() {
   return (
-    <div className="mb-6 flex items-center gap-3 overflow-x-auto pb-1 scrollbar-none [&::-webkit-scrollbar]:hidden">
+    <div className="mb-6 flex items-center gap-3 overflow-x-auto overscroll-x-contain touch-pan-x pb-1 scrollbar-none [&::-webkit-scrollbar]:hidden">
       <span className="shrink-0 text-[0.78rem] uppercase tracking-wider text-white/45">
         More to explore
       </span>

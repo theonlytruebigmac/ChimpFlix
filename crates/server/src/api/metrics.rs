@@ -133,7 +133,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     // Reads via the shared `statvfs_usage` helper from the dashboard
     // handler so the metric matches the operator-facing UI exactly.
     if let Some(data_dir_str) = state.data_dir.to_str() {
-        if let Some((total, used)) = crate::api::admin::dashboard::statvfs_usage(data_dir_str) {
+        if let Some((total, used, _fsid)) = crate::api::admin::dashboard::statvfs_usage(data_dir_str) {
             let free = total.saturating_sub(used);
             let _ = writeln!(
                 out,

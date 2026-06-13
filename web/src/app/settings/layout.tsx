@@ -1,12 +1,18 @@
 import { TopNav } from "@/components/TopNav";
-import { SettingsTabs } from "@/components/SettingsTabs";
+import { SettingsShell } from "@/components/SettingsShell";
 import { requireUser } from "@/lib/chimpflix-server";
+import "./console.css";
 
-/// Unified shell for everything under /settings: the per-user tabs
-/// (Account, Player, Integrations, Libraries) plus the admin section
-/// when the signed-in user is an owner. The Admin tab is just another
-/// link on the same strip — the deeper admin sidebar nav is owned by
-/// /settings/admin/layout.tsx.
+/// Unified shell for everything under /settings. A single left sidebar
+/// (SettingsShell) switches between the personal ("You") and server
+/// ("Server", owner-only) contexts and hosts the ⌘K command palette;
+/// the page renders in the content column to its right. The breadcrumb +
+/// active sidebar item identify the page, so there's no page-title header.
+///
+/// `.cf-console` carries the redesign design-system tokens + component
+/// classes (console.css) down to both the sidebar and the page body so
+/// every page renders in the mockup's visual language. Page content is
+/// centred in a 1080px column (.cf-content-inner) per the mockup.
 export default async function SettingsLayout({
   children,
 }: {
@@ -17,23 +23,15 @@ export default async function SettingsLayout({
   return (
     <main className="relative min-h-screen bg-background">
       <TopNav />
-      <div className="mx-auto max-w-7xl px-4 pb-24 pt-24 sm:px-6 sm:pt-28">
-        <header className="mb-6 flex flex-col items-start gap-2 sm:flex-row sm:items-baseline sm:justify-between sm:gap-4">
-          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Settings</h1>
-          <div className="text-xs text-white/45">
-            Signed in as{" "}
-            <span className="text-white/80">
-              {user.display_name ?? user.username}
-            </span>
-            {user.role === "owner" && (
-              <span className="ml-2 rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
-                Owner
-              </span>
-            )}
+      <div className="cf-console mx-auto max-w-350 px-4 pb-24 pt-24 sm:px-6 sm:pt-28">
+        <div className="flex flex-col gap-6 lg:flex-row lg:gap-10">
+          <div className="lg:w-64 lg:shrink-0">
+            <SettingsShell isOwner={user.role === "owner"} />
           </div>
-        </header>
-        <SettingsTabs isOwner={user.role === "owner"} />
-        <div className="mt-6">{children}</div>
+          <div className="min-w-0 flex-1">
+            <div className="cf-content-inner">{children}</div>
+          </div>
+        </div>
       </div>
     </main>
   );

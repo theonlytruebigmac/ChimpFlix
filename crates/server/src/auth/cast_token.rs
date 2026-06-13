@@ -35,6 +35,19 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Domain-separation prefix mixed into the HMAC for cast tokens.
+///
+/// Several token types (cast tokens here, the TOTP login challenge in
+/// `crate::totp`) share the same `session_secret` and the same
+/// `"{user_id}:{timestamp_ms}"` payload shape. Without a per-purpose
+/// prefix, a token minted for one purpose verifies as the other —
+/// e.g. a TOTP challenge string (returned in the login response before
+/// 2FA is satisfied) could be replayed as a `?ct=` cast token,
+/// bypassing 2FA on the stream surface. Prefixing the HMAC input binds
+/// each token to its purpose. Keep this in sync with the matching
+/// prefix in `totp.rs`.
+const CAST_TOKEN_DOMAIN: &[u8] = b"cast:";
+
 /// Default token TTL: 6 hours. Sized to outlast any single feature-
 /// length film (most are <3h) plus a full TV-episode binge sitting,
 /// while still expiring within the same evening so a stolen URL
@@ -73,6 +86,7 @@ pub fn verify(token: &str, secret: &[u8]) -> Option<(i64, i64)> {
     let payload = format!("{user_id}:{expires_at_ms}");
     let sig = hex::decode(sig_hex).ok()?;
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+    mac.update(CAST_TOKEN_DOMAIN);
     mac.update(payload.as_bytes());
     mac.verify_slice(&sig).ok()?;
     if now_ms() > expires_at_ms {
@@ -83,6 +97,7 @@ pub fn verify(token: &str, secret: &[u8]) -> Option<(i64, i64)> {
 
 fn sign(payload: &str, secret: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(CAST_TOKEN_DOMAIN);
     mac.update(payload.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }

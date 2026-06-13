@@ -1,9 +1,10 @@
 //! Request extractors that resolve a session cookie into the current
 //! user (or 401 the request).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::FromRequestParts;
 use axum::http::header::COOKIE;
@@ -11,6 +12,7 @@ use axum::http::request::Parts;
 use chimpflix_common::now_ms;
 use chimpflix_library::UserRole;
 use chimpflix_library::queries;
+use ipnet::IpNet;
 use tokio::sync::RwLock;
 
 use crate::api::error::ApiError;
@@ -19,6 +21,15 @@ use crate::client_ip::EffectiveClientIp;
 use crate::net;
 use crate::state::AppState;
 
+/// Process-local cache of the last-parsed `auth_bypass_cidrs` list.
+/// Stores the raw string alongside the parsed `Vec<IpNet>` so the hot
+/// path (every authenticated request) can skip `parse_cidr_list` as
+/// long as the setting hasn't changed. The raw string is a cheap `==`
+/// check; re-parsing only happens on the first request after an admin
+/// updates the CIDR setting (rare).
+static BYPASS_CIDR_CACHE: LazyLock<RwLock<(String, Vec<IpNet>)>> =
+    LazyLock::new(|| RwLock::new((String::new(), Vec::new())));
+
 /// Process-local set of client IPs that have already triggered an
 /// info-level "network bypass granted" audit log. Keeps logging
 /// quiet for chatty LAN clients while still surfacing the first
@@ -26,6 +37,42 @@ use crate::state::AppState;
 /// notice if their bypass CIDR is wider than they intended.
 static NETWORK_BYPASS_LOGGED: LazyLock<RwLock<HashSet<IpAddr>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Debounce window for the per-request `last_seen_at` session touch. The
+/// touch only feeds the 14-day idle-session sweep, so minute-granularity
+/// staleness is harmless — but writing it on EVERY authenticated request was
+/// a top source of WAL-writer contention (186 slow-statement WARNs in the
+/// 2026-06-13 wedge). One write per session per minute is plenty.
+const SESSION_TOUCH_DEBOUNCE: Duration = Duration::from_secs(60);
+
+/// Last instant each session's `last_seen_at` was written (process-local).
+/// Bounded opportunistically in [`should_touch_session`].
+static SESSION_TOUCH_SEEN: LazyLock<Mutex<HashMap<i64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// True if `sid` is due for a `last_seen_at` write (not touched within
+/// [`SESSION_TOUCH_DEBOUNCE`]); records the decision instant when it returns
+/// true so the next request inside the window skips the write entirely.
+fn should_touch_session(sid: i64) -> bool {
+    let now = Instant::now();
+    // Recover from a poisoned lock rather than propagate a panic onto the
+    // auth hot path — a stale debounce map is harmless.
+    let mut seen = SESSION_TOUCH_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&last) = seen.get(&sid) {
+        if now.duration_since(last) < SESSION_TOUCH_DEBOUNCE {
+            return false;
+        }
+    }
+    seen.insert(sid, now);
+    // The map only needs entries within the debounce window; under churn
+    // (many short-lived sessions) drop stale ones so it can't grow unbounded.
+    if seen.len() > 4096 {
+        seen.retain(|_, &mut t| now.duration_since(t) < SESSION_TOUCH_DEBOUNCE);
+    }
+    true
+}
 
 /// Sentinel session id used by the network-bypass path. The bypass
 /// fakes an AuthUser without a real DB-backed session row; this
@@ -50,6 +97,14 @@ pub struct AuthUser {
     /// and by session-rotation paths that want to spare the current
     /// session.
     pub session_id: i64,
+    /// The user's `kids_safe` preference, copied from the user row the
+    /// extractor already loaded (no extra DB read). When true, listing
+    /// handlers restrict results to kid-safe-certified titles. Defaults
+    /// to `false` for the network-bypass owner + cast-token paths where
+    /// preserving the historical (unfiltered) behaviour is correct — a
+    /// LAN automation token or Cast session shouldn't inherit a viewer's
+    /// kid-safe filter. The cookie auth path carries the real value.
+    pub kids_safe: bool,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -71,11 +126,28 @@ impl FromRequestParts<AppState> for AuthUser {
         // `X-Forwarded-For: 192.168.x.x` to gain owner — without a
         // trusted proxy in front, headers are ignored, and the LAN
         // CIDR won't match a public peer IP.
-        let bypass_raw = state.settings.read().await.auth_bypass_cidrs.clone();
-        if !bypass_raw.trim().is_empty() {
-            if let Some(ip) = client_ip(parts) {
-                let nets = net::parse_cidr_list(&bypass_raw);
-                if net::ip_in_list(ip, &nets) {
+        //
+        // Only proceed when there's actually a client IP to match
+        // (avoids acquiring the settings lock on every request when
+        // the middleware didn't run, e.g. in tests).
+        if let Some(ip) = client_ip(parts) {
+            let bypass_raw = state.settings.read().await.auth_bypass_cidrs.clone();
+            if !bypass_raw.trim().is_empty() {
+                // Return the cached parsed list if the raw string is
+                // unchanged; re-parse and update on mismatch (happens
+                // only after an admin edits the setting).
+                let nets_snapshot = {
+                    let cache = BYPASS_CIDR_CACHE.read().await;
+                    if cache.0 == bypass_raw {
+                        cache.1.clone()
+                    } else {
+                        drop(cache);
+                        let parsed = net::parse_cidr_list(&bypass_raw);
+                        *BYPASS_CIDR_CACHE.write().await = (bypass_raw, parsed.clone());
+                        parsed
+                    }
+                };
+                if net::ip_in_list(ip, &nets_snapshot) {
                     if let Some(owner) = queries::find_first_owner(&state.pool)
                         .await
                         .map_err(ApiError::Internal)?
@@ -99,6 +171,9 @@ impl FromRequestParts<AppState> for AuthUser {
                             username: owner.username,
                             role: owner.role,
                             session_id: BYPASS_SESSION_ID,
+                            // Network-bypass automation runs unfiltered —
+                            // it stands in for the owner's full visibility.
+                            kids_safe: false,
                         });
                     }
                     // No owner user on this deployment — fall through
@@ -150,18 +225,34 @@ impl FromRequestParts<AppState> for AuthUser {
             .map_err(ApiError::Internal)?
             .ok_or(ApiError::Unauthorized)?;
 
-        // Best-effort: update last_seen_at without blocking the request.
-        let pool = state.pool.clone();
-        let sid = session.id;
-        tokio::spawn(async move {
-            let _ = queries::touch_session(&pool, sid).await;
-        });
+        // Locked-account gate: mirror the /auth/login check on every
+        // authenticated request so an account an admin has disabled
+        // can't keep riding a session minted before the lock. The user
+        // row is already loaded above, so this is a free in-memory field
+        // test — no extra DB read. Owners can't be locked (the admin
+        // lock route refuses), so the role guard matches login.
+        if user.locked && user.role != UserRole::Owner {
+            return Err(ApiError::Unauthorized);
+        }
+
+        // Best-effort: bump last_seen_at without blocking the request,
+        // debounced to ~once/minute per session (see should_touch_session) so
+        // the auth hot path stops hammering the single WAL writer.
+        if should_touch_session(session.id) {
+            let pool = state.pool.clone();
+            let sid = session.id;
+            tokio::spawn(async move {
+                let _ = queries::touch_session(&pool, sid).await;
+            });
+        }
 
         Ok(AuthUser {
             id: user.id,
             username: user.username,
             role: user.role,
             session_id: session.id,
+            // Free read — `user` was already fetched above for auth.
+            kids_safe: user.kids_safe,
         })
     }
 }
@@ -245,6 +336,12 @@ impl FromRequestParts<AppState> for StreamAuthUser {
                         .await
                         .map_err(ApiError::Internal)?
                         .ok_or(ApiError::Unauthorized)?;
+                    // Same locked-account gate as the cookie path: a cast
+                    // token minted before the account was locked must not
+                    // outlive the lock.
+                    if user.locked && user.role != UserRole::Owner {
+                        return Err(ApiError::Unauthorized);
+                    }
                     return Ok(StreamAuthUser(AuthUser {
                         id: user.id,
                         username: user.username,
@@ -254,6 +351,9 @@ impl FromRequestParts<AppState> for StreamAuthUser {
                         // a real session" if they care, while keeping
                         // the field typed as `i64`.
                         session_id: 0,
+                        // Streaming/cast playback isn't a listing surface;
+                        // the kid-safe filter only gates browse/home lists.
+                        kids_safe: false,
                     }));
                 }
                 // Token present but invalid — fall through to cookie

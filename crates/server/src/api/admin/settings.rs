@@ -21,6 +21,12 @@ use crate::state::AppState;
 #[derive(Debug, Serialize)]
 pub struct SettingsResponse {
     pub settings: ServerSettings,
+    /// Read-only server version (from the server crate's Cargo
+    /// package version). For display only — PATCH ignores it.
+    pub version: &'static str,
+    /// Read-only on-disk DATA_DIR path. For display only — PATCH
+    /// ignores it.
+    pub data_dir: String,
 }
 
 pub async fn get(
@@ -30,7 +36,11 @@ pub async fn get(
     // Serve from the cache — it's already populated at startup and kept
     // fresh by `patch`. Cheap clone, no DB round-trip.
     let settings = state.settings.read().await.clone();
-    Ok(Json(SettingsResponse { settings }))
+    Ok(Json(SettingsResponse {
+        settings,
+        version: env!("CARGO_PKG_VERSION"),
+        data_dir: state.data_dir.display().to_string(),
+    }))
 }
 
 pub async fn patch(
@@ -96,7 +106,11 @@ pub async fn patch(
     )
     .await;
 
-    Ok(Json(SettingsResponse { settings: updated }))
+    Ok(Json(SettingsResponse {
+        settings: updated,
+        version: env!("CARGO_PKG_VERSION"),
+        data_dir: state.data_dir.display().to_string(),
+    }))
 }
 
 /// Validate every field on a `ServerSettingsUpdate` that has a

@@ -23,7 +23,7 @@ export function GenreFilterBar({
     <div className="relative z-30 pt-24">
       <div className="flex items-center gap-3 px-4 pb-3 sm:px-8 md:px-12">
         <h1 className="text-3xl font-bold tracking-tight">{title}</h1>
-        <div className="ml-2 flex min-w-0 items-center gap-1.5 overflow-x-auto scrollbar-none [&::-webkit-scrollbar]:hidden">
+        <div className="ml-2 flex min-w-0 items-center gap-1.5 overflow-x-auto overscroll-x-contain touch-pan-x scrollbar-none [&::-webkit-scrollbar]:hidden">
           <Chip href={allHref} label="All" active />
           {genres.map((g) => (
             <Chip

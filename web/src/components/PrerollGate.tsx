@@ -150,16 +150,21 @@ export function PrerollGate({
     });
   }, [done, suppressChecked, prerollVolume, prerollUrl]);
 
-  // Stamp the suppression cookie whenever the gate completes — covers
-  // both ended/error paths and explicit skip clicks. Stamping happens
-  // on transition, not on every effect run, so the timestamp reflects
-  // the latest play rather than the first.
+  // Stamp the suppression cookie when the user actually watched the
+  // pre-roll (ended or explicit skip). Stamping happens on transition,
+  // not on every effect run, so the timestamp reflects the latest play.
   const stamp = () => {
     if (prerollKey) {
       writePrerollState({ key: prerollKey, at: Date.now() });
     }
     setDone(true);
   };
+  // On load error (network blip, codec mismatch, server 5xx) skip the
+  // gate without stamping — the user never saw the pre-roll, so the
+  // suppression window should not start. Mirrors the autoplay-rejection
+  // catch path at lines 141-149 which also skips stamping for the same
+  // reason.
+  const onVideoError = () => setDone(true);
 
   if (done) return <>{children}</>;
 
@@ -175,7 +180,7 @@ export function PrerollGate({
         // slow-start codec never see a button they can't yet use.
         onPlaying={() => setShowSkip(true)}
         onEnded={stamp}
-        onError={stamp}
+        onError={onVideoError}
         className="h-full w-full object-contain"
       />
       {showSkip && (

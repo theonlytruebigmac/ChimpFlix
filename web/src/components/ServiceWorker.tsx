@@ -20,9 +20,16 @@ export function ServiceWorker() {
       .catch(() => {});
 
     if ("caches" in window) {
+      // Only delete caches owned by this app's old service worker (prefixed
+      // "cf-") so we don't wipe caches created by other libraries or the
+      // browser under the same origin.
       caches
         .keys()
-        .then((names) => Promise.all(names.map((n) => caches.delete(n))))
+        .then((names) =>
+          Promise.all(
+            names.filter((n) => n.startsWith("cf-")).map((n) => caches.delete(n))
+          )
+        )
         .catch(() => {});
     }
   }, []);

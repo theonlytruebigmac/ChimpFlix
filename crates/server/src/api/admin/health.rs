@@ -89,8 +89,12 @@ pub async fn get(
     )
     .fetch_one(pool);
     let q_orphan_episodes = sqlx::query_scalar::<_, i64>(
+        // Exclude PLACEHOLDER episodes: they have no media_files by design
+        // (agent-materialized to complete a season for the finale flag /
+        // calendar), so they are not orphans the operator needs to clean.
         "SELECT COUNT(*) FROM episodes e
-         WHERE NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)",
+         WHERE e.is_placeholder = 0
+           AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)",
     )
     .fetch_one(pool);
     let q_orphan_media_files = sqlx::query_scalar::<_, i64>(
@@ -103,12 +107,19 @@ pub async fn get(
     // anyway, and the typical case (most files present) iterates the
     // full 200 doing one stat per row — 200 stat calls on a container
     // mount is the dominant cost of this endpoint.
+    //
+    // `removed_at IS NULL` excludes files already soft-deleted by a
+    // previous verify run so they don't surface again as spurious hits.
+    // `ORDER BY RANDOM()` gives a uniform sample across the whole
+    // library rather than just the 50 most recently added rows, so an
+    // old disconnected drive is as likely to surface as a new one.
     let q_candidates = sqlx::query(
         "SELECT mf.id AS id, mf.path AS path, i.title AS item_title, e.title AS episode_title
          FROM media_files mf
          LEFT JOIN items i ON i.id = mf.item_id
          LEFT JOIN episodes e ON e.id = mf.episode_id
-         ORDER BY mf.id DESC
+         WHERE mf.removed_at IS NULL
+         ORDER BY RANDOM()
          LIMIT 50",
     )
     .fetch_all(pool);
@@ -432,8 +443,11 @@ pub async fn items(
         }
         "orphan_episodes" => {
             let total: i64 = sqlx::query_scalar(
+                // Placeholder episodes are intentionally fileless — not
+                // orphans — so they're excluded from the orphan count.
                 "SELECT COUNT(*) FROM episodes e
-                 WHERE NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)",
+                 WHERE e.is_placeholder = 0
+                   AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)",
             )
             .fetch_one(pool)
             .await
@@ -446,7 +460,8 @@ pub async fn items(
                  JOIN seasons s ON s.id = e.season_id
                  JOIN items show ON show.id = s.show_id
                  LEFT JOIN libraries l ON l.id = show.library_id
-                 WHERE NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)
+                 WHERE e.is_placeholder = 0
+                   AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)
                  ORDER BY show.title COLLATE NOCASE ASC,
                           e.season_number ASC, e.episode_number ASC
                  LIMIT ? OFFSET ?",

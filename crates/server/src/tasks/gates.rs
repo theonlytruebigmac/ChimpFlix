@@ -55,7 +55,7 @@ impl GateState {
 /// takes effect on the *next* call here.
 pub async fn is_kind_allowed(state: &AppState, name: &str) -> GateState {
     let settings = state.settings.read().await;
-    evaluate(name, |key| Some(read_gate_bool(&settings, key)))
+    evaluate(name, |key| read_gate_bool(&settings, key))
 }
 
 /// Pure-function gate evaluator. Production wraps it with the live
@@ -100,16 +100,16 @@ fn evaluate(name: &str, read_bool: impl Fn(&str) -> Option<bool>) -> GateState {
 /// keys rather than a reflection / map lookup — adding a new gate
 /// is then a compile error here, which forces the registry
 /// addition and the wiring to stay in sync.
-fn read_gate_bool(settings: &chimpflix_library::ServerSettings, key: &str) -> bool {
+///
+/// Returns `None` for unknown keys so `evaluate` can warn and deny.
+fn read_gate_bool(settings: &chimpflix_library::ServerSettings, key: &str) -> Option<bool> {
     match key {
-        "loudness_analysis_enabled" => settings.loudness_analysis_enabled,
-        "subtitle_fetch_enabled" => settings.subtitle_fetch_enabled,
-        "embedded_subs_extract_enabled" => settings.embedded_subs_extract_enabled,
-        "external_ratings_enabled" => settings.external_ratings_enabled,
-        // Falling through here would silently leave a Gated kind
-        // permanently allowed. Caller (`evaluate`) handles the None
-        // case by warning + denying.
-        _ => false,
+        "loudness_analysis_enabled" => Some(settings.loudness_analysis_enabled),
+        "subtitle_fetch_enabled" => Some(settings.subtitle_fetch_enabled),
+        "embedded_subs_extract_enabled" => Some(settings.embedded_subs_extract_enabled),
+        "external_ratings_enabled" => Some(settings.external_ratings_enabled),
+        // Unknown key — let `evaluate` warn and deny.
+        _ => None,
     }
 }
 

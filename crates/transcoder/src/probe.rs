@@ -10,6 +10,36 @@ use tracing::debug;
 
 use crate::FfmpegConfig;
 
+// ffprobe timeouts. Several of these calls run INLINE in the
+// stream-session HTTP handler (`probe_gop`, `probe_subtitle_codec`), so
+// without a ceiling a stalled NFS/SMB mount, an accidentally-indexed
+// RTSP stream, or a crafted container with a huge metadata section can
+// pin a Tokio worker indefinitely — eventually starving every worker.
+const FFPROBE_TIMEOUT_GOP_S: u64 = 20;
+const FFPROBE_TIMEOUT_STREAMS_S: u64 = 30;
+const FFPROBE_TIMEOUT_META_S: u64 = 15;
+
+/// Run an ffprobe `Command` with a hard timeout. A timer elapse becomes
+/// an error rather than an indefinite hang of the caller (and its worker
+/// thread). Mirrors the `.output().await.with_context(...)` the call
+/// sites used before, just bounded.
+async fn output_with_timeout(
+    cmd: &mut Command,
+    secs: u64,
+    what: &str,
+    path: &Path,
+) -> Result<std::process::Output> {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), cmd.output())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "ffprobe ({what}) timed out after {secs}s for {}",
+                path.display()
+            )
+        })?
+        .with_context(|| format!("spawn ffprobe ({what}) for {}", path.display()))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeResult {
     pub duration_ms: Option<i64>,
@@ -96,25 +126,28 @@ impl GopProbe {
 /// surface packet-level data for the container.
 pub async fn probe_gop(cfg: &FfmpegConfig, path: &Path, read_seconds: f64) -> Result<GopProbe> {
     let interval = format!("%+#{}", read_seconds.max(2.0));
-    let output = Command::new(&cfg.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "packet=pts_time,dts_time,flags",
-            "-read_intervals",
-            &interval,
-        ])
-        // file: prefix prevents leading-`-` filenames from being parsed
-        // as ffprobe flags (see crate::safe_ffmpeg_input).
-        .arg(crate::safe_ffmpeg_input(path))
-        .output()
-        .await
-        .with_context(|| format!("spawn ffprobe (gop) for {}", path.display()))?;
+    let output = output_with_timeout(
+        Command::new(&cfg.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time,dts_time,flags",
+                "-read_intervals",
+                &interval,
+            ])
+            // file: prefix prevents leading-`-` filenames from being parsed
+            // as ffprobe flags (see crate::safe_ffmpeg_input).
+            .arg(crate::safe_ffmpeg_input(path)),
+        FFPROBE_TIMEOUT_GOP_S,
+        "gop",
+        path,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -193,21 +226,24 @@ struct RawPacket {
 }
 
 pub async fn probe(cfg: &FfmpegConfig, path: &Path) -> Result<ProbeResult> {
-    let output = Command::new(&cfg.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-show_format",
-        ])
-        // file: prefix prevents leading-`-` filenames from being parsed
-        // as ffprobe flags (see crate::safe_ffmpeg_input).
-        .arg(crate::safe_ffmpeg_input(path))
-        .output()
-        .await
-        .with_context(|| format!("spawn ffprobe for {}", path.display()))?;
+    let output = output_with_timeout(
+        Command::new(&cfg.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-show_format",
+            ])
+            // file: prefix prevents leading-`-` filenames from being parsed
+            // as ffprobe flags (see crate::safe_ffmpeg_input).
+            .arg(crate::safe_ffmpeg_input(path)),
+        FFPROBE_TIMEOUT_STREAMS_S,
+        "streams",
+        path,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -279,14 +315,17 @@ pub struct Chapter {
 /// but that conflates two unrelated parsers — kept separate here for
 /// the same reason the GOP probe is its own function.
 pub async fn probe_chapters(cfg: &FfmpegConfig, path: &Path) -> Result<Vec<Chapter>> {
-    let output = Command::new(&cfg.ffprobe)
-        .args(["-v", "error", "-print_format", "json", "-show_chapters"])
-        // file: prefix prevents leading-`-` filenames from being parsed
-        // as ffprobe flags (see crate::safe_ffmpeg_input).
-        .arg(crate::safe_ffmpeg_input(path))
-        .output()
-        .await
-        .with_context(|| format!("spawn ffprobe (chapters) for {}", path.display()))?;
+    let output = output_with_timeout(
+        Command::new(&cfg.ffprobe)
+            .args(["-v", "error", "-print_format", "json", "-show_chapters"])
+            // file: prefix prevents leading-`-` filenames from being parsed
+            // as ffprobe flags (see crate::safe_ffmpeg_input).
+            .arg(crate::safe_ffmpeg_input(path)),
+        FFPROBE_TIMEOUT_META_S,
+        "chapters",
+        path,
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
@@ -359,23 +398,26 @@ pub async fn probe_subtitle_codec(
     // turns ffprobe's enumeration into "the Nth row is the Nth
     // subtitle by stream-index order" — matching what the API gives
     // us. Much cheaper than parsing the full per-stream JSON.
-    let output = Command::new(&cfg.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "s",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        // file: prefix prevents leading-`-` filenames from being parsed
-        // as ffprobe flags (see crate::safe_ffmpeg_input).
-        .arg(crate::safe_ffmpeg_input(path))
-        .output()
-        .await
-        .with_context(|| format!("spawn ffprobe (subtitle codec) for {}", path.display()))?;
+    let output = output_with_timeout(
+        Command::new(&cfg.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            // file: prefix prevents leading-`-` filenames from being parsed
+            // as ffprobe flags (see crate::safe_ffmpeg_input).
+            .arg(crate::safe_ffmpeg_input(path)),
+        FFPROBE_TIMEOUT_META_S,
+        "subtitle codec",
+        path,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

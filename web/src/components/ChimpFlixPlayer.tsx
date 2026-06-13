@@ -15,7 +15,6 @@ import type Hls from "hls.js";
 import {
   ChimpFlixApiError,
   auth as authApi,
-  cast as castApi,
   stream as streamApi,
   playState as playStateApi,
   seasons as seasonsApi,
@@ -24,12 +23,22 @@ import {
 import { plexImage } from "@/lib/image";
 import {
   buildCastUrl,
+  castPlayPause,
+  castSeekToMediaTime,
+  castSetVolume,
+  castToggleMute,
+  ensureCastToken,
+  getRemoteSnapshot,
+  loadCastMedia,
+  setCastTrackController,
   subscribeRemotePlayback,
   useCastState,
   type CastMediaPayload,
+  type CastTrackOption,
   type RemotePlaybackState,
 } from "@/lib/cast";
 import { CastButton } from "./CastButton";
+import { CastRemote } from "./cast/CastRemote";
 import { TOAST_DISMISS_LONG_MS, TOAST_DISMISS_PLAYER_MS } from "@/lib/toast";
 import { devError, devWarn } from "@/lib/dev-log";
 import { detectClientCapabilities, isSafari } from "@/lib/client-caps";
@@ -166,11 +175,25 @@ export type EpisodeSibling = {
   viewOffset?: number;
   index?: number;
   parentTitle?: string;
+  /// False marks a PLACEHOLDER episode — a metadata-agent row with no
+  /// downloaded file behind it. The picker renders these non-playable
+  /// (muted, no Link, no navigation) so the viewer can see the full
+  /// season but can't jump to an episode that can't be streamed.
+  /// Optional + defaulted-playable (a missing flag is treated as a real
+  /// file) so a downloaded episode is never wrongly muted.
+  hasFile?: boolean;
 };
 
 interface Props {
   title: string;
   subtitle?: string;
+  /// Poster / cover art URL for the cast now-playing screen + the
+  /// app-wide mini/expanded controller + the OS media-notification chip.
+  /// Only ABSOLUTE (http/https) URLs are used for the Cast receiver,
+  /// which fetches art without our cookie — relative `/api/...` art is
+  /// ignored for casting. Optional; the remote falls back to a branded
+  /// card when absent.
+  posterUrl?: string;
   mediaFileId: number;
   // Best-known duration in milliseconds. Comes from the file's metadata
   // (ffprobe) — authoritative across the whole title, unlike `video.duration`
@@ -484,6 +507,7 @@ function SkipMarkerButton({
 export function ChimpFlixPlayer({
   title,
   subtitle,
+  posterUrl,
   mediaFileId,
   durationMs,
   startPositionMs = 0,
@@ -581,6 +605,27 @@ export function ChimpFlixPlayer({
   /// that can break a session.
   const castState = useCastState();
   const isCasting = castState.connected;
+  // Mirror of `isCasting` for reads inside effects/handlers that must NOT
+  // re-subscribe when casting toggles (the session-creation effect, the
+  // local play() recovery callers). Synced in the cast-start effect below.
+  const isCastingRef = useRef(false);
+  // The cookieless Cast receiver can only fetch ABSOLUTE poster URLs
+  // (e.g. TMDB); a relative `/api/...` art path is dropped so the remote
+  // shows its branded card instead of a broken image on the TV.
+  const castPosterUrl =
+    posterUrl && /^https?:\/\//i.test(posterUrl) ? posterUrl : undefined;
+  // Last source-time (ms) the receiver reported during casting. On
+  // cast-end we rebuild a working local session at this position — a
+  // track/quality switch while casting rebuilds the transcode onto the
+  // RECEIVER and leaves the local <video> pointing at a now-deleted
+  // session, so a plain resume would 404. Rebuilding also lands the local
+  // player where the TV left off instead of the stale cast-start point.
+  const lastCastSourceMsRef = useRef<number | null>(null);
+  // One-shot flag: suppress the next autoplay in the session-attach path.
+  // Set when rebuilding on cast-end so the local player comes up PAUSED
+  // (the user resumes deliberately) rather than surprising someone who
+  // walked away by auto-starting audio.
+  const suppressAutoplayOnceRef = useRef(false);
   // Captured the resume position so a track switch mid-playback comes back
   // to roughly where the user was, not the original startPositionMs.
   // Always source-time (file timeline), not HLS media-time.
@@ -688,6 +733,11 @@ export function ChimpFlixPlayer({
     nonce: number;
   } | null>(null);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  // Ref mirror so onCanPlay can read autoplayBlocked without being listed
+  // as a dep of the video-event effect (which would tear down + re-register
+  // ALL listeners on every autoplay-block/unblock cycle).
+  const autoplayBlockedRef = useRef(false);
+  useEffect(() => { autoplayBlockedRef.current = autoplayBlocked; }, [autoplayBlocked]);
   // Local selection state. `undefined` = transcoder default. For subtitles
   // we use `null` to mean "explicitly off" (no subtitle_index sent).
   const [audioSel, setAudioSel] = useState<number | undefined>(audioIndex);
@@ -902,13 +952,32 @@ export function ChimpFlixPlayer({
     // arriving (loadedmetadata supplies videoWidth/Height), the
     // player element resizing (fullscreen toggle, window
     // resize, sidebar collapse).
-    const onAddTrack = () => applyAll();
     const onCueChange = () => applyAll();
+    // `cuechange` is the signal that a track's cues are populated and
+    // active, so it must be attached to EVERY track — including the one
+    // HLS.js (or a late external `<track>` append) adds AFTER this effect
+    // first runs. The old code only wired the tracks present at mount and
+    // had `addtrack` re-run `applyAll()` (which no-ops while the new
+    // track's cues are still empty) WITHOUT wiring `cuechange` to it. So a
+    // stream's subtitles never picked up the saved bottom-inset until the
+    // user nudged the slider — which re-ran this effect once the track
+    // already existed. That was the "position doesn't persist on load"
+    // regression. We now track wired tracks so cleanup stays exact and
+    // attach `cuechange` to any track added later.
+    const wired = new Set<TextTrack>();
+    const wireTrack = (track: TextTrack) => {
+      if (wired.has(track)) return;
+      wired.add(track);
+      track.addEventListener("cuechange", onCueChange);
+    };
+    for (let i = 0; i < v.textTracks.length; i++) wireTrack(v.textTracks[i]);
+    const onAddTrack = (e: Event) => {
+      const track = (e as TrackEvent).track;
+      if (track) wireTrack(track);
+      applyAll();
+    };
     const onMeta = () => applyAll();
     v.textTracks.addEventListener("addtrack", onAddTrack);
-    for (let i = 0; i < v.textTracks.length; i++) {
-      v.textTracks[i].addEventListener("cuechange", onCueChange);
-    }
     v.addEventListener("loadedmetadata", onMeta);
     v.addEventListener("resize", onMeta);
     const ro = new ResizeObserver(() => applyAll());
@@ -917,9 +986,7 @@ export function ChimpFlixPlayer({
     document.addEventListener("fullscreenchange", fsHandler);
     return () => {
       v.textTracks.removeEventListener("addtrack", onAddTrack);
-      for (let i = 0; i < v.textTracks.length; i++) {
-        v.textTracks[i].removeEventListener("cuechange", onCueChange);
-      }
+      wired.forEach((t) => t.removeEventListener("cuechange", onCueChange));
       v.removeEventListener("loadedmetadata", onMeta);
       v.removeEventListener("resize", onMeta);
       ro.disconnect();
@@ -937,6 +1004,15 @@ export function ChimpFlixPlayer({
   // WebVTT captions; CSS variables in here let `background-color`
   // and `color` be controlled live without re-mounting the
   // stylesheet.
+  // Validate a CSS color string before interpolating it into a style
+  // element. CSS.supports('color', v) is the canonical browser check;
+  // falls back to the supplied default on failure so a tampered server
+  // value can't break layout via CSS injection.
+  function safeColor(value: string, fallback: string): string {
+    if (typeof CSS !== "undefined" && CSS.supports("color", value)) return value;
+    return fallback;
+  }
+
   useEffect(() => {
     if (typeof document === "undefined") return;
     const STYLE_ID = "chimpflix-subtitle-style";
@@ -981,10 +1057,12 @@ export function ChimpFlixPlayer({
     // for the "default" choice, meaning "let the browser pick its caption
     // default" — emit no rule in that case so we don't override the UA.
     const family = cssFontFamilyForSubtitleStyle(subtitleStyle.fontFamily);
+    const safeBg = safeColor(subtitleStyle.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor);
+    const safeText = safeColor(subtitleStyle.textColor, DEFAULT_SUBTITLE_STYLE.textColor);
     const cssBlock = `
-      background: ${subtitleStyle.backgroundColor} !important;
-      background-color: ${subtitleStyle.backgroundColor} !important;
-      color: ${subtitleStyle.textColor} !important;
+      background: ${safeBg} !important;
+      background-color: ${safeBg} !important;
+      color: ${safeText} !important;
       font-size: ${subtitleStyle.fontSizePx}px !important;
       ${family ? `font-family: ${family} !important;` : ""}
       line-height: 1.25 !important;
@@ -1038,8 +1116,8 @@ export function ChimpFlixPlayer({
       document.head.appendChild(styleEl);
     }
     const fontSize = Math.max(8, Math.min(128, subtitleStyle.fontSizePx));
-    const bg = subtitleStyle.backgroundColor;
-    const color = subtitleStyle.textColor;
+    const bg = safeColor(subtitleStyle.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor);
+    const color = safeColor(subtitleStyle.textColor, DEFAULT_SUBTITLE_STYLE.textColor);
     const family = cssFontFamilyForSubtitleStyle(subtitleStyle.fontFamily);
     // Edge → CSS text-shadow. Outline = multi-direction tight shadow
     // (poor man's stroke; CSS doesn't have a real text-stroke that
@@ -1157,6 +1235,12 @@ export function ChimpFlixPlayer({
   const attemptPlay = useCallback(async () => {
     const v = videoRef.current;
     if (!v) return;
+    if (suppressAutoplayOnceRef.current) {
+      // Consumed once: the local session rebuilt on cast-end should come
+      // up paused, not auto-start.
+      suppressAutoplayOnceRef.current = false;
+      return;
+    }
     try {
       await v.play();
       setAutoplayBlocked(false);
@@ -1441,6 +1525,56 @@ export function ChimpFlixPlayer({
           ? resp.session.start_position_ms
           : 0;
 
+      // ---- Casting: hand this session to the RECEIVER, not the local
+      // <video>. While a Cast session is live the local element stays
+      // dark; a subtitle/audio/quality switch or an out-of-window seek
+      // re-runs this effect, builds a fresh transcode, and we load it
+      // onto the TV at the current position. Subs are burned in and
+      // audio/quality rebuild the transcode, so a reload is the only
+      // correct switch path (there is no cheap in-stream track edit).
+      // The initial cast (from the toolbar button) is handled separately
+      // by resolveCastMedia + the CastButton; this branch covers every
+      // change AFTER casting has started.
+      if (isCastingRef.current && castSourceRef.current) {
+        const src = castSourceRef.current;
+        // Receiver media-time of the current position: the new session's
+        // media-time 0 maps to source-time `sessionStartMsRef.current`,
+        // so the position to resume at is the delta (≈0 for a freshly
+        // rooted session; the offset from the encoder origin for an
+        // adopted find_compatible session; full position for direct play
+        // where the offset is 0).
+        const startMediaS = Math.max(
+          0,
+          (resumeMs - sessionStartMsRef.current) / 1000,
+        );
+        void (async () => {
+          let token: string;
+          try {
+            token = await ensureCastToken();
+          } catch (e) {
+            devWarn("[cast] token sign failed on session reload", e);
+            return;
+          }
+          if (cancelled) return;
+          const ok = await loadCastMedia({
+            url: buildCastUrl(src.url, token),
+            contentType: src.contentType,
+            title,
+            subtitle,
+            posterUrl: castPosterUrl,
+            mediaKind: episodeId != null ? "episode" : "movie",
+            seriesTitle: showTitle,
+            startTimeS: startMediaS,
+            durationS: src.durationS,
+          });
+          if (!ok && !cancelled) {
+            showNotice("Couldn't update the cast stream on your TV.");
+          }
+        })();
+        setLoading(false);
+        return;
+      }
+
       function applyResume() {
         if (!video) return;
         if (
@@ -1512,6 +1646,7 @@ export function ChimpFlixPlayer({
         // call attemptPlay() on a stale closure — visible in profilers
         // as a slow accumulation of detached HTMLVideoElement references.
         let warmupSafetyTimer: number | null = null;
+        let reconnectClearTimer: number | null = null;
         try {
           const HlsModule = (await import("hls.js")).default;
           if (cancelled) return;
@@ -1647,10 +1782,37 @@ export function ChimpFlixPlayer({
               const WARMUP_TARGET_SEC = 30;
               const WARMUP_TIMEOUT_MS = 45000;
               let started = false;
+              // Subtitle-readiness gate. When the user has a subtitle
+              // selected it arrives as an HLS subtitle rendition whose
+              // WebVTT sidecar the server extracts on demand — instant on
+              // a cache hit, a few seconds for an episode, longer for a
+              // big remux. Hold the first frame until hls.js has parsed
+              // that sidecar so playback doesn't start subtitle-less and
+              // then pop the text in a beat later. For a normal episode
+              // the sidecar is ready well before the 30s buffer target,
+              // so this adds no delay; the WARMUP_TIMEOUT_MS safety cap
+              // means a pathologically slow extraction falls through to
+              // play rather than hanging the start forever.
+              const expectsSubs = !!(
+                hls.subtitleTracks && hls.subtitleTracks.length > 0
+              );
+              let subsReady = !expectsSubs;
+              // Belt-and-suspenders for the cache-hit race where the
+              // sidecar was parsed before our listener attached: any text
+              // track carrying cues means subs are already in hand.
+              const subsHaveCues = (): boolean => {
+                const tts = video.textTracks;
+                for (let i = 0; i < tts.length; i++) {
+                  const c = tts[i].cues;
+                  if (c && c.length > 0) return true;
+                }
+                return false;
+              };
               const start = () => {
                 if (started) return;
                 started = true;
                 hls.off(HlsModule.Events.FRAG_BUFFERED, onFrag);
+                hls.off(HlsModule.Events.SUBTITLE_FRAG_PROCESSED, onSubFrag);
                 if (warmupSafetyTimer !== null) {
                   window.clearTimeout(warmupSafetyTimer);
                   warmupSafetyTimer = null;
@@ -1676,16 +1838,26 @@ export function ChimpFlixPlayer({
                 }
                 return 0;
               };
-              const onFrag = () => {
-                if (video.buffered.length === 0) return;
-                if (
-                  aheadFromCurrent() >= WARMUP_TARGET_SEC &&
-                  video.readyState >= 3 /* HAVE_FUTURE_DATA */
-                ) {
-                  start();
-                }
+              const bufferReady = (): boolean =>
+                video.buffered.length > 0 &&
+                aheadFromCurrent() >= WARMUP_TARGET_SEC &&
+                video.readyState >= 3; /* HAVE_FUTURE_DATA */
+              // Start once BOTH the forward buffer and (if applicable) the
+              // subtitle sidecar are ready. Called from every fragment-
+              // buffered tick and when the sidecar finishes parsing.
+              const maybeStart = () => {
+                if (!subsReady && !subsHaveCues()) return;
+                if (bufferReady()) start();
+              };
+              const onFrag = () => maybeStart();
+              const onSubFrag = () => {
+                subsReady = true;
+                maybeStart();
               };
               hls.on(HlsModule.Events.FRAG_BUFFERED, onFrag);
+              if (expectsSubs && HlsModule.Events.SUBTITLE_FRAG_PROCESSED) {
+                hls.on(HlsModule.Events.SUBTITLE_FRAG_PROCESSED, onSubFrag);
+              }
               warmupSafetyTimer = window.setTimeout(start, WARMUP_TIMEOUT_MS);
             });
             // Fatal-error recovery: HLS.js docs recommend trying
@@ -1711,7 +1883,8 @@ export function ChimpFlixPlayer({
                   hls.startLoad();
                   // Clear the reconnecting overlay after a beat; if
                   // the error returns we'll flip it back on.
-                  window.setTimeout(() => setReconnecting(false), 1500);
+                  if (reconnectClearTimer !== null) window.clearTimeout(reconnectClearTimer);
+                  reconnectClearTimer = window.setTimeout(() => { reconnectClearTimer = null; setReconnecting(false); }, 1500);
                   return;
                 case HlsModule.ErrorTypes.MEDIA_ERROR:
                   if (mediaRecoveryAttempts < MAX_MEDIA_RECOVERY) {
@@ -1723,7 +1896,8 @@ export function ChimpFlixPlayer({
                       hls.swapAudioCodec();
                     }
                     hls.recoverMediaError();
-                    window.setTimeout(() => setReconnecting(false), 1500);
+                    if (reconnectClearTimer !== null) window.clearTimeout(reconnectClearTimer);
+                    reconnectClearTimer = window.setTimeout(() => { reconnectClearTimer = null; setReconnecting(false); }, 1500);
                     return;
                   }
                   break;
@@ -1740,6 +1914,10 @@ export function ChimpFlixPlayer({
               if (warmupSafetyTimer !== null) {
                 window.clearTimeout(warmupSafetyTimer);
                 warmupSafetyTimer = null;
+              }
+              if (reconnectClearTimer !== null) {
+                window.clearTimeout(reconnectClearTimer);
+                reconnectClearTimer = null;
               }
               hls.destroy();
               // Firefox holds onto the MediaSource and SourceBuffers
@@ -1978,6 +2156,15 @@ export function ChimpFlixPlayer({
       setBufferedEnd(end + sessionStartMsRef.current / 1000);
     };
     const onPlay = () => {
+      // Catch-all: while casting the local element must stay dark. If
+      // anything starts it (autoplay on a re-roll, recovery kick, canplay
+      // refire, PiP exit), re-pause immediately so audio never plays
+      // under the cast remote. This backstops the cast-start pause +
+      // per-caller guards.
+      if (isCastingRef.current) {
+        video.pause();
+        return;
+      }
       setPlaying(true);
       setAutoplayBlocked(false);
     };
@@ -1988,7 +2175,9 @@ export function ChimpFlixPlayer({
       // Only auto-(re)start if the user hasn't deliberately paused.
       // `canplay` re-fires on its own after buffer refills / recovery /
       // refocus; without this guard each refire resumes a paused video.
-      if (video.paused && !autoplayBlocked && !userPausedRef.current) {
+      // Read via ref so autoplayBlocked doesn't sit in the outer effect's
+      // deps and trigger a full listener teardown on every block/unblock.
+      if (video.paused && !autoplayBlockedRef.current && !userPausedRef.current) {
         attemptPlay();
       }
     };
@@ -2065,7 +2254,7 @@ export function ChimpFlixPlayer({
       video.removeEventListener("volumechange", onVolumeChange);
       video.removeEventListener("error", onMediaError);
     };
-  }, [attemptPlay, autoplayBlocked, durationMs]);
+  }, [attemptPlay, durationMs]);
 
   // Stall-recovery watchdog. Two paths to detect a stall:
   //   1. `waiting` event — the browser tells us directly that playback
@@ -2327,6 +2516,11 @@ export function ChimpFlixPlayer({
   useEffect(() => {
     if (typeof navigator === "undefined") return;
     if (!("mediaSession" in navigator)) return;
+    // While casting, CastDock owns the media session (its metadata +
+    // action handlers drive the receiver, and it stays mounted app-wide).
+    // Yield so we don't fight it; on cast-end this effect re-runs
+    // (isCasting dep) and reclaims the local lock-screen controls.
+    if (isCasting) return;
     const ms = navigator.mediaSession;
     const v = videoRef.current;
     if (!v) return;
@@ -2368,7 +2562,7 @@ export function ChimpFlixPlayer({
         // ignore
       }
     };
-  }, [title, subtitle]);
+  }, [title, subtitle, isCasting]);
 
   // Persist play position + run the watched-threshold scrobble for a
   // given SOURCE-time position. Extracted so the local <video> reporter
@@ -2511,6 +2705,7 @@ export function ChimpFlixPlayer({
     if (itemId == null && episodeId == null) return;
     let snap: RemotePlaybackState | null = null;
     let lastGoodMs: number | null = null;
+    let lastWasPlaying = true;
     const unsub = subscribeRemotePlayback((s) => {
       snap = s;
     });
@@ -2524,7 +2719,9 @@ export function ChimpFlixPlayer({
       if (!snap || !snap.isMediaLoaded || !(snap.currentTimeS > 0)) return;
       const ms = Math.floor(snap.currentTimeS * 1000 + offsetMs());
       lastGoodMs = ms;
-      reportProgress(ms, !snap.isPaused);
+      lastCastSourceMsRef.current = ms;
+      lastWasPlaying = !snap.isPaused;
+      reportProgress(ms, lastWasPlaying);
     };
     const interval = window.setInterval(tick, PLAY_STATE_INTERVAL_MS);
     return () => {
@@ -2532,7 +2729,7 @@ export function ChimpFlixPlayer({
       unsub();
       // Persist the last known-good position (not the zeroed teardown
       // snapshot) so ending the cast resumes where the TV stopped.
-      if (lastGoodMs != null) reportProgress(lastGoodMs, true);
+      if (lastGoodMs != null) reportProgress(lastGoodMs, lastWasPlaying);
     };
   }, [isCasting, itemId, episodeId, reportProgress]);
 
@@ -2666,6 +2863,13 @@ export function ChimpFlixPlayer({
 
   // Imperative controls.
   const togglePlay = useCallback(() => {
+    if (isCastingRef.current) {
+      // Drive the receiver, not the (paused) local element. playOrPause
+      // flips based on the TV's actual state, so it's correct even if a
+      // second sender / TV remote changed it.
+      castPlayPause();
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) {
@@ -2723,9 +2927,26 @@ export function ChimpFlixPlayer({
   // single NaN propagating into a `setCurrentTime`/`seekTo` chain
   // would land the player at an undefined position.
   const seekTo = useCallback((time: number) => {
+    if (!Number.isFinite(time) || time < 0) return;
+    if (isCastingRef.current) {
+      // Casting: seek the RECEIVER. Convert source-time → the receiver's
+      // media-time (source minus the session's encode-start offset).
+      // In-window → a RemotePlayerController seek (instant). A target
+      // before the session's encode origin isn't in the receiver's
+      // manifest, so rebuild the transcode there and reload it onto the
+      // TV — mirroring the local out-of-window restart path.
+      const sessionStartSec = sessionStartMsRef.current / 1000;
+      const mediaTarget = time - sessionStartSec;
+      if (mediaTarget < 0) {
+        triggerSessionRestart(time);
+      } else {
+        castSeekToMediaTime(mediaTarget);
+      }
+      liveTimeMsRef.current = Math.floor(time * 1000);
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
-    if (!Number.isFinite(time) || time < 0) return;
     const sessionStartSec = sessionStartMsRef.current / 1000;
     const offsetSec = time - sessionStartSec;
     if (offsetSec < 0) {
@@ -2773,6 +2994,16 @@ export function ChimpFlixPlayer({
 
   const seekBy = useCallback(
     (delta: number) => {
+      if (isCastingRef.current) {
+        // Source-time of the receiver's current position = its media-time
+        // plus the session start offset. seekTo then re-converts and
+        // drives the TV.
+        const snap = getRemoteSnapshot();
+        const srcTimeSec =
+          snap.currentTimeS + sessionStartMsRef.current / 1000;
+        seekTo(srcTimeSec + delta);
+        return;
+      }
       const v = videoRef.current;
       if (!v) return;
       const cur = v.currentTime;
@@ -2805,11 +3036,18 @@ export function ChimpFlixPlayer({
   // (150ms × small closure), but inconsistent with how the other
   // player timers are managed.
   const suppressClearTimerRef = useRef<number | null>(null);
+  // Tracks the 650ms auto-clear timer for the seek-flash animation.
+  // Cancelled on unmount to avoid calling setSeekFlash on a dead component.
+  const seekFlashTimerRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
       if (suppressClearTimerRef.current !== null) {
         window.clearTimeout(suppressClearTimerRef.current);
         suppressClearTimerRef.current = null;
+      }
+      if (seekFlashTimerRef.current !== null) {
+        window.clearTimeout(seekFlashTimerRef.current);
+        seekFlashTimerRef.current = null;
       }
     };
   }, []);
@@ -2878,9 +3116,11 @@ export function ChimpFlixPlayer({
         });
         // Auto-clear the flash after the animation finishes so a
         // re-tap of the same side fires a fresh animation rather than
-        // continuing the previous one.
+        // continuing the previous one. Tracked so unmount can cancel it.
         const myNonce = seekFlashIdRef.current;
-        window.setTimeout(() => {
+        if (seekFlashTimerRef.current !== null) window.clearTimeout(seekFlashTimerRef.current);
+        seekFlashTimerRef.current = window.setTimeout(() => {
+          seekFlashTimerRef.current = null;
           setSeekFlash((cur) => (cur?.nonce === myNonce ? null : cur));
         }, 650);
         lastTapRef.current = null;
@@ -2942,11 +3182,7 @@ export function ChimpFlixPlayer({
       for (let i = 0; i < v.buffered.length; i++) {
         bufferedEndSec = Math.max(bufferedEndSec, v.buffered.end(i));
       }
-      if (
-        targetHlsSec >= 0 &&
-        targetHlsSec <= bufferedEndSec &&
-        targetHlsSec >= 0
-      ) {
+      if (targetHlsSec >= 0 && targetHlsSec <= bufferedEndSec) {
         return;
       }
       const livePrefs = getPrefs();
@@ -3019,6 +3255,10 @@ export function ChimpFlixPlayer({
   }, [activeMarkerOverlay, prefs.autoSkipIntro, seekTo]);
 
   const toggleMute = useCallback(() => {
+    if (isCastingRef.current) {
+      castToggleMute();
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     v.muted = !v.muted;
@@ -3062,28 +3302,30 @@ export function ChimpFlixPlayer({
     if (!source) return null;
     let token: string;
     try {
-      const resp = await castApi.sign();
-      token = resp.token;
+      token = await ensureCastToken();
     } catch (e) {
       devWarn("[cast] sign request failed", e);
       return null;
     }
     const url = buildCastUrl(source.url, token);
-    // Hand the receiver wall-clock source-time, not HLS media-time
-    // — for a transcode session the latter starts at 0 even when we
-    // joined mid-file, and we want the receiver to land where the
-    // user was watching on screen.
-    const liveS = (videoRef.current?.currentTime ?? 0) +
-      sessionStartMsRef.current / 1000;
+    // `LoadRequest.currentTime` is RECEIVER MEDIA-time. Our transcoder
+    // zeroes HLS PTS (`setpts=PTS-STARTPTS`), so media-time 0 is the
+    // session's encode start and the local element's `currentTime` IS
+    // that media-time. Pass it directly — adding `sessionStartMs`
+    // (source-time) would over-seek a resumed cast by the session offset.
+    const mediaS = videoRef.current?.currentTime ?? 0;
     return {
       url,
       contentType: source.contentType,
       title,
       subtitle,
-      startTimeS: Number.isFinite(liveS) ? liveS : undefined,
+      posterUrl: castPosterUrl,
+      mediaKind: episodeId != null ? "episode" : "movie",
+      seriesTitle: showTitle,
+      startTimeS: Number.isFinite(mediaS) ? Math.max(0, mediaS) : undefined,
       durationS: source.durationS,
     };
-  }, [title, subtitle]);
+  }, [title, subtitle, castPosterUrl, episodeId, showTitle]);
 
   // Pause local playback the moment a cast session goes live. We
   // do *not* auto-resume on disconnect — a user who ended their
@@ -3094,16 +3336,37 @@ export function ChimpFlixPlayer({
   // the UI down without a dedicated callback.
   const wasCastingRef = useRef(false);
   useEffect(() => {
-    if (isCasting && !wasCastingRef.current) {
+    isCastingRef.current = isCasting;
+    if (isCasting) {
+      // Pause the local element on cast-start. The catch-all guard in the
+      // `onPlay` listener re-pauses if anything (autoplay on a session
+      // re-roll, stall-recovery kick, canplay refire, PiP exit) tries to
+      // restart it while casting — so audio never plays under the remote.
       wasCastingRef.current = true;
       const v = videoRef.current;
       if (v && !v.paused) v.pause();
-    } else if (!isCasting && wasCastingRef.current) {
+    } else if (wasCastingRef.current) {
       wasCastingRef.current = false;
+      // Cast ended (user stopped, or receiver-side disconnect). Rebuild a
+      // fresh local session at the TV's last position so resuming locally
+      // works — a track switch during the cast left the local element on
+      // a deleted session — and lands where the user was watching rather
+      // than the stale cast-start point. Kept paused (suppress autoplay +
+      // mark user-paused) so it doesn't surprise someone who walked away.
+      const resumeMs = lastCastSourceMsRef.current;
+      if (resumeMs != null && resumeMs > 0) {
+        userPausedRef.current = true;
+        suppressAutoplayOnceRef.current = true;
+        liveTimeMsRef.current = resumeMs;
+        triggerSessionRestart(resumeMs / 1000);
+      }
     }
-  }, [isCasting]);
+  }, [isCasting, triggerSessionRestart]);
 
   const togglePip = useCallback(() => {
+    // PiP of the paused, dark local element while casting is meaningless
+    // — the picture is on the TV. No-op rather than pop a blank PiP.
+    if (isCastingRef.current) return;
     const v = videoRef.current;
     if (!v) return;
     // PiP can be force-disabled per-element by extensions / a11y tools.
@@ -3205,9 +3468,15 @@ export function ChimpFlixPlayer({
   }, [subtitleSel, externalSubUrl, activeSubtitleTracks, selectSubtitle]);
 
   const setVolumeValue = useCallback((value: number) => {
+    const clamped = Math.max(0, Math.min(1, value));
+    if (isCastingRef.current) {
+      // Drive the receiver's volume; leave the local element + saved
+      // volume preference untouched (the TV's level is its own thing).
+      castSetVolume(clamped);
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
-    const clamped = Math.max(0, Math.min(1, value));
     v.volume = clamped;
     const wasMuted = v.muted;
     if (clamped > 0 && wasMuted) v.muted = false;
@@ -3218,12 +3487,76 @@ export function ChimpFlixPlayer({
   }, []);
 
   const setSpeed = useCallback((rate: number) => {
+    if (isCastingRef.current) {
+      // Playback speed isn't exposed by the Chromecast media protocol
+      // (RemotePlayerController has no rate control, and the stock
+      // receiver ignores it). Supporting it would need a custom
+      // SET_PLAYBACK_RATE message in our receiver — deferred — so we tell
+      // the user rather than silently no-op the local element.
+      showNotice("Playback speed isn't available while casting");
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     v.playbackRate = rate;
     setPlaybackRate(rate);
     updatePrefs({ playbackRate: rate });
-  }, []);
+  }, [showNotice]);
+
+  // Publish the active track/quality controls to the app-wide cast
+  // surface while casting, so the mini/expanded controller can switch
+  // subtitles, audio, and quality. Each switch sets player state, which
+  // re-runs the session effect; its cast branch rebuilds the transcode
+  // and reloads it on the receiver at the current position. Cleared when
+  // not casting / on unmount, leaving a transport-only remote.
+  useEffect(() => {
+    if (!isCasting) {
+      setCastTrackController(null);
+      return;
+    }
+    const audio: CastTrackOption[] = activeAudioTracks.map((t) => ({
+      label: t.label,
+      active: audioSel === t.idx,
+      onSelect: () => selectAudio(t.idx),
+    }));
+    // "Off" + embedded burn-in tracks only. External (<track>) subtitles
+    // are local-only — the receiver plays burned-in HLS — so they're
+    // omitted from the cast menu.
+    const subtitle: CastTrackOption[] = [
+      {
+        label: "Off",
+        active:
+          externalSubUrl === null &&
+          (subtitleSel === null || subtitleSel === undefined),
+        onSelect: () => selectSubtitle(null),
+      },
+      ...activeSubtitleTracks
+        .filter((t) => !t.externalUrl)
+        .map((t) => ({
+          label: t.label,
+          active: externalSubUrl === null && subtitleSel === t.idx,
+          onSelect: () => selectSubtitle(t),
+        })),
+    ];
+    const quality: CastTrackOption[] = QUALITY_OPTIONS.map((q) => ({
+      label: q.label,
+      active: qualitySel.height === q.height,
+      onSelect: () => setQualitySel(q),
+    }));
+    setCastTrackController({ audio, subtitle, quality, busy: loading });
+    return () => setCastTrackController(null);
+  }, [
+    isCasting,
+    activeAudioTracks,
+    activeSubtitleTracks,
+    audioSel,
+    subtitleSel,
+    externalSubUrl,
+    qualitySel,
+    loading,
+    selectAudio,
+    selectSubtitle,
+  ]);
 
   // Keyboard shortcuts.
   useEffect(() => {
@@ -3430,7 +3763,26 @@ export function ChimpFlixPlayer({
       {loading && !error && !autoplayBlocked && <LoadingSpinner />}
       {autoplayBlocked && !error && <BigPlayButton onClick={attemptPlay} />}
       {reconnecting && !error && <ReconnectingOverlay />}
-      {isCasting && !error && <CastingOverlay title={title} />}
+      {isCasting && !error && (
+        <div className="absolute inset-0 z-30">
+          {/* The connected-cast remote replaces the local frame: artwork,
+              a scrub bar bound to the TV, transport, volume, and the
+              track/quality menus — all driving the receiver. */}
+          <CastRemote variant="embedded" />
+          {/* Always-visible exit. Leaving the player keeps the cast going
+              and drops to the app-wide mini-controller (CastDock). Lives
+              above the remote and never auto-hides — the fix for "the
+              overlay couldn't be dismissed". */}
+          <Link
+            href={backHref}
+            aria-label="Back"
+            className="absolute left-3 top-[max(0.75rem,env(safe-area-inset-top))] z-10 flex items-center gap-2 rounded-full bg-black/40 p-2 text-white/85 backdrop-blur transition-colors hover:text-white sm:left-6"
+          >
+            <BackIcon />
+            <span className="hidden text-sm font-medium sm:inline">Back</span>
+          </Link>
+        </div>
+      )}
       {notice && !error && (
         <div
           role="status"
@@ -3562,6 +3914,7 @@ export function ChimpFlixPlayer({
               <CastButton
                 videoRef={videoRef}
                 resolveMedia={resolveCastMedia}
+                onNotice={showNotice}
               />
             </div>
           </div>
@@ -4541,6 +4894,19 @@ function VolumeControl({
   const [hovered, setHovered] = useState(false);
   const trackRef = useRef<HTMLDivElement>(null);
   const effectiveVolume = muted ? 0 : volume;
+  // Refs to active drag listeners so the cleanup effect can remove them
+  // if the component unmounts while a drag is still in progress.
+  const dragMoveRef = useRef<((e: PointerEvent) => void) | null>(null);
+  const dragUpRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (dragMoveRef.current)
+        window.removeEventListener("pointermove", dragMoveRef.current);
+      if (dragUpRef.current)
+        window.removeEventListener("pointerup", dragUpRef.current);
+    };
+  }, []);
 
   function pointToVolume(clientX: number): number {
     const track = trackRef.current;
@@ -4557,7 +4923,11 @@ function VolumeControl({
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      dragMoveRef.current = null;
+      dragUpRef.current = null;
     };
+    dragMoveRef.current = onMove;
+    dragUpRef.current = onUp;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -4730,6 +5100,8 @@ function EpisodesControl({
   } | null>(null);
   const [loadingSeason, setLoadingSeason] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Monotonic counter to discard results from superseded season fetches.
+  const seasonReqIdRef = useRef(0);
 
   const viewSeasonId = override?.seasonId ?? currentSeasonId;
   const viewEpisodes = override?.episodes ?? episodes;
@@ -4763,9 +5135,14 @@ function EpisodesControl({
   }, [open, handleClose, pickerOpen]);
 
   async function switchSeason(seasonId: number) {
+    // Stamp this request so a stale response from a previous season
+    // fetch doesn't overwrite the result of the most-recent click.
+    const reqId = ++seasonReqIdRef.current;
     setLoadingSeason(true);
     try {
       const season = await seasonsApi.get(seasonId);
+      // Discard if another season was requested while this one was in flight.
+      if (reqId !== seasonReqIdRef.current) return;
       const mapped: EpisodeSibling[] = season.episodes.map((e) => ({
         ratingKey: `e${e.id}`,
         title: e.title,
@@ -4776,6 +5153,9 @@ function EpisodesControl({
         viewOffset: e.play_state?.max_position_ms,
         index: e.episode_number,
         parentTitle: `Season ${e.season_number}`,
+        // Placeholder (undownloaded) rows render non-playable in the
+        // picker — backend `has_file` defaults true when absent.
+        hasFile: e.has_file !== false,
       }));
       setOverride({
         seasonId,
@@ -4787,7 +5167,8 @@ function EpisodesControl({
       // Best-effort — leave the existing pane in place if the season
       // fetch fails so the user isn't stuck in a half-loaded picker.
     } finally {
-      setLoadingSeason(false);
+      // Only clear the loading spinner for the active request.
+      if (reqId === seasonReqIdRef.current) setLoadingSeason(false);
     }
   }
 
@@ -4963,6 +5344,35 @@ function EpisodeRow({
     episode.viewOffset && episode.duration
       ? Math.min(100, (episode.viewOffset / episode.duration) * 100)
       : null;
+
+  // A PLACEHOLDER episode (metadata-agent row with no downloaded file)
+  // can't be streamed, so it renders as a muted, non-navigable strip —
+  // no Link, no onClose, no play affordance. The viewer still sees the
+  // full season for context (Netflix-style "coming up") but can't jump
+  // to an episode that has no file behind it. `hasFile` defaults to a
+  // real file when absent, so downloaded episodes are never muted.
+  if (episode.hasFile === false) {
+    return (
+      <li>
+        <div
+          aria-disabled="true"
+          className="flex cursor-default items-center gap-3 border-b border-white/5 px-4 py-2.5 opacity-45 last:border-b-0"
+        >
+          {episode.index !== undefined && (
+            <span className="w-6 shrink-0 text-sm font-semibold tabular-nums text-white/50">
+              {episode.index}
+            </span>
+          )}
+          <span className="line-clamp-1 flex-1 text-sm text-white/60">
+            {episode.title}
+          </span>
+          <span className="shrink-0 text-[0.65rem] font-medium uppercase tracking-wide text-white/40">
+            Not downloaded
+          </span>
+        </div>
+      </li>
+    );
+  }
 
   // Netflix's pattern: the row the viewer is *on* gets the rich
   // thumbnail-plus-synopsis treatment; every other row is a compact
@@ -5160,44 +5570,6 @@ function ReconnectingOverlay() {
       <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/75 px-3 py-1.5 text-xs font-medium text-white/85 shadow-lg backdrop-blur-sm">
         <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-(--color-accent)" />
         Reconnecting…
-      </div>
-    </div>
-  );
-}
-
-/// Shown over the local frame while a Cast session is active. The
-/// receiver paints the video on the TV; locally we go dark so the
-/// laptop screen doesn't double-render and waste battery. The "Stop
-/// casting" button on the toolbar (`CastButton` in connected state)
-/// is how the user comes back.
-function CastingOverlay({ title }: { title: string }) {
-  return (
-    <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/85 text-center text-white">
-      <svg
-        width="64"
-        height="64"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-(--color-accent)"
-        aria-hidden
-      >
-        <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
-        <path d="M2 12a8 8 0 0 1 8 8" />
-        <path d="M2 16a4 4 0 0 1 4 4" />
-        <circle cx="3" cy="20" r="1.2" fill="currentColor" stroke="none" />
-      </svg>
-      <div className="mt-6 text-sm tracking-wide text-white/55 uppercase">
-        Casting
-      </div>
-      <div className="mt-1 max-w-md truncate text-2xl font-semibold">
-        {title}
-      </div>
-      <div className="mt-4 text-xs text-white/40">
-        Use the toolbar button to stop casting.
       </div>
     </div>
   );
@@ -5558,6 +5930,10 @@ function ProgressBar({
   // would session-restart on every micromove past the buffer.
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const hintTimerRef = useRef<number | null>(null);
+  // Refs to active drag listeners so the cleanup effect can remove them
+  // if the component unmounts while a scrub drag is still in progress.
+  const scrubMoveRef = useRef<((e: PointerEvent) => void) | null>(null);
+  const scrubUpRef = useRef<(() => void) | null>(null);
   // Mirrored width of the progress track. Read during render to map
   // `hoverX` → time; updated by a ResizeObserver. Storing in state
   // (vs. reading trackRef.current.getBoundingClientRect() at render
@@ -5574,6 +5950,17 @@ function ProgressBar({
     });
     ro.observe(node);
     return () => ro.disconnect();
+  }, []);
+
+  // Cancel any in-progress scrub drag on unmount so the global
+  // pointermove/pointerup listeners don't outlive the component.
+  useEffect(() => {
+    return () => {
+      if (scrubMoveRef.current)
+        window.removeEventListener("pointermove", scrubMoveRef.current);
+      if (scrubUpRef.current)
+        window.removeEventListener("pointerup", scrubUpRef.current);
+    };
   }, []);
 
   const pointToTime = useCallback(
@@ -5627,12 +6014,16 @@ function ProgressBar({
       }
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      scrubMoveRef.current = null;
+      scrubUpRef.current = null;
       // Commit ONCE at release — `seekTo` either does a native
       // currentTime jump (if buffered) or tears down + restarts the
       // session at this position. No more multi-restart cascade
       // from intermediate drag positions.
       onSeek(lastT);
     };
+    scrubMoveRef.current = onMove;
+    scrubUpRef.current = onUp;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };

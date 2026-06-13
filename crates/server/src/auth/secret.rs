@@ -37,6 +37,13 @@ pub async fn load_or_migrate(pool: &SqlitePool, vault: &Vault, data_dir: &Path) 
         if !trimmed.is_empty() {
             let bytes = decode_secret_hex(trimmed).context("SESSION_SECRET")?;
             queries::vault_set(pool, vault, VAULT_KEY, trimmed, None).await?;
+            // Scrub the secret from the process environment so it is not visible
+            // in /proc/<pid>/environ or inherited by subprocesses.  remove_var is
+            // not thread-safe in general, but load_or_migrate runs at startup
+            // before the server begins accepting connections, so this is safe.
+            // SAFETY: single-threaded startup path; no concurrent env reads.
+            #[allow(unused_unsafe)]
+            unsafe { std::env::remove_var("SESSION_SECRET") };
             info!("imported SESSION_SECRET from env into credential vault");
             return Ok(bytes);
         }

@@ -94,8 +94,11 @@ fn is_unsafe_ip(ip: IpAddr) -> bool {
             if (v6.segments()[0] & 0xFE00) == 0xFC00 {
                 return true;
             }
-            // Mapped IPv4 — extract and re-check.
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // Mapped IPv4 (::ffff:x.y.z.w) and deprecated IPv4-compatible
+            // (::x.y.z.w) — `to_ipv4()` covers both forms; `to_ipv4_mapped()`
+            // only covers the ::ffff: variant and would miss ::127.0.0.1 etc.
+            #[allow(deprecated)]
+            if let Some(v4) = v6.to_ipv4() {
                 return is_unsafe_v4(v4);
             }
             false
@@ -197,5 +200,16 @@ mod tests {
             let v4: Ipv4Addr = ip.parse().unwrap();
             assert!(!is_unsafe_v4(v4), "{ip} should be allowed");
         }
+    }
+
+    #[test]
+    fn rejects_ipv4_compatible_v6() {
+        use std::net::Ipv6Addr;
+        // ::127.0.0.1 — deprecated IPv4-compatible form; must be blocked.
+        let compat_loopback: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001));
+        assert!(is_unsafe_ip(compat_loopback), "::127.0.0.1 should be blocked");
+        // ::10.0.0.1 — private range via IPv4-compatible form.
+        let compat_private: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001));
+        assert!(is_unsafe_ip(compat_private), "::10.0.0.1 should be blocked");
     }
 }

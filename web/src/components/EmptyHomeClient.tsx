@@ -102,7 +102,7 @@ function ScanningLibraries({
         <span>This page auto-refreshes — no need to reload.</span>
         {isAdmin && (
           <Link
-            href="/settings/admin/library/libraries"
+            href="/settings/admin/libraries"
             className="text-white/75 underline-offset-2 hover:text-white hover:underline"
           >
             Manage libraries →

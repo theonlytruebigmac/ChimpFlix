@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import {
@@ -15,6 +15,11 @@ interface CounterTile {
   category: LibraryHealthCategory;
   label: string;
   value: number;
+  /// SVG path(s) for the `cf-stat-ico` glyph.
+  icon: ReactNode;
+  /// Tone applied when the counter is non-zero (a problem to look at).
+  /// Zero always renders green regardless of this.
+  tone: "amber" | "blue" | "red";
   /// Drives the drill-in modal's title + the hint copy at the top of
   /// the list so each pathology has its own short explanation.
   hint: string;
@@ -30,6 +35,13 @@ export function AdminLibraryHealthClient({
       category: "no_files",
       label: "Items without files",
       value: report.items_without_files,
+      tone: "amber",
+      icon: (
+        <>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M7 4v16M17 4v16M3 9h4M17 9h4M3 15h4M17 15h4" />
+        </>
+      ),
       hint:
         "Movie items whose media_files row was removed (e.g. the file was unmounted or deleted). Re-scan the library, or delete the item if the source is gone for good.",
     },
@@ -37,6 +49,13 @@ export function AdminLibraryHealthClient({
       category: "no_metadata",
       label: "Items missing every metadata id",
       value: report.items_without_metadata,
+      tone: "amber",
+      icon: (
+        <>
+          <circle cx="8" cy="14" r="4" />
+          <path d="M11 11l9-9M17 5l2 2M14 8l2 2" />
+        </>
+      ),
       hint:
         "Items the scanner couldn't match to TMDB/IMDb/TVDB/AniList. Open the item modal and use Fix Match to point it at the right entry.",
     },
@@ -44,6 +63,13 @@ export function AdminLibraryHealthClient({
       category: "no_poster",
       label: "Items without a poster",
       value: report.items_without_poster,
+      tone: "amber",
+      icon: (
+        <>
+          <rect x="4" y="3" width="16" height="18" rx="2" />
+          <path d="M4 15l4-4 4 4 3-3 5 5" />
+        </>
+      ),
       hint:
         "Items with no poster image cached. Usually metadata-related — Fix Match or Refresh Metadata typically resolves these.",
     },
@@ -51,6 +77,14 @@ export function AdminLibraryHealthClient({
       category: "no_backdrop",
       label: "Items without a backdrop",
       value: report.items_without_backdrop,
+      tone: "blue",
+      icon: (
+        <>
+          <rect x="3" y="5" width="18" height="14" rx="2" />
+          <path d="M3 15l5-5 4 4 3-3 6 6" />
+          <circle cx="8" cy="9" r="1.5" />
+        </>
+      ),
       hint:
         "Items with no backdrop image cached. Same fix as missing posters; some niche titles genuinely don't ship a backdrop on TMDB.",
     },
@@ -58,6 +92,13 @@ export function AdminLibraryHealthClient({
       category: "orphan_episodes",
       label: "Orphan episodes (no file)",
       value: report.orphan_episodes,
+      tone: "amber",
+      icon: (
+        <>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M7 4v16M17 4v16M3 9h4M17 9h4M3 15h4M17 15h4" />
+        </>
+      ),
       hint:
         "Episodes that exist in metadata but have no media file on disk. Either the file is missing or the scanner didn't bind it — re-scan the show, or accept the gap.",
     },
@@ -65,6 +106,13 @@ export function AdminLibraryHealthClient({
       category: "orphan_media_files",
       label: "Orphan media files (no item/episode)",
       value: report.orphan_media_files,
+      tone: "red",
+      icon: (
+        <>
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+          <path d="M12 17v.5" />
+        </>
+      ),
       hint:
         "Files the scanner couldn't bind to any item or episode. Usually a naming mismatch — rename the file to match the show's folder structure and re-scan.",
     },
@@ -73,104 +121,135 @@ export function AdminLibraryHealthClient({
   const [drill, setDrill] = useState<CounterTile | null>(null);
 
   return (
-    <div className="space-y-6">
-      <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {tiles.map((c) => (
-          <button
-            key={c.category}
-            type="button"
-            onClick={() => c.value > 0 && setDrill(c)}
-            disabled={c.value === 0}
-            className={`rounded-lg border p-4 text-left transition-colors ${
-              c.value === 0
-                ? "cursor-default border-white/10 bg-white/2"
-                : "cursor-pointer border-white/10 bg-white/2 hover:border-white/25 hover:bg-white/5"
-            }`}
-          >
-            <div className="flex items-baseline justify-between gap-2">
-              <span className="text-xs uppercase tracking-wider text-white/50">
-                {c.label}
-              </span>
-              {c.value > 0 && (
-                <span className="text-[10px] uppercase tracking-wider text-white/35">
-                  click →
-                </span>
-              )}
-            </div>
-            <div
-              className={`mt-2 text-3xl font-bold ${
-                c.value === 0 ? "text-emerald-300" : "text-amber-300"
-              }`}
+    <div className="cf-grid" style={{ gridTemplateColumns: "1fr", gap: 24 }}>
+      <div className="cf-grid cf-c3">
+        {tiles.map((c) => {
+          const tone = c.value === 0 ? "green" : c.tone;
+          return (
+            <button
+              key={c.category}
+              type="button"
+              onClick={() => c.value > 0 && setDrill(c)}
+              disabled={c.value === 0}
+              className={`cf-stat cf-tone-${tone}`}
+              style={{
+                textAlign: "left",
+                cursor: c.value === 0 ? "default" : "pointer",
+                appearance: "none",
+              }}
             >
-              {c.value.toLocaleString()}
-            </div>
-          </button>
-        ))}
-      </section>
+              <div className="cf-stat-top">
+                <span className="cf-stat-ico">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    {c.icon}
+                  </svg>
+                </span>
+                {c.label}
+              </div>
+              <div className="cf-stat-val">{c.value.toLocaleString()}</div>
+              {c.value > 0 && <div className="cf-stat-meta">view →</div>}
+            </button>
+          );
+        })}
+      </div>
 
-      <section className="rounded-lg border border-white/10 bg-white/2 p-5">
-        <h2 className="text-lg font-semibold">
-          Missing files on disk ({report.missing_files.length})
-        </h2>
-        <p className="mt-1 text-xs text-white/50">
-          Sample of media file rows whose path no longer exists. The full
-          scrub-and-fix workflow belongs to a maintenance task; this is a
-          preview limited to the 50 most recent matches.
-        </p>
-        {report.missing_files.length === 0 ? (
-          <p className="mt-3 text-sm text-emerald-300">
-            No missing files detected in the sample.
-          </p>
-        ) : (
-          <ul className="mt-3 space-y-1 text-xs">
-            {report.missing_files.map((m) => (
-              <li
-                key={m.id}
-                className="flex items-baseline gap-3 border-b border-white/5 py-1.5 last:border-b-0"
-              >
-                <span className="w-12 shrink-0 font-mono text-white/40">
-                  #{m.id}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <div className="truncate font-mono">{m.path}</div>
-                  {(m.item_title || m.episode_title) && (
-                    <div className="truncate text-white/55">
-                      {m.item_title}
-                      {m.episode_title ? ` · ${m.episode_title}` : ""}
+      <div className="cf-card" style={{ marginBottom: 0 }}>
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">
+              Missing files on disk ({report.missing_files.length})
+            </div>
+            <div className="cf-sub">
+              Sample of media file rows whose path no longer exists. The full
+              scrub-and-fix workflow belongs to a maintenance task; this is a
+              preview limited to the 50 most recent matches.
+            </div>
+          </div>
+        </div>
+        <div className="cf-card-body cf-pad">
+          {report.missing_files.length === 0 ? (
+            <p style={{ color: "var(--ok)", fontSize: 13 }}>
+              No missing files detected in the sample.
+            </p>
+          ) : (
+            <ul style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+              {report.missing_files.map((m) => (
+                <li
+                  key={m.id}
+                  className="cf-flex cf-gap12"
+                  style={{
+                    alignItems: "baseline",
+                    padding: "6px 0",
+                    borderBottom: "1px solid var(--line-faint)",
+                    fontSize: 12,
+                  }}
+                >
+                  <span
+                    className="cf-mono cf-faint"
+                    style={{ width: 48, flex: "none" }}
+                  >
+                    #{m.id}
+                  </span>
+                  <span style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      className="cf-mono"
+                      style={{
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {m.path}
                     </div>
-                  )}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+                    {(m.item_title || m.episode_title) && (
+                      <div
+                        className="cf-muted"
+                        style={{
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {m.item_title}
+                        {m.episode_title ? ` · ${m.episode_title}` : ""}
+                      </div>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
 
       {report.libraries_without_paths.length > 0 && (
-        <section className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-5">
-          <h2 className="text-lg font-semibold text-amber-100">
-            Libraries with no paths
-          </h2>
-          <p className="mt-1 text-xs text-amber-100/80">
-            These libraries exist but have nothing to scan. Add a path
-            under Settings → Libraries.
-          </p>
-          <ul className="mt-3 space-y-1 text-sm text-amber-100">
-            {report.libraries_without_paths.map((l) => (
-              <li key={l.id}>
-                {l.name} <span className="text-amber-100/60">#{l.id}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
+        <div className="cf-banner cf-warn" style={{ marginBottom: 0 }}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 3l9 16H3z" />
+            <path d="M12 10v4M12 17v.5" />
+          </svg>
+          <div>
+            <b>Libraries with no paths.</b> These libraries exist but have
+            nothing to scan. Add a path under Settings → Libraries.
+            <ul style={{ marginTop: 8, listStyle: "none", padding: 0 }}>
+              {report.libraries_without_paths.map((l) => (
+                <li key={l.id}>
+                  {l.name} <span className="cf-faint">#{l.id}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
       )}
 
-      {drill && (
-        <HealthDrillIn
-          tile={drill}
-          onClose={() => setDrill(null)}
-        />
-      )}
+      {drill && <HealthDrillIn tile={drill} onClose={() => setDrill(null)} />}
     </div>
   );
 }
@@ -190,6 +269,7 @@ function HealthDrillIn({
   tile: CounterTile;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [rows, setRows] = useState<LibraryHealthItemRow[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
   const [offset, setOffset] = useState(0);
@@ -237,6 +317,12 @@ function HealthDrillIn({
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Move focus into the dialog on mount so keyboard/screen-reader users
+  // don't land at an invisible location outside the portal.
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
   if (typeof document === "undefined") return null;
 
   const loaded = rows?.length ?? 0;
@@ -244,8 +330,11 @@ function HealthDrillIn({
 
   return createPortal(
     <div
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
+      aria-labelledby="health-drill-title"
+      tabIndex={-1}
       className="fixed inset-0 z-60 flex items-center justify-center bg-black/70 p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -254,7 +343,7 @@ function HealthDrillIn({
       <div className="flex max-h-[85vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-white/15 bg-(--color-surface) shadow-2xl">
         <div className="flex items-baseline justify-between gap-3 border-b border-white/10 px-6 py-4">
           <div>
-            <h2 className="text-lg font-semibold">{tile.label}</h2>
+            <h2 id="health-drill-title" className="text-lg font-semibold">{tile.label}</h2>
             <p className="mt-0.5 text-xs text-white/55">
               {total == null ? (
                 <LoadingPlaceholder variant="inline" />

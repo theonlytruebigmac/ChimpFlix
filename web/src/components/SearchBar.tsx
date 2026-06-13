@@ -14,6 +14,13 @@ export function SearchBar() {
   const [query, setQuery] = useState(initialQuery);
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<number | null>(null);
+  // True only while the search input is focused (the user is actively
+  // typing). The debounced navigation is gated on this so that LEAVING
+  // the search page — e.g. clicking the "Home" nav link, which flips
+  // `onSearchPage` and re-runs the effect below while `query` still holds
+  // the old text — can't fire a `router.push("/search?q=…")` and bounce
+  // the user straight back to the search page.
+  const focusedRef = useRef(false);
 
   // Keep local query in sync when /search?q=... changes (e.g. browser
   // back). The setState is the "URL is the source of truth, mirror
@@ -37,6 +44,10 @@ export function SearchBar() {
 
     const trimmed = query.trim();
     debounceRef.current = window.setTimeout(() => {
+      // Only drive navigation while the user is actually typing in the
+      // (focused) box. Without this, the effect re-running because the
+      // path changed (e.g. navigating Home) would push back to /search.
+      if (!focusedRef.current) return;
       if (!trimmed) {
         if (onSearchPage) router.replace("/search");
         return;
@@ -102,6 +113,12 @@ export function SearchBar() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKey}
+            onFocus={() => {
+              focusedRef.current = true;
+            }}
+            onBlur={() => {
+              focusedRef.current = false;
+            }}
             placeholder="Search titles"
             className="w-48 bg-transparent text-sm text-white placeholder:text-white/50 focus:outline-none sm:w-64"
             aria-label="Search"

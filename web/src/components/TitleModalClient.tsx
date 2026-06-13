@@ -432,7 +432,6 @@ function TitleModalView({
               detail.original_title.trim() !== title.trim() && (
                 <div
                   className="mt-2 max-w-3xl text-sm text-white/65 drop-shadow"
-                  lang="ja"
                   title="Original title"
                 >
                   {detail.original_title}
@@ -610,6 +609,7 @@ function TitleModalView({
           targetEpisodeKey={initialEpisodeKey}
           onWatchStatsChange={refreshDetail}
           bulkWatchVersion={bulkWatchVersion}
+          showPoster={item.thumb}
         />
       )}
 
@@ -1058,7 +1058,7 @@ function CollectionCard({
           View all {data.item_count}
         </Link>
       </div>
-      <div className="-mx-2 flex gap-3 overflow-x-auto px-2 pb-2">
+      <div className="-mx-2 flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x px-2 pb-2">
         {siblings.slice(0, 8).map((it) => (
           <CollectionMemberTile key={it.id} item={it} />
         ))}
@@ -1257,6 +1257,7 @@ function TagBar({ itemId }: { itemId: number }) {
   }
 
   async function removeTag(tagId: number) {
+    if (busy) return;
     setBusy(true);
     try {
       await tagsApi.remove(itemId, tagId);
@@ -1421,6 +1422,7 @@ function AdminActions({
   const [showMarkerEditor, setShowMarkerEditor] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [detectingMarkers, setDetectingMarkers] = useState(false);
+  const [fetchingSubtitles, setFetchingSubtitles] = useState(false);
   /// Brief one-shot toast for fire-and-forget admin actions
   /// (currently the marker-detect kickoff). The backend returns 202
   /// with "queued: N" and runs the work in the background, so the
@@ -1532,6 +1534,36 @@ function AdminActions({
     }
   }
 
+  async function fetchSubtitles() {
+    if (fetchingSubtitles) return;
+    setFetchingSubtitles(true);
+    setOpen(false);
+    try {
+      const { queued, configured, language } = await itemsApi.fetchSubtitles(
+        detail.id,
+      );
+      if (!configured) {
+        showActionToast(
+          "OpenSubtitles isn't set up — add credentials in Settings → Credentials.",
+        );
+      } else {
+        showActionToast(
+          queued === 0
+            ? "Subtitle fetch already queued — check back shortly."
+            : `Fetching ${language.toUpperCase()} subtitles in the background…`,
+        );
+      }
+    } catch (e) {
+      showActionToast(
+        e instanceof Error
+          ? `Couldn't fetch subtitles: ${e.message}`
+          : "Couldn't fetch subtitles. Try again.",
+      );
+    } finally {
+      setFetchingSubtitles(false);
+    }
+  }
+
   function onDeleted(report: { items_purged: number }) {
     // If the cascade swept the item itself, no point in keeping the
     // modal open against a now-dead id — pop the URL back to the
@@ -1619,6 +1651,13 @@ function AdminActions({
             icon: WaveIcon,
             disabled: detectingMarkers,
             onClick: detectMarkers,
+          },
+          {
+            kind: "item",
+            label: fetchingSubtitles ? "Fetching subtitles…" : "Fetch subtitles",
+            icon: SubtitlesIcon,
+            disabled: fetchingSubtitles,
+            onClick: fetchSubtitles,
           },
           // Owner-only marker editor. Disabled for shows (the editor
           // is per-media-file; surfacing it on the show item would
@@ -1748,15 +1787,20 @@ function AddToCollectionDialog({
   const [toast, setToast] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
+  // Guard setState calls in refresh() against running after unmount.
+  const cancelledRef = useRef(false);
+  useEffect(() => () => { cancelledRef.current = true; }, []);
 
   const refresh = useCallback(async () => {
     try {
       const r = await collectionsApi.list();
-      setManualCollections(r.collections.filter((c) => c.kind === "manual"));
+      if (!cancelledRef.current)
+        setManualCollections(r.collections.filter((c) => c.kind === "manual"));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!cancelledRef.current)
+        setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (!cancelledRef.current) setLoading(false);
     }
   }, []);
 
@@ -1826,6 +1870,7 @@ function AddToCollectionDialog({
     <div
       role="dialog"
       aria-modal="true"
+      aria-labelledby="add-collection-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -1833,7 +1878,7 @@ function AddToCollectionDialog({
     >
       <div className="w-full max-w-md rounded-lg border border-white/15 bg-neutral-950 p-6 shadow-2xl space-y-4">
         <div className="flex items-baseline justify-between gap-2">
-          <h2 className="text-lg font-semibold">Add to collection</h2>
+          <h2 id="add-collection-title" className="text-lg font-semibold">Add to collection</h2>
           <button
             type="button"
             onClick={onClose}
@@ -1983,13 +2028,14 @@ function DeleteMediaDialog({
     <div
       role="dialog"
       aria-modal="true"
+      aria-labelledby="delete-media-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onClick={(e) => {
-        if (e.target === e.currentTarget) dismiss();
+        if (e.target === e.currentTarget && !busy) dismiss();
       }}
     >
       <div className="w-full max-w-md rounded-lg border border-red-500/30 bg-neutral-950 p-6 shadow-2xl">
-        <h2 className="text-lg font-semibold text-red-300">
+        <h2 id="delete-media-title" className="text-lg font-semibold text-red-300">
           Delete from disk
         </h2>
         {done ? (
@@ -2242,6 +2288,15 @@ const WaveIcon = () => (
     <path d="M2 12h2l3-9 4 18 3-12 3 6 2-3h3" />
   </IconBase>
 );
+const SubtitlesIcon = () => (
+  <IconBase>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="M7 15h4" />
+    <path d="M15 15h2" />
+    <path d="M7 11h2" />
+    <path d="M13 11h4" />
+  </IconBase>
+);
 const FolderPlusIcon = () => (
   <IconBase>
     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
@@ -2268,7 +2323,7 @@ function CastAndCrew({ credits }: { credits: Credit[] }) {
   return (
     <section className="border-t border-white/10 px-10 py-8">
       <h2 className="mb-6 text-2xl font-medium">Cast &amp; Crew</h2>
-      <div className="-mx-2 flex gap-2 overflow-x-auto px-2 pb-2">
+      <div className="-mx-2 flex gap-2 overflow-x-auto overscroll-x-contain touch-pan-x px-2 pb-2">
         {cast.map((c) => (
           <CastTile key={c.id} credit={c} />
         ))}
@@ -2333,7 +2388,7 @@ function ExtrasRail({ extras }: { extras: Extra[] }) {
   return (
     <section className="border-t border-white/10 px-10 py-8">
       <h2 className="mb-6 text-2xl font-medium">Extras</h2>
-      <div className="-mx-2 flex gap-3 overflow-x-auto px-2 pb-2">
+      <div className="-mx-2 flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x px-2 pb-2">
         {extras.map((e) => (
           <ExtraTile key={e.id} extra={e} />
         ))}

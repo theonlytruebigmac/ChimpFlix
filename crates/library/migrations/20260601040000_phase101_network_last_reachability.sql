@@ -1,0 +1,17 @@
+-- Phase 101: persisted last reachability check.
+--
+-- Reachability was on-demand only — the Network admin page ran a one-shot
+-- HTTP HEAD against `<public_url>/api/v1/health` and showed the result, but
+-- nothing survived a page reload. This column stores the LAST check as a
+-- small JSON blob so the page can render a standing
+-- "Reachable · checked Xm ago" (or a failure) banner without re-running the
+-- probe.
+--
+-- `network_last_reachability` : NULL when no check has ever run (the
+--   default). Otherwise a JSON object written by the reachability endpoint:
+--   { "ok": bool, "public_url": string|null, "status_code": int|null,
+--     "latency_ms": int|null, "error": string|null, "checked_at": int(ms) }.
+--   Shape is owned by the server (crates/server/src/api/admin/network.rs);
+--   the DB treats it as opaque text. No new table — this is one nullable
+--   column on the existing singleton server_settings row.
+ALTER TABLE server_settings ADD COLUMN network_last_reachability TEXT;

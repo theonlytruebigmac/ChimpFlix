@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   admin as adminApi,
   type DashboardResponse,
@@ -10,10 +10,28 @@ import {
   type ScheduledTask,
   type SecretSlotView,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner, HeroCard, Pill, StatusDot, type PillTone } from "./ui";
 
 interface Props {
   initial: DashboardResponse;
+}
+
+// Tone vocabulary kept local now that the dashboard no longer imports the
+// shared ./ui primitives. Maps to the console's `cf-pill cf-*` modifiers.
+type PillTone = "ok" | "warn" | "bad" | "info" | "muted";
+
+function pillClass(tone: PillTone): string {
+  switch (tone) {
+    case "ok":
+      return "cf-pill cf-ok";
+    case "warn":
+      return "cf-pill cf-warn";
+    case "bad":
+      return "cf-pill cf-err";
+    case "info":
+      return "cf-pill cf-info";
+    default:
+      return "cf-pill";
+  }
 }
 
 // Slower than before: the live source for active_transcodes is now the
@@ -22,17 +40,35 @@ interface Props {
 // drops without reconnecting.
 const POLL_INTERVAL_MS = 30_000;
 
+// Concurrent-streams sparkline: a REAL rolling window of the live session
+// count, sampled client-side (a 30-minute server-side history series is
+// net-new backend work). Idle => all-zero samples => the CSS 2px baseline,
+// which reads as "nothing happening" — unlike the old synthetic 35→100%
+// ramp that drew tall bars even with zero active streams.
+const SPARKLINE_BARS = 15;
+const SPARKLINE_SAMPLE_MS = 4_000; // 15 × 4s ≈ 60s window
+
 export function AdminDashboardClient({ initial }: Props) {
   const [data, setData] = useState<DashboardResponse>(initial);
   const [tasks, setTasks] = useState<ScheduledTask[] | null>(null);
   const [secrets, setSecrets] = useState<SecretSlotView[] | null>(null);
-  const [fetching, setFetching] = useState(false);
+  // Track in-flight stop requests per session so only that row's button is disabled.
+  const [stoppingIds, setStoppingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  // Rolling history of the live concurrent-stream count for the sparkline.
+  // Seeded flat at the current count; the sampler below scrolls real samples
+  // in so the card reflects ACTUAL recent activity.
+  const [concurrentHistory, setConcurrentHistory] = useState<number[]>(() =>
+    Array<number>(SPARKLINE_BARS).fill(initial.active_transcodes.length),
+  );
+  // Latest live count, kept in a ref so the once-mounted sampler interval can
+  // read it without resetting on every WS-driven re-render.
+  const liveCountRef = useRef(initial.active_transcodes.length);
 
   // Tasks + secrets are fetched separately from the dashboard payload
   // — same admin scope, different endpoints. Tasks refresh on the 30s
-  // cadence to keep "Up next" countdowns accurate; secrets are loaded
-  // once because they change rarely (operator action only).
+  // cadence to keep "Next scheduled" countdowns accurate; secrets are
+  // loaded once because they change rarely (operator action only).
   useEffect(() => {
     let cancelled = false;
     async function loadTasks() {
@@ -108,11 +144,32 @@ export function AdminDashboardClient({ initial }: Props) {
             active?: DashboardSession[];
           };
           if (msg.type === "sessions" && Array.isArray(msg.active)) {
-            setData((d) => ({
-              ...d,
-              active_transcodes: msg.active!,
-              server: { ...d.server, now_ms: Date.now() },
-            }));
+            setData((d) => {
+              // The WS frame carries raw snapshots (no DB enrichment —
+              // it's a hot broadcast path), so carry forward the
+              // resolved username/title we already have for any session
+              // still present. New sessions show ids until the next 5s
+              // poll re-enriches them.
+              const prev = new Map(
+                d.active_transcodes.map((s) => [s.id, s]),
+              );
+              const active = msg.active!.map((s) => {
+                const old = prev.get(s.id);
+                return old
+                  ? {
+                      ...s,
+                      username: s.username ?? old.username,
+                      title: s.title ?? old.title,
+                      subtitle: s.subtitle ?? old.subtitle,
+                    }
+                  : s;
+              });
+              return {
+                ...d,
+                active_transcodes: active,
+                server: { ...d.server, now_ms: Date.now() },
+              };
+            });
           }
         } catch {
           // Ignore non-JSON / unrelated frames (e.g. scan events).
@@ -137,8 +194,25 @@ export function AdminDashboardClient({ initial }: Props) {
     };
   }, []);
 
+  // Keep the latest live count in the ref (updated in an effect, not during
+  // render) so the sampler interval below always reads the current value.
+  useEffect(() => {
+    liveCountRef.current = data.active_transcodes.length;
+  }, [data]);
+
+  // Sample the live concurrent count into the rolling sparkline window on a
+  // steady cadence so the chart scrolls and an idle server fills with zeros.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setConcurrentHistory((h) =>
+        [...h, liveCountRef.current].slice(-SPARKLINE_BARS),
+      );
+    }, SPARKLINE_SAMPLE_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
   async function stopSession(id: string) {
-    setFetching(true);
+    setStoppingIds((prev) => new Set(prev).add(id));
     try {
       await adminApi.stopSession(id);
       const next = await adminApi.dashboard();
@@ -146,7 +220,11 @@ export function AdminDashboardClient({ initial }: Props) {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setFetching(false);
+      setStoppingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
@@ -160,19 +238,36 @@ export function AdminDashboardClient({ initial }: Props) {
     0,
   );
   const sessionCount = data.active_transcodes.length;
+  // Normalise the rolling history to bar heights. All-zero (idle) leaves the
+  // peak at 1 so every bar is 0% → collapses to the CSS 2px baseline.
+  const concurrentPeak = Math.max(1, ...concurrentHistory);
   const hwSessions = data.active_transcodes.filter(
     (s) => !s.encoder.toLowerCase().includes("software"),
   ).length;
   const remuxSessions = data.active_transcodes.filter(
     (s) => s.video_treatment === "copy" && s.audio_treatment === "copy",
   ).length;
+  const softwareSessions = Math.max(
+    0,
+    sessionCount - hwSessions - remuxSessions,
+  );
   const maxDiskPct = data.disks.reduce((acc, d) => {
     if (d.total_bytes <= 0) return acc;
     const pct = (d.used_bytes / d.total_bytes) * 100;
     return pct > acc ? pct : acc;
   }, 0);
-  const storageTone: PillTone =
-    maxDiskPct >= 90 ? "bad" : maxDiskPct >= 75 ? "warn" : "ok";
+  // Busiest disk drives the Storage tile's used/total readout.
+  const busiestDisk = data.disks.reduce<DashboardResponse["disks"][number] | null>(
+    (acc, d) => {
+      if (d.total_bytes <= 0) return acc;
+      const pct = (d.used_bytes / d.total_bytes) * 100;
+      const accPct = acc && acc.total_bytes > 0 ? (acc.used_bytes / acc.total_bytes) * 100 : -1;
+      return pct > accPct ? d : acc;
+    },
+    null,
+  );
+  const storageBarColor =
+    maxDiskPct >= 90 ? "var(--err)" : maxDiskPct >= 75 ? "var(--warn)" : "var(--ok)";
 
   // ─── Activity feed: merge recent scans + active session starts ──
   const feed = buildActivityFeed(
@@ -185,312 +280,475 @@ export function AdminDashboardClient({ initial }: Props) {
   // ─── Alerts: failed scans, near-full disks, missing recommended creds
   const alerts = buildAlerts(data, secrets);
 
+  // ─── "Next scheduled" — soonest upcoming enabled tasks ──────────
+  const upNext =
+    tasks === null
+      ? []
+      : tasks
+          .filter((t) => t.enabled)
+          .slice()
+          .sort((a, b) => a.next_run_at - b.next_run_at)
+          .slice(0, 4);
+
+  const allHealthy = alerts.length === 0;
+
   return (
-    <div className="space-y-6">
-      <ErrorBanner error={error ? `Failed to refresh: ${error}` : null} />
+    <div>
+      {/* ── Header status pill (no page title — the sidebar + breadcrumb
+          name the page; this replaces the mockup's page-head actions) ── */}
+      <div className="cf-flex cf-between" style={{ marginBottom: 18 }}>
+        <span />
+        <span className={allHealthy ? "cf-pill cf-ok" : "cf-pill cf-warn"}>
+          <span className="cf-dot" />
+          {allHealthy
+            ? "All systems healthy"
+            : `${alerts.length} item${alerts.length === 1 ? "" : "s"} need attention`}
+        </span>
+      </div>
 
-      {/* ── Hero strip ──────────────────────────────────────────── */}
-      <section className="grid grid-cols-1 gap-3 md:grid-cols-3">
-        <HeroCard
-          tone="ok"
-          label="System"
-          icon={
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-              <path d="M20 6 9 17l-5-5" />
-            </svg>
-          }
-          value="Healthy"
-          meta={`v${data.server.version} · uptime ${formatDuration(data.server.uptime_s)} · ${data.library_stats.length} libraries`}
-        />
-        <HeroCard
-          tone="info"
-          label="Active sessions"
-          icon={
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <polygon points="5 3 19 12 5 21 5 3" />
-            </svg>
-          }
-          value={sessionCount === 0 ? "Idle" : sessionCount}
-          meta={
-            sessionCount === 0
-              ? "No transcodes running"
-              : `${hwSessions} hardware · ${sessionCount - hwSessions - remuxSessions} software · ${remuxSessions} remux`
-          }
-        />
-        <HeroCard
-          tone={storageTone}
-          label="Storage"
-          icon={
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <ellipse cx="12" cy="5" rx="9" ry="3" />
-              <path d="M3 5v14a9 3 0 0 0 18 0V5" />
-              <path d="M3 12a9 3 0 0 0 18 0" />
-            </svg>
-          }
-          value={formatBytes(totalBytes)}
-          meta={`${formatNumber(totalItems)} items · ${data.disks.length > 0 ? `${maxDiskPct.toFixed(0)}% on busiest disk` : "no disks probed"}`}
-        />
-      </section>
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>Failed to refresh: {error}</div>
+        </div>
+      )}
 
-      {/* ── Activity + Alerts split ─────────────────────────────── */}
-      <section className="grid grid-cols-1 gap-3 lg:grid-cols-[1.4fr_1fr]">
-        <Card
-          title="Recent activity"
-          subtitle={
-            feed.length === 0
-              ? "Nothing yet"
-              : `Latest ${feed.length} event${feed.length === 1 ? "" : "s"}`
-          }
-        >
-          {feed.length === 0 ? (
-            <EmptyInline>Activity will appear here as scans and sessions run.</EmptyInline>
-          ) : (
-            <ul className="divide-y divide-white/6">
-              {feed.map((f) => (
-                <li
-                  key={f.key}
-                  className="grid grid-cols-[28px_1fr_auto] items-center gap-2.5 px-4 py-2.5"
-                >
-                  <span className="grid h-7 w-7 place-items-center rounded-full bg-white/6 text-white/65">
-                    {f.icon}
-                  </span>
-                  <span className="min-w-0 truncate text-[13px]">{f.text}</span>
-                  <span className="shrink-0 text-[11.5px] text-white/45">
-                    {formatAgo(data.server.now_ms - f.when)}
-                  </span>
-                </li>
-              ))}
-            </ul>
+      {/* ── In-page tab bar. Only "Dashboard" lives on this route; the
+          others are separate routes, rendered as links matching the
+          mockup's tab look. ──────────────────────────────────────── */}
+      <div className="cf-tabs">
+        <button type="button" className="cf-tab cf-on">
+          Dashboard
+        </button>
+        <Link className="cf-tab" href="/settings/admin/activity">
+          Activity &amp; stats
+        </Link>
+        <Link className="cf-tab" href="/settings/admin/status/alerts">
+          Alerts
+          {alerts.length > 0 && (
+            <span className="cf-pillcount">{alerts.length}</span>
           )}
-        </Card>
+        </Link>
+      </div>
 
-        <Card
-          title="Alerts"
-          subtitle="Surfaced from scans, scheduler, vault"
-          aside={
-            <Pill tone={alerts.length === 0 ? "muted" : "warn"} dot>
-              {alerts.length === 0 ? "all clear" : `${alerts.length} open`}
-            </Pill>
-          }
-        >
-          {alerts.length === 0 ? (
-            <EmptyInline>Nothing needs attention right now.</EmptyInline>
-          ) : (
-            <ul className="divide-y divide-white/6">
-              {alerts.map((a) => (
-                <li
-                  key={a.key}
-                  className="grid grid-cols-[10px_1fr_auto] items-start gap-2.5 px-4 py-3"
-                >
-                  <StatusDot tone={a.tone} className="mt-1.5" />
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-medium">{a.title}</div>
-                    <div className="text-[11.5px] text-white/50">{a.meta}</div>
-                  </div>
-                  {a.when !== null && (
-                    <span className="shrink-0 text-[11.5px] text-white/40">
-                      {formatAgo(data.server.now_ms - a.when)}
-                    </span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </Card>
-      </section>
-
-      {/* ── Quick actions ───────────────────────────────────────── */}
-      <section className="grid grid-cols-2 gap-2.5 md:grid-cols-4">
-        <QuickAction
-          href="/settings/admin/library/libraries"
-          title="Scan libraries"
-          subtitle={`${data.library_stats.length} libraries`}
-          icon={
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-            </svg>
-          }
-        />
-        <QuickAction
-          href="/settings/admin/maintenance/backup"
-          title="Backups"
-          subtitle="VACUUM INTO + verify"
-          icon={
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <polyline points="12 6 12 12 16 14" />
-            </svg>
-          }
-        />
-        <QuickAction
-          href="/settings/admin/maintenance/logs/audit"
-          title="Audit log"
-          subtitle="Recent admin actions"
-          icon={
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="11" cy="11" r="8" />
-              <path d="m21 21-4.3-4.3" />
-            </svg>
-          }
-        />
-        <QuickAction
-          href="/settings/admin/users/invites"
-          title="Invite a user"
-          subtitle="Email or one-time link"
-          icon={
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-              <circle cx="9" cy="7" r="4" />
-              <path d="M19 8v6" />
-              <path d="M22 11h-6" />
-            </svg>
-          }
-        />
-      </section>
-
-      {/* ── Active transcodes table ─────────────────────────────── */}
-      {data.active_transcodes.length > 0 && (
-        <Card
-          title="Active transcodes"
-          aside={
-            <Pill tone="ok" dot>
-              live
-            </Pill>
-          }
-        >
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="bg-white/4 text-left text-[11px] uppercase tracking-wider text-white/45">
-                <tr>
-                  <th className="px-4 py-2 font-semibold">Session</th>
-                  <th className="px-4 py-2 font-semibold">User</th>
-                  <th className="px-4 py-2 font-semibold">Resolution</th>
-                  <th className="px-4 py-2 font-semibold">Encoder</th>
-                  <th className="px-4 py-2 font-semibold">Started</th>
-                  <th className="px-4 py-2" />
-                </tr>
-              </thead>
-              <tbody>
-                {data.active_transcodes.map((s) => (
-                  <tr key={s.id} className="border-t border-white/6">
-                    <td className="whitespace-nowrap px-4 py-2 font-mono text-xs text-white/80">
-                      {s.id}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/70">
-                      #{s.user_id}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-xs text-white/70 tabular-nums">
-                      <ResolutionCell
-                        sourceHeight={s.source_height}
-                        targetHeight={s.target_height}
-                        bitrateBps={s.target_video_bitrate_bps}
-                      />
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-xs">
-                      <EncoderChip
-                        label={s.encoder}
-                        videoTreatment={s.video_treatment}
-                        audioTreatment={s.audio_treatment}
-                      />
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/60">
-                      {formatAgo(data.server.now_ms - s.created_at)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-right">
-                      <button
-                        disabled={fetching}
-                        onClick={() => stopSession(s.id)}
-                        className="rounded border border-white/10 px-2 py-1 text-xs text-white/70 hover:bg-white/5 disabled:opacity-40"
-                      >
-                        Stop
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {/* ── Hero stat tiles ─────────────────────────────────────────── */}
+      <div className="cf-grid cf-c4">
+        <div className="cf-stat cf-tone-green">
+          <div className="cf-stat-top">
+            <span className="cf-stat-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />
+                <path d="M9 12l2 2 4-4" />
+              </svg>
+            </span>
+            System
           </div>
-        </Card>
-      )}
+          <div className="cf-stat-val">Healthy</div>
+          <div className="cf-stat-meta">
+            v{data.server.version} · up {formatDuration(data.server.uptime_s)}
+          </div>
+        </div>
 
-      {/* ── Tasks summary ───────────────────────────────────────── */}
-      {tasks !== null && tasks.length > 0 && (
-        <TaskSummary tasks={tasks} nowMs={data.server.now_ms} />
-      )}
+        <div className="cf-stat cf-tone-blue">
+          <div className="cf-stat-top">
+            <span className="cf-stat-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polygon points="6 4 20 12 6 20 6 4" />
+              </svg>
+            </span>
+            Active sessions
+          </div>
+          <div className="cf-stat-val">{sessionCount}</div>
+          <div className="cf-stat-meta">
+            {sessionCount === 0
+              ? "No transcodes running"
+              : `${softwareSessions} direct · ${hwSessions} HW transcode · ${remuxSessions} remux`}
+          </div>
+        </div>
 
-      {/* ── Libraries + disks ───────────────────────────────────── */}
-      <section className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-        <Card title="Libraries" subtitle={`${data.library_stats.length} configured`}>
-          {data.library_stats.length === 0 ? (
-            <EmptyInline>
-              No libraries yet — add one under{" "}
-              <Link href="/settings/admin/library/libraries" className="underline hover:text-white">
-                Library → Libraries
-              </Link>
-              .
-            </EmptyInline>
-          ) : (
-            <ul className="divide-y divide-white/6">
-              {data.library_stats.map((s) => (
-                <li
-                  key={s.library_id}
-                  className="grid grid-cols-[1fr_auto_auto] items-center gap-3 px-4 py-2.5 text-[13px]"
+        <div className="cf-stat cf-tone-amber">
+          <div className="cf-stat-top">
+            <span className="cf-stat-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <ellipse cx="12" cy="6" rx="8" ry="3" />
+                <path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6" />
+              </svg>
+            </span>
+            Storage
+          </div>
+          <div className="cf-stat-val">
+            {data.disks.length > 0 ? (
+              <>
+                {maxDiskPct.toFixed(0)}
+                <small>%</small>
+              </>
+            ) : (
+              formatBytes(totalBytes)
+            )}
+          </div>
+          <div className="cf-stat-meta">
+            {busiestDisk
+              ? `${formatBytes(busiestDisk.used_bytes)} of ${formatBytes(busiestDisk.total_bytes)}`
+              : `${formatBytes(totalBytes)} of media`}
+          </div>
+          {data.disks.length > 0 && (
+            <div className="cf-stat-bar">
+              <i style={{ width: `${maxDiskPct}%`, background: storageBarColor }} />
+            </div>
+          )}
+        </div>
+
+        <div className="cf-stat cf-tone-red">
+          <div className="cf-stat-top">
+            <span className="cf-stat-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M7 4v16M17 4v16" />
+              </svg>
+            </span>
+            Library
+          </div>
+          <div className="cf-stat-val">{formatNumber(totalItems)}</div>
+          <div className="cf-stat-meta">
+            {data.library_stats.length} librar
+            {data.library_stats.length === 1 ? "y" : "ies"} ·{" "}
+            {formatNumber(data.movie_count)} movie
+            {data.movie_count === 1 ? "" : "s"} ·{" "}
+            {formatNumber(data.episode_count)} ep
+            {data.episode_count === 1 ? "" : "s"}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Two-column body ─────────────────────────────────────────── */}
+      <div className="cf-grid cf-c2" style={{ marginTop: 18, alignItems: "start" }}>
+        {/* left column */}
+        <div>
+          {/* Now playing */}
+          <div className="cf-card">
+            <div className="cf-card-head">
+              <div>
+                <div className="cf-ttl">Now playing</div>
+                <div className="cf-sub">Live · refreshes every 5s</div>
+              </div>
+              <div className="cf-head-aside">
+                <span className="cf-pill cf-accent">
+                  <span className="cf-dot" />
+                  {sessionCount} stream{sessionCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            </div>
+            {sessionCount === 0 ? (
+              <div className="cf-card-body cf-pad">
+                <span className="cf-faint" style={{ fontSize: 13 }}>
+                  No active streams right now.
+                </span>
+              </div>
+            ) : (
+              <table className="cf-table">
+                <tbody>
+                  {data.active_transcodes.map((s) => (
+                    <tr key={s.id}>
+                      <td>
+                        <div className="cf-flex cf-gap8">
+                          <span
+                            className={`cf-avatar ${avatarTone(s.user_id)}`}
+                            style={{ width: 28, height: 28, fontSize: 11 }}
+                          >
+                            {(s.username ?? String(s.user_id)).slice(0, 1).toUpperCase()}
+                          </span>
+                          {s.username ?? `User #${s.user_id}`}
+                        </div>
+                      </td>
+                      <td>
+                        {s.title ? (
+                          <div>
+                            <div>{s.title}</div>
+                            {s.subtitle ? (
+                              <div className="cf-faint" style={{ fontSize: 11.5, marginTop: 1 }}>
+                                {s.subtitle}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <span className="cf-mono">#{s.media_file_id}</span>
+                        )}
+                      </td>
+                      <td>{streamTag(s)}</td>
+                      <td className="cf-num cf-mono">{s.target_height}p</td>
+                      <td className="cf-num">
+                        <button
+                          type="button"
+                          className="cf-btn cf-ghost cf-tiny"
+                          disabled={stoppingIds.has(s.id)}
+                          onClick={() => stopSession(s.id)}
+                        >
+                          {stoppingIds.has(s.id) ? "…" : "Stop"}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {/* Concurrent streams sparkline */}
+          <div className="cf-card" style={{ marginBottom: 0 }}>
+            <div className="cf-card-head">
+              <div>
+                <div className="cf-ttl">Concurrent streams</div>
+                <div className="cf-sub">Live snapshot</div>
+              </div>
+            </div>
+            <div className="cf-card-body cf-pad">
+              <div className="cf-sparkline">
+                {concurrentHistory.map((v, i) => (
+                  <i
+                    key={i}
+                    style={{ height: `${(v / concurrentPeak) * 100}%` }}
+                  />
+                ))}
+              </div>
+              <div
+                className="cf-flex cf-between cf-faint"
+                style={{ fontSize: 11, marginTop: 8 }}
+              >
+                <span>
+                  {Math.round((SPARKLINE_BARS * SPARKLINE_SAMPLE_MS) / 1000)}s
+                  ago
+                </span>
+                <span>now · {sessionCount} active</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* right column */}
+        <div>
+          {/* Needs attention */}
+          <div className="cf-card">
+            <div className="cf-card-head">
+              <div>
+                <div className="cf-ttl">Needs attention</div>
+                <div className="cf-sub">
+                  {alerts.length === 0
+                    ? "Nothing open"
+                    : `${alerts.length} open item${alerts.length === 1 ? "" : "s"}`}
+                </div>
+              </div>
+              <div className="cf-head-aside">
+                <Link
+                  className="cf-btn cf-ghost cf-tiny"
+                  href="/settings/admin/status/alerts"
                 >
-                  <span className="min-w-0 truncate">
-                    <span className="font-medium">{s.name}</span>{" "}
-                    <span className="text-white/45">· {s.kind}</span>
-                  </span>
-                  <span className="shrink-0 tabular-nums text-white/70">
-                    {formatNumber(s.item_count)} items
-                  </span>
-                  <span className="shrink-0 tabular-nums text-white/55">
-                    {formatBytes(s.total_bytes)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Card>
+                  View all →
+                </Link>
+              </div>
+            </div>
+            <div className="cf-card-body">
+              {alerts.length === 0 ? (
+                <div className="cf-row">
+                  <div className="cf-row-main">
+                    <div className="cf-row-help">
+                      Nothing needs attention right now.
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                alerts.map((a) => (
+                  <div className="cf-row" key={a.key} style={{ padding: "13px 0" }}>
+                    <div className="cf-row-main">
+                      <div className="cf-row-label" style={{ fontSize: 13 }}>
+                        <span
+                          className={pillClass(a.tone)}
+                          style={{ padding: "1px 7px" }}
+                        >
+                          <span className="cf-dot" />
+                          {a.badge}
+                        </span>{" "}
+                        {a.title}
+                      </div>
+                      <div className="cf-row-help">{a.meta}</div>
+                    </div>
+                    {a.when !== null && (
+                      <div className="cf-row-control cf-faint" style={{ fontSize: 12 }}>
+                        {formatAgo(data.server.now_ms - a.when)}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
 
-        <Card title="Disk usage" subtitle={`${data.disks.length} mount${data.disks.length === 1 ? "" : "s"}`}>
-          {data.disks.length === 0 ? (
-            <EmptyInline>No probable disks (paths missing or unreadable).</EmptyInline>
-          ) : (
-            <ul className="divide-y divide-white/6">
-              {data.disks.map((d) => {
-                const pct =
-                  d.total_bytes > 0
-                    ? Math.min(100, (d.used_bytes / d.total_bytes) * 100)
-                    : 0;
-                const bar =
-                  pct > 90 ? "bg-red-500" : pct > 75 ? "bg-amber-400" : "bg-emerald-500";
-                return (
-                  <li key={d.path} className="px-4 py-2.5">
-                    <div className="flex items-center justify-between gap-2 text-[13px]">
-                      <span className="min-w-0 truncate font-medium">{d.label}</span>
-                      <span className="shrink-0 text-[11.5px] text-white/45">{pct.toFixed(1)}%</span>
+          {/* Recent activity */}
+          <div className="cf-card">
+            <div className="cf-card-head">
+              <div>
+                <div className="cf-ttl">Recent activity</div>
+              </div>
+            </div>
+            <div className="cf-card-body">
+              {feed.length === 0 ? (
+                <div className="cf-row">
+                  <div className="cf-row-main">
+                    <div className="cf-row-help">
+                      Activity will appear here as scans and sessions run.
                     </div>
-                    <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/8">
-                      <div className={`h-full ${bar}`} style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+              ) : (
+                feed.map((f) => (
+                  <div className="cf-row" key={f.key} style={{ padding: "11px 0" }}>
+                    <div className="cf-row-main">
+                      <div
+                        className="cf-row-label"
+                        style={{ fontSize: 13, fontWeight: 500 }}
+                      >
+                        {f.text}
+                      </div>
                     </div>
-                    <div className="mt-1 text-[11px] text-white/45">
-                      {formatBytes(d.used_bytes)} of {formatBytes(d.total_bytes)}
+                    <div className="cf-row-control cf-faint" style={{ fontSize: 12 }}>
+                      {formatAgo(data.server.now_ms - f.when)}
                     </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </Card>
-      </section>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
 
-      {/* ── Credential vault summary ─────────────────────────────── */}
-      {secrets !== null && secrets.filter((s) => !s.managed).length > 0 && (
-        <Card title="Credential vault" subtitle="External integrations">
-          <VaultSummary slots={secrets} />
-        </Card>
-      )}
+          {/* Next scheduled */}
+          <div className="cf-card" style={{ marginBottom: 0 }}>
+            <div className="cf-card-head">
+              <div>
+                <div className="cf-ttl">Next scheduled</div>
+              </div>
+            </div>
+            <div className="cf-card-body">
+              {upNext.length === 0 ? (
+                <div className="cf-row">
+                  <div className="cf-row-main">
+                    <div className="cf-row-help">
+                      {tasks === null ? "Loading…" : "No enabled tasks."}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                upNext.map((t) => {
+                  const dueMs = t.next_run_at - data.server.now_ms;
+                  return (
+                    <div className="cf-row" key={t.id} style={{ padding: "11px 0" }}>
+                      <div className="cf-row-main">
+                        <div
+                          className="cf-row-label"
+                          style={{ fontSize: 13, fontWeight: 500 }}
+                        >
+                          {t.name}
+                        </div>
+                      </div>
+                      <div className="cf-row-control">
+                        <span className="cf-pill">
+                          <span
+                            className="cf-dot"
+                            style={{ background: "var(--info)" }}
+                          />
+                          in {formatRelative(dueMs)}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Quick actions ───────────────────────────────────────────── */}
+      <div className="cf-section-title">Quick actions</div>
+      <div className="cf-grid cf-c4">
+        <Link
+          className="cf-btn"
+          style={{ justifyContent: "flex-start", padding: 14 }}
+          href="/settings/admin/libraries"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M4 10a8 8 0 0 1 14-4l2 2M20 14a8 8 0 0 1-14 4l-2-2" />
+            <path d="M18 4v4h-4M6 20v-4h4" />
+          </svg>
+          Scan libraries
+        </Link>
+        <Link
+          className="cf-btn"
+          style={{ justifyContent: "flex-start", padding: 14 }}
+          href="/settings/admin/maintenance?tab=backups"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <ellipse cx="12" cy="6" rx="8" ry="3" />
+            <path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6" />
+          </svg>
+          Backups
+        </Link>
+        <Link
+          className="cf-btn"
+          style={{ justifyContent: "flex-start", padding: 14 }}
+          href="/settings/admin/logs?tab=audit"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M5 4h11v14a2 2 0 0 0 2 2H7a2 2 0 0 1-2-2z" />
+          </svg>
+          Audit log
+        </Link>
+        <Link
+          className="cf-btn cf-primary"
+          style={{ justifyContent: "flex-start", padding: 14 }}
+          href="/settings/admin/users?tab=invites"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="9" cy="8" r="3.5" />
+            <path d="M3 20a6 6 0 0 1 12 0" />
+            <path d="M19 8v6M16 11h6" />
+          </svg>
+          Invite a user
+        </Link>
+      </div>
     </div>
+  );
+}
+
+// ─── Now-playing helpers ───────────────────────────────────────────
+
+// Deterministic avatar tone (cf-a1..a5) from the user id so the same user
+// always gets the same color across refreshes.
+function avatarTone(userId: number): string {
+  const n = (Math.abs(userId) % 5) + 1;
+  return `cf-a${n}`;
+}
+
+// The stream-type tag rendered in the Now-playing table. Mirrors the
+// mockup's Direct play / HW transcode / Remux chips, derived from the
+// session's encoder + copy treatments.
+function streamTag(s: DashboardSession) {
+  const isRemux =
+    s.video_treatment === "copy" && s.audio_treatment === "copy";
+  const isSoftware = s.encoder.toLowerCase().includes("software");
+  if (isRemux) {
+    return <span className="cf-tag">Remux</span>;
+  }
+  if (isSoftware) {
+    return <span className="cf-tag">Direct play</span>;
+  }
+  return (
+    <span
+      className="cf-tag"
+      style={{ borderColor: "var(--info-soft)", color: "var(--info)" }}
+    >
+      HW transcode
+    </span>
   );
 }
 
@@ -499,7 +757,6 @@ export function AdminDashboardClient({ initial }: Props) {
 interface FeedItem {
   key: string;
   when: number;
-  icon: React.ReactNode;
   text: React.ReactNode;
 }
 
@@ -522,20 +779,11 @@ function buildActivityFeed(
     items.push({
       key: `scan-${s.id}`,
       when: finished,
-      icon: (
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-        </svg>
-      ),
       text: (
         <span>
-          <span className="text-white/90">Scan</span>{" "}
-          <span className="text-white/55">on</span>{" "}
-          <span className="text-white/90">{libName(s.library_id)}</span>
-          <span className="text-white/55">
-            {" "}— +{s.files_added} added · {s.files_updated} updated
-            {s.files_removed > 0 ? ` · ${s.files_removed} removed` : ""}
-          </span>
+          Scan completed · <b>{libName(s.library_id)}</b> (+{s.files_added} ~
+          {s.files_updated}
+          {s.files_removed > 0 ? ` -${s.files_removed}` : ""})
         </span>
       ),
     });
@@ -546,23 +794,25 @@ function buildActivityFeed(
     items.push({
       key: `sess-${s.id}`,
       when: s.created_at,
-      icon: (
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <polygon points="5 3 19 12 5 21 5 3" />
-        </svg>
-      ),
       text: (
         <span>
-          <span className="text-white/90">User #{s.user_id}</span>{" "}
-          <span className="text-white/55">started a session ·</span>{" "}
-          <span className="text-white/75">{s.target_height}p · {s.encoder}</span>
+          {s.username ?? `User #${s.user_id}`}
+          {s.title ? (
+            <>
+              {" "}
+              started <b>{s.title}</b>
+            </>
+          ) : (
+            " started a session"
+          )}{" "}
+          · {s.target_height}p · {s.encoder}
         </span>
       ),
     });
   }
 
   items.sort((a, b) => b.when - a.when);
-  return items.slice(0, 8);
+  return items.slice(0, 6);
 }
 
 // ─── Alert builder ─────────────────────────────────────────────────
@@ -570,6 +820,7 @@ function buildActivityFeed(
 interface AlertItem {
   key: string;
   tone: PillTone;
+  badge: string;
   title: string;
   meta: string;
   when: number | null;
@@ -586,6 +837,7 @@ function buildAlerts(
       alerts.push({
         key: `scan-fail-${s.id}`,
         tone: "bad",
+        badge: "Scan",
         title: `Scan failed: library #${s.library_id}`,
         meta: s.error_message ?? "no error message captured",
         when: s.finished_at ?? s.started_at ?? s.created_at,
@@ -600,7 +852,8 @@ function buildAlerts(
       alerts.push({
         key: `disk-${d.path}`,
         tone: "bad",
-        title: `Disk almost full: ${d.label}`,
+        badge: "Disk",
+        title: `${d.label} ${pct.toFixed(0)}% full`,
         meta: `${pct.toFixed(1)}% used · ${d.path}`,
         when: null,
       });
@@ -608,8 +861,9 @@ function buildAlerts(
       alerts.push({
         key: `disk-${d.path}`,
         tone: "warn",
-        title: `Disk filling up: ${d.label}`,
-        meta: `${pct.toFixed(1)}% used · ${d.path}`,
+        badge: "Disk",
+        title: `${d.label} ${pct.toFixed(0)}% full`,
+        meta: `${d.path} is filling up. Consider pruning the transcode cache.`,
         when: null,
       });
     }
@@ -621,6 +875,7 @@ function buildAlerts(
       alerts.push({
         key: "cred-tmdb",
         tone: "info",
+        badge: "Vault",
         title: "TMDB credential not set",
         meta: "Movies + TV metadata fetch is disabled until configured.",
         when: null,
@@ -629,247 +884,6 @@ function buildAlerts(
   }
 
   return alerts;
-}
-
-// ─── Layout primitives kept local to the dashboard ─────────────────
-
-function Card({
-  title,
-  subtitle,
-  aside,
-  children,
-}: {
-  title: string;
-  subtitle?: string;
-  aside?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="overflow-hidden rounded-lg border border-white/10 bg-white/2">
-      <header className="flex items-baseline justify-between gap-3 border-b border-white/10 px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-[13px] font-semibold">{title}</div>
-          {subtitle && (
-            <div className="text-[11.5px] text-white/50">{subtitle}</div>
-          )}
-        </div>
-        {aside && <div className="shrink-0">{aside}</div>}
-      </header>
-      {children}
-    </section>
-  );
-}
-
-function EmptyInline({ children }: { children: React.ReactNode }) {
-  return <div className="px-4 py-5 text-sm text-white/45">{children}</div>;
-}
-
-function QuickAction({
-  href,
-  title,
-  subtitle,
-  icon,
-}: {
-  href: string;
-  title: string;
-  subtitle: string;
-  icon: React.ReactNode;
-}) {
-  return (
-    <Link
-      href={href}
-      className="block rounded-lg border border-white/10 bg-white/2 p-4 text-left transition-all hover:-translate-y-px hover:border-white/20 hover:bg-white/4"
-    >
-      <span className="mb-2.5 grid h-8 w-8 place-items-center rounded-lg bg-accent/15 text-(--color-accent)">
-        {icon}
-      </span>
-      <div className="text-[13px] font-semibold">{title}</div>
-      <div className="text-[11.5px] text-white/50">{subtitle}</div>
-    </Link>
-  );
-}
-
-// ─── Task + vault summaries (kept from previous version) ───────────
-
-function TaskSummary({
-  tasks,
-  nowMs,
-}: {
-  tasks: ScheduledTask[];
-  nowMs: number;
-}) {
-  const upNext = tasks
-    .filter((t) => t.enabled)
-    .slice()
-    .sort((a, b) => a.next_run_at - b.next_run_at)
-    .slice(0, 5);
-  const recent = tasks
-    .filter((t) => t.last_run_at !== null)
-    .slice()
-    .sort((a, b) => (b.last_run_at ?? 0) - (a.last_run_at ?? 0))
-    .slice(0, 5);
-  return (
-    <section className="grid grid-cols-1 gap-3 md:grid-cols-2">
-      <Card title="Up next" subtitle="Soonest scheduled run">
-        {upNext.length === 0 ? (
-          <EmptyInline>No enabled tasks.</EmptyInline>
-        ) : (
-          <ul className="divide-y divide-white/6">
-            {upNext.map((t) => (
-              <li
-                key={t.id}
-                className="flex items-baseline justify-between gap-3 px-4 py-2 text-[13px]"
-              >
-                <span className="truncate text-white/85">{t.name}</span>
-                <span className="shrink-0 text-[11.5px] text-white/55">
-                  in {formatRelative(t.next_run_at - nowMs)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </Card>
-      <Card title="Recently run" subtitle="Most recent first">
-        {recent.length === 0 ? (
-          <EmptyInline>No task runs yet.</EmptyInline>
-        ) : (
-          <ul className="divide-y divide-white/6">
-            {recent.map((t) => (
-              <li
-                key={t.id}
-                className="flex items-baseline justify-between gap-3 px-4 py-2 text-[13px]"
-              >
-                <span className="flex min-w-0 items-baseline gap-2">
-                  <TaskDot status={t.last_status} />
-                  <span className="truncate text-white/85">{t.name}</span>
-                </span>
-                <span className="shrink-0 text-[11.5px] text-white/55">
-                  {t.last_run_at ? formatAgo(nowMs - t.last_run_at) : "—"}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </Card>
-    </section>
-  );
-}
-
-function VaultSummary({ slots }: { slots: SecretSlotView[] }) {
-  const userSlots = slots.filter((s) => !s.managed);
-  return (
-    <div className="grid grid-cols-2 gap-2 px-4 py-3 sm:grid-cols-3 lg:grid-cols-4">
-      {userSlots.map((slot) => {
-        const set = Boolean(slot.stored?.set);
-        return (
-          <Link
-            key={slot.name}
-            href="/settings/admin/server/credentials"
-            className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/2 px-3 py-2 text-sm transition-colors hover:bg-white/4"
-          >
-            <span className="truncate text-white/85">{slot.display_name}</span>
-            <span
-              className={`flex shrink-0 items-center gap-1 text-xs ${
-                set ? "text-emerald-300" : "text-white/40"
-              }`}
-              aria-label={set ? "Configured" : "Not configured"}
-            >
-              <span
-                className={`inline-block h-1.5 w-1.5 rounded-full ${set ? "bg-emerald-400" : "bg-white/25"}`}
-              />
-              {set ? "Set" : "Empty"}
-            </span>
-          </Link>
-        );
-      })}
-    </div>
-  );
-}
-
-function TaskDot({ status }: { status: ScheduledTask["last_status"] }) {
-  const cls =
-    status === "success"
-      ? "bg-emerald-400"
-      : status === "failed"
-        ? "bg-red-400"
-        : status === "running"
-          ? "bg-blue-400 animate-pulse"
-          : "bg-white/30";
-  return <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${cls}`} />;
-}
-
-// ─── Encoder + resolution cells (kept from previous version) ───────
-
-function ResolutionCell({
-  sourceHeight,
-  targetHeight,
-  bitrateBps,
-}: {
-  sourceHeight: number | null;
-  targetHeight: number;
-  bitrateBps: number;
-}) {
-  const target = `${targetHeight}p`;
-  const source = sourceHeight ? `${sourceHeight}p` : null;
-  const rate = bitrateBps >= 1_000_000
-    ? `${(bitrateBps / 1_000_000).toFixed(1).replace(/\.0$/, "")} Mbps`
-    : `${Math.round(bitrateBps / 1000)} kbps`;
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      {source && source !== target ? (
-        <>
-          <span className="text-white/55">{source}</span>
-          <span className="text-white/35">→</span>
-          <span className="text-white/85">{target}</span>
-        </>
-      ) : (
-        <span className="text-white/85">{target}</span>
-      )}
-      <span className="text-white/45">·</span>
-      <span className="text-white/55">{rate}</span>
-    </span>
-  );
-}
-
-function EncoderChip({
-  label,
-  videoTreatment,
-  audioTreatment,
-}: {
-  label: string;
-  videoTreatment?: "copy" | "reencode";
-  audioTreatment?: "copy" | "reencode";
-}) {
-  const isSoftware = label.toLowerCase().includes("software");
-  const cls = isSoftware
-    ? "bg-white/10 text-white/60"
-    : "bg-emerald-500/15 text-emerald-300";
-  const vCopy = videoTreatment === "copy";
-  const aCopy = audioTreatment === "copy";
-  const copyBadge = vCopy && aCopy
-    ? { label: "Remux", title: "Both video and audio are being remuxed — no encoder running" }
-    : vCopy
-      ? { label: "V Copy", title: "Video stream is being remuxed, not re-encoded" }
-      : aCopy
-        ? { label: "A Copy", title: "Audio stream is being remuxed, not re-encoded" }
-        : null;
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <span
-        className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${cls}`}
-      >
-        {label}
-      </span>
-      {copyBadge && (
-        <span
-          className="inline-flex items-center rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-sky-300"
-          title={copyBadge.title}
-        >
-          {copyBadge.label}
-        </span>
-      )}
-    </span>
-  );
 }
 
 // ─── Formatters (unchanged from previous version) ──────────────────

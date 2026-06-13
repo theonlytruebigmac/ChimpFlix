@@ -1,44 +1,46 @@
-import { admin as adminApi } from "@/lib/chimpflix-api";
-import { AdminLibraryHealthClient } from "@/components/admin/AdminLibraryHealthClient";
+import {
+  admin as adminApi,
+  libraries as librariesApi,
+} from "@/lib/chimpflix-api";
+import { AdminMaintenanceTabs } from "@/components/admin/AdminMaintenanceTabs";
 import { AdminMaintenanceDashboardClient } from "@/components/admin/AdminMaintenanceDashboardClient";
-import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
+import { AdminLibraryHealthClient } from "@/components/admin/AdminLibraryHealthClient";
+import { AdminBackupRestoreClient } from "@/components/admin/AdminBackupRestoreClient";
+import { SettingsBackupClient } from "@/components/SettingsBackupClient";
+import { AdminBulkItemsClient } from "@/components/admin/AdminBulkItemsClient";
 
 export const dynamic = "force-dynamic";
 
-/// Maintenance overview — operator-facing health and on-demand
-/// cleanup tools in one surface. Used to be split across two
-/// sidebar entries (Overview + Library Health); folded together
-/// because they answer the same question ("how is the system
-/// holding up, and what can I run to fix it?") and the library
-/// health snapshot reads cheaply enough to render inline.
-export default async function AdminMaintenancePage() {
-  const report = await adminApi.libraryHealth();
+const TAB_IDS = ["cleanup", "health", "backups", "bulk"];
+
+/// Maintenance — on-demand cleanup, the library health snapshot, backup &
+/// restore, and bulk item operations, consolidated into one tabbed page
+/// (folds the old maintenance overview + backup + bulk pages).
+export default async function AdminMaintenancePage({
+  searchParams,
+}: {
+  searchParams: Promise<{ tab?: string }>;
+}) {
+  const sp = await searchParams;
+  const initialTab = TAB_IDS.includes(sp?.tab ?? "")
+    ? (sp.tab as string)
+    : "cleanup";
+  const [report, libsRes] = await Promise.all([
+    adminApi.libraryHealth(),
+    librariesApi.list(),
+  ]);
   return (
-    <div>
-      <AdminPageHeader
-        eyebrow="Maintenance"
-        title="Overview"
-        description={
-          <>
-            One-click cleanup across the entire instance, plus a
-            read-only health snapshot of the libraries themselves.
-            Cleanup buttons mirror scheduled tasks (which run on a
-            cadence); these are the on-demand path.
-          </>
-        }
-      />
-      <AdminMaintenanceDashboardClient />
-      <section className="mt-10">
-        <h2 className="mb-4 text-base font-semibold tracking-tight text-white/90">
-          Library health
-        </h2>
-        <p className="-mt-3 mb-5 max-w-2xl text-sm text-white/55">
-          Common library pathologies: orphaned rows, missing files on
-          disk, items lacking artwork or metadata ids. Reload the page
-          to re-run the checks.
-        </p>
-        <AdminLibraryHealthClient report={report} />
-      </section>
-    </div>
+    <AdminMaintenanceTabs
+      initialTab={initialTab}
+      cleanup={<AdminMaintenanceDashboardClient />}
+      health={<AdminLibraryHealthClient report={report} />}
+      backups={
+        <div>
+          <SettingsBackupClient />
+          <AdminBackupRestoreClient />
+        </div>
+      }
+      bulk={<AdminBulkItemsClient libraries={libsRes.libraries} />}
+    />
   );
 }

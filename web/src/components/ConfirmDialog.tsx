@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 /// In-app replacement for `window.confirm`. Portal-rendered so it
-/// escapes any transformed ancestor (TitleModalShell, etc.), focus-traps
-/// on the primary action, closes on Escape, and supports destructive
+/// escapes any transformed ancestor (TitleModalShell, etc.),
+/// auto-focuses the primary action, Tab-trapped within the dialog,
+/// closes on Escape, and supports destructive
 /// styling for delete/merge/sign-out flows where the confirm button
 /// should look dangerous.
 ///
@@ -36,6 +38,7 @@ export function ConfirmDialog({
   cancelLabel = "Cancel",
   destructive = false,
   busy = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -54,12 +57,28 @@ export function ConfirmDialog({
   /// (Cancel still works). Hand back to the parent so it can wire the
   /// disabled state to a long-running promise.
   busy?: boolean;
+  /// Disable the confirm button WITHOUT showing the busy spinner — for
+  /// gating on a pre-action precondition (e.g. a typed-name match)
+  /// rather than an in-flight request. Cancel stays enabled. `busy`
+  /// still takes precedence for the spinner/label.
+  confirmDisabled?: boolean;
   /// Called when the user clicks the confirm button. Parent is
   /// responsible for closing the dialog after the async action.
   onConfirm: () => void | Promise<void>;
   onCancel: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const confirmRef = useRef<HTMLButtonElement | null>(null);
+  // Unique per-instance ID so multiple ConfirmDialogs in the DOM at the
+  // same time don't produce duplicate id= / aria-labelledby= values.
+  const titleId = `${useId()}-confirm-dialog-title`;
+
+  // Trap Tab/Shift-Tab within the dialog so keyboard users can't
+  // navigate into the obscured page beneath. autoFocusFirst is off
+  // because we manually focus the confirm button below (cancel comes
+  // first in DOM order but confirm is the intentional default action).
+  // closeOnEscape is off so the Escape effect below can guard on `busy`.
+  useFocusTrap(dialogRef, { autoFocusFirst: false, closeOnEscape: false });
 
   // Focus the confirm button on mount so Enter activates it. We focus
   // confirm (not cancel) because the operator opened the dialog
@@ -86,15 +105,16 @@ export function ConfirmDialog({
       onClick={busy ? undefined : onCancel}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
+        aria-labelledby={titleId}
         className="zf-modal-in w-full max-w-md overflow-hidden rounded-lg border border-white/10 bg-(--color-surface) shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 pt-5 pb-2">
           <h2
-            id="confirm-dialog-title"
+            id={titleId}
             className="text-base font-semibold text-white"
           >
             {title}
@@ -116,7 +136,7 @@ export function ConfirmDialog({
             ref={confirmRef}
             type="button"
             onClick={() => void onConfirm()}
-            disabled={busy}
+            disabled={busy || confirmDisabled}
             className={
               destructive
                 ? "inline-flex items-center gap-2 rounded-md border border-red-500/40 bg-red-500/15 px-4 py-2 text-sm font-semibold text-red-200 transition-colors hover:border-red-500/65 hover:bg-red-500/25 disabled:opacity-50"

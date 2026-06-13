@@ -16,6 +16,23 @@ minor release (`0.y.z`); the changelog will call them out explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- **"Date added" now means file acquisition time, not scan time.** The
+  scanner seeds `items.added_at` / `episodes.added_at` from the media
+  file's mtime (clamped to now; earliest file wins across versions and
+  episodes), so the Recently Added rail reflects when titles actually
+  entered the collection instead of when a bulk scan happened to walk
+  them. A one-time migration (phase 109) backdates existing rows to the
+  earliest known file mtime. Operator notes:
+  - The Recently Added rail fully reorders once after the migration,
+    and "Recently Added" card badges recompute against the new dates.
+  - Smart collections filtering on `added_at` with absolute timestamps
+    re-evaluate against the new values and may change membership.
+  - Files copied with preserved mtimes (`rsync -a`, `cp -p`, backup
+    restores) date by their source mtime — a deliberately backdated
+    "new" file will not surface at the top of the rail.
+
 ### Added
 
 - **Public-release hardening pass.** See

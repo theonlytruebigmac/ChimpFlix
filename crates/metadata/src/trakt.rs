@@ -206,6 +206,10 @@ impl TraktClient {
             return Ok(());
         }
         let mut movies = Vec::new();
+        let mut shows = Vec::new();
+        // Episodes addressed by their OWN id go in the top-level `episodes`
+        // array (Trakt resolves them directly), sidestepping show+season+
+        // number resolution that misses for anime numbered unlike Trakt.
         let mut episodes = Vec::new();
         for e in entries {
             match e {
@@ -214,10 +218,21 @@ impl TraktClient {
                     "ids": ids.to_json(),
                 })),
                 HistoryPush::Episode {
+                    episode_ids,
+                    watched_at,
+                    ..
+                } if !episode_ids.is_empty() => {
+                    episodes.push(json!({
+                        "watched_at": watched_at,
+                        "ids": episode_ids.to_json(),
+                    }));
+                }
+                HistoryPush::Episode {
                     show_ids,
                     season,
                     episode,
                     watched_at,
+                    ..
                 } => {
                     // Trakt's POST /sync/history wants the show object
                     // *itself* in the `shows` array — `ids` at the top
@@ -228,7 +243,7 @@ impl TraktClient {
                     // 201 but `added.episodes` is 0), which is exactly
                     // the "push fires but nothing appears on Trakt"
                     // symptom.
-                    episodes.push(json!({
+                    shows.push(json!({
                         "ids": show_ids.to_json(),
                         "seasons": [{
                             "number": season,
@@ -241,7 +256,7 @@ impl TraktClient {
                 }
             }
         }
-        let body = json!({ "movies": movies, "shows": episodes });
+        let body = json!({ "movies": movies, "shows": shows, "episodes": episodes });
         self.user_post("/sync/history", access_token, &body).await?;
         Ok(())
     }
@@ -255,6 +270,7 @@ impl TraktClient {
             return Ok(());
         }
         let mut movies = Vec::new();
+        let mut shows = Vec::new();
         let mut episodes = Vec::new();
         for e in entries {
             match e {
@@ -262,12 +278,17 @@ impl TraktClient {
                     "ids": ids.to_json(),
                 })),
                 HistoryPush::Episode {
+                    episode_ids, ..
+                } if !episode_ids.is_empty() => {
+                    episodes.push(json!({ "ids": episode_ids.to_json() }));
+                }
+                HistoryPush::Episode {
                     show_ids,
                     season,
                     episode,
                     ..
                 } => {
-                    episodes.push(json!({
+                    shows.push(json!({
                         "ids": show_ids.to_json(),
                         "seasons": [{
                             "number": season,
@@ -277,7 +298,7 @@ impl TraktClient {
                 }
             }
         }
-        let body = json!({ "movies": movies, "shows": episodes });
+        let body = json!({ "movies": movies, "shows": shows, "episodes": episodes });
         self.user_post("/sync/history/remove", access_token, &body)
             .await?;
         Ok(())
@@ -301,22 +322,7 @@ impl TraktClient {
         action: ScrobbleAction,
         event: ScrobblePush,
     ) -> Result<()> {
-        let body = match event {
-            ScrobblePush::Movie { ids, progress } => json!({
-                "movie": { "ids": ids.to_json() },
-                "progress": progress.clamp(0.0, 100.0),
-            }),
-            ScrobblePush::Episode {
-                show_ids,
-                season,
-                episode,
-                progress,
-            } => json!({
-                "show": { "ids": show_ids.to_json() },
-                "episode": { "season": season, "number": episode },
-                "progress": progress.clamp(0.0, 100.0),
-            }),
-        };
+        let body = scrobble_body(&event);
         let url = format!("{}{}", self.base_url, action.path());
         let resp = self
             .http
@@ -828,6 +834,13 @@ impl TraktClient {
         // history, but a firm stop against a runaway loop / unbounded memory.
         const MAX_PAGES: u32 = 200;
 
+        // Max retries per page for 429 responses. Trakt's docs say they
+        // set Retry-After; we honour it and double a floor for servers that
+        // don't, capped at 120 s so a bad actor can't park us indefinitely.
+        const MAX_429_RETRIES: u32 = 3;
+        const MIN_RETRY_AFTER_S: u64 = 5;
+        const MAX_RETRY_AFTER_S: u64 = 120;
+
         let mut all: Vec<HistoryEntry> = Vec::new();
         let mut page: u32 = 1;
         loop {
@@ -836,15 +849,65 @@ impl TraktClient {
                 url.push_str("&start_at=");
                 url.push_str(&urlencode(s));
             }
-            let resp = self
-                .http
-                .get(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
-                .send()
-                .await
-                .with_context(|| format!("GET {url}"))?;
+
+            // Retry the same page on 429; break out (returning partial
+            // results) on any other non-success so the caller can advance
+            // the sync cursor over what we already fetched.
+            let mut backoff_floor = MIN_RETRY_AFTER_S;
+            let resp = 'retry: {
+                for attempt in 0..MAX_429_RETRIES {
+                    let resp = self
+                        .http
+                        .get(&url)
+                        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                        .send()
+                        .await
+                        .with_context(|| format!("GET {url}"))?;
+                    if resp.status().as_u16() == 429 && attempt + 1 < MAX_429_RETRIES {
+                        let header_wait = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let wait_s = header_wait.max(backoff_floor).min(MAX_RETRY_AFTER_S);
+                        warn!(
+                            wait_s,
+                            header_wait,
+                            page,
+                            attempt = attempt + 1,
+                            "Trakt history rate-limited (429); sleeping then retrying page"
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait_s)).await;
+                        // Double the floor so a server returning Retry-After:0
+                        // still backs off geometrically.
+                        backoff_floor = (backoff_floor * 2).min(MAX_RETRY_AFTER_S);
+                        continue;
+                    }
+                    break 'retry resp;
+                }
+                // All retries exhausted — fall through to the non-success
+                // handler below by re-issuing one final request.
+                self.http
+                    .get(&url)
+                    .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                    .send()
+                    .await
+                    .with_context(|| format!("GET {url}"))?
+            };
+
             if !resp.status().is_success() {
-                return Err(api_error("GET /sync/history", resp).await);
+                // Return whatever we accumulated so far. The caller
+                // (pull_user_history) records `all` before updating the
+                // sync cursor, so partial progress is not lost.
+                warn!(
+                    status = %resp.status(),
+                    page,
+                    fetched = all.len(),
+                    "Trakt history fetch failed mid-pagination; returning partial results"
+                );
+                let _ = resp.text().await; // consume body to free the connection
+                return Ok(all);
             }
             // Read the total-page-count header BEFORE the body is consumed.
             let page_count = resp
@@ -1168,6 +1231,11 @@ pub enum HistoryPush {
     },
     Episode {
         show_ids: TraktIdSet,
+        /// The episode's OWN ids (tvdb / tmdb). When non-empty the entry
+        /// is pushed via Trakt's top-level `episodes` array keyed on the
+        /// episode id, sidestepping the show + season/number resolution
+        /// that misses for anime numbered differently than Trakt.
+        episode_ids: TraktIdSet,
         season: i32,
         episode: i32,
         watched_at: String,
@@ -1401,10 +1469,52 @@ pub enum ScrobblePush {
     },
     Episode {
         show_ids: TraktIdSet,
+        /// The episode's OWN ids (tvdb / tmdb). When non-empty Trakt
+        /// resolves the exact episode directly, bypassing the
+        /// `show + season + number` lookup that fails for anime whose
+        /// local (TMDB-style) numbering doesn't match Trakt's TVDB-based
+        /// season structure. Empty → fall back to show + season/number.
+        episode_ids: TraktIdSet,
         season: i32,
         episode: i32,
         progress: f64,
     },
+}
+
+/// Build the JSON body for a `/scrobble/{action}` POST. Pure (no I/O) so the
+/// episode-by-id vs show+season/number shapes can be unit-tested without a
+/// live Trakt account — the shape is the whole point of the anime fix.
+fn scrobble_body(event: &ScrobblePush) -> serde_json::Value {
+    match event {
+        ScrobblePush::Movie { ids, progress } => json!({
+            "movie": { "ids": ids.to_json() },
+            "progress": progress.clamp(0.0, 100.0),
+        }),
+        ScrobblePush::Episode {
+            show_ids,
+            episode_ids,
+            season,
+            episode,
+            progress,
+        } => {
+            if episode_ids.is_empty() {
+                // No episode-level id — resolve via the parent show +
+                // season/number (works for normally-numbered shows).
+                json!({
+                    "show": { "ids": show_ids.to_json() },
+                    "episode": { "season": season, "number": episode },
+                    "progress": progress.clamp(0.0, 100.0),
+                })
+            } else {
+                // Address the episode by its own id; Trakt infers the show.
+                // The robust path for anime numbered unlike Trakt.
+                json!({
+                    "episode": { "ids": episode_ids.to_json() },
+                    "progress": progress.clamp(0.0, 100.0),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1621,6 +1731,64 @@ mod tests {
         assert_eq!(
             urlencode("2024-01-19T12:34:56Z"),
             "2024-01-19T12%3A34%3A56Z"
+        );
+    }
+
+    #[test]
+    fn scrobble_body_episode_prefers_own_ids() {
+        // With an episode-level id, address the episode directly — no show,
+        // no season/number — so Trakt resolves the exact episode regardless
+        // of how the season is numbered locally (the anime fix).
+        let ev = ScrobblePush::Episode {
+            show_ids: TraktIdSet {
+                tmdb: Some(117465),
+                imdb: None,
+                tvdb: Some(400),
+            },
+            episode_ids: TraktIdSet {
+                tmdb: None,
+                imdb: None,
+                tvdb: Some(99887),
+            },
+            season: 2,
+            episode: 1,
+            progress: 42.0,
+        };
+        let body = scrobble_body(&ev);
+        assert_eq!(body["episode"]["ids"]["tvdb"], 99887);
+        assert!(
+            body.get("show").is_none(),
+            "episode-id path must not send a show object"
+        );
+        assert!(
+            body["episode"].get("season").is_none(),
+            "episode-id path must not send season/number"
+        );
+        assert_eq!(body["progress"], 42.0);
+    }
+
+    #[test]
+    fn scrobble_body_episode_falls_back_to_show_season_number() {
+        // No episode-level id → resolve via show + season/number (the shape
+        // that works for normally-numbered shows).
+        let ev = ScrobblePush::Episode {
+            show_ids: TraktIdSet {
+                tmdb: Some(117465),
+                imdb: None,
+                tvdb: None,
+            },
+            episode_ids: TraktIdSet::default(),
+            season: 2,
+            episode: 1,
+            progress: 5.0,
+        };
+        let body = scrobble_body(&ev);
+        assert_eq!(body["show"]["ids"]["tmdb"], 117465);
+        assert_eq!(body["episode"]["season"], 2);
+        assert_eq!(body["episode"]["number"], 1);
+        assert!(
+            body["episode"].get("ids").is_none(),
+            "fallback path must not invent an episode ids object"
         );
     }
 }

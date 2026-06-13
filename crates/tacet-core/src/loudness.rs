@@ -289,10 +289,10 @@ fn measure_with_symphonia(
 
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
     let mut samples_seen: u64 = 0;
-    // Progress emit cadence: every ~1s of source time. With native
-    // rate × channels samples per second, gate emissions so a 2-hour
-    // file produces ~7200 events at most, not one per packet.
-    let mut next_progress_at_samples: u64 = native_rate as u64 * channels as u64;
+    // Progress emit cadence: every ~1s of source time. `samples_seen`
+    // counts PCM frames (interleaved samples ÷ channels), so the threshold
+    // is just native_rate frames — not native_rate × channels.
+    let mut next_progress_at_samples: u64 = native_rate as u64;
 
     loop {
         if cancel.is_cancelled() {
@@ -442,6 +442,8 @@ fn measure_with_ffmpeg(path: &Path, cancel: &CancellationToken) -> Result<Option
     loop {
         if cancel.is_cancelled() {
             let _ = child.kill();
+            let _ = child.wait(); // reap zombie — avoid defunct process entry
+            drop(stderr_handle); // thread will exit once the pipe closes
             return Err(Cancelled.into());
         }
         match child.try_wait()? {

@@ -122,8 +122,8 @@ function LoginContent() {
     };
   }, [invite]);
 
-  function setModeAndReset(next: Mode) {
-    setMode(next);
+  function setModeAndReset(newMode: Mode) {
+    setMode(newMode);
     setError(null);
     setNotice(null);
   }
@@ -373,12 +373,12 @@ function LoginContent() {
           )}
 
           {error && (
-            <div className="rounded bg-red-500/10 px-3 py-2 text-sm text-red-300 ring-1 ring-red-500/30">
+            <div role="alert" className="rounded bg-red-500/10 px-3 py-2 text-sm text-red-300 ring-1 ring-red-500/30">
               {error}
             </div>
           )}
           {notice && (
-            <div className="rounded bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 ring-1 ring-emerald-500/30">
+            <div role="status" aria-live="polite" className="rounded bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 ring-1 ring-emerald-500/30">
               {notice}
             </div>
           )}

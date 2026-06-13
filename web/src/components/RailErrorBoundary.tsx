@@ -58,6 +58,13 @@ export class RailErrorBoundary extends Component<Props, State> {
               This row couldn&apos;t load right now. The rest of the page is
               fine — check server logs for details.
             </span>
+            {/* Resetting state re-renders children, letting Suspense re-execute the async fetch. */}
+            <button
+              onClick={() => this.setState({ failed: false })}
+              className="ml-auto shrink-0 rounded px-2 py-0.5 text-[12.5px] text-white/55 underline-offset-2 hover:text-white/80 hover:underline"
+            >
+              Try again
+            </button>
           </div>
         </section>
       );

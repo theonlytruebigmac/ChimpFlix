@@ -6,6 +6,27 @@ import {
 } from "@/lib/chimpflix-api";
 import { plexImage } from "@/lib/image";
 
+// Cap SSR fan-out so a large Trakt calendar doesn't fire dozens of parallel
+// item-lookup requests before the page can stream any HTML.
+const SSR_FETCH_CONCURRENCY = 6;
+
+async function throttledAll<T>(
+  tasks: (() => Promise<T>)[],
+  limit: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 function formatAirRelative(firstAired: string, now: Date): string {
   const air = new Date(firstAired);
   const ms = air.getTime() - now.getTime();
@@ -67,11 +88,13 @@ export async function ComingSoonRail({
     seen.add(id);
     return true;
   });
-  // Fetch the show items in parallel so we can render thumbs.
-  const shows = await Promise.all(
-    oneEachShow.map((e) =>
+  // Fetch the show items with bounded concurrency so SSR doesn't fire an
+  // unbounded fan-out before the page can stream HTML.
+  const shows = await throttledAll(
+    oneEachShow.map((e) => () =>
       itemsApi.get(e.show_item_id as number).catch(() => null),
     ),
+    SSR_FETCH_CONCURRENCY,
   );
   const now = new Date();
   const tiles = oneEachShow
@@ -89,7 +112,7 @@ export async function ComingSoonRail({
       <h2 className="mb-3 text-lg font-semibold tracking-tight sm:text-xl md:text-[1.4rem]">
         {title}
       </h2>
-      <div className="flex gap-3 overflow-x-auto pb-2 sm:gap-4">
+      <div className="flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x pb-2 sm:gap-4">
         {tiles.map(({ entry, show }) => {
           if (!show) return null;
           const thumbPath =
@@ -99,8 +122,8 @@ export async function ComingSoonRail({
           return (
             <Link
               key={`${entry.show_item_id}-${entry.season}-${entry.episode}`}
-              href={`/show/${entry.show_item_id}`}
-              className="group relative flex-none overflow-hidden rounded-md bg-neutral-900 transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus:ring-2 focus:ring-white"
+              href={`/watch/${entry.show_item_id}`}
+              className="group relative flex-none overflow-hidden rounded-md bg-neutral-900 transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               style={{ width: 320 }}
             >
               {img && (
@@ -153,10 +176,13 @@ export async function UpcomingMoviesRail({
       m.movie_item_id !== null && m.movie_item_id !== undefined,
   );
   if (matched.length === 0) return null;
-  const movies = await Promise.all(
-    matched.map((m) =>
+  // Same bounded fan-out as ComingSoonRail — 30-day movie window can
+  // accumulate many more entries than the show calendar.
+  const movies = await throttledAll(
+    matched.map((m) => () =>
       itemsApi.get(m.movie_item_id as number).catch(() => null),
     ),
+    SSR_FETCH_CONCURRENCY,
   );
   const tiles = matched
     .map((entry, idx) => ({ entry, movie: movies[idx] }))
@@ -171,7 +197,7 @@ export async function UpcomingMoviesRail({
       <h2 className="mb-3 text-lg font-semibold tracking-tight sm:text-xl md:text-[1.4rem]">
         Upcoming Movies
       </h2>
-      <div className="flex gap-3 overflow-x-auto pb-2 sm:gap-4">
+      <div className="flex gap-3 overflow-x-auto overscroll-x-contain touch-pan-x pb-2 sm:gap-4">
         {tiles.map(({ entry, movie }) => {
           if (!movie) return null;
           const thumbPath =
@@ -184,8 +210,8 @@ export async function UpcomingMoviesRail({
           return (
             <Link
               key={`${entry.movie_item_id}-${entry.released}`}
-              href={`/movie/${entry.movie_item_id}`}
-              className="group relative flex-none overflow-hidden rounded-md bg-neutral-900 transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus:ring-2 focus:ring-white"
+              href={`/watch/${entry.movie_item_id}`}
+              className="group relative flex-none overflow-hidden rounded-md bg-neutral-900 transition-transform hover:scale-[1.04] focus:scale-[1.04] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               style={{ width: 320 }}
             >
               {img && (

@@ -326,18 +326,24 @@ async fn main() -> anyhow::Result<()> {
     // deciding whether to add `-hwaccel <name>` per session. The
     // probe is in-process — slow on a cold container (every codec
     // test makes a libavcodec call) but bounded by SMOKE_TIMEOUT.
-    let transcoder_caps = Arc::new(chimpflix_transcoder::detect_capabilities(&ffmpeg).await);
+    let probed = chimpflix_transcoder::detect_capabilities(&ffmpeg).await;
     info!(
-        ffmpeg = ?transcoder_caps.ffmpeg_version,
-        hwaccels = ?transcoder_caps.hwaccels,
-        h264_encoders = ?transcoder_caps.h264_encoders,
-        hevc_encoders = ?transcoder_caps.hevc_encoders,
-        cuda_decoders = ?transcoder_caps.decoders.cuda,
-        vaapi_decoders = ?transcoder_caps.decoders.vaapi,
-        qsv_decoders = ?transcoder_caps.decoders.qsv,
-        videotoolbox_decoders = ?transcoder_caps.decoders.videotoolbox,
+        ffmpeg = ?probed.ffmpeg_version,
+        hwaccels = ?probed.hwaccels,
+        h264_encoders = ?probed.h264_encoders,
+        hevc_encoders = ?probed.hevc_encoders,
+        cuda_decoders = ?probed.decoders.cuda,
+        vaapi_decoders = ?probed.decoders.vaapi,
+        qsv_decoders = ?probed.decoders.qsv,
+        videotoolbox_decoders = ?probed.decoders.videotoolbox,
         "ffmpeg capability probe complete"
     );
+    // Refreshable holder so the admin "re-probe" endpoint can swap in a
+    // fresh detection at runtime (after a driver/GPU change) without a
+    // restart. The same handle is shared with the transcode manager
+    // below so a re-probe is seen by both the admin GET and the live
+    // encoder-selection path.
+    let transcoder_caps = chimpflix_transcoder::SharedCapabilities::new(probed);
 
     let transcoder = TranscodeManager::new(
         data_dir.join("cache/sessions"),
@@ -488,6 +494,7 @@ async fn main() -> anyhow::Result<()> {
         // 1 permit = bulk operations serialize against each other.
         // See `AppState::bulk_write_lock` for the rationale.
         bulk_write_lock: Arc::new(tokio::sync::Semaphore::new(1)),
+        optimize_cancels: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
     };
 
     // Reap orphaned sessions on the operator's configured idle window.

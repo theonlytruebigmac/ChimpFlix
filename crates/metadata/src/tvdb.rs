@@ -146,17 +146,39 @@ impl TvdbClient {
     /// Returns episodes in the order TVDB lists them. Empty Vec when
     /// the series exists but has no episode rows (rare but seen on
     /// upcoming-only series).
+    ///
+    /// TVDB v4 paginates episode lists at 100 per page. This method
+    /// follows `links.next` until all pages are fetched or the safety
+    /// cap (20 pages = up to 2 000 episodes) is reached.
     pub async fn fetch_episodes(&self, tvdb_id: i64) -> Result<Vec<TvdbEpisode>> {
         let lang = &self.language;
-        let raw: Envelope<RawEpisodesPage> = self
-            .get(&format!("/series/{tvdb_id}/episodes/default/{lang}"))
-            .await?;
-        Ok(raw
-            .data
-            .episodes
-            .into_iter()
-            .map(TvdbEpisode::from_raw)
-            .collect())
+        let mut episodes: Vec<TvdbEpisode> = Vec::new();
+        // Start with page 0 (TVDB v4 default).
+        let mut next_path: Option<String> =
+            Some(format!("/series/{tvdb_id}/episodes/default/{lang}"));
+        // Safety cap: TVDB returns 100 eps/page; 20 pages = 2 000 episodes.
+        const MAX_PAGES: usize = 20;
+        for _ in 0..MAX_PAGES {
+            let path = match next_path.take() {
+                Some(p) => p,
+                None => break,
+            };
+            let raw: Envelope<RawEpisodesPage> = self.get(&path).await?;
+            episodes.extend(raw.data.episodes.into_iter().map(TvdbEpisode::from_raw));
+            // `links.next` is an absolute URL; strip the base so `get()`
+            // can re-prepend it (avoids duplicating auth/retry logic).
+            next_path = raw
+                .data
+                .links
+                .and_then(|l| l.next)
+                .filter(|u| !u.is_empty())
+                .map(|u| {
+                    u.strip_prefix(&self.base_url)
+                        .map(str::to_owned)
+                        .unwrap_or(u)
+                });
+        }
+        Ok(episodes)
     }
 
     /// Fetch extended data for a single episode — characters (cast +
@@ -391,7 +413,9 @@ impl TvdbEpisodeExtended {
                 profile_url: c.image,
                 sort: c.sort.unwrap_or(0),
             })
-            .filter(|c| !c.person_name.is_empty())
+            // person_id == 0 means TVDB omitted the id; drop these to avoid
+            // multiple anonymous entries collapsing onto the synthetic key "tvdb:0".
+            .filter(|c| !c.person_name.is_empty() && c.person_id != 0)
             .collect();
         Self {
             tvdb_id: r.id,
@@ -413,6 +437,17 @@ struct Envelope<T> {
 struct RawEpisodesPage {
     #[serde(default)]
     episodes: Vec<RawEpisode>,
+    /// Pagination info returned by TVDB v4. `links.next` is the absolute
+    /// URL for the next page; `None` / empty means this is the last page.
+    #[serde(default)]
+    links: Option<RawPageLinks>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPageLinks {
+    /// Absolute URL for the next page, or `null` when on the last page.
+    #[serde(default)]
+    next: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

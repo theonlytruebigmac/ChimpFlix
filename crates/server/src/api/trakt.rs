@@ -114,25 +114,35 @@ pub async fn link_poll(
     let Some(client) = state.trakt_snapshot().await else {
         return Err(ApiError::validation("Trakt is not configured"));
     };
+    // Peek at the entry without removing it yet. We only evict on
+    // terminal outcomes (Ready/Expired/Denied/AlreadyApproved); on
+    // transient HTTP errors or Pending/SlowDown the entry must survive
+    // so the UI can retry without restarting the whole device-code flow.
     let entry = {
         let mut guard = device_cache().lock().await;
         sweep_expired(&mut guard);
-        guard.remove(&user.id)
+        // Clone the device_code so we can release the lock before the
+        // HTTP call; the `CachedDevice` stays in the map until we know
+        // the outcome.
+        guard.get(&user.id).map(|e| (e.device_code.clone(), e.expires_at))
     };
-    let Some(entry) = entry else {
+    let Some((device_code, expires_at)) = entry else {
         return Err(ApiError::validation(
             "no pending link — call /trakt/link/start first",
         ));
     };
-    if entry.expires_at <= Instant::now() {
+    if expires_at <= Instant::now() {
+        device_cache().lock().await.remove(&user.id);
         return Ok(Json(LinkPollResponse::Expired));
     }
     let result = client
-        .poll_device_token(&entry.device_code)
+        .poll_device_token(&device_code)
         .await
         .map_err(ApiError::Internal)?;
     match result {
         DevicePollResult::Ready(pair) => {
+            // Terminal: evict the cached entry now that we have tokens.
+            device_cache().lock().await.remove(&user.id);
             let expires_at = now_ms() + pair.expires_in * 1000;
             queries::upsert_trakt_tokens(
                 &state.pool,
@@ -148,8 +158,8 @@ pub async fn link_poll(
             Ok(Json(LinkPollResponse::Ready))
         }
         DevicePollResult::Pending | DevicePollResult::SlowDown => {
-            // Put it back so the next poll uses the same code.
-            device_cache().lock().await.insert(user.id, entry);
+            // Non-terminal: the entry was never removed, so the next
+            // poll will use the same device_code — nothing to do here.
             Ok(Json(if matches!(result, DevicePollResult::SlowDown) {
                 LinkPollResponse::SlowDown
             } else {
@@ -157,9 +167,15 @@ pub async fn link_poll(
             }))
         }
         DevicePollResult::Expired | DevicePollResult::AlreadyApproved => {
+            // Terminal: clear the stale entry.
+            device_cache().lock().await.remove(&user.id);
             Ok(Json(LinkPollResponse::Expired))
         }
-        DevicePollResult::Denied => Ok(Json(LinkPollResponse::Denied)),
+        DevicePollResult::Denied => {
+            // Terminal: clear the stale entry.
+            device_cache().lock().await.remove(&user.id);
+            Ok(Json(LinkPollResponse::Denied))
+        }
     }
 }
 
@@ -565,7 +581,11 @@ pub async fn recommendations(
     let acc = queries::user_library_filter(&state.pool, user.id, user.role)
         .await
         .map_err(ApiError::Internal)?;
-    let mut items = Vec::new();
+    // Collect local ids for all matching recs, then fetch in one batch.
+    // Mirrors the favorites pattern: N per-entry tmdb lookups but a
+    // single list_items_by_ids call instead of one per entry.
+    let mut local_ids: Vec<i64> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for entry in entries {
         let Some(tmdb_id) = entry.ids.tmdb else {
             continue;
@@ -586,24 +606,16 @@ pub async fn recommendations(
         else {
             continue;
         };
-        // Pull the full ListedItem with play_state so the Card can
-        // show "watched" badges and the rail can drop items the
-        // user already finished.
-        let Some(listed) = queries::list_items_by_ids(
-            &state.pool,
-            &[local_id],
-            user.id,
-            acc.as_deref(),
-        )
-        .await
-        .map_err(ApiError::Internal)?
-        .into_iter()
-        .next()
-        else {
-            continue;
-        };
-        items.push(listed);
+        if seen.insert(local_id) {
+            local_ids.push(local_id);
+        }
     }
+    // Pull the full ListedItem rows with play_state in one query so
+    // the Cards can show "watched" badges. list_items_by_ids preserves
+    // input order (Trakt recommendation order is signal-bearing).
+    let items = queries::list_items_by_ids(&state.pool, &local_ids, user.id, acc.as_deref())
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(RecommendationsResponse { items }))
 }
 
@@ -704,10 +716,12 @@ pub async fn user_lists(
 ) -> Result<Json<TraktListsResponse>, ApiError> {
     let result = trakt_sync::with_user_client(&state, user.id, |client, token| async move {
         let lists = client.pull_my_lists(&token).await?;
-        // Per-list items in parallel — Trakt's per-request rate limit
-        // is generous enough that a small fan-out is fine, and most
-        // users have <10 lists. `try_join_all` cancels in-flight
-        // requests if any errors so we don't hammer Trakt on a 401.
+        // Per-list items in parallel — capped at 20 to bound the
+        // simultaneous Trakt API calls and avoid exhausting the shared
+        // app-key rate limit (1000 req / 5 min). `try_join_all`
+        // cancels in-flight requests on the first error so we don't
+        // hammer Trakt on a 401.
+        let lists: Vec<_> = lists.into_iter().take(20).collect();
         let list_ids: Vec<String> = lists.iter().map(|l| l.ids.trakt.to_string()).collect();
         let items_per_list = futures::future::try_join_all(
             list_ids
@@ -731,6 +745,108 @@ pub async fn user_lists(
     let acc = queries::user_library_filter(&state.pool, user.id, user.role)
         .await
         .map_err(ApiError::Internal)?;
+
+    // ── Batch DB resolution ────────────────────────────────────────────
+    // Collect every (tmdb_id, kind) pair referenced across ALL lists
+    // into one query rather than issuing a separate SELECT per item.
+    // This brings N×M per-item lookups down to a single SQL call.
+
+    // Gather unique tmdb_ids so we can use a single IN clause.
+    let mut all_tmdb_ids: Vec<i64> = Vec::new();
+    let mut tmdb_id_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (_, items) in &pairs {
+        for entry in items {
+            let tmdb_id = match entry.kind.as_str() {
+                "movie" => entry.movie.as_ref().and_then(|m| m.ids.tmdb),
+                "show" => entry.show.as_ref().and_then(|s| s.ids.tmdb),
+                _ => None,
+            };
+            if let Some(t) = tmdb_id {
+                if tmdb_id_set.insert(t) {
+                    all_tmdb_ids.push(t);
+                }
+            }
+        }
+    }
+
+    // One SELECT to resolve all tmdb_ids to local ids. Build a
+    // (tmdb_id, kind) → local_id map keyed by the kind strings we
+    // actually store ("movie" / "tv").
+    let mut tmdb_to_local: std::collections::HashMap<(i64, String), i64> =
+        std::collections::HashMap::new();
+    if !all_tmdb_ids.is_empty() {
+        let placeholders = all_tmdb_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, tmdb_id, kind FROM items \
+             WHERE tmdb_id IN ({placeholders}) AND kind IN ('movie', 'tv')"
+        );
+        let mut q = sqlx::query(&sql);
+        for t in &all_tmdb_ids {
+            q = q.bind(t);
+        }
+        let rows = q
+            .fetch_all(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(ApiError::Internal)?;
+        for row in rows {
+            use sqlx::Row as _;
+            let local_id: i64 = row.get("id");
+            let tmdb_id: i64 = row.get("tmdb_id");
+            let kind: String = row.get("kind");
+            tmdb_to_local.insert((tmdb_id, kind), local_id);
+        }
+    }
+
+    // Collect all unique local_ids across all lists for one batched
+    // list_items_by_ids call, then index the results by id for O(1)
+    // per-list reconstruction.
+    let mut all_local_ids: Vec<i64> = Vec::new();
+    let mut all_local_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (_, items) in &pairs {
+        for entry in items {
+            let (kind_key, tmdb_id) = match entry.kind.as_str() {
+                "movie" => {
+                    let Some(t) = entry.movie.as_ref().and_then(|m| m.ids.tmdb) else {
+                        continue;
+                    };
+                    ("movie", t)
+                }
+                "show" => {
+                    let Some(t) = entry.show.as_ref().and_then(|s| s.ids.tmdb) else {
+                        continue;
+                    };
+                    ("tv", t)
+                }
+                _ => continue,
+            };
+            if let Some(&local_id) = tmdb_to_local.get(&(tmdb_id, kind_key.to_owned())) {
+                if all_local_seen.insert(local_id) {
+                    all_local_ids.push(local_id);
+                }
+            }
+        }
+    }
+
+    let all_listed = queries::list_items_by_ids(
+        &state.pool,
+        &all_local_ids,
+        user.id,
+        acc.as_deref(),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    // Index the hydrated items so each list can reconstruct its slice
+    // without additional DB calls.
+    let listed_by_id: std::collections::HashMap<i64, chimpflix_library::ListedItem> =
+        all_listed.into_iter().map(|li| (li.item.id, li)).collect();
+
+    // ── Rebuild per-list output ────────────────────────────────────────
     let mut out = Vec::with_capacity(pairs.len());
     for (list, items) in pairs {
         // Walk in Trakt's list order — for many users, the manual
@@ -738,43 +854,35 @@ pub async fn user_lists(
         // "watch order for franchise").
         let mut local_ids: Vec<i64> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for entry in items {
-            let (kind, tmdb_id) = match entry.kind.as_str() {
+        for entry in &items {
+            let (kind_key, tmdb_id) = match entry.kind.as_str() {
                 "movie" => {
-                    let Some(m) = entry.movie else { continue };
-                    let Some(t) = m.ids.tmdb else { continue };
+                    let Some(t) = entry.movie.as_ref().and_then(|m| m.ids.tmdb) else {
+                        continue;
+                    };
                     ("movie", t)
                 }
                 "show" => {
-                    let Some(s) = entry.show else { continue };
-                    let Some(t) = s.ids.tmdb else { continue };
+                    let Some(t) = entry.show.as_ref().and_then(|s| s.ids.tmdb) else {
+                        continue;
+                    };
                     ("tv", t)
                 }
                 _ => continue,
             };
-            let Some(local_id) = sqlx::query_scalar::<_, i64>(
-                "SELECT id FROM items WHERE tmdb_id = ? AND kind = ? LIMIT 1",
-            )
-            .bind(tmdb_id)
-            .bind(kind)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten()
-            else {
-                continue;
-            };
-            if seen.insert(local_id) {
-                local_ids.push(local_id);
+            if let Some(&local_id) = tmdb_to_local.get(&(tmdb_id, kind_key.to_owned())) {
+                if seen.insert(local_id) {
+                    local_ids.push(local_id);
+                }
             }
         }
         if local_ids.is_empty() {
             continue;
         }
-        let listed =
-            queries::list_items_by_ids(&state.pool, &local_ids, user.id, acc.as_deref())
-                .await
-                .map_err(ApiError::Internal)?;
+        let listed: Vec<chimpflix_library::ListedItem> = local_ids
+            .iter()
+            .filter_map(|id| listed_by_id.get(id).cloned())
+            .collect();
         if listed.is_empty() {
             continue;
         }
@@ -912,7 +1020,7 @@ pub async fn put_episode_rating(
     let row = queries::set_user_rating(&state.pool, user.id, None, Some(id), input.rating)
         .await
         .map_err(|e| ApiError::validation(format!("{e:#}")))?;
-    if let Ok(Some((show_ids, season, episode))) =
+    if let Ok(Some(coords)) =
         trakt_sync::episode_trakt_coords(&state.pool, id).await
     {
         let state_clone = state.clone();
@@ -921,9 +1029,9 @@ pub async fn put_episode_rating(
                 &state_clone,
                 user.id,
                 chimpflix_metadata::RatingPush::Episode {
-                    show_ids,
-                    season,
-                    episode,
+                    show_ids: coords.show_ids,
+                    season: coords.season,
+                    episode: coords.episode,
                     rating: input.rating,
                     rated_at: trakt_sync::epoch_ms_to_iso(row.rated_at),
                 },
@@ -968,7 +1076,7 @@ pub async fn delete_episode_rating(
     let _ = queries::delete_user_rating(&state.pool, user.id, None, Some(id))
         .await
         .map_err(ApiError::Internal)?;
-    if let Ok(Some((show_ids, season, episode))) =
+    if let Ok(Some(coords)) =
         trakt_sync::episode_trakt_coords(&state.pool, id).await
     {
         let state_clone = state.clone();
@@ -977,9 +1085,9 @@ pub async fn delete_episode_rating(
                 &state_clone,
                 user.id,
                 chimpflix_metadata::RatingPush::Episode {
-                    show_ids,
-                    season,
-                    episode,
+                    show_ids: coords.show_ids,
+                    season: coords.season,
+                    episode: coords.episode,
                     rating: 0,
                     rated_at: trakt_sync::epoch_ms_to_iso(now_ms()),
                 },

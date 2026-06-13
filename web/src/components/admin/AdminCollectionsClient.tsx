@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Children, useCallback, useEffect, useRef, useState } from "react";
 import { SmartRuleBuilder } from "@/components/admin/SmartRuleBuilder";
 import {
   ChimpFlixApiError,
@@ -10,7 +10,6 @@ import {
   type CollectionDetail,
   type ListedItem,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 
 interface Props {
@@ -45,28 +44,41 @@ export function AdminCollectionsClient({ initial }: Props) {
     }
   }, []);
 
-  return (
-    <div className="space-y-6">
-      <ErrorBanner error={error} />
+  const total = collections.length;
 
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-sm text-white/55">
-          {manual.length} manual · {smart.length} smart · {auto.length} auto
+  return (
+    <div>
+      {error && (
+        <div className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
         </div>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={() => setCreating((v) => !v)}
-            className="rounded-md bg-red-500 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-red-600"
-          >
-            {creating ? "Cancel" : "+ New manual"}
-          </button>
+      )}
+
+      <div className="cf-flex cf-between cf-wrap cf-gap12" style={{ marginBottom: 14 }}>
+        <div className="cf-muted" style={{ fontSize: 13 }}>
+          <b style={{ color: "#fff" }}>
+            {total} collection{total === 1 ? "" : "s"}
+          </b>{" "}
+          · {manual.length} manual · {smart.length} smart · {auto.length} auto
+        </div>
+        <div className="cf-flex cf-gap8">
           <button
             type="button"
             onClick={() => setSmartCreating((v) => !v)}
-            className="rounded-md border border-red-500/60 px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-red-300 hover:bg-red-500/10"
+            className="cf-btn cf-sm"
           >
-            {smartCreating ? "Cancel" : "+ New smart"}
+            {smartCreating ? "Cancel" : "New smart"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setCreating((v) => !v)}
+            className="cf-btn cf-primary cf-sm"
+          >
+            {creating ? "Cancel" : "New manual"}
           </button>
         </div>
       </div>
@@ -91,7 +103,11 @@ export function AdminCollectionsClient({ initial }: Props) {
         />
       )}
 
-      <Section title="Smart" emptyText="No smart collections yet. Rules return up to 500 items each.">
+      <Section
+        title="Smart"
+        description="Built from query rules — update themselves on scan."
+        emptyText="No smart collections yet. Rules return up to 500 items each."
+      >
         {smart.map((c) => (
           <CollectionRow
             key={c.id}
@@ -106,7 +122,11 @@ export function AdminCollectionsClient({ initial }: Props) {
         ))}
       </Section>
 
-      <Section title="Manual" emptyText="No manual collections yet.">
+      <Section
+        title="Manual"
+        description="Hand-curated rows."
+        emptyText="No manual collections yet."
+      >
         {manual.map((c) => (
           <CollectionRow
             key={c.id}
@@ -121,7 +141,12 @@ export function AdminCollectionsClient({ initial }: Props) {
         ))}
       </Section>
 
-      <Section title="Auto (TMDB franchises)" emptyText="No auto collections — none of your movies belong to a TMDB collection yet.">
+      <Section
+        title="Auto · TMDB franchises"
+        description="Discovered automatically from movie metadata."
+        emptyText="No auto collections — none of your movies belong to a TMDB collection yet."
+        last
+      >
         {auto.map((c) => (
           <CollectionRow
             key={c.id}
@@ -143,29 +168,36 @@ export function AdminCollectionsClient({ initial }: Props) {
 
 function Section({
   title,
+  description,
   emptyText,
+  last = false,
   children,
 }: {
   title: string;
+  description: string;
   emptyText: string;
+  last?: boolean;
   children: React.ReactNode;
 }) {
-  const hasChildren = Array.isArray(children) && children.length > 0;
+  const hasChildren = Children.count(children) > 0;
   return (
-    <section>
-      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-white/45">
-        {title}
-      </h2>
+    <div className="cf-card" style={last ? { marginBottom: 0 } : undefined}>
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">{title}</div>
+          <div className="cf-sub">{description}</div>
+        </div>
+      </div>
       {hasChildren ? (
-        <ul className="divide-y divide-white/5 overflow-hidden rounded-lg border border-white/10 bg-white/2">
-          {children}
-        </ul>
+        <table className="cf-table">
+          <tbody>{children}</tbody>
+        </table>
       ) : (
-        <div className="rounded-lg border border-dashed border-white/15 bg-white/2 px-4 py-6 text-center text-sm text-white/50">
+        <div className="cf-card-body cf-pad cf-faint cf-center" style={{ fontSize: 13 }}>
           {emptyText}
         </div>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -204,51 +236,94 @@ function CollectionRow({
     }
   }
 
+  // Second cell mirrors the mockup: a rule snippet for smart, the
+  // discovery source for auto, "Curated by you" for manual.
+  const subText =
+    collection.kind === "smart"
+      ? (collection.rule_json ?? "rule")
+      : collection.kind === "auto"
+        ? "themoviedb.org"
+        : (collection.description ?? "Curated by you");
+
   return (
-    <li>
-      <button
-        type="button"
-        onClick={onToggle}
-        className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-white/5"
-      >
-        <span className="grow text-sm">
-          <span className="font-medium">{collection.name}</span>
-          {collection.kind !== "manual" && (
-            <span className="ml-2 rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-white/55">
-              {collection.kind}
-            </span>
-          )}
-        </span>
-        <span className="shrink-0 text-xs tabular-nums text-white/55">
-          {collection.item_count} item
-          {collection.item_count === 1 ? "" : "s"}
-        </span>
-        <span className="shrink-0 text-xs text-white/40">
-          {expanded ? "▾" : "▸"}
-        </span>
-      </button>
+    <>
+      <tr>
+        <td>
+          <button
+            type="button"
+            onClick={onToggle}
+            className="cf-btn cf-ghost cf-tiny"
+            style={{ padding: 0, fontWeight: 700 }}
+          >
+            <b>{collection.name}</b>
+          </button>
+        </td>
+        <td className="cf-muted" style={{ maxWidth: 360 }}>
+          <span
+            style={{
+              display: "block",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={subText}
+          >
+            {subText}
+          </span>
+        </td>
+        <td className="cf-num cf-muted">
+          {collection.item_count} title{collection.item_count === 1 ? "" : "s"}
+        </td>
+        <td className="cf-num">
+          <div
+            className="cf-flex cf-gap8"
+            style={{ justifyContent: "flex-end" }}
+          >
+            <button
+              type="button"
+              onClick={onToggle}
+              className="cf-btn cf-ghost cf-tiny"
+            >
+              {expanded ? "Hide" : collection.kind === "auto" ? "View" : "Edit"}
+            </button>
+            {collection.kind === "manual" && (
+              <button
+                type="button"
+                onClick={remove}
+                className="cf-btn cf-ghost cf-tiny cf-danger"
+              >
+                Delete
+              </button>
+            )}
+          </div>
+        </td>
+      </tr>
       {expanded && (
-        <div className="border-t border-white/5 bg-black/20 px-4 py-4">
-          {collection.kind === "manual" ? (
-            <ManualCollectionDetail
-              collection={collection}
-              onChanged={onChanged}
-              onError={onError}
-              onDelete={remove}
-            />
-          ) : collection.kind === "smart" ? (
-            <SmartCollectionDetail
-              collection={collection}
-              onChanged={onChanged}
-              onError={onError}
-              onDelete={remove}
-            />
-          ) : (
-            <AutoCollectionDetail collection={collection} onError={onError} />
-          )}
-        </div>
+        <tr>
+          <td colSpan={4} style={{ background: "rgba(255,255,255,0.02)" }}>
+            {collection.kind === "manual" ? (
+              <ManualCollectionDetail
+                collection={collection}
+                onChanged={onChanged}
+                onError={onError}
+                onDelete={remove}
+              />
+            ) : collection.kind === "smart" ? (
+              <SmartCollectionDetail
+                collection={collection}
+                onChanged={onChanged}
+                onError={onError}
+                onDelete={remove}
+              />
+            ) : (
+              <AutoCollectionDetail collection={collection} onError={onError} />
+            )}
+          </td>
+        </tr>
       )}
       {askDelete && (
+        // Portal-rendered (escapes the table), so no wrapper row is
+        // needed — it produces no in-table DOM.
         <ConfirmDialog
           title={`Delete collection "${collection.name}"?`}
           body="Member items remain in your library; only the grouping is removed."
@@ -259,7 +334,7 @@ function CollectionRow({
           onCancel={() => setAskDelete(false)}
         />
       )}
-    </li>
+    </>
   );
 }
 
@@ -340,14 +415,18 @@ function ManualCollectionDetail({
   const [editing, setEditing] = useState(false);
 
   const loadDetail = useCallback(async () => {
+    // Guard against setState on an unmounted component (e.g. row collapsed
+    // while a reload triggered by addItems/removeItem/move is still in flight).
+    let cancelled = false;
     try {
       const d = await collectionsApi.get(collection.id);
-      setDetail(d);
+      if (!cancelled) setDetail(d);
     } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
+      if (!cancelled) onError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (!cancelled) setLoading(false);
     }
+    return () => { cancelled = true; };
   }, [collection.id, onError]);
 
   useEffect(() => {
@@ -710,56 +789,51 @@ function NewSmartCollectionForm({
   }
 
   return (
-    <form
-      onSubmit={submit}
-      className="rounded-lg border border-red-500/30 bg-red-500/5 p-4 space-y-3"
-    >
-      <div className="text-xs font-semibold uppercase tracking-wider text-red-300">
-        New smart collection
+    <form onSubmit={submit} className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">New smart collection</div>
+          <div className="cf-sub">
+            Members are computed from a query rule and refresh on each scan.
+          </div>
+        </div>
       </div>
-      <div>
-        <label className="mb-1 block text-xs font-medium text-white/80">
-          Name
-        </label>
-        <input
-          autoFocus
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          maxLength={200}
-          placeholder="e.g. 2020s Action Movies"
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-          required
-        />
+      <div className="cf-card-body cf-pad">
+        <div className="cf-field">
+          <label className="cf-field-label">Name</label>
+          <input
+            autoFocus
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={200}
+            placeholder="e.g. 2020s Action Movies"
+            className="cf-input"
+            required
+          />
+        </div>
+        <div className="cf-field">
+          <label className="cf-field-label">Description (optional)</label>
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            maxLength={4000}
+            rows={2}
+            className="cf-textarea"
+          />
+        </div>
+        <div className="cf-field">
+          <label className="cf-field-label">Rule</label>
+          <SmartRuleBuilder initialJson={ruleJson} onChange={setRuleJson} />
+        </div>
+        <button
+          type="submit"
+          disabled={!name.trim() || saving}
+          className="cf-btn cf-primary cf-sm"
+        >
+          {saving ? "Creating…" : "Create smart collection"}
+        </button>
       </div>
-      <div>
-        <label className="mb-1 block text-xs font-medium text-white/80">
-          Description <span className="text-white/40">(optional)</span>
-        </label>
-        <textarea
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          maxLength={4000}
-          rows={2}
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-        />
-      </div>
-      <div>
-        <label className="mb-2 block text-xs font-medium text-white/80">
-          Rule
-        </label>
-        <SmartRuleBuilder
-          initialJson={ruleJson}
-          onChange={setRuleJson}
-        />
-      </div>
-      <button
-        type="submit"
-        disabled={!name.trim() || saving}
-        className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-      >
-        {saving ? "Creating…" : "Create smart collection"}
-      </button>
     </form>
   );
 }
@@ -795,44 +869,45 @@ function NewCollectionForm({
   }
 
   return (
-    <form
-      onSubmit={submit}
-      className="rounded-lg border border-white/10 bg-white/2 p-4 space-y-3"
-    >
-      <div>
-        <label className="mb-1 block text-xs font-medium text-white/80">
-          Name
-        </label>
-        <input
-          autoFocus
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          maxLength={200}
-          placeholder="e.g. Sunday Night Sci-Fi"
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-          required
-        />
+    <form onSubmit={submit} className="cf-card">
+      <div className="cf-card-head">
+        <div>
+          <div className="cf-ttl">New manual collection</div>
+          <div className="cf-sub">A hand-curated row you fill with items.</div>
+        </div>
       </div>
-      <div>
-        <label className="mb-1 block text-xs font-medium text-white/80">
-          Description <span className="text-white/40">(optional)</span>
-        </label>
-        <textarea
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          maxLength={4000}
-          rows={2}
-          className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30"
-        />
+      <div className="cf-card-body cf-pad">
+        <div className="cf-field">
+          <label className="cf-field-label">Name</label>
+          <input
+            autoFocus
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={200}
+            placeholder="e.g. Sunday Night Sci-Fi"
+            className="cf-input"
+            required
+          />
+        </div>
+        <div className="cf-field">
+          <label className="cf-field-label">Description (optional)</label>
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            maxLength={4000}
+            rows={2}
+            className="cf-textarea"
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={!name.trim() || saving}
+          className="cf-btn cf-primary cf-sm"
+        >
+          {saving ? "Creating…" : "Create collection"}
+        </button>
       </div>
-      <button
-        type="submit"
-        disabled={!name.trim() || saving}
-        className="rounded-md bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40"
-      >
-        {saving ? "Creating…" : "Create collection"}
-      </button>
     </form>
   );
 }

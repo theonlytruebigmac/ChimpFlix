@@ -16,7 +16,8 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::header::USER_AGENT;
 use chimpflix_library::{
-    AccessGroup, AccessGroupDetail, AccessGroupUpdate, NewAccessGroup, NewAuditEntry, queries,
+    AccessGroup, AccessGroupDetail, AccessGroupUpdate, AccessLevel, GroupLibraryGrant,
+    NewAccessGroup, NewAuditEntry, queries,
 };
 use serde::{Deserialize, Serialize};
 
@@ -149,9 +150,19 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Request for replacing a group's bound libraries.
+///
+/// Phase 107 tri-state: when `grants` is present, each entry's `level`
+/// (`view`/`full`; `none` drops the binding) is stored on the group-library
+/// row. When only the legacy `library_ids` list is sent (older clients),
+/// every listed library is bound at `full` — preserving the prior binary
+/// behaviour with no regression.
 #[derive(Debug, Deserialize)]
 pub struct SetLibrariesRequest {
+    #[serde(default)]
     pub library_ids: Vec<i64>,
+    #[serde(default)]
+    pub grants: Option<Vec<GroupLibraryGrant>>,
 }
 
 pub async fn set_libraries(
@@ -161,7 +172,20 @@ pub async fn set_libraries(
     Path(id): Path<i64>,
     Json(input): Json<SetLibrariesRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if input.library_ids.len() > MAX_GROUP_LIBRARIES {
+    // Resolve to a single (library_id, level) list. `grants` wins; the
+    // legacy `library_ids` shape maps every entry to `full`.
+    let grants: Vec<GroupLibraryGrant> = match input.grants {
+        Some(g) => g,
+        None => input
+            .library_ids
+            .iter()
+            .map(|&library_id| GroupLibraryGrant {
+                library_id,
+                level: AccessLevel::Full,
+            })
+            .collect(),
+    };
+    if grants.len() > MAX_GROUP_LIBRARIES {
         return Err(ApiError::validation(format!(
             "a group can bind at most {MAX_GROUP_LIBRARIES} libraries"
         )));
@@ -175,7 +199,11 @@ pub async fn set_libraries(
     {
         return Err(ApiError::NotFound);
     }
-    queries::set_access_group_libraries(&state.pool, id, &input.library_ids)
+    let count = grants
+        .iter()
+        .filter(|g| !matches!(g.level, AccessLevel::None))
+        .count();
+    queries::set_access_group_libraries(&state.pool, id, &grants)
         .await
         .map_err(ApiError::Internal)?;
     audit_change(
@@ -183,7 +211,7 @@ pub async fn set_libraries(
         actor.id,
         "access_group.libraries.update",
         id,
-        Some(format!(r#"{{"count":{}}}"#, input.library_ids.len())),
+        Some(format!(r#"{{"count":{count}}}"#)),
         &headers,
     )
     .await;
@@ -262,6 +290,15 @@ pub async fn set_user_groups(
             "a user can belong to at most 64 groups",
         ));
     }
+    // Ensure the user exists; the DELETE+INSERT in set_user_groups succeeds
+    // silently for any user_id (including phantom ones) when group_ids is empty.
+    if queries::find_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
     queries::set_user_groups(&state.pool, user_id, &input.group_ids)
         .await
         .map_err(ApiError::Internal)?;
@@ -317,10 +354,23 @@ async fn audit_change(
     .await;
 }
 
-/// Minimal JSON string escaper for audit payloads. We don't want to
-/// pull serde_json::to_string in here for a single value — and the
-/// audit row is fine with hand-built JSON since the only field is a
-/// validated name (no embedded newlines/control chars to worry about).
+/// Minimal JSON string escaper for audit payloads. Escapes `\`, `"`,
+/// and ASCII control characters (0x00–0x1F) per RFC 8259.
 fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

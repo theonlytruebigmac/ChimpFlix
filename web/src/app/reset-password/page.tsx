@@ -83,7 +83,11 @@ function ResetContent() {
 
         {done ? (
           <div className="space-y-3">
-            <div className="rounded bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 ring-1 ring-emerald-500/30">
+            <div
+              role="status"
+              aria-live="polite"
+              className="rounded bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 ring-1 ring-emerald-500/30"
+            >
               Your password has been updated.
               {done.sessionsRevoked > 0 && (
                 <>
@@ -145,7 +149,10 @@ function ResetContent() {
             </label>
 
             {error && (
-              <div className="rounded bg-red-500/10 px-3 py-2 text-sm text-red-300 ring-1 ring-red-500/30">
+              <div
+                role="alert"
+                className="rounded bg-red-500/10 px-3 py-2 text-sm text-red-300 ring-1 ring-red-500/30"
+              >
                 {error}
               </div>
             )}

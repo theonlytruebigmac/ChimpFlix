@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
-import { Suspense } from "react";
+import { Fragment, type ReactNode, Suspense } from "react";
+import { CalendarRail } from "@/components/CalendarRail";
 import { CollectionsRail } from "@/components/CollectionsRail";
 import {
   ComingSoonRail,
@@ -8,6 +9,7 @@ import {
 import { EmptyHomeClient } from "@/components/EmptyHomeClient";
 import { Hero } from "@/components/Hero";
 import { ModalRoot } from "@/components/ModalRoot";
+import { NewEpisodesRail } from "@/components/NewEpisodesRail";
 import { Rail } from "@/components/Rail";
 import { RailErrorBoundary } from "@/components/RailErrorBoundary";
 import { HeroSkeleton, RailSkeleton } from "@/components/Skeleton";
@@ -23,6 +25,7 @@ import {
   prefs as prefsApi,
   trakt as traktApi,
   type Library,
+  type ListedItem,
 } from "@/lib/chimpflix-api";
 import { adaptItem, adaptOnDeck } from "@/lib/chimpflix-adapt";
 import { requireUser } from "@/lib/chimpflix-server";
@@ -31,6 +34,105 @@ import type { MediaItem } from "@/lib/chimpflix-types";
 const RAIL_PAGE_SIZE = 20;
 const MOVIE_GENRES = ["Action", "Comedy", "Drama"];
 const SHOW_GENRES = ["Drama", "Comedy", "Animation"];
+// Genre rails: tiles shown per rail, and how many we over-fetch so cross-rail
+// de-dup (a title claimed by an earlier rail is dropped from later ones) still
+// leaves each surviving rail full. Overlapping genres — especially anime,
+// where one title is Drama AND Comedy AND Animation — would otherwise repeat
+// the same handful of titles down the page.
+const GENRE_DISPLAY = 16;
+const GENRE_OVERFETCH = 48;
+const DAY_MS = 86_400_000;
+
+// Stable rail-id catalogue, in default top-to-bottom order. MUST stay in
+// sync with the backend `HOME_RAIL_CATALOGUE` (crates/library/src/models.rs)
+// — that constant is the source of truth the prefs API validates against;
+// this array maps each id to the rendered rail node so a user's
+// `home_rails_json` overlay can drop/reorder them. Grouped rails
+// (`library_sections`, `movie_genres`, `show_genres`) toggle as one unit.
+const HOME_RAIL_ORDER = [
+  "continue_watching",
+  "recently_added",
+  "new_episodes",
+  "coming_soon",
+  "season_premieres",
+  "calendar",
+  "upcoming_movies",
+  "trakt_recs_movies",
+  "trakt_recs_shows",
+  "trakt_favorites",
+  "trakt_lists",
+  "top10_movies",
+  "top10_shows",
+  "collections",
+  "library_sections",
+  "movie_genres",
+  "show_genres",
+] as const;
+
+type HomeRailId = (typeof HOME_RAIL_ORDER)[number];
+
+/// Parse the user's `home_rails_json` overlay into an id→enabled map plus the
+/// user-desired order, or `null` when the user hasn't customized anything
+/// (empty array / unparseable). A `null` result is the signal that the home
+/// page renders its byte-for-byte default tree — no reorder logic runs at all.
+function parseRailOverlay(
+  raw: string,
+): { enabled: Map<string, boolean>; order: string[] } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  const enabled = new Map<string, boolean>();
+  const order: string[] = [];
+  for (const entry of parsed) {
+    if (
+      entry &&
+      typeof entry === "object" &&
+      typeof (entry as { rail_id?: unknown }).rail_id === "string"
+    ) {
+      const id = (entry as { rail_id: string }).rail_id;
+      // Ignore ids we don't render (forward-compat: a future rail removed
+      // from the frontend but still in someone's saved overlay).
+      if (!(HOME_RAIL_ORDER as readonly string[]).includes(id)) continue;
+      const on = (entry as { enabled?: unknown }).enabled !== false;
+      enabled.set(id, on);
+      order.push(id);
+    }
+  }
+  if (order.length === 0) return null;
+  return { enabled, order };
+}
+
+/// Apply the parsed overlay over the default catalogue order:
+///   - rails the user explicitly disabled (`enabled === false`) are dropped;
+///   - rails present in the overlay are placed first, in the user's order;
+///   - rails absent from the overlay keep their default relative position,
+///     appended after the user-ordered ones (sparse-overlay semantics).
+function orderRailIds(overlay: {
+  enabled: Map<string, boolean>;
+  order: string[];
+}): HomeRailId[] {
+  const result: HomeRailId[] = [];
+  const placed = new Set<string>();
+  const isEnabled = (id: string) => overlay.enabled.get(id) !== false;
+  // 1. User-ordered rails first (only valid catalogue ids, only enabled).
+  for (const id of overlay.order) {
+    if (placed.has(id)) continue;
+    if (!(HOME_RAIL_ORDER as readonly string[]).includes(id)) continue;
+    placed.add(id);
+    if (isEnabled(id)) result.push(id as HomeRailId);
+  }
+  // 2. Remaining default rails keep their default order, dropping any the
+  //    user disabled.
+  for (const id of HOME_RAIL_ORDER) {
+    if (placed.has(id)) continue;
+    if (isEnabled(id)) result.push(id);
+  }
+  return result;
+}
 
 export default async function Home() {
   const user = await requireUser("/");
@@ -85,9 +187,15 @@ export default async function Home() {
     itemTotal = 0;
   } else {
     try {
+      // `count_only` makes this a pure existence check: the server returns
+      // `total` with zero items AND bypasses the per-user kids_safe filter.
+      // Without the bypass, a kids_safe profile on a library with no rated
+      // items would see `total === 0` and a false "scan in progress" screen.
+      // The probe returns no titles, so the bypass can't leak content.
       const probe = await itemsApi.list({
         library_ids: visibleLibIds,
         page_size: 1,
+        count_only: true,
       });
       itemTotal = probe.total;
     } catch {
@@ -107,6 +215,171 @@ export default async function Home() {
     );
   }
 
+  // Per-user home customization (Feature 2). `parseRailOverlay` returns
+  // `null` when the user hasn't customized their rails at all — the common
+  // case — in which case we fall through to the byte-for-byte default tree
+  // below, identical to the pre-feature home page.
+  const railOverlay = parseRailOverlay(user.home_rails_json);
+
+  // Each catalogue rail rendered exactly as in the default tree. Keyed by the
+  // stable rail id so a customized layout can pick/drop/reorder them without
+  // duplicating the JSX. NOTE: building this map does NOT trigger any data
+  // fetch — these are inert React elements; the fetch only happens when (and
+  // if) a node is actually rendered inside its Suspense boundary. So dropping
+  // a rail genuinely skips its API call.
+  const railNodes: Record<HomeRailId, ReactNode> = {
+    continue_watching: (
+      <RailErrorBoundary key="continue_watching" label="ContinueWatching">
+        <Suspense fallback={<RailSkeleton title="Continue Watching" />}>
+          <ContinueWatchingRail />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    recently_added: (
+      <RailErrorBoundary key="recently_added" label="RecentlyAdded">
+        <Suspense fallback={<RailSkeleton title="Recently Added" />}>
+          <RecentlyAddedRail visibleLibIds={visibleLibIds} />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    new_episodes: (
+      <RailErrorBoundary key="new_episodes" label="NewEpisodes">
+        <Suspense fallback={null}>
+          <NewEpisodesRail visibleLibIds={visibleLibIds} />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    coming_soon: (
+      <RailErrorBoundary key="coming_soon" label="ComingSoon">
+        <Suspense fallback={null}>
+          <ComingSoonRail />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    season_premieres: (
+      <RailErrorBoundary key="season_premieres" label="SeasonPremieres">
+        <Suspense fallback={null}>
+          <ComingSoonRail variant="premieres" title="New Seasons" days={30} />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    calendar: (
+      <RailErrorBoundary key="calendar" label="Calendar">
+        <Suspense fallback={null}>
+          <CalendarRail visibleLibIds={visibleLibIds} />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    upcoming_movies: (
+      <RailErrorBoundary key="upcoming_movies" label="UpcomingMovies">
+        <Suspense fallback={null}>
+          <UpcomingMoviesRail />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    trakt_recs_movies: (
+      <RailErrorBoundary key="trakt_recs_movies" label="TraktRecsMovies">
+        <Suspense fallback={null}>
+          <TraktRecommendationsRail kind="movie" title="Recommended for You · Movies" />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    trakt_recs_shows: (
+      <RailErrorBoundary key="trakt_recs_shows" label="TraktRecsShows">
+        <Suspense fallback={null}>
+          <TraktRecommendationsRail kind="show" title="Recommended for You · Shows" />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    trakt_favorites: (
+      <RailErrorBoundary key="trakt_favorites" label="TraktFavorites">
+        <Suspense fallback={null}>
+          <TraktFavoritesRail />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    trakt_lists: (
+      <RailErrorBoundary key="trakt_lists" label="TraktLists">
+        <Suspense fallback={null}>
+          <TraktListsRails />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    top10_movies: (
+      <RailErrorBoundary key="top10_movies" label="Top10Movies">
+        <Suspense fallback={null}>
+          <Top10TrendingRail
+            kind="movie"
+            title="Top 10 Movies This Week"
+            visibleLibIds={visibleLibIds}
+          />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    top10_shows: (
+      <RailErrorBoundary key="top10_shows" label="Top10Shows">
+        <Suspense fallback={null}>
+          <Top10TrendingRail
+            kind="show"
+            title="Top 10 Shows This Week"
+            visibleLibIds={visibleLibIds}
+          />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    collections: (
+      <RailErrorBoundary key="collections" label="Collections">
+        <Suspense fallback={<RailSkeleton title="Collections" />}>
+          <HomeCollectionsRail />
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    library_sections: (
+      <Fragment key="library_sections">
+        {libs.map((lib) => (
+          <RailErrorBoundary key={`lib-${lib.id}`} label={`Lib:${lib.name}`}>
+            <Suspense fallback={<RailSkeleton title={`New in ${lib.name}`} />}>
+              <LibSectionRail lib={lib} />
+            </Suspense>
+          </RailErrorBoundary>
+        ))}
+      </Fragment>
+    ),
+    movie_genres: (
+      <RailErrorBoundary key="movie_genres" label="MovieGenres">
+        <Suspense fallback={null}>
+          {firstMovieLib && (
+            <GenreRails
+              libraryId={firstMovieLib.id}
+              kind="movie"
+              genres={MOVIE_GENRES}
+            />
+          )}
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+    show_genres: (
+      <RailErrorBoundary key="show_genres" label="ShowGenres">
+        <Suspense fallback={null}>
+          {firstShowLib && (
+            <GenreRails
+              libraryId={firstShowLib.id}
+              kind="show"
+              genres={SHOW_GENRES}
+            />
+          )}
+        </Suspense>
+      </RailErrorBoundary>
+    ),
+  };
+
+  // Default path (no overlay): render every rail in catalogue order. This is
+  // identical to the pre-feature tree — same components, same props, same
+  // order.
+  const orderedIds: HomeRailId[] = railOverlay
+    ? orderRailIds(railOverlay)
+    : [...HOME_RAIL_ORDER];
+
   return (
     <main className="relative">
       <RailErrorBoundary label="HomeHero">
@@ -115,97 +388,7 @@ export default async function Home() {
         </Suspense>
       </RailErrorBoundary>
       <div className="relative z-20 space-y-1 pb-24 pt-4">
-        <RailErrorBoundary label="ContinueWatching">
-          <Suspense fallback={<RailSkeleton title="Continue Watching" />}>
-            <ContinueWatchingRail />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="RecentlyAdded">
-          <Suspense fallback={<RailSkeleton title="Recently Added" />}>
-            <RecentlyAddedRail visibleLibIds={visibleLibIds} />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="ComingSoon">
-          <Suspense fallback={null}>
-            <ComingSoonRail />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="SeasonPremieres">
-          <Suspense fallback={null}>
-            <ComingSoonRail variant="premieres" title="New Seasons" days={30} />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="UpcomingMovies">
-          <Suspense fallback={null}>
-            <UpcomingMoviesRail />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="TraktRecsMovies">
-          <Suspense fallback={null}>
-            <TraktRecommendationsRail kind="movie" title="Recommended for You · Movies" />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="TraktRecsShows">
-          <Suspense fallback={null}>
-            <TraktRecommendationsRail kind="show" title="Recommended for You · Shows" />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="TraktFavorites">
-          <Suspense fallback={null}>
-            <TraktFavoritesRail />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="TraktLists">
-          <Suspense fallback={null}>
-            <TraktListsRails />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="Top10Movies">
-          <Suspense fallback={null}>
-            <Top10TrendingRail
-              kind="movie"
-              title="Top 10 Movies This Week"
-              visibleLibIds={visibleLibIds}
-            />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="Top10Shows">
-          <Suspense fallback={null}>
-            <Top10TrendingRail
-              kind="show"
-              title="Top 10 Shows This Week"
-              visibleLibIds={visibleLibIds}
-            />
-          </Suspense>
-        </RailErrorBoundary>
-        <RailErrorBoundary label="Collections">
-          <Suspense fallback={<RailSkeleton title="Collections" />}>
-            <HomeCollectionsRail />
-          </Suspense>
-        </RailErrorBoundary>
-        {libs.map((lib) => (
-          <RailErrorBoundary key={`lib-${lib.id}`} label={`Lib:${lib.name}`}>
-            <Suspense fallback={<RailSkeleton title={`New in ${lib.name}`} />}>
-              <LibSectionRail lib={lib} />
-            </Suspense>
-          </RailErrorBoundary>
-        ))}
-        {firstMovieLib &&
-          MOVIE_GENRES.map((g) => (
-            <RailErrorBoundary key={`movie-genre-${g}`} label={`MovieGenre:${g}`}>
-              <Suspense fallback={null}>
-                <GenreRail libraryId={firstMovieLib.id} kind="movie" genre={g} />
-              </Suspense>
-            </RailErrorBoundary>
-          ))}
-        {firstShowLib &&
-          SHOW_GENRES.map((g) => (
-            <RailErrorBoundary key={`show-genre-${g}`} label={`ShowGenre:${g}`}>
-              <Suspense fallback={null}>
-                <GenreRail libraryId={firstShowLib.id} kind="show" genre={g} />
-              </Suspense>
-            </RailErrorBoundary>
-          ))}
+        {orderedIds.map((id) => railNodes[id])}
       </div>
       <ModalRoot />
     </main>
@@ -248,6 +431,10 @@ async function HomeHero({ visibleLibIds }: { visibleLibIds: number[] }) {
 }
 
 async function ContinueWatchingRail() {
+  // On-deck already excludes finished titles server-side, so Continue
+  // Watching never shows anything the user has completed — no client-side
+  // "hide watched" filter is needed (the removed `hide_watched_cw` pref was
+  // a guaranteed no-op against this list).
   const res = await playStateApi.onDeck();
   const items = res.items.map(adaptOnDeck);
   if (items.length === 0) return null;
@@ -347,11 +534,17 @@ async function Top10TrendingRail({
     // ranks are global TMDB popularity; once we intersect with the
     // local library we'd see gaps (3, 4, 5, 7, …) — Netflix shows a
     // clean 1, 2, 3 sequence, and relative order is what matters.
-    const seen = new Set<number>();
+    const seenIds = new Set<number>();
+    const seenTmdb = new Set<number>();
     const unique = res.items.filter((it) => {
-      if (it.tmdb_id == null) return true;
-      if (seen.has(it.tmdb_id)) return false;
-      seen.add(it.tmdb_id);
+      // Always dedupe by DB id so two library rows for the same local
+      // title (tmdb_id == null) don't both appear in the Top-10 rail.
+      if (seenIds.has(it.id)) return false;
+      seenIds.add(it.id);
+      if (it.tmdb_id != null) {
+        if (seenTmdb.has(it.tmdb_id)) return false;
+        seenTmdb.add(it.tmdb_id);
+      }
       return true;
     });
     entries = unique.map(({ rank: _rank, ...item }, idx) => ({
@@ -390,28 +583,87 @@ async function HomeCollectionsRail() {
   return <CollectionsRail collections={collections} />;
 }
 
-async function GenreRail({
+/// Distinct per-genre, per-day seed for the random sort. djb2 string hash of
+/// the genre XOR the day number, kept positive and inside i32 (the backend
+/// `random_seed` is an i64 used as `((id * seed) % 100000007)`, clamped
+/// `.max(1)`). Distinct per genre so two rails never mirror each other;
+/// rotates daily so the page feels fresh without reshuffling on every refresh
+/// (stable within a day → pagination-stable).
+function genreSeed(genre: string, daySeed: number): number {
+  let h = 5381;
+  for (let i = 0; i < genre.length; i++) {
+    h = ((h << 5) + h + genre.charCodeAt(i)) | 0;
+  }
+  return (Math.abs(h ^ daySeed) % 2147483647) || 1;
+}
+
+/// All genre rails for one library, fetched together so they can de-duplicate
+/// across each other. Each genre is shuffled with its own daily seed (so the
+/// rails don't all surface the same recently-added titles), then a greedy
+/// first-claim pass drops any title already shown in an earlier rail.
+///
+/// Renders as one streaming unit: the trade-off for cross-rail de-dup is that
+/// the genre block can't stream per-genre, so it deliberately sits below the
+/// independently-streamed Recently Added / New Episodes / library rails.
+async function GenreRails({
   libraryId,
   kind,
-  genre,
+  genres,
 }: {
   libraryId: number;
   kind: "movie" | "show";
-  genre: string;
+  genres: readonly string[];
 }) {
-  const res = await itemsApi.list({
-    library_id: libraryId,
-    kind,
-    genre,
-    page_size: 16,
+  // Server component renders once per request — the day-bucket snapshot is
+  // intentional (and only seeds the shuffle; it's never rendered as text, so
+  // there's no SSR/CSR mismatch to worry about).
+  // eslint-disable-next-line react-hooks/purity
+  const daySeed = Math.floor(Date.now() / DAY_MS);
+  const fetched = await Promise.all(
+    genres.map(async (genre) => {
+      try {
+        const res = await itemsApi.list({
+          library_id: libraryId,
+          kind,
+          genre,
+          sort: "random",
+          random_seed: genreSeed(genre, daySeed),
+          page_size: GENRE_OVERFETCH,
+        });
+        return { genre, items: res.items };
+      } catch {
+        return { genre, items: [] as ListedItem[] };
+      }
+    }),
+  );
+
+  // Cross-rail de-dup: claim each title for the first rail that wants it, in
+  // rail order, so an overlapping-genre title doesn't repeat down the page.
+  // Over-fetching above keeps later rails full despite the drops.
+  const claimed = new Set<number>();
+  const rails = fetched.map(({ genre, items }) => {
+    const picked: ListedItem[] = [];
+    for (const it of items) {
+      if (claimed.has(it.id)) continue;
+      claimed.add(it.id);
+      picked.push(it);
+      if (picked.length >= GENRE_DISPLAY) break;
+    }
+    return { genre, items: picked.map(adaptItem) };
   });
-  const items = res.items.map(adaptItem);
-  if (items.length < 4) return null;
+
   return (
-    <Rail
-      title={genre}
-      items={items}
-      href={`/genre/${encodeURIComponent(genre)}`}
-    />
+    <>
+      {rails.map(({ genre, items }) =>
+        items.length < 4 ? null : (
+          <Rail
+            key={`${kind}-genre-${genre}`}
+            title={genre}
+            items={items}
+            href={`/genre/${encodeURIComponent(genre)}`}
+          />
+        ),
+      )}
+    </>
   );
 }

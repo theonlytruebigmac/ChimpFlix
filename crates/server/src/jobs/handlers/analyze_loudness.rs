@@ -96,6 +96,21 @@ pub async fn run(state: AppState, payload: Value) -> Result<()> {
         }
         Err(e) => {
             warn!(file_id, error = %format!("{e:#}"), "loudness analysis failed");
+            // Stamp `loudnorm_analyzed_at` with a NULL measurement so this
+            // file drops out of the `WHERE loudnorm_analyzed_at IS NULL`
+            // sweep. Without this, a file that reliably fails analysis
+            // (corrupt codec, zero-length, exotic container) is re-enqueued
+            // on every sweep cycle forever. Mirrors `detect_markers_file`,
+            // which stamps its watermark on the same failure. Best-effort:
+            // if even this write fails we still return Ok so the job isn't
+            // retried into the same loop.
+            if let Err(e) = queries::record_loudness_measurement(&state.pool, file_id, None).await {
+                warn!(
+                    file_id,
+                    error = %format!("{e:#}"),
+                    "failed to stamp loudness watermark after analysis failure"
+                );
+            }
             return Ok(());
         }
     };

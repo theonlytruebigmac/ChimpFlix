@@ -288,26 +288,26 @@ pub async fn enqueue_for_season(
     show_id: i64,
     season_number: i32,
 ) -> Result<bool> {
-    // The dedup column on job_queue is an i64; pack (show_id,
-    // season_number) into one. Show ids fit in 47 bits (way more
-    // than any reasonable install will reach); season numbers are
-    // typically 1-100 but some scanners use 0 or -1 for "specials"
-    // / "absolute". `rem_euclid` keeps negatives non-overlapping
-    // with positives in the low 16 bits — so season=-1 hashes
-    // distinctly from season=65535 (which doesn't exist in
-    // practice but defends the dedup key shape against a future
-    // exotic season-numbering scheme).
+    // The dedup column on job_queue is an i64; combine (show_id,
+    // season_number) into one stable key. We use a multiplicative
+    // hash mix rather than bit-packing: bit-packing overflows i64
+    // for show_id >= 2^47 (wraps silently in release builds,
+    // causing collisions for imports with large external IDs).
     //
-    // The packed key is also stamped onto the payload as
-    // `show_season` so `enqueue_job_unique`'s
-    // `json_extract(payload, '$.show_season')` dedup lookup
-    // actually matches a field in the row. Without that field
-    // present, dedup always misses and every enqueue inserts a
-    // new job — observed in the wild as 7-8 concurrent
-    // bootstrap runs fingerprinting the same season in parallel,
-    // saturating the SQLite writer.
-    let season_lo = (season_number as i64).rem_euclid(1 << 16);
-    let dedup_key = (show_id << 16) | season_lo;
+    // Mix: multiply show_id by a large odd prime (Knuth's golden-
+    // ratio constant for 64-bit), then add the season number.
+    // `wrapping_*` makes the modular arithmetic explicit. All
+    // (show_id, season_number) pairs that fit in their declared
+    // types map to distinct keys in the practical range.
+    //
+    // The key is also stamped onto the payload as `show_season`
+    // so `enqueue_job_unique`'s `json_extract(payload,
+    // '$.show_season')` lookup matches a real field. Without it,
+    // dedup always misses — observed as 7-8 concurrent bootstrap
+    // runs saturating the SQLite writer.
+    let dedup_key = show_id
+        .wrapping_mul(0x9e3779b97f4a7c15u64 as i64)
+        .wrapping_add(season_number as i64);
     let payload = serde_json::json!({
         "show_id": show_id,
         "season_number": season_number,

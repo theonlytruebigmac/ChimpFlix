@@ -9,7 +9,7 @@ use chimpflix_metadata::{
     AniListClient, MalClient, OmdbClient, OpenSubtitlesClient, PlexOAuthClient, TmdbClient,
     TraktClient, TvMazeClient, TvdbClient,
 };
-use chimpflix_transcoder::{FfmpegConfig, TranscodeManager, TranscoderCapabilities};
+use chimpflix_transcoder::{FfmpegConfig, SharedCapabilities, TranscodeManager};
 use ipnet::IpNet;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
@@ -157,9 +157,15 @@ pub struct AppState {
     /// Epoch ms when the server process started. Used by the dashboard
     /// to report uptime.
     pub started_at_ms: i64,
-    /// Detected ffmpeg hardware accelerators + encoders at startup. The
-    /// admin UI uses this to grey out options the host can't run.
-    pub transcoder_caps: Arc<TranscoderCapabilities>,
+    /// Detected ffmpeg hardware accelerators + encoders. Probed at
+    /// startup and refreshable at runtime via the admin "re-probe"
+    /// endpoint (POST /admin/transcoder/capabilities/reprobe). The admin
+    /// UI uses this to grey out options the host can't run. This is the
+    /// *same* `Arc<SharedCapabilities>` handle held inside
+    /// `transcoder` (the `TranscodeManager`), so a re-probe `store`
+    /// here is observed by both the admin GET and the live encoder-
+    /// selection path. Readers call `.load()` for a lock-free snapshot.
+    pub transcoder_caps: Arc<SharedCapabilities>,
     /// In-memory ring buffer of recent `tracing` events for the Logs page.
     pub log_buffer: crate::log_buffer::LogBuffer,
     /// Credential vault — owns the master key and the encrypt/decrypt
@@ -215,6 +221,15 @@ pub struct AppState {
     /// token is about to expire — that produces duplicate refreshes,
     /// each minting a new token pair, and a last-writer-wins upsert
     /// that can lose a valid refresh_token.
+    ///
+    /// Growth is bounded: at most one `Arc<Mutex<()>>` (≈ 24 bytes)
+    /// per Trakt-linked user, and entries persist until restart even
+    /// after a user unlinks Trakt. For typical deployments (tens to
+    /// low hundreds of users) this is negligible; if explicit pruning
+    /// is ever wanted, add `state.trakt_refresh_locks.write().await
+    /// .remove(&user_id)` to the Trakt unlink handler
+    /// (`api::trakt::unlink`) and the user-delete handler
+    /// (`api::auth::delete_user`).
     pub trakt_refresh_locks: Arc<RwLock<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
     /// Live, in-memory per-kind counters and recent-run ring
     /// buffer. Used by the admin activity screen to render
@@ -268,6 +283,19 @@ pub struct AppState {
     /// operations that would otherwise blast thousands of writes into
     /// the queue while regular traffic is also writing.
     pub bulk_write_lock: Arc<tokio::sync::Semaphore>,
+
+    /// Set of `optimized_versions.id`s the operator has requested be
+    /// cancelled. The cancel route flips the DB row to `cancelled` and
+    /// inserts the id here; the `optimize_versions` worker polls this
+    /// set between ffmpeg progress reads and, when it sees its own row,
+    /// kills the in-flight ffmpeg child + removes the partial output.
+    /// Entries are removed by the worker once it has acted on them (or
+    /// when it finishes a row, defensively). Queued-only cancels never
+    /// reach the worker — the claim query skips non-`queued` rows — so
+    /// this set only ever matters for the running row(s) of the current
+    /// batch. Process-local; a restart drops the set, which is fine
+    /// because a restart also kills every in-flight ffmpeg child.
+    pub optimize_cancels: Arc<RwLock<HashSet<i64>>>,
 }
 
 impl AppState {
@@ -458,5 +486,26 @@ impl AppState {
             .entry(user_id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Request cancellation of a running optimized-version re-encode.
+    /// Inserts the id so the worker's poll loop sees it. Idempotent.
+    pub async fn request_optimize_cancel(&self, id: i64) {
+        self.optimize_cancels.write().await.insert(id);
+    }
+
+    /// True if the operator has requested cancellation of this
+    /// optimized-version id. Polled by the worker between ffmpeg
+    /// progress reads. A read-lock check kept off the hot path (called
+    /// a handful of times per second, not per frame).
+    pub async fn optimize_cancel_requested(&self, id: i64) -> bool {
+        self.optimize_cancels.read().await.contains(&id)
+    }
+
+    /// Drop a cancel request once the worker has acted on it (killed the
+    /// child) or finished the row. Keeps the set from accreting stale
+    /// ids across batches. Idempotent.
+    pub async fn clear_optimize_cancel(&self, id: i64) {
+        self.optimize_cancels.write().await.remove(&id);
     }
 }

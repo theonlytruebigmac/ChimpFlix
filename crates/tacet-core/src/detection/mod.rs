@@ -148,10 +148,9 @@ pub fn detect_season_adaptive(season: &Season, config: &Config) -> Result<Detect
     // Decide whether the narrow attempt produced useful references.
     // Both kinds are tracked independently because some shows have a
     // tail-anchored credits but a long cold open before the intro
-    // (or vice versa). When one side succeeds and the other doesn't,
-    // we still need to expand for the failing side — easiest path
-    // is to re-run the full detect_season at the wide config and
-    // merge.
+    // (or vice versa). When one side fails, fall back to a full
+    // detect_season at the wide config (both windows re-decoded from
+    // scratch). Narrow-pass results are discarded on partial failure.
     let intro_ok = !narrow_result.intro_references.is_empty();
     let credits_ok = !narrow_result.credits_references.is_empty();
     if intro_ok && credits_ok {

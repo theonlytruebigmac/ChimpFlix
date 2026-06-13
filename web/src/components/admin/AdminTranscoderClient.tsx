@@ -14,25 +14,22 @@ import {
   type TranscoderEncoderPreset,
   type TranscoderHwAccel,
   type TranscoderHwStrictness,
-  type TranscoderPreset,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner, Pill, SaveBar, SettingsCard, SettingsRow } from "./ui";
-import { ConfirmDialog } from "../ConfirmDialog";
 
 const HEVC_MODES: ReadonlyArray<{ value: HevcMode; label: string; hint: string }> = [
   {
     value: "off",
-    label: "Off (always H.264)",
+    label: "Off — always H.264",
     hint: "Default. Maximum browser compatibility — every client can decode H.264.",
   },
   {
     value: "when_client_supports",
-    label: "When client supports HEVC",
+    label: "When the client supports it",
     hint: "Safe-conservative: HEVC for Safari + some Edge / Chrome builds, H.264 otherwise.",
   },
   {
     value: "always",
-    label: "Always (HEVC)",
+    label: "Always (Safari only)",
     hint: "Forces HEVC for every transcode. Breaks Firefox + many Chrome builds. Set only on Safari-only deployments.",
   },
 ];
@@ -56,7 +53,7 @@ const TONEMAP_ALGOS: ReadonlyArray<{
   label: string;
   hint: string;
 }> = [
-  { value: "hable", label: "Hable", hint: "Filmic curve — default, balanced." },
+  { value: "hable", label: "Hable (filmic)", hint: "Filmic curve — default, balanced." },
   { value: "reinhard", label: "Reinhard", hint: "Classic, slightly washed-out highlights." },
   { value: "mobius", label: "Mobius", hint: "Preserves bright highlights — good for HDR10." },
   { value: "bt2390", label: "BT.2390", hint: "ITU reference — broadcast-style." },
@@ -69,31 +66,43 @@ const HW_ACCEL_OPTIONS: ReadonlyArray<{
   label: string;
   requires: string | null;
 }> = [
-  { value: "auto", label: "Auto (best available)", requires: null },
-  { value: "none", label: "Software (libx264)", requires: null },
+  { value: "auto", label: "Auto", requires: null },
   { value: "nvenc", label: "NVENC (NVIDIA)", requires: "h264_nvenc" },
-  { value: "qsv", label: "Quick Sync (Intel)", requires: "h264_qsv" },
-  { value: "vaapi", label: "VAAPI (Linux Intel/AMD)", requires: "h264_vaapi" },
-  { value: "videotoolbox", label: "VideoToolbox (macOS)", requires: "h264_videotoolbox" },
-  { value: "amf", label: "AMF (AMD)", requires: "h264_amf" },
+  { value: "vaapi", label: "VAAPI", requires: "h264_vaapi" },
+  { value: "qsv", label: "Quick Sync", requires: "h264_qsv" },
+  { value: "videotoolbox", label: "VideoToolbox", requires: "h264_videotoolbox" },
+  { value: "amf", label: "AMF", requires: "h264_amf" },
+  { value: "none", label: "None (software / libx264)", requires: null },
+];
+
+/// The H.264 capability chips shown in the detected-hardware card. Each
+/// maps a friendly label to the encoder token ffmpeg reports; the chip
+/// renders "available" (green tick) when the token was probed at boot.
+const H264_CAP_CHIPS: ReadonlyArray<{ label: string; encoder: string }> = [
+  { label: "NVENC", encoder: "h264_nvenc" },
+  { label: "VAAPI", encoder: "h264_vaapi" },
+  { label: "Quick Sync", encoder: "h264_qsv" },
+  { label: "VideoToolbox", encoder: "h264_videotoolbox" },
+  { label: "AMF", encoder: "h264_amf" },
 ];
 
 interface Props {
   capabilities: TranscoderCapabilities;
   cacheRoot: string;
-  presets: TranscoderPreset[];
   settings: ServerSettings;
 }
 
-const INPUT_CLASS =
-  "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-white/30";
-const INPUT_CHANGED_CLASS =
-  "w-full rounded-md border border-amber-400/40 bg-black/30 px-3 py-2 text-sm outline-none focus:border-amber-300";
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+      <path d="M5 12l5 5 9-11" />
+    </svg>
+  );
+}
 
 export function AdminTranscoderClient({
   capabilities,
   cacheRoot,
-  presets,
   settings,
 }: Props) {
   // See AdminGeneralForm for rationale — keep a local baseline so
@@ -113,6 +122,8 @@ export function AdminTranscoderClient({
     job_workers: settings.job_workers,
     transcoder_hdr_tonemap_enabled: settings.transcoder_hdr_tonemap_enabled,
     transcoder_hdr_tonemap_algo: settings.transcoder_hdr_tonemap_algo,
+    transcoder_burn_ass_subtitles: settings.transcoder_burn_ass_subtitles,
+    transcoder_two_pass_loudnorm: settings.transcoder_two_pass_loudnorm,
     transcoder_hevc_encoding_mode: (settings.transcoder_hevc_encoding_mode ??
       "off") as HevcMode,
     transcoder_gpu_device: settings.transcoder_gpu_device ?? "auto",
@@ -148,15 +159,26 @@ export function AdminTranscoderClient({
   const [tonemapAlgo, setTonemapAlgo] = useState<TonemapAlgorithm>(
     baseline.transcoder_hdr_tonemap_algo,
   );
+  const [burnAssSubtitles, setBurnAssSubtitles] = useState(
+    baseline.transcoder_burn_ass_subtitles,
+  );
+  const [twoPassLoudnorm, setTwoPassLoudnorm] = useState(
+    baseline.transcoder_two_pass_loudnorm,
+  );
   const [hevcMode, setHevcMode] = useState<HevcMode>(
     baseline.transcoder_hevc_encoding_mode,
   );
   const [gpuDevice, setGpuDevice] = useState<string>(
     baseline.transcoder_gpu_device,
   );
-  const [allPresets, setAllPresets] = useState(presets);
-  const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  // Detected hardware is server-rendered into the `capabilities` prop,
+  // but the "Re-probe" button can refresh it at runtime without a page
+  // reload — so the displayed chips read from this local copy.
+  const [caps, setCaps] = useState<TranscoderCapabilities>(capabilities);
+  const [reprobing, setReprobing] = useState(false);
+  const [reprobedAt, setReprobedAt] = useState<number | null>(null);
   const [active, setActive] = useState<DashboardSession[]>([]);
   // Start at 0 — first dashboard response below replaces it with
   // server.now_ms. Initializing from Date.now() in useState would call
@@ -231,32 +253,53 @@ export function AdminTranscoderClient({
     }
   }
 
-  // Per-field dirty flags. Drives the SettingsRow `changed` outline
-  // and the SaveBar `dirtyCount` + summary.
+  // Re-run ffmpeg hardware detection server-side and refresh the
+  // displayed chips. Useful after a driver upgrade or GPU change without
+  // restarting the server. The server swaps the fresh result into the
+  // live encoder-selection path too, so this is not cosmetic.
+  async function reprobe() {
+    setReprobing(true);
+    setError(null);
+    try {
+      const res = await adminApi.transcoder.reprobeCapabilities();
+      setCaps(res.capabilities);
+      setReprobedAt(Date.now());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReprobing(false);
+    }
+  }
+
+  // Per-field dirty flags. Drives the cf-changed input outline
+  // and the savebar dirtyCount + summary.
   const dirtyFields: Record<string, boolean> = {
     "Hardware acceleration": hwAccel !== baseline.transcoder_hw_accel,
-    "Max concurrent transcodes":
-      maxConcurrent !== baseline.transcoder_max_concurrent,
-    "Max CPU transcodes":
+    "Max concurrent": maxConcurrent !== baseline.transcoder_max_concurrent,
+    "Max CPU-only":
       maxCpuConcurrent !== baseline.transcoder_max_cpu_concurrent,
     "Quality ceiling":
       (ceiling === "" ? null : Number(ceiling)) !==
       baseline.transcoder_quality_ceiling_kbps,
-    "Encoder preset": encoderPreset !== baseline.transcoder_encoder_preset,
-    "Hardware strictness": hwStrictness !== baseline.transcoder_hw_strictness,
-    "x264 preset":
+    "Live encoder preset":
+      encoderPreset !== baseline.transcoder_encoder_preset,
+    "Fallback strictness": hwStrictness !== baseline.transcoder_hw_strictness,
+    "Background preset":
       backgroundPreset !== baseline.transcoder_background_preset,
-    "Max background jobs":
+    "Background slots":
       maxBackgroundConcurrent !==
       baseline.transcoder_max_background_concurrent,
-    "Job queue workers": jobWorkers !== baseline.job_workers,
-    "Tone map HDR sources":
+    "Job workers": jobWorkers !== baseline.job_workers,
+    "HDR tonemapping":
       tonemapEnabled !== baseline.transcoder_hdr_tonemap_enabled,
     "Tonemap algorithm":
       tonemapAlgo !== baseline.transcoder_hdr_tonemap_algo,
-    "Transcode device": gpuDevice !== baseline.transcoder_gpu_device,
-    "HEVC encoding mode":
-      hevcMode !== baseline.transcoder_hevc_encoding_mode,
+    "Burn-in subtitles":
+      burnAssSubtitles !== baseline.transcoder_burn_ass_subtitles,
+    "Two-pass loudnorm":
+      twoPassLoudnorm !== baseline.transcoder_two_pass_loudnorm,
+    "GPU device": gpuDevice !== baseline.transcoder_gpu_device,
+    "HEVC encoding": hevcMode !== baseline.transcoder_hevc_encoding_mode,
   };
   const dirtyLabels = Object.entries(dirtyFields)
     .filter(([, isDirty]) => isDirty)
@@ -264,6 +307,9 @@ export function AdminTranscoderClient({
   const dirtyCount = dirtyLabels.length;
 
   async function saveSettings() {
+    // Guard against concurrent saves from a double-click.
+    if (saving) return;
+    setSaving(true);
     setError(null);
     const patch = {
       transcoder_hw_accel: hwAccel,
@@ -277,26 +323,58 @@ export function AdminTranscoderClient({
       job_workers: jobWorkers,
       transcoder_hdr_tonemap_enabled: tonemapEnabled,
       transcoder_hdr_tonemap_algo: tonemapAlgo,
+      transcoder_burn_ass_subtitles: burnAssSubtitles,
+      transcoder_two_pass_loudnorm: twoPassLoudnorm,
       transcoder_hevc_encoding_mode: hevcMode,
       transcoder_gpu_device: gpuDevice,
     };
-    await adminApi.settings.patch(patch);
-    setBaseline({
-      transcoder_hw_accel: hwAccel,
-      transcoder_max_concurrent: maxConcurrent,
-      transcoder_max_cpu_concurrent: maxCpuConcurrent,
-      transcoder_quality_ceiling_kbps:
-        ceiling === "" ? null : Number(ceiling),
-      transcoder_encoder_preset: encoderPreset,
-      transcoder_hw_strictness: hwStrictness,
-      transcoder_background_preset: backgroundPreset,
-      transcoder_max_background_concurrent: maxBackgroundConcurrent,
-      job_workers: jobWorkers,
-      transcoder_hdr_tonemap_enabled: tonemapEnabled,
-      transcoder_hdr_tonemap_algo: tonemapAlgo,
-      transcoder_hevc_encoding_mode: hevcMode,
-      transcoder_gpu_device: gpuDevice,
-    });
+    try {
+      // Capture the server response so the baseline reflects server-persisted
+      // values (the backend may clamp or normalize individual fields).
+      const { settings: saved } = await adminApi.settings.patch(patch);
+      const savedHevc = (saved.transcoder_hevc_encoding_mode ?? "off") as HevcMode;
+      const savedGpu = saved.transcoder_gpu_device ?? "auto";
+      setBaseline({
+        transcoder_hw_accel: saved.transcoder_hw_accel,
+        transcoder_max_concurrent: saved.transcoder_max_concurrent,
+        transcoder_max_cpu_concurrent: saved.transcoder_max_cpu_concurrent,
+        transcoder_quality_ceiling_kbps:
+          saved.transcoder_quality_ceiling_kbps ?? null,
+        transcoder_encoder_preset: saved.transcoder_encoder_preset,
+        transcoder_hw_strictness: saved.transcoder_hw_strictness,
+        transcoder_background_preset: saved.transcoder_background_preset,
+        transcoder_max_background_concurrent:
+          saved.transcoder_max_background_concurrent,
+        job_workers: saved.job_workers,
+        transcoder_hdr_tonemap_enabled: saved.transcoder_hdr_tonemap_enabled,
+        transcoder_hdr_tonemap_algo: saved.transcoder_hdr_tonemap_algo,
+        transcoder_burn_ass_subtitles: saved.transcoder_burn_ass_subtitles,
+        transcoder_two_pass_loudnorm: saved.transcoder_two_pass_loudnorm,
+        transcoder_hevc_encoding_mode: savedHevc,
+        transcoder_gpu_device: savedGpu,
+      });
+      // Sync control state from server-accepted values so UI reflects what
+      // was actually stored (e.g. if the server clamped a numeric field).
+      setHwAccel(saved.transcoder_hw_accel);
+      setMaxConcurrent(saved.transcoder_max_concurrent);
+      setMaxCpuConcurrent(saved.transcoder_max_cpu_concurrent);
+      setCeiling(saved.transcoder_quality_ceiling_kbps ?? "");
+      setEncoderPreset(saved.transcoder_encoder_preset);
+      setHwStrictness(saved.transcoder_hw_strictness);
+      setBackgroundPreset(saved.transcoder_background_preset);
+      setMaxBackgroundConcurrent(saved.transcoder_max_background_concurrent);
+      setJobWorkers(saved.job_workers);
+      setTonemapEnabled(saved.transcoder_hdr_tonemap_enabled);
+      setTonemapAlgo(saved.transcoder_hdr_tonemap_algo);
+      setBurnAssSubtitles(saved.transcoder_burn_ass_subtitles);
+      setTwoPassLoudnorm(saved.transcoder_two_pass_loudnorm);
+      setHevcMode(savedHevc);
+      setGpuDevice(savedGpu);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
   }
 
   function discardChanges() {
@@ -311,708 +389,701 @@ export function AdminTranscoderClient({
     setJobWorkers(baseline.job_workers);
     setTonemapEnabled(baseline.transcoder_hdr_tonemap_enabled);
     setTonemapAlgo(baseline.transcoder_hdr_tonemap_algo);
+    setBurnAssSubtitles(baseline.transcoder_burn_ass_subtitles);
+    setTwoPassLoudnorm(baseline.transcoder_two_pass_loudnorm);
     setHevcMode(baseline.transcoder_hevc_encoding_mode);
     setGpuDevice(baseline.transcoder_gpu_device);
-  }
-
-  async function refreshPresets() {
-    const r = await adminApi.transcoder.listPresets();
-    setAllPresets(r.presets);
   }
 
   const tonemapHint =
     TONEMAP_ALGOS.find((a) => a.value === tonemapAlgo)?.hint ?? "";
   const hevcHint = HEVC_MODES.find((m) => m.value === hevcMode)?.hint ?? "";
+  const autoLabel = pickAutoLabel(caps.h264_encoders);
+  // Per-hwaccel decode lists for the "Hardware decode" chip rows. Only
+  // backends with at least one probed codec are shown.
+  const decodeBackends: ReadonlyArray<[string, string[]]> = [
+    ["NVDEC (cuda)", caps.decoders.cuda],
+    ["VAAPI", caps.decoders.vaapi],
+    ["Quick Sync (qsv)", caps.decoders.qsv],
+    ["VideoToolbox", caps.decoders.videotoolbox],
+  ];
+  const decodeBackendsWithCodecs = decodeBackends.filter(
+    ([, codecs]) => codecs.length > 0,
+  );
+  const usingHw =
+    caps.h264_encoders.length > 0 &&
+    (hwAccel === "auto"
+      ? autoLabel !== "Software (libx264)"
+      : hwAccel !== "none" &&
+        caps.h264_encoders.includes(`h264_${hwAccel}`));
 
   return (
     <div>
-      <ErrorBanner error={error} className="mb-4" />
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
 
-      {/* ── Engine ────────────────────────────────────────────────── */}
-      <SettingsCard
-        title="Engine"
-        description={
-          <>
-            ffmpeg {capabilities.ffmpeg_version ?? "?"} —{" "}
-            {capabilities.h264_encoders.length === 0
-              ? "no h264 encoders detected"
-              : capabilities.h264_encoders.join(", ")}
-          </>
-        }
-      >
-        <SettingsRow
-          label="Hardware acceleration"
-          help={
-            hwAccel === "auto" ? (
-              <>
-                Auto will pick:{" "}
-                <span className="font-medium text-white/80">
-                  {pickAutoLabel(capabilities.h264_encoders)}
-                </span>
-              </>
-            ) : (
-              "Specific encoder used for live transcodes. Greys out options the host can't run."
-            )
-          }
-          changed={dirtyFields["Hardware acceleration"]}
-        >
-          <select
-            value={hwAccel}
-            onChange={(e) => setHwAccel(e.target.value as TranscoderHwAccel)}
-            className={
-              dirtyFields["Hardware acceleration"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          >
-            {HW_ACCEL_OPTIONS.map((opt) => {
-              const available =
-                opt.requires == null ||
-                capabilities.h264_encoders.includes(opt.requires);
+      {/* ── Detected hardware ─────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Detected hardware</div>
+            <div className="cf-sub">
+              Probed via{" "}
+              <span className="cf-mono">ffmpeg -encoders</span>
+              {caps.ffmpeg_version ? ` · ${caps.ffmpeg_version}` : ""}
+              {reprobedAt
+                ? ` · re-probed ${new Date(reprobedAt).toLocaleTimeString()}`
+                : " at boot"}
+            </div>
+          </div>
+          <div className="cf-head-aside">
+            <button
+              type="button"
+              className="cf-btn cf-sm"
+              onClick={reprobe}
+              disabled={reprobing}
+              title="Re-run ffmpeg hardware detection without restarting the server (use after a driver or GPU change)"
+            >
+              {reprobing ? "Re-probing…" : "Re-probe"}
+            </button>
+          </div>
+        </div>
+        <div className="cf-card-body cf-pad">
+          <div className="cf-field-label">H.264 acceleration</div>
+          <div className="cf-flex cf-wrap cf-gap8" style={{ marginBottom: 14 }}>
+            {H264_CAP_CHIPS.map((chip) => {
+              const ok = caps.h264_encoders.includes(chip.encoder);
               return (
-                <option
-                  key={opt.value}
-                  value={opt.value}
-                  disabled={!available && opt.value !== hwAccel}
+                <span
+                  key={chip.encoder}
+                  className={"cf-pill" + (ok ? " cf-ok" : "")}
                 >
-                  {opt.label}
-                  {!available && " (not available)"}
-                </option>
+                  {ok && <CheckIcon />}
+                  {chip.label}
+                </span>
               );
             })}
-          </select>
-        </SettingsRow>
-
-        <SettingsRow
-          label="Max concurrent transcodes"
-          help="Sessions exceeding this limit are rejected with 429."
-          changed={dirtyFields["Max concurrent transcodes"]}
-        >
-          <input
-            type="number"
-            min={1}
-            max={64}
-            value={maxConcurrent}
-            onChange={(e) => setMaxConcurrent(Number(e.target.value))}
-            className={
-              dirtyFields["Max concurrent transcodes"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          />
-        </SettingsRow>
-
-        <SettingsRow
-          label="Max CPU transcodes"
-          help="Sub-cap for software (libx264 / libx265) sessions only. A single CPU encode pegs N cores; capping these separately stops a wave of fallback-to-software encodes from starving GPU sessions. Default 1."
-          changed={dirtyFields["Max CPU transcodes"]}
-        >
-          <input
-            type="number"
-            min={1}
-            max={16}
-            value={maxCpuConcurrent}
-            onChange={(e) => setMaxCpuConcurrent(Number(e.target.value))}
-            className={
-              dirtyFields["Max CPU transcodes"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          />
-        </SettingsRow>
-
-        <SettingsRow
-          label="Quality ceiling (kbps)"
-          help="Blank = no cap. Sessions never exceed this bitrate."
-          changed={dirtyFields["Quality ceiling"]}
-        >
-          <input
-            type="number"
-            min={100}
-            max={200_000}
-            value={ceiling}
-            placeholder="Unlimited"
-            onChange={(e) =>
-              setCeiling(e.target.value === "" ? "" : Number(e.target.value))
-            }
-            className={
-              dirtyFields["Quality ceiling"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          />
-        </SettingsRow>
-
-        <SettingsRow
-          label="Encoder preset"
-          help="Speed–quality dial: speed shaves CPU, quality spends more cycles for finer detail. Applied to whichever encoder is active above."
-          changed={dirtyFields["Encoder preset"]}
-        >
-          <select
-            value={encoderPreset}
-            onChange={(e) =>
-              setEncoderPreset(e.target.value as TranscoderEncoderPreset)
-            }
-            className={
-              dirtyFields["Encoder preset"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          >
-            <option value="speed">Speed (lowest CPU)</option>
-            <option value="balanced">Balanced (default)</option>
-            <option value="quality">Quality (slower)</option>
-          </select>
-        </SettingsRow>
-
-        <SettingsRow
-          label="Hardware strictness"
-          help="How aggressively to enforce HW use. Require HW refuses sessions that need software fallback for any stage (decode / filter / encode)."
-          changed={dirtyFields["Hardware strictness"]}
-        >
-          <select
-            value={hwStrictness}
-            onChange={(e) =>
-              setHwStrictness(e.target.value as TranscoderHwStrictness)
-            }
-            className={
-              dirtyFields["Hardware strictness"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          >
-            <option value="auto">Auto (HW where possible, SW fallback)</option>
-            <option value="prefer_hw">Prefer HW (warn on fallback)</option>
-            <option value="require_hw">Require HW (refuse fallback)</option>
-          </select>
-        </SettingsRow>
-
-        <details className="border-t border-white/10 px-5 py-3 text-xs text-white/50">
-          <summary className="cursor-pointer hover:text-white/70">
-            Capability detail (probed at startup)
-          </summary>
-          <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-            <div>
-              <div className="text-white/40">H.264 hardware encoders</div>
-              <div className="mt-0.5 font-mono">
-                {capabilities.h264_encoders.length > 0
-                  ? capabilities.h264_encoders.join(", ")
-                  : "none"}
-              </div>
-            </div>
-            <div>
-              <div className="text-white/40">HEVC hardware encoders</div>
-              <div className="mt-0.5 font-mono">
-                {capabilities.hevc_encoders.length > 0
-                  ? capabilities.hevc_encoders.join(", ")
-                  : "none"}
-              </div>
-            </div>
-            <DecoderRow label="NVDEC (CUDA) decoders" list={capabilities.decoders.cuda} />
-            <DecoderRow label="VAAPI decoders" list={capabilities.decoders.vaapi} />
-            <DecoderRow label="QSV decoders" list={capabilities.decoders.qsv} />
-            <DecoderRow label="VideoToolbox decoders" list={capabilities.decoders.videotoolbox} />
           </div>
-          <p className="mt-3 text-[11px] text-white/40">
-            Decoder support is probed at server start by running a one-frame
-            test through each hwaccel — so this reflects what your actual
-            card can do, not the codec list ffmpeg was compiled with.
-          </p>
-          <div className="mt-3 flex flex-wrap items-baseline gap-2 text-[11px] text-white/40">
-            <span className="text-white/55">Transcoder temp directory:</span>
-            <code className="font-mono text-white/70">{cacheRoot}</code>
-            <span className="text-white/40">
-              (set via the <code className="font-mono">TRANSCODER_CACHE_DIR</code> env;
-              requires server restart to change)
+          <div className="cf-field-label">HEVC / others</div>
+          <div className="cf-flex cf-wrap cf-gap8">
+            <span
+              className={
+                "cf-pill" +
+                (caps.hevc_encoders.includes("hevc_nvenc") ? " cf-ok" : "")
+              }
+            >
+              {caps.hevc_encoders.includes("hevc_nvenc") && <CheckIcon />}
+              NVENC HEVC
             </span>
+            <span className="cf-pill">libx265 (software)</span>
+            {usingHw && caps.gpu_devices.length === 0 && (
+              <span className="cf-pill cf-ok">
+                <CheckIcon />
+                GPU active
+              </span>
+            )}
           </div>
-        </details>
-      </SettingsCard>
 
-      {/* ── Background transcoding ─────────────────────────────────── */}
-      <SettingsCard
-        title="Background transcoding"
-        description={
-          <>
-            The <code className="font-mono">optimize_versions</code> scheduled
-            task pre-encodes media into operator-defined presets so weak
-            clients don&apos;t need a live transcode. These dials trade CPU
-            time vs. output size and protect live playback from background
-            starvation. Always uses libx264 (no GPU).
-          </>
-        }
-      >
-        <SettingsRow
-          label="x264 preset"
-          help="Slower presets produce smaller files at the same quality, but consume more CPU per encode."
-          changed={dirtyFields["x264 preset"]}
-        >
-          <select
-            value={backgroundPreset}
-            onChange={(e) =>
-              setBackgroundPreset(
-                e.target.value as TranscoderBackgroundPreset,
-              )
-            }
-            className={
-              dirtyFields["x264 preset"] ? INPUT_CHANGED_CLASS : INPUT_CLASS
-            }
-          >
-            {BACKGROUND_PRESETS.map((p) => (
-              <option key={p.value} value={p.value}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-        </SettingsRow>
-        <SettingsRow
-          label="Max background jobs"
-          help="Hard cap on how many optimize_versions jobs run per scheduler tick (every 30s)."
-          changed={dirtyFields["Max background jobs"]}
-        >
-          <input
-            type="number"
-            min={1}
-            max={16}
-            value={maxBackgroundConcurrent}
-            onChange={(e) =>
-              setMaxBackgroundConcurrent(Number(e.target.value))
-            }
-            className={
-              dirtyFields["Max background jobs"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          />
-        </SettingsRow>
-        <SettingsRow
-          label="Job queue workers"
-          help="How many worker tasks pull from the durable job queue (marker detection, loudness, subtitles, ratings). Each worker can run any kind, so raising this lets more pipeline kinds make progress in parallel when files pile up. Applies live — shrinking drains workers as soon as they finish their current job."
-          changed={dirtyFields["Job queue workers"]}
-        >
-          <input
-            type="number"
-            min={1}
-            max={16}
-            value={jobWorkers}
-            onChange={(e) => setJobWorkers(Number(e.target.value))}
-            className={
-              dirtyFields["Job queue workers"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          />
-        </SettingsRow>
-      </SettingsCard>
+          {/* GPU devices — one chip per enumerated card. */}
+          {caps.gpu_devices.length > 0 && (
+            <>
+              <div className="cf-field-label" style={{ marginTop: 14 }}>
+                GPU devices
+              </div>
+              <div className="cf-flex cf-wrap cf-gap8">
+                {caps.gpu_devices.map((d) => (
+                  <span key={d.value} className="cf-pill cf-ok">
+                    <CheckIcon />
+                    {d.name}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
 
-      {/* ── HDR tone mapping ──────────────────────────────────────── */}
-      <SettingsCard
-        title="HDR tone mapping"
-        description="When the source is HDR (HDR10 / HLG / Dolby Vision) and the session is being re-encoded, ffmpeg applies a tonemap filter so the SDR output isn't washed out. Disabling skips the filter — saves CPU but the picture will look flat on SDR displays."
-      >
-        <SettingsRow
-          label="Tone map HDR sources"
-          help="Recommended unless you only stream to HDR-capable clients."
-          changed={dirtyFields["Tone map HDR sources"]}
-        >
-          <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={tonemapEnabled}
-              onChange={(e) => setTonemapEnabled(e.target.checked)}
-            />
-            <span>Apply HDR → SDR tonemap during reencode</span>
-          </label>
-        </SettingsRow>
-        <SettingsRow
-          label="Tonemap algorithm"
-          help={tonemapHint}
-          changed={dirtyFields["Tonemap algorithm"]}
-        >
-          <select
-            value={tonemapAlgo}
-            disabled={!tonemapEnabled}
-            onChange={(e) => setTonemapAlgo(e.target.value as TonemapAlgorithm)}
-            className={`${
-              dirtyFields["Tonemap algorithm"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            } disabled:opacity-40`}
-          >
-            {TONEMAP_ALGOS.map((a) => (
-              <option key={a.value} value={a.value}>
-                {a.label}
-              </option>
-            ))}
-          </select>
-        </SettingsRow>
-      </SettingsCard>
+          {/* Hardware decode — per-hwaccel list of source codecs the
+              runtime probe confirmed this host can decode on the GPU.
+              Rendered as cf-tag chips per codec under each backend. */}
+          {decodeBackendsWithCodecs.length > 0 && (
+            <>
+              <div className="cf-field-label" style={{ marginTop: 14 }}>
+                Hardware decode
+              </div>
+              <div
+                className="cf-flex cf-wrap cf-gap8"
+                style={{ alignItems: "center" }}
+              >
+                {decodeBackendsWithCodecs.map(([backend, codecs]) => (
+                  <span
+                    key={backend}
+                    className="cf-flex cf-gap8"
+                    style={{ alignItems: "center" }}
+                  >
+                    <span className="cf-pill cf-ok">
+                      <CheckIcon />
+                      {backend}
+                    </span>
+                    {codecs.map((codec) => (
+                      <span key={codec} className="cf-tag">
+                        {codec}
+                      </span>
+                    ))}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+          {usingHw && (
+            <div className="cf-banner cf-ok" style={{ margin: "16px 0 0" }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />
+              </svg>
+              <div>
+                Hardware encoding is active — CPU stays free during transcodes.
+                Software fallback only kicks in if the GPU is saturated.
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
 
-      {/* ── GPU device ────────────────────────────────────────────── */}
-      <SettingsCard
-        title="GPU device"
-        description="Multi-GPU hosts can pin transcoding to a specific card. Auto lets the driver pick — fine for single-GPU systems (~99% of installs)."
-      >
-        <SettingsRow
-          label="Transcode device"
-          help={
-            capabilities.gpu_devices.length === 0
-              ? "No multi-GPU devices detected; the dropdown only shows Auto."
-              : "Pinned to the chosen card for every new session. Restart not required."
-          }
-          changed={dirtyFields["Transcode device"]}
-        >
-          <select
-            value={gpuDevice}
-            onChange={(e) => setGpuDevice(e.target.value)}
-            className={
-              dirtyFields["Transcode device"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
-          >
-            <option value="auto">Auto (driver picks)</option>
-            {capabilities.gpu_devices.map((d) => (
-              <option key={d.value} value={d.value}>
-                {d.name}
-              </option>
-            ))}
-          </select>
-        </SettingsRow>
-      </SettingsCard>
+      {/* ── Acceleration ──────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Acceleration</div>
+          </div>
+        </div>
+        <div className="cf-card-body">
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Hardware acceleration</div>
+              <div className="cf-row-help">
+                {hwAccel === "auto" ? (
+                  <>
+                    Auto will pick:{" "}
+                    <span className="cf-mono">{autoLabel}</span>. Greyed options
+                    weren&apos;t detected on this host.
+                  </>
+                ) : (
+                  "Greyed options weren't detected on this host."
+                )}
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["Hardware acceleration"] ? " cf-changed" : "")
+                }
+                value={hwAccel}
+                onChange={(e) => setHwAccel(e.target.value as TranscoderHwAccel)}
+              >
+                {HW_ACCEL_OPTIONS.map((opt) => {
+                  const available =
+                    opt.requires == null ||
+                    caps.h264_encoders.includes(opt.requires);
+                  return (
+                    <option
+                      key={opt.value}
+                      value={opt.value}
+                      disabled={!available && opt.value !== hwAccel}
+                    >
+                      {opt.label}
+                      {!available && opt.requires != null
+                        ? " — not detected"
+                        : ""}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          </div>
 
-      {/* ── HEVC ──────────────────────────────────────────────────── */}
-      <SettingsCard
-        title="HEVC output"
-        description="HEVC (H.265) produces ~30% smaller files at the same visual quality but isn't universally browser-supported. Output container is forced to fMP4 when HEVC is selected; the ABR fallback variant is disabled (HEVC ABR is a future expansion)."
-      >
-        <SettingsRow
-          label="HEVC encoding mode"
-          help={hevcHint}
-          changed={dirtyFields["HEVC encoding mode"]}
-        >
-          <select
-            value={hevcMode}
-            onChange={(e) => setHevcMode(e.target.value as HevcMode)}
-            className={
-              dirtyFields["HEVC encoding mode"]
-                ? INPUT_CHANGED_CLASS
-                : INPUT_CLASS
-            }
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Fallback strictness</div>
+              <div className="cf-row-help">
+                What to do when the GPU is busy or a codec isn&apos;t
+                HW-supported.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["Fallback strictness"] ? " cf-changed" : "")
+                }
+                value={hwStrictness}
+                onChange={(e) =>
+                  setHwStrictness(e.target.value as TranscoderHwStrictness)
+                }
+              >
+                <option value="auto">Prefer HW, fall back to software</option>
+                <option value="prefer_hw">Prefer HW (warn on fallback)</option>
+                <option value="require_hw">HW only — fail if unavailable</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">GPU device</div>
+              <div className="cf-row-help">
+                {caps.gpu_devices.length === 0
+                  ? "Pin to a specific GPU when more than one is present. No multi-GPU devices detected; only Auto is offered."
+                  : "Pin to a specific GPU when more than one is present."}
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["GPU device"] ? " cf-changed" : "")
+                }
+                value={gpuDevice}
+                onChange={(e) => setGpuDevice(e.target.value)}
+              >
+                <option value="auto">auto</option>
+                {caps.gpu_devices.map((d) => (
+                  <option key={d.value} value={d.value}>
+                    {d.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Concurrency ───────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Concurrency</div>
+            <div className="cf-sub">
+              Slot limits so a busy night doesn&apos;t melt the box.
+            </div>
+          </div>
+        </div>
+        <div className="cf-card-body cf-pad">
+          <div className="cf-grid cf-c4">
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Max concurrent</label>
+              <input
+                type="number"
+                min={1}
+                max={64}
+                className={
+                  "cf-input" + (dirtyFields["Max concurrent"] ? " cf-changed" : "")
+                }
+                value={maxConcurrent}
+                onChange={(e) => setMaxConcurrent(Number(e.target.value))}
+              />
+            </div>
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Max CPU-only</label>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                className={
+                  "cf-input" + (dirtyFields["Max CPU-only"] ? " cf-changed" : "")
+                }
+                value={maxCpuConcurrent}
+                onChange={(e) => setMaxCpuConcurrent(Number(e.target.value))}
+              />
+            </div>
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Background slots</label>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                className={
+                  "cf-input" +
+                  (dirtyFields["Background slots"] ? " cf-changed" : "")
+                }
+                value={maxBackgroundConcurrent}
+                onChange={(e) =>
+                  setMaxBackgroundConcurrent(Number(e.target.value))
+                }
+              />
+            </div>
+            <div className="cf-field" style={{ marginBottom: 0 }}>
+              <label className="cf-field-label">Job workers</label>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                className={
+                  "cf-input" + (dirtyFields["Job workers"] ? " cf-changed" : "")
+                }
+                value={jobWorkers}
+                onChange={(e) => setJobWorkers(Number(e.target.value))}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Quality ───────────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Quality</div>
+          </div>
+        </div>
+        <div className="cf-card-body">
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Live encoder preset</div>
+              <div className="cf-row-help">
+                Speed vs quality for on-the-fly transcodes.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["Live encoder preset"] ? " cf-changed" : "")
+                }
+                value={encoderPreset}
+                onChange={(e) =>
+                  setEncoderPreset(e.target.value as TranscoderEncoderPreset)
+                }
+              >
+                <option value="speed">Speed (fastest)</option>
+                <option value="balanced">Balanced (default)</option>
+                <option value="quality">Quality (best)</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Background preset</div>
+              <div className="cf-row-help">
+                For unattended optimize jobs — can afford to be slower. Always
+                uses libx264 (no GPU).
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["Background preset"] ? " cf-changed" : "")
+                }
+                value={backgroundPreset}
+                onChange={(e) =>
+                  setBackgroundPreset(e.target.value as TranscoderBackgroundPreset)
+                }
+              >
+                {BACKGROUND_PRESETS.map((p) => (
+                  <option key={p.value} value={p.value}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Quality ceiling</div>
+              <div className="cf-row-help">
+                Cap the max output bitrate. Blank = no cap.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <input
+                type="number"
+                min={100}
+                max={200_000}
+                className={
+                  "cf-input cf-w-auto" +
+                  (dirtyFields["Quality ceiling"] ? " cf-changed" : "")
+                }
+                style={{ minWidth: 120 }}
+                placeholder="kbps"
+                value={ceiling}
+                onChange={(e) =>
+                  setCeiling(e.target.value === "" ? "" : Number(e.target.value))
+                }
+              />
+              <span className="cf-faint">kbps</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Advanced video ────────────────────────────────────────── */}
+      <div className="cf-card">
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Advanced video</div>
+            <div className="cf-sub">
+              Leave defaults unless you know you need these.
+            </div>
+          </div>
+        </div>
+        <div className="cf-card-body">
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">HDR → SDR tonemapping</div>
+              <div className="cf-row-help">
+                Convert HDR10 / HLG / Dolby Vision for SDR clients.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={tonemapEnabled}
+                aria-label="HDR to SDR tonemapping"
+                className={"cf-switch" + (tonemapEnabled ? " cf-on" : "")}
+                onClick={() => setTonemapEnabled((v) => !v)}
+              />
+            </div>
+          </div>
+
+          <div
+            className="cf-row"
+            style={{
+              transition: "opacity .2s",
+              opacity: tonemapEnabled ? 1 : 0.4,
+              pointerEvents: tonemapEnabled ? "auto" : "none",
+            }}
           >
-            {HEVC_MODES.map((m) => (
-              <option key={m.value} value={m.value}>
-                {m.label}
-              </option>
-            ))}
-          </select>
-        </SettingsRow>
-      </SettingsCard>
+            <div className="cf-row-main">
+              <div className="cf-row-label">Tonemap algorithm</div>
+              <div className="cf-row-help">
+                {tonemapHint || "Only used when tonemapping is on."}
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["Tonemap algorithm"] ? " cf-changed" : "")
+                }
+                value={tonemapAlgo}
+                disabled={!tonemapEnabled}
+                onChange={(e) =>
+                  setTonemapAlgo(e.target.value as TonemapAlgorithm)
+                }
+              >
+                {TONEMAP_ALGOS.map((a) => (
+                  <option key={a.value} value={a.value}>
+                    {a.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">HEVC encoding</div>
+              <div className="cf-row-help">
+                {hevcHint ||
+                  "HEVC halves bitrate but only Safari plays it reliably."}
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <select
+                className={
+                  "cf-select cf-w-auto" +
+                  (dirtyFields["HEVC encoding"] ? " cf-changed" : "")
+                }
+                value={hevcMode}
+                onChange={(e) => setHevcMode(e.target.value as HevcMode)}
+              >
+                {HEVC_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Burn-in ASS/SSA subtitles</div>
+              <div className="cf-row-help">
+                Bake text subtitles (SRT / ASS / SSA) into the video
+                instead of overlaying them as a selectable track. Costs
+                CPU and forces a re-encode, but guarantees styled subs
+                render identically on every client. Picture subs
+                (PGS / VobSub) always burn regardless.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={burnAssSubtitles}
+                aria-label="Burn-in ASS/SSA subtitles"
+                className={"cf-switch" + (burnAssSubtitles ? " cf-on" : "")}
+                onClick={() => setBurnAssSubtitles((v) => !v)}
+              />
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">
+                Two-pass loudness normalization
+              </div>
+              <div className="cf-row-help">
+                Use precise per-file EBU R 128 measurements (from the
+                loudness-analysis task) for measure-then-apply volume
+                leveling, instead of the cheaper single-pass estimate.
+                Only takes effect when normalization is on.
+              </div>
+            </div>
+            <div className="cf-row-control">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={twoPassLoudnorm}
+                aria-label="Two-pass loudness normalization"
+                className={"cf-switch" + (twoPassLoudnorm ? " cf-on" : "")}
+                onClick={() => setTwoPassLoudnorm((v) => !v)}
+              />
+            </div>
+          </div>
+
+          <div className="cf-row">
+            <div className="cf-row-main">
+              <div className="cf-row-label">Transcode cache</div>
+              <div className="cf-row-help">
+                Where HLS segments are written. Set via the{" "}
+                <span className="cf-mono">TRANSCODER_CACHE_DIR</span> env;
+                read-only.
+              </div>
+            </div>
+            <div className="cf-row-control cf-mono cf-faint">{cacheRoot}</div>
+          </div>
+        </div>
+      </div>
 
       {/* ── Sticky save bar ───────────────────────────────────────── */}
-      <SaveBar
-        dirtyCount={dirtyCount}
-        summary={dirtyLabels.slice(0, 3).join(", ") +
-          (dirtyLabels.length > 3 ? `, +${dirtyLabels.length - 3} more` : "")}
-        onSave={saveSettings}
-        onDiscard={discardChanges}
-      />
+      {dirtyCount > 0 && (
+        <div className="cf-savebar">
+          <div className="cf-sb-status">
+            <span className="cf-dot" style={{ background: "var(--warn)" }} />
+            <b>
+              {dirtyCount} unsaved {dirtyCount === 1 ? "change" : "changes"}
+            </b>
+            {" · "}
+            {dirtyLabels.slice(0, 3).join(", ")}
+            {dirtyLabels.length > 3 ? `, +${dirtyLabels.length - 3} more` : ""}
+          </div>
+          <div className="cf-sb-actions">
+            <button
+              type="button"
+              className="cf-btn cf-ghost cf-sm"
+              onClick={discardChanges}
+              disabled={saving}
+            >
+              Discard
+            </button>
+            <button
+              type="button"
+              className="cf-btn cf-primary cf-sm"
+              onClick={saveSettings}
+              disabled={saving}
+            >
+              {saving ? "Saving…" : "Save changes"}
+            </button>
+          </div>
+        </div>
+      )}
 
-      {/* ── Active transcodes (no save state) ─────────────────────── */}
-      <section className="mt-6">
-        <div className="mb-3 flex items-center gap-2">
-          <h2 className="text-base font-semibold">Active transcodes</h2>
+      {/* ── Active transcodes (no save state, WS-fed) ─────────────── */}
+      <div className="cf-card" style={{ marginTop: 24 }}>
+        <div className="cf-card-head">
+          <div>
+            <div className="cf-ttl">Active transcodes</div>
+            <div className="cf-sub">Live sessions in flight, pushed over the dashboard socket.</div>
+          </div>
           {active.length > 0 && (
-            <Pill tone="ok" dot>
-              {active.length} running
-            </Pill>
+            <div className="cf-head-aside">
+              <span className="cf-pill cf-ok">
+                <span className="cf-dot" />
+                {active.length} running
+              </span>
+            </div>
           )}
         </div>
         {active.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-6 text-center text-sm text-white/50">
-            No transcodes in flight.
+          <div className="cf-card-body cf-pad">
+            <span className="cf-faint" style={{ fontSize: 13 }}>
+              No transcodes in flight.
+            </span>
           </div>
         ) : (
-          <div className="overflow-hidden rounded-lg border border-white/10">
-            <table className="w-full text-sm">
-              <thead className="bg-white/5 text-left text-xs uppercase tracking-wider text-white/40">
-                <tr>
-                  <th className="px-4 py-2">Session</th>
-                  <th className="px-4 py-2">User</th>
-                  <th className="px-4 py-2">File</th>
-                  <th className="px-4 py-2">Health</th>
-                  <th className="px-4 py-2">Started</th>
-                  <th className="px-4 py-2">Last seen</th>
-                  <th className="px-4 py-2" />
-                </tr>
-              </thead>
-              <tbody>
-                {active.map((s) => (
-                  <tr key={s.id} className="border-t border-white/5">
-                    <td className="whitespace-nowrap px-4 py-2 font-mono text-xs">
-                      {s.id}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/70">
-                      #{s.user_id}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/70">
-                      file #{s.media_file_id}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2">
-                      <SessionHealthPills
-                        transcode={s.transcode_health}
-                        subtitle={s.subtitle_health ?? undefined}
-                      />
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/60">
-                      {formatRelative(nowMs - s.created_at)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/60">
-                      {formatRelative(nowMs - s.last_seen_at)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-right">
-                      <button
-                        onClick={() => stopSession(s.id)}
-                        className="rounded border border-white/10 px-2 py-1 text-xs text-white/70 hover:bg-white/5"
-                      >
-                        Stop
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      {/* ── Quality presets (CRUD) ────────────────────────────────── */}
-      <section className="mt-6">
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-base font-semibold">Quality presets</h2>
-          <button
-            onClick={() => setShowAdd((v) => !v)}
-            className="rounded-md bg-accent px-4 py-2.5 text-sm font-semibold sm:px-3 sm:py-1.5 text-white hover:bg-accent-hover"
-          >
-            {showAdd ? "Cancel" : "+ New preset"}
-          </button>
-        </div>
-        {showAdd && (
-          <NewPresetForm
-            onCreated={async () => {
-              setShowAdd(false);
-              await refreshPresets();
-            }}
-            onError={setError}
-          />
-        )}
-        <div className="overflow-hidden rounded-lg border border-white/10">
-          <table className="w-full text-sm">
-            <thead className="bg-white/5 text-left text-xs uppercase tracking-wider text-white/40">
+          <table className="cf-table">
+            <thead>
               <tr>
-                <th className="px-4 py-2">Name</th>
-                <th className="px-4 py-2">Max height</th>
-                <th className="px-4 py-2">Max video kbps</th>
-                <th className="px-4 py-2">Audio</th>
-                <th className="px-4 py-2">Enabled</th>
-                <th className="px-4 py-2" />
+                <th>Session</th>
+                <th>User</th>
+                <th>File</th>
+                <th>Health</th>
+                <th>Started</th>
+                <th>Last seen</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
-              {allPresets.map((p) => (
-                <PresetRow
-                  key={p.id}
-                  preset={p}
-                  onChanged={refreshPresets}
-                  onError={setError}
-                />
+              {active.map((s) => (
+                <tr key={s.id}>
+                  <td className="cf-mono">{s.id}</td>
+                  <td className="cf-muted">#{s.user_id}</td>
+                  <td className="cf-muted">file #{s.media_file_id}</td>
+                  <td>
+                    <SessionHealthPills
+                      transcode={s.transcode_health}
+                      subtitle={s.subtitle_health ?? undefined}
+                    />
+                  </td>
+                  <td className="cf-muted">
+                    {formatRelative(nowMs - s.created_at)}
+                  </td>
+                  <td className="cf-muted">
+                    {formatRelative(nowMs - s.last_seen_at)}
+                  </td>
+                  <td className="cf-num">
+                    <button
+                      type="button"
+                      onClick={() => stopSession(s.id)}
+                      className="cf-btn cf-ghost cf-tiny"
+                    >
+                      Stop
+                    </button>
+                  </td>
+                </tr>
               ))}
             </tbody>
           </table>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function PresetRow({
-  preset,
-  onChanged,
-  onError,
-}: {
-  preset: TranscoderPreset;
-  onChanged: () => Promise<void>;
-  onError: (msg: string | null) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [askDelete, setAskDelete] = useState(false);
-
-  async function toggle() {
-    setBusy(true);
-    onError(null);
-    try {
-      await adminApi.transcoder.updatePreset(preset.id, { enabled: !preset.enabled });
-      await onChanged();
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function remove() {
-    setAskDelete(false);
-    setBusy(true);
-    onError(null);
-    try {
-      await adminApi.transcoder.deletePreset(preset.id);
-      await onChanged();
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <>
-    <tr className="border-t border-white/5">
-      <td className="px-4 py-2 font-medium">{preset.name}</td>
-      <td className="px-4 py-2 tabular-nums text-white/70">
-        {preset.max_height === 0 ? "—" : preset.max_height}
-      </td>
-      <td className="px-4 py-2 tabular-nums text-white/70">
-        {preset.max_video_bitrate_kbps === 0 ? "—" : preset.max_video_bitrate_kbps}
-      </td>
-      <td className="px-4 py-2 text-white/70">
-        {preset.audio_codec} @ {preset.audio_bitrate_kbps}k
-      </td>
-      <td className="px-4 py-2">
-        <button
-          disabled={busy}
-          onClick={toggle}
-          className={`rounded border px-2 py-0.5 text-[10px] uppercase tracking-wider ${preset.enabled ? "border-emerald-500/40 text-emerald-300" : "border-white/15 text-white/50"}`}
-        >
-          {preset.enabled ? "Enabled" : "Disabled"}
-        </button>
-      </td>
-      <td className="whitespace-nowrap px-4 py-2 text-right">
-        <button
-          disabled={busy}
-          onClick={() => setAskDelete(true)}
-          className="rounded border border-white/15 px-2 py-1 text-xs text-white/50 hover:border-red-500/50 hover:text-red-300"
-        >
-          Delete
-        </button>
-      </td>
-    </tr>
-    {askDelete && (
-      <ConfirmDialog
-        title={`Delete preset "${preset.name}"?`}
-        body="Active sessions using this preset keep running. New sessions will fall back to the default."
-        confirmLabel="Delete"
-        destructive
-        busy={busy}
-        onConfirm={() => void remove()}
-        onCancel={() => setAskDelete(false)}
-      />
-    )}
-    </>
-  );
-}
-
-function NewPresetForm({
-  onCreated,
-  onError,
-}: {
-  onCreated: () => Promise<void>;
-  onError: (msg: string | null) => void;
-}) {
-  const [name, setName] = useState("");
-  const [maxHeight, setMaxHeight] = useState(720);
-  const [maxBitrate, setMaxBitrate] = useState(4000);
-  const [busy, setBusy] = useState(false);
-
-  async function submit() {
-    setBusy(true);
-    onError(null);
-    try {
-      await adminApi.transcoder.createPreset({
-        name: name.trim(),
-        max_video_bitrate_kbps: maxBitrate,
-        max_height: maxHeight,
-      });
-      setName("");
-      await onCreated();
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="mb-3 grid grid-cols-1 gap-3 rounded-lg border border-white/10 bg-white/2 p-4 md:grid-cols-4">
-      <PresetField label="Name">
-        <input
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. Mobile 360p"
-          className={INPUT_CLASS}
-        />
-      </PresetField>
-      <PresetField label="Max height (px)">
-        <input
-          type="number"
-          value={maxHeight}
-          min={0}
-          max={4320}
-          onChange={(e) => setMaxHeight(Number(e.target.value))}
-          className={INPUT_CLASS}
-        />
-      </PresetField>
-      <PresetField label="Max bitrate (kbps)">
-        <input
-          type="number"
-          value={maxBitrate}
-          min={0}
-          max={200_000}
-          onChange={(e) => setMaxBitrate(Number(e.target.value))}
-          className={INPUT_CLASS}
-        />
-      </PresetField>
-      <div className="flex items-end">
-        <button
-          disabled={busy || !name.trim()}
-          onClick={submit}
-          className="w-full rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-50"
-        >
-          {busy ? "Creating…" : "Create"}
-        </button>
+        )}
       </div>
-    </div>
-  );
-}
-
-function PresetField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-sm font-medium">{label}</label>
-      {children}
     </div>
   );
 }
 
 /// Renders one or two pills on the active-transcodes row representing
 /// the ffmpeg-child health and the subtitle-extraction state. Healthy
-/// + Ready (or absent subtitle) renders the neutral "Live" pill so the
+/// + Ready (or absent subtitle) renders the neutral "live" pill so the
 /// column never looks empty for a normal row.
 function SessionHealthPills({
   transcode,
@@ -1023,20 +1094,28 @@ function SessionHealthPills({
 }) {
   const t = transcode ?? { kind: "healthy" as const };
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
+    <div className="cf-flex cf-wrap cf-gap8">
       {t.kind === "exited" ? (
-        <span title={t.detail}>
-          <Pill tone="bad">ffmpeg exited</Pill>
+        <span className="cf-pill cf-err" title={t.detail}>
+          <span className="cf-dot" />
+          ffmpeg exited
         </span>
       ) : (
-        <Pill tone="ok">live</Pill>
+        <span className="cf-pill cf-ok">
+          <span className="cf-dot" />
+          live
+        </span>
       )}
       {subtitle && subtitle.kind === "pending" && (
-        <Pill tone="info">subs pending</Pill>
+        <span className="cf-pill cf-info">
+          <span className="cf-dot" />
+          subs pending
+        </span>
       )}
       {subtitle && subtitle.kind === "failed" && (
-        <span title={subtitle.reason}>
-          <Pill tone="warn">subs failed</Pill>
+        <span className="cf-pill cf-warn" title={subtitle.reason}>
+          <span className="cf-dot" />
+          subs failed
         </span>
       )}
     </div>
@@ -1051,17 +1130,6 @@ function formatRelative(ms: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return m > 0 ? `${h}h ${m}m ago` : `${h}h ago`;
-}
-
-function DecoderRow({ label, list }: { label: string; list: string[] }) {
-  return (
-    <div>
-      <div className="text-white/40">{label}</div>
-      <div className="mt-0.5 font-mono">
-        {list.length > 0 ? list.join(", ") : "none"}
-      </div>
-    </div>
-  );
 }
 
 function pickAutoLabel(encoders: string[]): string {

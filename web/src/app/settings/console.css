@@ -1,0 +1,543 @@
+/* ============================================================================
+   ChimpFlix — Settings & Admin console design system.
+
+   A near-verbatim port of docs/redesign/styles.css so every page under
+   /settings renders in the redesign's visual language. Two rules keep it
+   from fighting the rest of the app:
+
+     1. Every class is prefixed `cf-` so it can never collide with a
+        Tailwind utility (`.flex`, `.grid`, `.table`, `.block`, …). The
+        preserved client components keep using raw Tailwind utilities.
+     2. Everything is scoped under the `.cf-console` root (set on the
+        settings content column) so the tokens + component rules never
+        leak outside settings.
+
+   Translation from a mockup is mechanical: `class="card"` → `cf-card`,
+   `class="row"` → `cf-row`, `class="pill ok"` → `cf-pill cf-ok`, etc.
+   ============================================================================ */
+
+.cf-console {
+  /* surfaces */
+  --bg: #0d0d0d;
+  --bg-deep: #080808;
+  --surface: #141414;
+  --surface-2: #181818;
+  --elevated: #1f1f1f;
+  --elevated-2: #262626;
+
+  /* lines */
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --line-faint: rgba(255, 255, 255, 0.05);
+
+  /* text */
+  --fg: #ffffff;
+  --muted: #b3b3b3;
+  --faint: rgba(255, 255, 255, 0.45);
+  --ghost: rgba(255, 255, 255, 0.3);
+
+  /* brand */
+  --accent: #e50914;
+  --accent-hover: #f6121d;
+  --accent-soft: rgba(229, 9, 20, 0.14);
+  --accent-line: rgba(229, 9, 20, 0.45);
+
+  /* semantic */
+  --ok: #34d399;
+  --ok-soft: rgba(52, 211, 153, 0.12);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.12);
+  --err: #f87171;
+  --err-soft: rgba(248, 113, 113, 0.12);
+  --info: #60a5fa;
+  --info-soft: rgba(96, 165, 250, 0.12);
+  --violet: #a78bfa;
+
+  /* shape */
+  --r-sm: 5px;
+  --r: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 24px 60px -16px rgba(0, 0, 0, 0.8);
+  --shadow-pop: 0 12px 40px -8px rgba(0, 0, 0, 0.75);
+
+  --topbar-h: 58px;
+
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── content frame ─────────────────────────────────────────────────────── */
+.cf-content-inner { max-width: 1080px; margin: 0 auto; }
+.cf-content-inner.cf-wide { max-width: 1280px; }
+
+/* ── section title (uppercase + trailing hairline) ─────────────────────── */
+.cf-console .cf-section-title {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--faint);
+  margin: 30px 0 12px;
+}
+.cf-console .cf-section-title:first-child { margin-top: 0; }
+.cf-console .cf-section-title::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+/* ── cards ─────────────────────────────────────────────────────────────── */
+.cf-console .cf-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  margin-bottom: 18px;
+  overflow: hidden;
+}
+.cf-console .cf-card > .cf-card-head {
+  display: flex; align-items: flex-start; gap: 14px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+/* First child (title/sub block) must be allowed to shrink so a long
+   description doesn't squeeze the head-aside (status pill + actions) into a
+   sliver. cf-sub breaks long unbreakable tokens (e.g. OAuth URLs) instead of
+   forcing the row wide; the aside never shrinks (flex: none) so its pill keeps
+   its one-line width. */
+.cf-console .cf-card > .cf-card-head > :first-child { min-width: 0; }
+.cf-console .cf-card > .cf-card-head .cf-ttl { font-size: 14.5px; font-weight: 700; }
+.cf-console .cf-card > .cf-card-head .cf-sub { margin-top: 2px; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.cf-console .cf-card > .cf-card-head .cf-head-aside { margin-left: auto; display: flex; align-items: center; gap: 10px; flex: none; }
+.cf-console .cf-card-body { padding: 6px 20px; }
+.cf-console .cf-card-body.cf-pad { padding: 18px 20px; }
+
+/* ── setting row: label+help left, control right ──────────────────────── */
+.cf-console .cf-row {
+  display: flex; align-items: center; gap: 24px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+.cf-console .cf-row:last-child { border-bottom: 0; }
+.cf-console .cf-row .cf-row-main { min-width: 0; flex: 1; }
+.cf-console .cf-row .cf-row-label { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.cf-console .cf-row .cf-row-help { margin-top: 3px; font-size: 12.5px; color: var(--muted); max-width: 64ch; }
+.cf-console .cf-row .cf-row-control { flex: none; display: flex; align-items: center; gap: 10px; }
+.cf-console .cf-row.cf-stack { align-items: flex-start; }
+.cf-console .cf-row.cf-col { flex-direction: column; align-items: stretch; gap: 12px; }
+.cf-console .cf-row.cf-col .cf-row-control { width: 100%; }
+
+/* ── buttons ───────────────────────────────────────────────────────────── */
+.cf-console .cf-btn {
+  appearance: none; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 600;
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px;
+  border-radius: var(--r);
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--fg);
+  transition: background 0.13s, border-color 0.13s, opacity 0.13s;
+  white-space: nowrap;
+}
+.cf-console .cf-btn:hover { background: rgba(255, 255, 255, 0.11); border-color: var(--line-strong); }
+.cf-console .cf-btn svg { width: 15px; height: 15px; flex: none; }
+.cf-console .cf-btn.cf-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cf-console .cf-btn.cf-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.cf-console .cf-btn.cf-white { background: #fff; border-color: #fff; color: #000; }
+.cf-console .cf-btn.cf-white:hover { background: rgba(255, 255, 255, 0.85); }
+.cf-console .cf-btn.cf-ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.cf-console .cf-btn.cf-ghost:hover { background: rgba(255, 255, 255, 0.06); color: var(--fg); }
+.cf-console .cf-btn.cf-danger { background: transparent; border-color: rgba(248, 113, 113, 0.4); color: var(--err); }
+.cf-console .cf-btn.cf-danger:hover { background: var(--err-soft); }
+.cf-console .cf-btn.cf-sm { padding: 5px 10px; font-size: 12px; }
+.cf-console .cf-btn.cf-tiny { padding: 3px 8px; font-size: 11.5px; border-radius: 6px; }
+.cf-console .cf-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ── toggle switch ─────────────────────────────────────────────────────── */
+.cf-console .cf-switch {
+  position: relative;
+  width: 42px; height: 24px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--line-strong);
+  cursor: pointer;
+  transition: background 0.18s;
+  flex: none;
+  appearance: none; padding: 0;
+}
+.cf-console .cf-switch::after {
+  content: "";
+  position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.18s;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+.cf-console .cf-switch.cf-on { background: var(--accent); border-color: var(--accent); }
+.cf-console .cf-switch.cf-on::after { transform: translateX(18px); }
+.cf-console .cf-switch:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ── segmented control ─────────────────────────────────────────────────── */
+.cf-console .cf-seg {
+  display: inline-flex; padding: 3px; gap: 3px;
+  border-radius: var(--r);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+}
+.cf-console .cf-seg button {
+  appearance: none; border: 0; background: transparent;
+  color: var(--muted); font: inherit; font-size: 12.5px; font-weight: 600;
+  padding: 6px 12px; border-radius: 6px; cursor: pointer;
+  transition: background 0.13s, color 0.13s;
+  white-space: nowrap;
+}
+.cf-console .cf-seg button:hover { color: var(--fg); }
+.cf-console .cf-seg button.cf-on { background: rgba(255, 255, 255, 0.12); color: #fff; }
+.cf-console .cf-seg.cf-accent button.cf-on { background: var(--accent); color: #fff; }
+
+/* ── inputs / selects / textareas ──────────────────────────────────────── */
+.cf-console .cf-input,
+.cf-console .cf-select,
+.cf-console .cf-textarea {
+  width: 100%;
+  font: inherit; font-size: 13.5px;
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  padding: 9px 12px;
+  outline: none;
+  transition: border-color 0.13s, background 0.13s;
+}
+.cf-console .cf-input::placeholder,
+.cf-console .cf-textarea::placeholder { color: var(--ghost); }
+.cf-console .cf-input:focus,
+.cf-console .cf-select:focus,
+.cf-console .cf-textarea:focus { border-color: var(--accent-line); background: rgba(255, 255, 255, 0.06); }
+.cf-console .cf-input.cf-changed,
+.cf-console .cf-select.cf-changed,
+.cf-console .cf-textarea.cf-changed { border-color: rgba(251, 191, 36, 0.5); }
+.cf-console .cf-textarea { resize: vertical; min-height: 80px; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 12.5px; }
+.cf-console .cf-select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23b3b3b3' stroke-width='3'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 34px;
+  cursor: pointer;
+}
+.cf-console .cf-input.cf-w-auto,
+.cf-console .cf-select.cf-w-auto { width: auto; min-width: 160px; }
+.cf-console .cf-field-label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 7px; }
+.cf-console .cf-field { margin-bottom: 16px; }
+
+/* ── range slider ──────────────────────────────────────────────────────── */
+.cf-console .cf-range {
+  -webkit-appearance: none; appearance: none; width: 100%; height: 5px; border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.15); outline: none; cursor: pointer;
+}
+.cf-console .cf-range::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #fff; cursor: pointer;
+}
+.cf-console .cf-range::-moz-range-thumb {
+  width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: 2px solid #fff;
+}
+
+/* ── color swatches ────────────────────────────────────────────────────── */
+.cf-console .cf-swatches { display: flex; gap: 8px; }
+.cf-console .cf-swatch { width: 28px; height: 28px; border-radius: 7px; cursor: pointer; border: 2px solid transparent; }
+.cf-console .cf-swatch.cf-on { border-color: #fff; box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.6); }
+
+/* ── pills / tags ──────────────────────────────────────────────────────── */
+.cf-console .cf-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; font-weight: 600;
+  padding: 3px 9px; border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  /* Pills never wrap their own content — a squeezed flex slot would
+     otherwise break a label like "Not set" onto two lines and balloon the
+     pill into a tall blob that no longer lines up with its siblings. */
+  white-space: nowrap;
+}
+.cf-console .cf-pill .cf-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.cf-console .cf-pill.cf-ok { color: var(--ok); background: var(--ok-soft); border-color: rgba(52, 211, 153, 0.25); }
+.cf-console .cf-pill.cf-warn { color: var(--warn); background: var(--warn-soft); border-color: rgba(251, 191, 36, 0.25); }
+.cf-console .cf-pill.cf-err { color: var(--err); background: var(--err-soft); border-color: rgba(248, 113, 113, 0.25); }
+.cf-console .cf-pill.cf-info { color: var(--info); background: var(--info-soft); border-color: rgba(96, 165, 250, 0.25); }
+.cf-console .cf-pill.cf-accent { color: #ff7a82; background: var(--accent-soft); border-color: var(--accent-line); }
+.cf-console .cf-tag {
+  display: inline-flex; align-items: center;
+  font-size: 11px; font-weight: 600;
+  padding: 2px 7px; border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* Icons inside pills/tags (e.g. a capability check-mark) MUST be sized — a
+   bare <svg viewBox=...> with no width/height balloons to the replaced-element
+   default and blows the chip's proportions out. Mirrors the .cf-btn svg rule. */
+.cf-console .cf-pill svg,
+.cf-console .cf-tag svg { width: 13px; height: 13px; flex: none; }
+
+/* ── stat / hero cards ─────────────────────────────────────────────────── */
+.cf-console .cf-grid { display: grid; gap: 16px; }
+.cf-console .cf-grid.cf-c2 { grid-template-columns: repeat(2, 1fr); }
+.cf-console .cf-grid.cf-c3 { grid-template-columns: repeat(3, 1fr); }
+.cf-console .cf-grid.cf-c4 { grid-template-columns: repeat(4, 1fr); }
+.cf-console .cf-grid.cf-c5 { grid-template-columns: repeat(5, 1fr); }
+
+.cf-console .cf-stat {
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 18px;
+  position: relative;
+  overflow: hidden;
+}
+.cf-console .cf-stat .cf-stat-top { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.cf-console .cf-stat .cf-stat-ico { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; flex: none; }
+.cf-console .cf-stat .cf-stat-ico svg { width: 16px; height: 16px; }
+.cf-console .cf-stat .cf-stat-val { font-size: 28px; font-weight: 800; letter-spacing: -0.02em; margin-top: 12px; }
+.cf-console .cf-stat .cf-stat-val small { font-size: 14px; font-weight: 600; color: var(--faint); }
+.cf-console .cf-stat .cf-stat-meta { margin-top: 4px; font-size: 12px; color: var(--faint); }
+.cf-console .cf-stat .cf-stat-bar { margin-top: 12px; height: 6px; border-radius: 9999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.cf-console .cf-stat .cf-stat-bar > i { display: block; height: 100%; border-radius: 9999px; }
+.cf-console .cf-tone-red .cf-stat-ico { background: var(--accent-soft); color: #ff7a82; }
+.cf-console .cf-tone-green .cf-stat-ico { background: var(--ok-soft); color: var(--ok); }
+.cf-console .cf-tone-blue .cf-stat-ico { background: var(--info-soft); color: var(--info); }
+.cf-console .cf-tone-amber .cf-stat-ico { background: var(--warn-soft); color: var(--warn); }
+.cf-console .cf-tone-violet .cf-stat-ico { background: rgba(167, 139, 250, 0.14); color: var(--violet); }
+
+/* ── progress bars ─────────────────────────────────────────────────────── */
+/* Determinate fill (driven by inline `width: NN%`). Indeterminate variant
+   (`.cf-prog.cf-indet`) ignores the inline width and runs a left→right
+   sweep so a "running but no measured progress yet" row still reads as
+   alive without faking a number. */
+.cf-console .cf-prog {
+  position: relative; height: 6px; border-radius: 9999px; overflow: hidden;
+  background: rgba(255, 255, 255, 0.08); min-width: 90px;
+}
+.cf-console .cf-prog > i {
+  display: block; height: 100%; border-radius: 9999px;
+  background: var(--info); transition: width 0.4s ease;
+}
+.cf-console .cf-prog.cf-indet > i {
+  width: 38% !important; position: absolute; left: 0;
+  background: var(--info);
+  animation: cfProgSweep 1.25s ease-in-out infinite;
+}
+@keyframes cfProgSweep {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cf-console .cf-prog.cf-indet > i {
+    animation: none; left: 0; width: 100% !important; opacity: 0.4;
+  }
+}
+
+/* ── tables ────────────────────────────────────────────────────────────── */
+.cf-console .cf-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cf-console .cf-table thead th {
+  text-align: left;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--faint);
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.cf-console .cf-table tbody td { padding: 12px 14px; border-bottom: 1px solid var(--line-faint); vertical-align: middle; }
+.cf-console .cf-table tbody tr:hover td { background: rgba(255, 255, 255, 0.02); }
+.cf-console .cf-table tbody tr:last-child td { border-bottom: 0; }
+.cf-console .cf-table .cf-mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); }
+.cf-console .cf-table .cf-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ── master-detail ─────────────────────────────────────────────────────── */
+.cf-console .cf-md { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 22px; align-items: start; }
+.cf-console .cf-md-list { display: flex; flex-direction: column; gap: 8px; }
+.cf-console .cf-md-item {
+  display: flex; align-items: center; gap: 13px;
+  padding: 13px 14px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.13s, background 0.13s;
+  text-align: left; width: 100%;
+}
+.cf-console .cf-md-item:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.cf-console .cf-md-item.cf-active { border-color: var(--accent-line); background: linear-gradient(90deg, var(--accent-soft), var(--surface-2)); }
+.cf-console .cf-md-item .cf-md-ico {
+  width: 40px; height: 40px; border-radius: 9px; flex: none;
+  display: grid; place-items: center; background: var(--elevated); color: var(--muted);
+}
+.cf-console .cf-md-item .cf-md-ico svg { width: 19px; height: 19px; }
+.cf-console .cf-md-item .cf-md-name { font-weight: 600; font-size: 14px; }
+.cf-console .cf-md-item .cf-md-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+.cf-console .cf-md-item .cf-md-trail { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+
+.cf-console .cf-drawer {
+  position: sticky; top: calc(var(--topbar-h) + 22px);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  z-index: 30;
+}
+.cf-console .cf-drawer .cf-drawer-head { padding: 18px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 13px; }
+.cf-console .cf-drawer .cf-drawer-body { padding: 6px 20px 18px; max-height: calc(100vh - 230px); overflow-y: auto; }
+.cf-console .cf-drawer .cf-drawer-foot {
+  padding: 13px 20px; border-top: 1px solid var(--line);
+  display: flex; align-items: center; gap: 10px; background: var(--surface-2);
+}
+
+.cf-console .cf-mtabs { display: flex; gap: 2px; padding: 4px; background: rgba(255, 255, 255, 0.04); border-radius: var(--r); margin: 14px 0; }
+.cf-console .cf-mtab { flex: 1; text-align: center; appearance: none; border: 0; background: transparent; color: var(--muted);
+  font: inherit; font-size: 12px; font-weight: 600; padding: 7px; border-radius: 6px; cursor: pointer; }
+.cf-console .cf-mtab.cf-on { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+/* ── in-page tabs ──────────────────────────────────────────────────────── */
+.cf-console .cf-tabs {
+  display: flex; gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 26px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.cf-console .cf-tabs::-webkit-scrollbar { display: none; }
+.cf-console .cf-tab {
+  appearance: none; border: 0; background: transparent;
+  color: var(--muted); font: inherit; font-size: 13.5px; font-weight: 600;
+  padding: 11px 14px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+  transition: color 0.13s, border-color 0.13s;
+  display: flex; align-items: center; gap: 8px;
+}
+.cf-console .cf-tab:hover { color: var(--fg); }
+.cf-console .cf-tab.cf-on { color: #fff; border-bottom-color: var(--accent); }
+.cf-console .cf-tab .cf-pillcount {
+  font-size: 11px; font-weight: 700; padding: 0 6px; border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.09); color: var(--muted);
+}
+.cf-console .cf-tab.cf-on .cf-pillcount { background: var(--accent-soft); color: #ff7a82; }
+
+/* ── save bar ──────────────────────────────────────────────────────────── */
+.cf-console .cf-savebar {
+  position: sticky; bottom: 20px;
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 24px;
+  padding: 13px 18px;
+  border-radius: var(--r-lg);
+  background: rgba(20, 20, 20, 0.92);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-pop);
+}
+.cf-console .cf-savebar .cf-sb-status { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--muted); }
+.cf-console .cf-savebar .cf-sb-status .cf-dot { width: 8px; height: 8px; border-radius: 50%; }
+.cf-console .cf-savebar .cf-sb-actions { margin-left: auto; display: flex; gap: 10px; }
+
+/* ── banners / callouts ────────────────────────────────────────────────── */
+.cf-console .cf-banner {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 13px 16px; border-radius: var(--r);
+  font-size: 13px; margin-bottom: 16px;
+}
+.cf-console .cf-banner svg { width: 18px; height: 18px; flex: none; margin-top: 1px; }
+.cf-console .cf-banner.cf-warn { background: var(--warn-soft); border: 1px solid rgba(251, 191, 36, 0.3); color: #fcd34d; }
+.cf-console .cf-banner.cf-err { background: var(--err-soft); border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5; }
+.cf-console .cf-banner.cf-info { background: var(--info-soft); border: 1px solid rgba(96, 165, 250, 0.3); color: #93c5fd; }
+.cf-console .cf-banner.cf-ok { background: var(--ok-soft); border: 1px solid rgba(52, 211, 153, 0.3); color: #6ee7b7; }
+.cf-console .cf-banner b { color: #fff; }
+.cf-console .cf-banner a { text-decoration: underline; }
+
+/* ── misc utilities ────────────────────────────────────────────────────── */
+.cf-console .cf-muted { color: var(--muted); }
+.cf-console .cf-faint { color: var(--faint); }
+.cf-console .cf-mono { font-family: ui-monospace, Menlo, monospace; }
+.cf-console .cf-flex { display: flex; align-items: center; }
+.cf-console .cf-flex.cf-between { justify-content: space-between; }
+.cf-console .cf-flex.cf-wrap { flex-wrap: wrap; }
+.cf-console .cf-gap8 { gap: 8px; }
+.cf-console .cf-gap12 { gap: 12px; }
+.cf-console .cf-gap16 { gap: 16px; }
+.cf-console .cf-center { text-align: center; }
+.cf-console .cf-sparkline { display: flex; align-items: flex-end; gap: 3px; height: 44px; }
+.cf-console .cf-sparkline > i { flex: 1; background: linear-gradient(180deg, var(--accent), rgba(229, 9, 20, 0.3)); border-radius: 2px 2px 0 0; min-height: 2px; }
+.cf-console .cf-divider { height: 1px; background: var(--line); margin: 22px 0; }
+.cf-console .cf-avatar {
+  width: 34px; height: 34px; border-radius: 50%; flex: none;
+  display: grid; place-items: center; font-weight: 700; font-size: 13px; color: #fff;
+}
+.cf-console .cf-avatar.cf-a1 { background: linear-gradient(135deg, #dc2626, #7f1d1d); }
+.cf-console .cf-avatar.cf-a2 { background: linear-gradient(135deg, #2563eb, #1e3a8a); }
+.cf-console .cf-avatar.cf-a3 { background: linear-gradient(135deg, #7c3aed, #4c1d95); }
+.cf-console .cf-avatar.cf-a4 { background: linear-gradient(135deg, #059669, #064e3b); }
+.cf-console .cf-avatar.cf-a5 { background: linear-gradient(135deg, #d97706, #78350f); }
+
+.cf-console .cf-num-badge {
+  display: inline-grid; place-items: center; min-width: 24px; height: 24px;
+  border-radius: 7px; background: rgba(255, 255, 255, 0.08); border: 1px solid var(--line);
+  color: var(--muted); font-weight: 800; font-size: 12px;
+}
+
+/* ── integration service tile (integrations page) ─────────────────────── */
+.cf-console .cf-itile {
+  display: flex; flex-direction: column; gap: 0;
+  border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: var(--surface); overflow: hidden;
+  transition: border-color 0.15s, transform 0.15s;
+}
+.cf-console .cf-itile.cf-linked { border-color: rgba(52, 211, 153, 0.28); }
+.cf-console .cf-itile:hover { border-color: var(--line-strong); transform: translateY(-2px); }
+.cf-console .cf-itile .cf-it-top { display: flex; align-items: flex-start; gap: 13px; padding: 16px 16px 12px; }
+.cf-console .cf-itile .cf-it-logo { width: 42px; height: 42px; border-radius: 10px; display: grid; place-items: center; font-weight: 900; font-size: 17px; flex: none; }
+.cf-console .cf-itile .cf-it-name { font-size: 15px; font-weight: 700; }
+.cf-console .cf-itile .cf-it-desc { padding: 0 16px 14px; font-size: 12.5px; color: var(--muted); flex: 1; }
+.cf-console .cf-itile .cf-it-foot { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--surface-2); }
+
+/* ── sidebar nav (SettingsShell) ───────────────────────────────────────── */
+.cf-console .cf-nav-group { margin-bottom: 14px; }
+.cf-console .cf-nav-label {
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--ghost); padding: 4px 10px 6px;
+}
+.cf-console .cf-nav-item {
+  display: flex; align-items: center; gap: 11px;
+  padding: 8px 10px; border-radius: var(--r);
+  color: var(--muted); font-size: 13.5px; font-weight: 500;
+  position: relative; transition: background 0.13s, color 0.13s;
+}
+.cf-console .cf-nav-item:hover { background: rgba(255, 255, 255, 0.05); color: var(--fg); }
+.cf-console .cf-nav-item svg { width: 17px; height: 17px; flex: none; opacity: 0.85; }
+.cf-console .cf-nav-item.cf-active {
+  background: linear-gradient(90deg, var(--accent-soft), rgba(255, 255, 255, 0.02));
+  color: #fff; box-shadow: inset 3px 0 0 var(--accent);
+}
+.cf-console .cf-nav-item.cf-active svg { opacity: 1; }
+.cf-console .cf-nav-badge {
+  margin-left: auto; font-size: 11px; font-weight: 700;
+  padding: 1px 7px; border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.08); color: var(--muted);
+}
+.cf-console .cf-nav-badge.cf-alert { background: var(--accent); color: #fff; }
+
+/* ── responsive collapse ───────────────────────────────────────────────── */
+@media (max-width: 1180px) {
+  .cf-console .cf-md { grid-template-columns: 1fr; }
+  .cf-console .cf-drawer { position: static; }
+  .cf-console .cf-grid.cf-c4 { grid-template-columns: repeat(2, 1fr); }
+  .cf-console .cf-grid.cf-c5 { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 900px) {
+  .cf-console .cf-grid.cf-c3,
+  .cf-console .cf-grid.cf-c2 { grid-template-columns: 1fr; }
+  .cf-console .cf-grid.cf-c5 { grid-template-columns: repeat(2, 1fr); }
+  .cf-console .cf-row { flex-wrap: wrap; gap: 12px; }
+}

@@ -536,10 +536,10 @@ function MatchChips({
   );
 }
 
-/// Popover anchored to the "Filters" trigger button. Native `<details>`
-/// gives us open/close + Escape + click-outside-via-overlay for free,
-/// which is enough for a tertiary control like this without pulling in
-/// the modal/focus-trap machinery the dialogs use.
+/// Popover anchored to the "Filters" trigger button. Uses a controlled
+/// <details> element with a document mousedown listener so the popover
+/// closes when the user clicks outside it (native <details> does NOT
+/// close on outside clicks by itself).
 function FiltersPopover({
   activeCount,
   resolutions,
@@ -559,8 +559,23 @@ function FiltersPopover({
   ) => void;
   onClear: () => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+
+  // Close when a mousedown fires outside the <details> element.
+  useEffect(() => {
+    if (!open) return;
+    function handleMouseDown(e: MouseEvent) {
+      if (detailsRef.current && !detailsRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [open]);
+
   return (
-    <details className="relative">
+    <details ref={detailsRef} className="relative" open={open} onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}>
       <summary
         className={`inline-flex cursor-pointer list-none items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 py-1 text-[12px] transition-colors [&::-webkit-details-marker]:hidden ${
           activeCount > 0

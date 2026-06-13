@@ -244,7 +244,10 @@ impl MetadataAgent for TmdbAgent {
             });
         }
         let logo_url = meta.logo_path.as_deref().map(|p| tmdb_image_url(p, "w500"));
-        let rating_audience = meta.rating_audience.map(|r| (r * 10.0).round() as i32);
+        // TMDB returns vote_average=0.0 (not null) for newly-added titles with
+        // zero votes. Filter those out so unrated titles stay NULL in the DB
+        // rather than sorting as 0 in rating-based queries.
+        let rating_audience = meta.rating_audience.filter(|&r| r > 0.0).map(|r| (r * 10.0).round() as i32);
 
         // Cast/crew + videos + reviews are fetched in parallel — three
         // independent endpoints, each with its own auth + URL. Failure
@@ -363,7 +366,10 @@ impl MetadataAgent for TmdbAgent {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("{e:#}");
-                if msg.contains("404") {
+                // Match "returned 404" rather than bare "404" to avoid
+                // treating a non-404 error whose URL happens to contain
+                // "404" (e.g. show id 4040404) as a missing-season.
+                if msg.contains("returned 404") {
                     return Ok(None);
                 }
                 return Err(e);
@@ -883,25 +889,24 @@ impl MetadataAgent for AniListAgent {
             return Ok(None);
         };
         // Fetch (or cache-hit) the streamingEpisodes list.
+        // Hold the lock across the network call so concurrent callers for the
+        // same anilist_id don't each fire a redundant fetch (AniList free tier:
+        // 30 req/min). tokio::sync::Mutex is async-aware so holding it across
+        // an `.await` is safe and won't block the executor thread.
         let episodes = {
-            let guard = self.episode_cache.lock().await;
+            let mut guard = self.episode_cache.lock().await;
             match guard.get(&anilist_id) {
                 Some(CachedAniListEpisodes::Loaded(eps)) => eps.clone(),
                 Some(CachedAniListEpisodes::Errored) => return Ok(None),
                 None => {
-                    drop(guard);
                     match self.client.fetch_episodes(anilist_id).await {
                         Ok(list) => {
                             let arc = std::sync::Arc::new(list);
-                            let mut g = self.episode_cache.lock().await;
-                            g.entry(anilist_id)
-                                .or_insert(CachedAniListEpisodes::Loaded(arc.clone()));
+                            guard.insert(anilist_id, CachedAniListEpisodes::Loaded(arc.clone()));
                             arc
                         }
                         Err(e) => {
-                            let mut g = self.episode_cache.lock().await;
-                            g.entry(anilist_id)
-                                .or_insert(CachedAniListEpisodes::Errored);
+                            guard.insert(anilist_id, CachedAniListEpisodes::Errored);
                             return Err(e);
                         }
                     }

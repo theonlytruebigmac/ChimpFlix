@@ -50,6 +50,11 @@ let current: Cached | null = null;
 /// Tracks the in-flight prewarm so a rapid second hover for the
 /// same ratingKey doesn't double up on the request.
 let inflight: Promise<void> | null = null;
+/// Monotonically-increasing generation. Incremented whenever we
+/// start a new prewarm so that a superseded in-flight async block
+/// can detect it was replaced and discard its result instead of
+/// clobbering the newer entry.
+let generation = 0;
 
 /// Kick off a prewarm for `ratingKey`. Idempotent for the same key
 /// — repeated calls during the hover window are folded into one
@@ -74,14 +79,20 @@ export function prewarmFor(
   ) {
     return;
   }
-  if (inflight) return;
 
-  // Different key in cache: cancel and clear before the new request
-  // races. The DELETE is best-effort; we don't wait on it.
+  // In-flight for the same key — fold in; don't double up.
+  if (inflight && current?.ratingKey === ratingKey) return;
+
+  // Different key (whether in-flight or cached): cancel/clear first,
+  // then fall through to start the new prewarm. The DELETE is
+  // best-effort; we don't wait on it.
   if (current && current.ratingKey !== ratingKey) {
     void cancelPrewarm();
   }
 
+  // Bump the generation so any in-flight async block for the old key
+  // will see the mismatch and discard its result.
+  const myGen = ++generation;
   inflight = (async () => {
     try {
       const resp = await streamApi.prewarmSession({
@@ -89,12 +100,15 @@ export function prewarmFor(
         client: clientCaps,
         audio_normalize: audioNormalize ? true : undefined,
       });
-      current = {
-        ratingKey,
-        session: resp.session,
-        createdAtMs: Date.now(),
-        consumed: false,
-      };
+      // Only commit if we are still the current prewarm request.
+      if (myGen === generation) {
+        current = {
+          ratingKey,
+          session: resp.session,
+          createdAtMs: Date.now(),
+          consumed: false,
+        };
+      }
     } catch (e) {
       // Permission errors (401/404) or unsupported routes shouldn't
       // poison subsequent hovers. We just log and forget — the
@@ -102,9 +116,13 @@ export function prewarmFor(
       if (!(e instanceof ChimpFlixApiError)) {
         devWarn("[prewarm] failed:", e);
       }
-      current = null;
+      if (myGen === generation) {
+        current = null;
+      }
     } finally {
-      inflight = null;
+      if (myGen === generation) {
+        inflight = null;
+      }
     }
   })();
 }

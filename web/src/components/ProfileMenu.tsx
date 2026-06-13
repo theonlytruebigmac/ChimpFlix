@@ -183,19 +183,6 @@ export function ProfileMenu() {
           >
             Settings
           </Link>
-          {isOwner && (
-            <Link
-              href="/settings/admin"
-              role="menuitem"
-              onClick={() => setOpen(false)}
-              className="flex items-center justify-between border-t border-white/10 px-4 py-2.5 text-sm text-white/85 transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:bg-white/10 focus-visible:text-white"
-            >
-              <span>Admin</span>
-              <span className="rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-red-300">
-                Owner
-              </span>
-            </Link>
-          )}
           <button
             type="button"
             role="menuitem"

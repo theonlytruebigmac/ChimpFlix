@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Card } from "./Card";
 import { CardSkeleton } from "./Skeleton";
-import { MY_LIST_EVENT } from "@/lib/my-list";
+import { MY_LIST_EVENT, getMyList } from "@/lib/my-list";
 import { adaptItem } from "@/lib/chimpflix-adapt";
 import type { MediaItem } from "@/lib/chimpflix-types";
 
@@ -72,12 +72,26 @@ export function MyListClient() {
     }
 
     load();
-    // Reload whenever any tab/component toggles a saved title so the list
-    // reflects the change without a manual refresh.
-    window.addEventListener(MY_LIST_EVENT, load);
+
+    // On MY_LIST_EVENT, sync from the client-side cache instead of
+    // re-fetching from the server. The event fires before the POST/DELETE
+    // response completes, so a server re-fetch would race and could return
+    // stale data. Reading getMyList() (the optimistic Set) is consistent with
+    // the state the toggle already applied. A server re-fetch (load()) is
+    // still used on failure rollback because the cache reverts and fires
+    // another event, and on mount for the initial full item list.
+    function syncFromCache() {
+      if (cancelled) return;
+      const ids = new Set(getMyList());
+      setItems((prev) =>
+        prev === null ? prev : prev.filter((it) => ids.has(it.ratingKey)),
+      );
+    }
+
+    window.addEventListener(MY_LIST_EVENT, syncFromCache);
     return () => {
       cancelled = true;
-      window.removeEventListener(MY_LIST_EVENT, load);
+      window.removeEventListener(MY_LIST_EVENT, syncFromCache);
     };
   }, []);
 

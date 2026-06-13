@@ -98,7 +98,8 @@ export function SaveBar({
         {onDiscard && (
           <button
             type="button"
-            onClick={onDiscard}
+            // Clear a stale save-error so the bar can dismiss after Discard.
+            onClick={() => { setError(null); onDiscard?.(); }}
             disabled={busy || !dirty}
             className="rounded-md border border-transparent px-3 py-1.5 text-[13px] text-white/70 hover:bg-white/5 disabled:opacity-40"
           >

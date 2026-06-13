@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import type { Collection } from "@/lib/chimpflix-api";
 import { plexImage, plexSrcSet } from "@/lib/image";
+import { RailScroller } from "./RailScroller";
 
 /// Home rail for both auto (TMDB franchise) and manual (admin-curated)
 /// collections. Tiles use the collection's own backdrop/poster art when
@@ -27,13 +28,13 @@ export function CollectionsRail({ collections }: { collections: Collection[] }) 
       <h2 className="mb-3 text-lg font-semibold tracking-tight sm:text-xl md:text-[1.4rem]">
         Collections
       </h2>
-      <ul className="-mx-1 flex snap-x snap-mandatory gap-1.5 overflow-x-auto px-1 pb-12 pt-2 scrollbar-none md:snap-none [&::-webkit-scrollbar]:hidden">
+      <RailScroller className="-mx-1 flex snap-x snap-mandatory touch-pan-x gap-1.5 overflow-x-auto overscroll-x-contain px-1 pb-12 pt-2 scrollbar-none md:snap-none [&::-webkit-scrollbar]:hidden">
         {collections.map((c) => (
           <li key={c.id} className="snap-start flex-none">
             <CollectionCard collection={c} />
           </li>
         ))}
-      </ul>
+      </RailScroller>
     </section>
   );
 }

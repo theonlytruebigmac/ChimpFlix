@@ -19,11 +19,69 @@
 
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tracing::{debug, warn};
+/// Monotonically-increasing counter used to give each decoder smoke-test
+/// temp file a unique name within the process. Eliminates path collisions
+/// when two concurrent `detect_capabilities` calls (boot + admin reprobe)
+/// probe the same (hwaccel, codec) pair simultaneously.
+static PROBE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+use tracing::debug;
 
 use crate::FfmpegConfig;
+
+/// Refreshable holder for the detected hardware capabilities.
+///
+/// Capabilities are probed once at boot, but a driver swap or GPU
+/// hot-add can change what the host can do without the process
+/// restarting. This wrapper lets the admin "re-probe" endpoint swap in
+/// a fresh [`TranscoderCapabilities`] atomically while live readers
+/// (the stream session path, the admin GET) keep seeing a consistent
+/// snapshot.
+///
+/// Readers call [`SharedCapabilities::load`], which clones the inner
+/// `Arc` under a very short read lock and hands it back — identical in
+/// shape to the previous `Arc<TranscoderCapabilities>` the code held
+/// directly, so the hot path keeps a lock-free snapshot for the rest of
+/// its work. Writers call [`SharedCapabilities::store`] to publish a new
+/// snapshot; in-flight readers that already loaded the old `Arc` keep
+/// using it until they drop it, exactly like `ArcSwap` semantics but
+/// with no extra dependency.
+#[derive(Debug)]
+pub struct SharedCapabilities {
+    inner: RwLock<Arc<TranscoderCapabilities>>,
+}
+
+impl SharedCapabilities {
+    /// Wrap an initial (boot-time) capability snapshot.
+    pub fn new(caps: TranscoderCapabilities) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(Arc::new(caps)),
+        })
+    }
+
+    /// Current snapshot. Clones the inner `Arc` under a short read lock
+    /// and releases the lock before returning, so callers never hold
+    /// the lock across `.await`.
+    pub fn load(&self) -> Arc<TranscoderCapabilities> {
+        // A poisoned lock here just means a writer panicked mid-swap;
+        // the held data is still a valid snapshot, so recover it rather
+        // than propagate the panic into the playback path.
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Publish a fresh snapshot (used by the re-probe endpoint).
+    pub fn store(&self, caps: TranscoderCapabilities) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Arc::new(caps);
+    }
+}
 
 /// Per-encoder time budget for the startup smoke test. Working
 /// encoders complete in under 300 ms on every box we've tested;
@@ -289,9 +347,11 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
     };
 
     // Make a tiny test bitstream: 1-frame 64x64 black clip, ~kilobytes.
+    // Use a per-call monotonic counter (not PID) so concurrent calls from
+    // the boot probe and an admin reprobe don't share the same path.
     let tmp = std::env::temp_dir().join(format!(
         "chimpflix_dec_probe_{hwaccel}_{codec}_{}.dat",
-        std::process::id()
+        PROBE_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = tokio::fs::remove_file(&tmp).await;
 
@@ -302,8 +362,16 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
         .args(["-vf", "format=yuv420p"])
         .args(["-c:v", encoder, "-frames:v", "1", "-f", container])
         .arg(&tmp);
+    // libaom-av1's first encode is notoriously slow (5–30 s for initial
+    // model load + allocation), so give it a much longer budget than
+    // the standard smoke timeout to avoid falsely marking AV1 HW decode
+    // as unavailable on GPUs that support it (e.g. NVDEC Ampere+).
+    let enc_timeout = match codec {
+        "av1" => Duration::from_secs(60),
+        _ => SMOKE_TIMEOUT,
+    };
     let enc_ok = matches!(
-        tokio::time::timeout(SMOKE_TIMEOUT, enc_cmd.output()).await,
+        tokio::time::timeout(enc_timeout, enc_cmd.output()).await,
         Ok(Ok(out)) if out.status.success()
     );
     if !enc_ok {
@@ -336,10 +404,11 @@ async fn smoke_test_decoder(cfg: &FfmpegConfig, hwaccel: &str, codec: &str) -> b
 }
 
 /// Run a one-frame smoke encode for every candidate and keep only
-/// the ones that exit zero. Each failure logs a `warn!` with the
-/// encoder name so the operator can see which encoder ffmpeg
-/// advertised but couldn't actually start (the libcuda.so missing /
-/// VAAPI render node missing / Intel iHD driver missing cases).
+/// the ones that exit zero. Each failure logs at `debug!` with the
+/// encoder name (it's expected pruning of encoders ffmpeg advertises
+/// but the host can't actually start — libcuda.so missing / VAAPI
+/// render node missing / Intel iHD driver missing); the surviving set
+/// is reported at `info!` by the caller.
 async fn filter_to_working(cfg: &FfmpegConfig, candidates: Vec<String>) -> Vec<String> {
     let mut working = Vec::with_capacity(candidates.len());
     for enc in candidates {
@@ -347,10 +416,17 @@ async fn filter_to_working(cfg: &FfmpegConfig, candidates: Vec<String>) -> Vec<S
             debug!(encoder = %enc, "encoder smoke test ok");
             working.push(enc);
         } else {
-            warn!(
+            // Expected on most hosts: ffmpeg advertises encoders for hardware
+            // that isn't present (e.g. VAAPI/QSV/V4L2 on an NVIDIA-only box,
+            // where the VAAPI smoke test can't open /dev/dri/renderD128). This
+            // is benign pruning, not a problem — logged at debug so it doesn't
+            // spam WARN once per boot. The surviving set is reported at info
+            // by the caller, so a genuinely-missing expected encoder (e.g. no
+            // NVENC) is still visible as an empty/short capability list.
+            debug!(
                 encoder = %enc,
-                "hardware encoder advertised by ffmpeg but failed smoke test \
-                 (likely missing driver / device); dropping from capability list"
+                "encoder advertised by ffmpeg but failed smoke test \
+                 (missing driver / device); dropping from capability list"
             );
         }
     }

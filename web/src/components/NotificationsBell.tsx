@@ -26,6 +26,10 @@ export function NotificationsBell() {
   // during render (which is impure under strict mode).
   const [openedAtMs, setOpenedAtMs] = useState<number>(0);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  // Guards all async handlers against setState-after-unmount (same
+  // pattern as the `cancelled` flag used in the polling useEffect below).
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,16 +74,20 @@ export function NotificationsBell() {
   async function openAndLoad() {
     setOpen(true);
     setOpenedAtMs(Date.now());
-    if (items === null) {
+    // `!loading` prevents a second concurrent fetch when the popover is
+    // toggled open/closed/open quickly before the first request resolves.
+    if (items === null && !loading) {
       setLoading(true);
       try {
         const res = await authApi.notifications.list();
+        if (!mountedRef.current) return;
         setItems(res.notifications);
         setUnread(res.unread);
       } catch {
+        if (!mountedRef.current) return;
         setItems([]);
       } finally {
-        setLoading(false);
+        if (mountedRef.current) setLoading(false);
       }
     }
   }
@@ -87,6 +95,7 @@ export function NotificationsBell() {
   async function markAll() {
     try {
       await authApi.notifications.markAllRead();
+      if (!mountedRef.current) return;
       setItems((prev) =>
         prev?.map((n) => (n.read_at ? n : { ...n, read_at: Date.now() })) ??
         prev,
@@ -97,9 +106,27 @@ export function NotificationsBell() {
     }
   }
 
+  async function clearAll() {
+    // Optimistically empty the inbox; mark-read only dims rows, whereas
+    // Clear removes them so the list doesn't grow without bound.
+    const prev = items;
+    setItems([]);
+    setUnread(0);
+    try {
+      await authApi.notifications.clearAll();
+    } catch {
+      // Restore on failure so the user knows it didn't take. Use a
+      // functional update so any concurrent markOne/markAll changes
+      // that arrived during the await aren't silently discarded.
+      if (mountedRef.current)
+        setItems((current) => (current !== null && current.length === 0 ? prev : current));
+    }
+  }
+
   async function markOne(id: number) {
     try {
       await authApi.notifications.markRead(id);
+      if (!mountedRef.current) return;
       setItems((prev) =>
         prev?.map((n) =>
           n.id === id && !n.read_at ? { ...n, read_at: Date.now() } : n,
@@ -140,15 +167,26 @@ export function NotificationsBell() {
             <div className="text-xs font-semibold uppercase tracking-wider text-white/55">
               Notifications
             </div>
-            {unread > 0 && (
-              <button
-                type="button"
-                onClick={markAll}
-                className="rounded text-[11px] text-white/60 underline-offset-2 transition-colors hover:text-white hover:underline focus:outline-none focus-visible:text-white focus-visible:underline focus-visible:ring-1 focus-visible:ring-(--color-accent)"
-              >
-                Mark all read
-              </button>
-            )}
+            <div className="flex items-center gap-3">
+              {unread > 0 && (
+                <button
+                  type="button"
+                  onClick={markAll}
+                  className="rounded text-[11px] text-white/60 underline-offset-2 transition-colors hover:text-white hover:underline focus:outline-none focus-visible:text-white focus-visible:underline focus-visible:ring-1 focus-visible:ring-(--color-accent)"
+                >
+                  Mark all read
+                </button>
+              )}
+              {(items?.length ?? 0) > 0 && (
+                <button
+                  type="button"
+                  onClick={clearAll}
+                  className="rounded text-[11px] text-white/60 underline-offset-2 transition-colors hover:text-white hover:underline focus:outline-none focus-visible:text-white focus-visible:underline focus-visible:ring-1 focus-visible:ring-(--color-accent)"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
           </div>
 
           <div className="max-h-96 overflow-y-auto">
@@ -253,7 +291,7 @@ function render(n: Notification): Rendered {
       return {
         title: `${display} joined`,
         body: `@${username} accepted their invite. Grant library access if needed.`,
-        href: "/settings/admin/users/access",
+        href: "/settings/admin/users?tab=access",
       };
     }
     case "user.2fa.disabled": {
@@ -271,6 +309,51 @@ function render(n: Notification): Rendered {
         title: `2FA reset for @${target}`,
         body: `@${actor} reset their 2FA from the admin panel.`,
         href: "/settings/admin/users",
+      };
+    }
+    case "content.new_movie": {
+      // Batch summary payload carries `count` + `library_name`; the
+      // singular payload carries `title` + `year` + `item_id`.
+      if (typeof payload.count === "number") {
+        const count = Number(payload.count);
+        const lib = String(payload.library_name ?? "your library");
+        return {
+          title: `${count} new movies`,
+          body: `${count} new movies were added to ${lib}.`,
+          href: "/",
+        };
+      }
+      const title = String(payload.title ?? "A new movie");
+      const year = payload.year ? ` (${String(payload.year)})` : "";
+      const itemId = payload.item_id;
+      return {
+        title: `New movie: ${title}${year}`,
+        body: `${title}${year} was just added.`,
+        href: itemId != null ? `/?title=${String(itemId)}` : "/",
+      };
+    }
+    case "content.new_episode": {
+      const showTitle = String(payload.show_title ?? "a show you watch");
+      const showId = payload.show_id;
+      const href = showId != null ? `/?title=${String(showId)}` : "/";
+      // Batch summary payload carries `count`; the singular payload carries
+      // `season_number` / `episode_number` / optional `episode_title`.
+      if (typeof payload.count === "number") {
+        const count = Number(payload.count);
+        return {
+          title: `${count} new episodes of ${showTitle}`,
+          body: `${count} new episodes are ready to watch.`,
+          href,
+        };
+      }
+      const s = Number(payload.season_number ?? 0);
+      const e = Number(payload.episode_number ?? 0);
+      const code = `S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}`;
+      const epTitle = payload.episode_title ? ` — ${String(payload.episode_title)}` : "";
+      return {
+        title: `New episode of ${showTitle}`,
+        body: `${code}${epTitle} is ready to watch.`,
+        href,
       };
     }
     default:

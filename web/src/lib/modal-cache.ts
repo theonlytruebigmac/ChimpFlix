@@ -28,7 +28,19 @@ export type ModalData = {
   detail: ItemDetail;
 };
 
+// Cap the cache so long browsing sessions don't accumulate hundreds of large
+// entries. JS Maps preserve insertion order, so deleting `keys().next().value`
+// evicts the oldest entry (LRU-by-insertion).
+const MAX_CACHE_SIZE = 100;
 const cache = new Map<string, Promise<ModalData | null>>();
+
+function setCached(ratingKey: string, p: Promise<ModalData | null>): void {
+  cache.set(ratingKey, p);
+  if (cache.size > MAX_CACHE_SIZE) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    cache.delete(cache.keys().next().value!);
+  }
+}
 
 async function loadModalData(
   ratingKey: string,
@@ -53,7 +65,7 @@ export function prefetchModalData(ratingKey: string): void {
   if (typeof window === "undefined") return;
   if (cache.has(ratingKey)) return;
   const p = loadModalData(ratingKey);
-  cache.set(ratingKey, p);
+  setCached(ratingKey, p);
   // Swallow the rejection here so a failed prefetch doesn't surface as an
   // unhandled rejection. The actual click site awaits the same promise via
   // getOrFetchModalData and handles the error.
@@ -66,7 +78,7 @@ export function getOrFetchModalData(
   let p = cache.get(ratingKey);
   if (!p) {
     p = loadModalData(ratingKey);
-    cache.set(ratingKey, p);
+    setCached(ratingKey, p);
   }
   return p;
 }

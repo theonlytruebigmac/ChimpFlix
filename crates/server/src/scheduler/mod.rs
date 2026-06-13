@@ -623,6 +623,9 @@ fn spawn_execute_caught(state: AppState, task: ScheduledTask) {
     let task_id = task.id;
     let task_name = task.name.clone();
     let task_kind = task.kind.clone();
+    // Clone the pool before `state` is moved into `execute` so the panic
+    // branch can still reach the DB to un-wedge the task.
+    let pool = state.pool.clone();
     tokio::spawn(async move {
         let outcome = AssertUnwindSafe(execute(state, task)).catch_unwind().await;
         if let Err(panic) = outcome {
@@ -636,8 +639,27 @@ fn spawn_execute_caught(state: AppState, task: ScheduledTask) {
                 task = %task_name,
                 kind = %task_kind,
                 panic = %msg,
-                "scheduled task panicked — worker survives, but the task's status was not updated"
+                "scheduled task panicked — worker survives; resetting task status to failed"
             );
+            // `claim_due_tasks` already set this task to 'running', and the
+            // panic skipped `mark_task_finished`. Without this reset the
+            // task is excluded from every future tick (claim filters out
+            // 'running') and is effectively disabled until a restart. Flip
+            // it to 'failed' with a backoff so it retries later instead of
+            // crash-looping. Best-effort: a DB error here only logs.
+            let now = chimpflix_common::now_ms();
+            const PANIC_BACKOFF_MS: i64 = 60 * 60 * 1000; // 1h
+            let detail = format!("panicked: {msg}");
+            if let Err(e) =
+                queries::mark_task_panicked(&pool, task_id, now, now + PANIC_BACKOFF_MS, &detail)
+                    .await
+            {
+                error!(
+                    task_id,
+                    error = %format!("{e:#}"),
+                    "failed to reset panicked task status — it may stay wedged until restart"
+                );
+            }
         }
     });
 }
@@ -653,7 +675,24 @@ pub async fn run_now(state: AppState, task_id: i64) -> Result<()> {
     let Some(task) = queries::get_scheduled_task(&state.pool, task_id).await? else {
         bail!("task {task_id} not found");
     };
-    if task.last_status.as_deref() == Some("running") {
+    // Atomically claim the task by flipping last_status to 'running' only
+    // if it is not already running. Two concurrent POST requests both
+    // calling get_scheduled_task above could both observe status != 'running'
+    // and pass a plain equality check simultaneously. The UPDATE with the
+    // WHERE guard serialises them: exactly one writer wins (rows_affected=1)
+    // and the other bails here — matching the atomic claim used in
+    // claim_due_tasks for the scheduled path.
+    let claimed = sqlx::query(
+        "UPDATE scheduled_tasks
+         SET last_status = 'running', last_run_at = ?
+         WHERE id = ? AND (last_status IS NULL OR last_status <> 'running')",
+    )
+    .bind(now_ms())
+    .bind(task_id)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    if claimed == 0 {
         bail!("task {} is already running", task.name);
     }
     spawn_execute_caught(state, task);
@@ -666,6 +705,24 @@ async fn execute(state: AppState, task: ScheduledTask) {
         Ok(id) => id,
         Err(e) => {
             warn!(task_id = task.id, error = %format!("{e:#}"), "could not mark task running");
+            // claim_due_tasks (and run_now) already set last_status='running'.
+            // Without resetting it here the task is permanently excluded from
+            // future scheduler ticks (claim filters out 'running' rows) until
+            // the next server restart. Best-effort: if the reset also fails we
+            // just log; mark_interrupted_tasks on restart is the safety net.
+            if let Err(re) = sqlx::query(
+                "UPDATE scheduled_tasks SET last_status = NULL WHERE id = ?",
+            )
+            .bind(task.id)
+            .execute(&state.pool)
+            .await
+            {
+                error!(
+                    task_id = task.id,
+                    error = %format!("{re:#}"),
+                    "could not reset task status after mark_task_running failure — task may stay wedged until restart"
+                );
+            }
             return;
         }
     };
@@ -707,10 +764,10 @@ async fn execute(state: AppState, task: ScheduledTask) {
     // schedule via `max`, so a normally-daily task whose backoff is
     // only 20 minutes still waits the full day.
     //
-    // We count *including this run* — the query reads task_runs after
-    // mark_task_finished below, so we read before-the-finish and
-    // include this run's outcome by checking `status` locally. This
-    // avoids a second round-trip after the UPDATE.
+    // We read task_runs BEFORE mark_task_finished so the current
+    // failure run is not yet recorded in the DB; we add +1 manually
+    // to include it in the consecutive-failure count. This avoids a
+    // second round-trip after the UPDATE.
     let next = if status == "failed" {
         let prior_failures = queries::count_consecutive_task_failures(&state.pool, task.id)
             .await
@@ -911,8 +968,7 @@ async fn dispatch(
             Ok(())
         }
         "scan_library" => {
-            let params: serde_json::Value =
-                serde_json::from_str(&task.params_json).context("parse params_json")?;
+            let params = parse_task_params(&task.kind, &task.params_json);
             let library_id = params
                 .get("library_id")
                 .and_then(|v| v.as_i64())
@@ -1105,14 +1161,23 @@ async fn optimize_one(
     state: &AppState,
     row: &chimpflix_library::OptimizedVersion,
 ) -> anyhow::Result<()> {
-    // Resolve source path + preset config.
+    // Resolve source path + preset config. `duration_ms` is the denominator
+    // for the determinate progress bar — when it's missing or zero (rare;
+    // very old scans, or a source ffprobe couldn't measure) we leave
+    // progress at NULL and the UI shows an indeterminate bar instead of a
+    // fake number.
     use sqlx::Row;
-    let source_row = sqlx::query("SELECT path FROM media_files WHERE id = ?")
+    let source_row = sqlx::query("SELECT path, duration_ms FROM media_files WHERE id = ?")
         .bind(row.source_file_id)
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("source media_file {} missing", row.source_file_id))?;
     let source_path: String = source_row.try_get("path")?;
+    let source_duration_ms: Option<i64> = source_row
+        .try_get::<Option<i64>, _>("duration_ms")
+        .ok()
+        .flatten()
+        .filter(|d| *d > 0);
 
     let preset = queries::get_transcoder_preset(&state.pool, row.preset_id)
         .await?
@@ -1142,6 +1207,12 @@ async fn optimize_one(
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        // Machine-readable progress on stdout (key=value blocks ending in
+        // `progress=continue|end`); suppress the human stats line on
+        // stderr so stderr stays clean for error capture.
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
         "-i".into(),
         source_path.clone(),
     ];
@@ -1171,23 +1242,124 @@ async fn optimize_one(
     args.push("+faststart".into());
     args.push(output_str.clone());
 
-    let out = tokio::process::Command::new(&state.ffmpeg.ffmpeg)
+    // Spawn ffmpeg (rather than the previous blocking `.output()`) so we
+    // can (a) tail its `-progress` stream to drive the determinate bar and
+    // (b) hold the child handle to kill it if the operator hits Cancel.
+    // `kill_on_drop` is belt-and-suspenders: if this task is dropped (e.g.
+    // server shutdown) the child is signalled too.
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new(&state.ffmpeg.ffmpeg)
         .args(&args)
-        .output()
-        .await?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    // Drain stderr concurrently into a bounded buffer so a chatty encoder
+    // can't deadlock by filling the pipe while we're blocked reading
+    // stdout. We keep at most the last ~8 KiB — enough to surface the
+    // failing line, bounded so a pathological run can't balloon memory.
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(se) = stderr {
+            let mut lines = BufReader::new(se).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                buf.push_str(&line);
+                buf.push('\n');
+                if buf.len() > 8192 {
+                    let cut = buf.len() - 8192;
+                    buf.drain(..cut);
+                }
+            }
+        }
+        buf
+    });
+
+    // Tail the progress stream. ffmpeg emits blocks of `key=value` lines
+    // terminated by `progress=continue` (mid-stream) or `progress=end`
+    // (final). We pull `out_time_us` / `out_time_ms` to compute permille
+    // against the source duration, throttling DB writes to "changed by ≥
+    // 1 permille" so a long encode doesn't hammer the writer.
+    let mut cancelled = false;
+    let mut last_permille_written: i64 = -1;
+    if let Some(stdout) = child.stdout.take() {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut last_out_time_ms: i64 = 0;
+        loop {
+            // Cancel is checked on every progress line AND on the
+            // read-timeout tick so a stalled encoder (no progress lines)
+            // can still be cancelled promptly.
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = (match line { Ok(l) => l, Err(_) => None }) else {
+                        break; // stdout closed → ffmpeg is exiting
+                    };
+                    if let Some(v) = line.strip_prefix("out_time_ms=") {
+                        if let Ok(us) = v.trim().parse::<i64>() {
+                            // ffmpeg's `out_time_ms` is actually microseconds.
+                            last_out_time_ms = us / 1000;
+                        }
+                    } else if let Some(v) = line.strip_prefix("out_time_us=") {
+                        if let Ok(us) = v.trim().parse::<i64>() {
+                            last_out_time_ms = us / 1000;
+                        }
+                    }
+                    if let Some(total) = source_duration_ms {
+                        let permille =
+                            ((last_out_time_ms.max(0) as i128 * 1000) / total as i128) as i64;
+                        let permille = permille.clamp(0, 1000);
+                        if permille != last_permille_written {
+                            last_permille_written = permille;
+                            let _ = queries::update_optimized_progress(
+                                &state.pool,
+                                row.id,
+                                permille,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            }
+            if state.optimize_cancel_requested(row.id).await {
+                cancelled = true;
+                let _ = child.start_kill();
+                break;
+            }
+        }
+    }
+
+    // Reap the child. On cancel we kill it above; otherwise this awaits
+    // natural exit. Either way we collect status + drained stderr.
+    let status = child.wait().await?;
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    if cancelled {
+        // The cancel route already flipped the DB row to `cancelled`; we
+        // just clean up the partial output file and drop the cancel flag.
+        let _ = tokio::fs::remove_file(&output).await;
+        state.clear_optimize_cancel(row.id).await;
+        return Ok(());
+    }
+    // Defensive: clear any stale cancel flag for this id (e.g. a cancel
+    // requested for a since-completed earlier row reusing the id is
+    // impossible, but a no-op clear costs nothing and keeps the set tidy).
+    state.clear_optimize_cancel(row.id).await;
+
+    if !status.success() {
         let _ = queries::mark_optimized_finished(
             &state.pool,
             row.id,
             false,
             None,
             None,
-            Some(&stderr.chars().take(1024).collect::<String>()),
+            Some(&stderr_text.chars().take(1024).collect::<String>()),
         )
         .await;
         let _ = tokio::fs::remove_file(&output).await;
-        anyhow::bail!("ffmpeg exited {}", out.status);
+        anyhow::bail!("ffmpeg exited {}", status);
     }
 
     let meta = tokio::fs::metadata(&output).await?;
@@ -1538,10 +1710,16 @@ async fn prune_old_backups(
     let kept = entries.len().min(keep);
     let to_remove: Vec<std::path::PathBuf> =
         entries.into_iter().skip(keep).map(|(p, _)| p).collect();
+    // Best-effort: attempt all deletions, collect errors so a single
+    // locked/missing file doesn't abandon the rest of the to-remove list.
+    let mut errs: Vec<String> = Vec::new();
     for p in &to_remove {
         if let Err(e) = tokio::fs::remove_file(p).await {
-            return Err(anyhow::anyhow!("delete {}: {e}", p.display()));
+            errs.push(format!("delete {}: {e}", p.display()));
         }
+    }
+    if !errs.is_empty() {
+        return Err(anyhow::anyhow!("{}", errs.join("; ")));
     }
     Ok((kept, to_remove))
 }
@@ -1563,7 +1741,10 @@ async fn verify_backups_task(state: &AppState, log: &Arc<std::sync::Mutex<String
         Err(e) => return Err(e.into()),
     };
     let mut files: Vec<std::path::PathBuf> = Vec::new();
-    while let Ok(Some(ent)) = entries.next_entry().await {
+    // Use `?` so an I/O error (e.g. permissions, stale NFS handle) is
+    // propagated rather than silently truncating the listing and reporting
+    // "all OK" on an incomplete set — mirrors prune_old_backups at line 1656.
+    while let Some(ent) = entries.next_entry().await? {
         let path = ent.path();
         if path
             .file_name()
@@ -1592,16 +1773,30 @@ async fn verify_backups_task(state: &AppState, log: &Arc<std::sync::Mutex<String
             .unwrap_or("?")
             .to_string();
         // Quick header check first — a malformed SQLite file fails
-        // here before we even spawn a pool.
-        match tokio::fs::read(&path).await {
-            Ok(bytes) if bytes.len() >= 16 && &bytes[..16] == b"SQLite format 3\0" => {}
-            Ok(_) => {
-                bad.push(format!("{name}: not a SQLite file (bad header)"));
-                continue;
-            }
-            Err(e) => {
-                bad.push(format!("{name}: read error: {e}"));
-                continue;
+        // here before we even spawn a pool. Read exactly 16 bytes rather
+        // than the entire file: backup DBs can be gigabytes and reading
+        // the whole file just to inspect the magic header risks OOM.
+        {
+            use tokio::io::AsyncReadExt;
+            match tokio::fs::File::open(&path).await {
+                Ok(mut f) => {
+                    let mut hdr = [0u8; 16];
+                    match f.read_exact(&mut hdr).await {
+                        Ok(_) if &hdr == b"SQLite format 3\0" => {}
+                        Ok(_) => {
+                            bad.push(format!("{name}: not a SQLite file (bad header)"));
+                            continue;
+                        }
+                        Err(e) => {
+                            bad.push(format!("{name}: read error: {e}"));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    bad.push(format!("{name}: open error: {e}"));
+                    continue;
+                }
             }
         }
         // Open read-only + run integrity check. Read-only prevents a
@@ -2090,9 +2285,15 @@ async fn spawn_library_scan(state: &AppState, library_id: i64) -> Result<Option<
             fn drop(&mut self) {
                 let st = self.state.clone();
                 let lib = self.library_id;
-                tokio::spawn(async move {
-                    st.release_library_scan(lib).await;
-                });
+                // Guard against dropping after the Tokio runtime has shut down
+                // (e.g. SIGTERM while a scan is in progress). If no runtime is
+                // active the in-memory lock is irrelevant for the dying process,
+                // so we silently skip the spawn rather than panicking.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        st.release_library_scan(lib).await;
+                    });
+                }
             }
         }
         let _guard = ScanLockGuard {

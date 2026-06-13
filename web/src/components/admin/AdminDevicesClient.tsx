@@ -5,13 +5,13 @@ import {
   admin as adminApi,
   type AdminSessionSummary,
 } from "@/lib/chimpflix-api";
-import { ErrorBanner, Pill } from "./ui";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { formatDateTime } from "@/lib/format";
 
 export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[] }) {
   const [sessions, setSessions] = useState(initial);
-  const [busy, setBusy] = useState(false);
+  // Track which session id is currently being revoked (null = idle).
+  const [busyId, setBusyId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [askRevoke, setAskRevoke] = useState<AdminSessionSummary | null>(null);
   // Wall-clock at the time of the most recent fetch. Captured
@@ -32,7 +32,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
   }
 
   async function revoke(id: number) {
-    setBusy(true);
+    setBusyId(id);
     setError(null);
     try {
       await adminApi.sessions.revoke(id);
@@ -40,7 +40,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      setBusyId(null);
     }
   }
 
@@ -53,74 +53,116 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
     sessions.length > 0 && sessions.every((s) => isPrivateIp(s.ip));
 
   return (
-    <div className="space-y-4">
-      <ErrorBanner error={error} />
+    <div>
+      <div className="cf-flex cf-between" style={{ marginBottom: 14 }}>
+        <div className="cf-muted" style={{ fontSize: 13 }}>
+          Every active session across all users.
+        </div>
+      </div>
+
+      {error && (
+        <div role="alert" aria-live="assertive" className="cf-banner cf-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
+        </div>
+      )}
 
       {allPrivate && (
-        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-          <strong>All session IPs look private.</strong> Your reverse proxy is
-          probably terminating the connection, leaving us with the LAN /
-          Docker-bridge peer IP. Set the{" "}
-          <code className="font-mono text-amber-100">TRUSTED_PROXIES</code> env
-          var to a comma-separated CIDR list of your proxies (e.g.{" "}
-          <code className="font-mono text-amber-100">172.16.0.0/12</code> for
-          Docker, plus your Traefik / Cloudflare ranges) so we honour{" "}
-          <code className="font-mono text-amber-100">X-Forwarded-For</code> and
-          record the real client IP.
+        <div className="cf-banner cf-warn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 3l9 16H3z" />
+            <path d="M12 9v4M12 16v.5" />
+          </svg>
+          <div>
+            <b>All session IPs look private.</b> Your reverse proxy is probably
+            terminating the connection, leaving us with the LAN / Docker-bridge
+            peer IP. Set the{" "}
+            <span className="cf-mono">TRUSTED_PROXIES</span> env var to a
+            comma-separated CIDR list of your proxies (e.g.{" "}
+            <span className="cf-mono">172.16.0.0/12</span> for Docker, plus your
+            Traefik / Cloudflare ranges) so we honour{" "}
+            <span className="cf-mono">X-Forwarded-For</span> and record the real
+            client IP.
+          </div>
         </div>
       )}
 
       {sessions.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-white/15 bg-white/2 p-8 text-center text-sm text-white/50">
-          No active sessions.
+        <div className="cf-card" style={{ marginBottom: 0 }}>
+          <div
+            className="cf-card-body cf-pad cf-center cf-muted"
+            style={{ fontSize: 13 }}
+          >
+            No active sessions.
+          </div>
         </div>
       ) : (
-        <div className="overflow-hidden rounded-lg border border-white/10">
-          <table className="w-full text-sm">
-            <thead className="bg-white/5 text-left text-xs uppercase tracking-wider text-white/40">
+        <div className="cf-card" style={{ marginBottom: 0, overflowX: "auto" }}>
+          <table className="cf-table">
+            <thead>
               <tr>
-                <th className="px-4 py-2">User</th>
-                <th className="px-4 py-2">Device</th>
-                <th className="px-4 py-2">IP</th>
-                <th className="px-4 py-2">Last seen</th>
-                <th className="px-4 py-2">Expires</th>
-                <th className="px-4 py-2" />
+                <th>User</th>
+                <th>Device</th>
+                <th>IP</th>
+                <th>Last seen</th>
+                <th>Expires</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
               {sessions.map((s) => {
-                const expiring =
-                  nowMs > 0 && s.expires_at - nowMs < 7 * 86_400_000;
+                const expired = nowMs > 0 && s.expires_at < nowMs;
+                const expiringSoon =
+                  !expired &&
+                  nowMs > 0 &&
+                  s.expires_at - nowMs < 7 * 86_400_000;
                 return (
-                  <tr key={s.id} className="border-t border-white/5">
-                    <td className="whitespace-nowrap px-4 py-2 font-medium">
+                  <tr key={s.id}>
+                    <td style={{ whiteSpace: "nowrap", fontWeight: 600 }}>
                       @{s.username}
                     </td>
-                    <td className="px-4 py-2 text-xs text-white/60">
-                      <div className="line-clamp-2 max-w-md" title={s.user_agent ?? ""}>
+                    <td className="cf-muted">
+                      <div
+                        title={s.user_agent ?? ""}
+                        style={{
+                          maxWidth: 320,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden",
+                        }}
+                      >
                         {summarizeUserAgent(s.user_agent)}
                       </div>
                     </td>
-                    <td className="whitespace-nowrap px-4 py-2 font-mono text-xs text-white/60">
-                      {s.ip ?? "—"}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-white/60">
+                    <td className="cf-mono">{s.ip ?? "—"}</td>
+                    <td className="cf-muted" style={{ whiteSpace: "nowrap" }}>
                       {formatDateTime(s.last_seen_at)}
                     </td>
-                    <td className="whitespace-nowrap px-4 py-2">
-                      {expiring ? (
-                        <Pill tone="warn">{formatDateTime(s.expires_at)}</Pill>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      {expired ? (
+                        <span className="cf-pill cf-err">
+                          {formatDateTime(s.expires_at)}
+                        </span>
+                      ) : expiringSoon ? (
+                        <span className="cf-pill cf-warn">
+                          {formatDateTime(s.expires_at)}
+                        </span>
                       ) : (
-                        <span className="text-xs text-white/60">
+                        <span className="cf-muted" style={{ fontSize: 12 }}>
                           {formatDateTime(s.expires_at)}
                         </span>
                       )}
                     </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-right">
+                    <td className="cf-num">
                       <button
-                        disabled={busy}
+                        type="button"
+                        disabled={busyId === s.id}
                         onClick={() => setAskRevoke(s)}
-                        className="rounded border border-white/15 px-2 py-1 text-xs text-white/70 hover:border-red-500/50 hover:text-red-300"
+                        className="cf-btn cf-ghost cf-tiny"
                       >
                         Revoke
                       </button>
@@ -132,6 +174,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
           </table>
         </div>
       )}
+
       {askRevoke && (
         <ConfirmDialog
           title={`Revoke session for @${askRevoke.username}?`}
@@ -145,7 +188,7 @@ export function AdminDevicesClient({ initial }: { initial: AdminSessionSummary[]
           }
           confirmLabel="Revoke session"
           destructive
-          busy={busy}
+          busy={busyId !== null}
           onConfirm={async () => {
             const target = askRevoke;
             await revoke(target.id);

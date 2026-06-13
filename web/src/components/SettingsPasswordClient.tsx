@@ -52,12 +52,8 @@ export function SettingsPasswordClient() {
   }
 
   return (
-    <form onSubmit={onSubmit} className="space-y-3">
-      <p className="text-xs text-white/55">
-        Changing your password signs out every other device. You stay
-        signed in here.
-      </p>
-      <div className="grid gap-3 sm:grid-cols-3">
+    <form onSubmit={onSubmit}>
+      <div className="cf-grid cf-c3">
         <PasswordField
           label="Current password"
           autoComplete="current-password"
@@ -74,6 +70,7 @@ export function SettingsPasswordClient() {
           show={showNew}
           onToggle={() => setShowNew((v) => !v)}
           minLength={8}
+          placeholder="At least 8 characters"
         />
         <PasswordField
           label="Confirm"
@@ -87,22 +84,31 @@ export function SettingsPasswordClient() {
       </div>
       <PasswordStrengthHint value={next} />
       {error && (
-        <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
+        <div className="cf-banner cf-err" style={{ marginTop: 14 }}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16v.5" />
+          </svg>
+          <div>{error}</div>
         </div>
       )}
       {message && (
-        <div className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
-          {message}
+        <div className="cf-banner cf-ok" style={{ marginTop: 14 }}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+          <div>{message}</div>
         </div>
       )}
-      <button
-        type="submit"
-        disabled={busy || !current || !next || !confirm}
-        className="rounded bg-(--color-accent) px-4 py-2.5 text-sm font-semibold text-white sm:px-3 sm:py-2 sm:text-xs disabled:opacity-50"
-      >
-        {busy ? "Updating…" : "Change password"}
-      </button>
+      <div className="cf-flex" style={{ marginTop: 16 }}>
+        <button
+          type="submit"
+          disabled={busy || !current || !next || !confirm}
+          className="cf-btn cf-primary"
+        >
+          {busy ? "Updating…" : "Change password"}
+        </button>
+      </div>
     </form>
   );
 }
@@ -115,6 +121,7 @@ function PasswordField({
   show,
   onToggle,
   minLength,
+  placeholder,
 }: {
   label: string;
   autoComplete: "current-password" | "new-password";
@@ -123,11 +130,12 @@ function PasswordField({
   show: boolean;
   onToggle: () => void;
   minLength?: number;
+  placeholder?: string;
 }) {
   return (
-    <label className="block text-xs">
-      <span className="mb-1 block text-white/70">{label}</span>
-      <div className="relative">
+    <div className="cf-field" style={{ marginBottom: 0 }}>
+      <label className="cf-field-label">{label}</label>
+      <div style={{ position: "relative" }}>
         <input
           type={show ? "text" : "password"}
           autoComplete={autoComplete}
@@ -136,7 +144,9 @@ function PasswordField({
           required
           minLength={minLength}
           maxLength={1024}
-          className="w-full rounded bg-white/10 px-3 py-2 pr-9 text-sm outline-none ring-1 ring-white/10 focus:ring-(--color-accent)"
+          placeholder={placeholder}
+          className="cf-input"
+          style={{ paddingRight: 38 }}
         />
         <button
           type="button"
@@ -144,7 +154,22 @@ function PasswordField({
           aria-label={show ? "Hide password" : "Show password"}
           aria-pressed={show}
           tabIndex={-1}
-          className="absolute right-1 top-1/2 -translate-y-1/2 inline-flex h-7 w-7 items-center justify-center rounded text-white/55 transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus:ring-1 focus:ring-(--color-accent)"
+          style={{
+            position: "absolute",
+            right: 4,
+            top: "50%",
+            transform: "translateY(-50%)",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: 28,
+            width: 28,
+            borderRadius: 6,
+            border: 0,
+            background: "transparent",
+            color: "var(--faint)",
+            cursor: "pointer",
+          }}
         >
           {show ? (
             <svg
@@ -179,7 +204,7 @@ function PasswordField({
           )}
         </button>
       </div>
-    </label>
+    </div>
   );
 }
 

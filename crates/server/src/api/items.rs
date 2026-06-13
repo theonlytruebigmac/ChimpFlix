@@ -78,6 +78,19 @@ pub async fn list(
     }
     let acc = access(&state, &user).await?;
     let effective = restrict_access(acc, filter.library_ids.take());
+    // Apply the user's kid-safe preference server-side. `ItemFilter::kids_safe`
+    // is `#[serde(skip)]`, so it's always `false` off the wire and a client
+    // can't set it by hand — the toggle is authoritative from the stored
+    // preference. When false (the default) `list_items` adds no clause and
+    // the query is unchanged.
+    //
+    // EXCEPTION: the `count_only` existence probe (used by the home page to
+    // decide whether the server has been scanned at all) bypasses kids_safe so
+    // a kids_safe profile on a library with zero rated items doesn't see a
+    // false "scan in progress" screen. This is safe because `count_only`
+    // returns ZERO items (only `total`) — a viewer can never extract a
+    // non-kid-safe title through it, just an unfiltered content count.
+    filter.kids_safe = user.kids_safe && !filter.count_only;
     let page = queries::list_items(&state.pool, filter, user.id, effective.as_deref()).await?;
     Ok(Json(page))
 }
@@ -125,9 +138,17 @@ pub async fn trending(
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     let acc = access(&state, &user).await?;
     let effective = restrict_access(acc, q.library_ids);
-    let rows =
-        queries::list_trending_in_library(&state.pool, kind, user.id, limit, effective.as_deref())
-            .await?;
+    let rows = queries::list_trending_in_library(
+        &state.pool,
+        kind,
+        user.id,
+        limit,
+        effective.as_deref(),
+        // Top-10 rails honor the same per-user kid-safe toggle as plain
+        // browse; authoritative from the stored preference.
+        user.kids_safe,
+    )
+    .await?;
     let items = rows
         .into_iter()
         .map(|(rank, item)| TrendingItem { rank, item })
@@ -168,6 +189,14 @@ pub async fn library_top(
         LibraryKind::Anime => ("show", "mal_ranking"),
     };
     let acc = access(&state, &user).await?;
+    // Prevent library-id enumeration: treat an inaccessible library the same
+    // as a non-existent one so callers can't distinguish the two via status
+    // codes. Owners (acc = None) bypass this check.
+    if let Some(ref allowed) = acc {
+        if !allowed.contains(&library_id) {
+            return Err(ApiError::NotFound);
+        }
+    }
     let rows = queries::list_library_top(
         &state.pool,
         library_id,
@@ -183,6 +212,143 @@ pub async fn library_top(
         .map(|(rank, item)| TrendingItem { rank, item })
         .collect();
     Ok(Json(TrendingResponse { items }))
+}
+
+/// Query for `GET /api/v1/calendar`. Two ways to express the window:
+///   * `?days=N` — a window of N days *ahead* of now, plus a fixed look-back
+///     so "this week" (episodes that aired in the last few days) still shows.
+///   * `?from=<ms>&to=<ms>` — an explicit epoch-millisecond window; takes
+///     precedence over `days` when both bounds are supplied.
+/// `library_ids` carries the same hidden-libraries preference as the rest of
+/// browse (the client passes its visible-library set), intersected with the
+/// user's access grants server-side.
+#[derive(Debug, Deserialize)]
+pub struct CalendarQuery {
+    /// Window size in days ahead of now. Defaults to 35 (~5 weeks).
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// Days of look-back *before* today to include, so a surface can show
+    /// recently-aired episodes for context. Defaults to 0 (today + upcoming
+    /// only — what the home "Coming Up" rail wants). The /calendar page passes
+    /// 1 so it leads with "Yesterday". Clamped server-side. Ignored when
+    /// explicit `from`/`to` are supplied.
+    #[serde(default)]
+    pub lookback_days: Option<i64>,
+    /// Explicit window start, epoch milliseconds.
+    #[serde(default)]
+    pub from: Option<i64>,
+    /// Explicit window end, epoch milliseconds.
+    #[serde(default)]
+    pub to: Option<i64>,
+    /// Cap on returned rows. Defaults to 200; clamped server-side.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Visible-library filter, same shape as `ItemFilter::library_ids`.
+    #[serde(default, deserialize_with = "chimpflix_library::deserialize_csv_i64s")]
+    pub library_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CalendarResponse {
+    pub episodes: Vec<queries::UpcomingEpisode>,
+}
+
+const DAY_MS: i64 = 86_400_000;
+const CALENDAR_DEFAULT_DAYS_AHEAD: i64 = 35;
+
+/// `GET /api/v1/calendar` — locally-known episodes whose air date falls in
+/// the requested window, honoring the same per-library visibility +
+/// kids-safe rules as every other browse surface. The LOCAL-data complement
+/// to the Trakt-driven coming-soon rail. The frontend groups by `airDate`.
+pub async fn calendar(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<CalendarQuery>,
+) -> Result<Json<CalendarResponse>, ApiError> {
+    let now = chimpflix_common::now_ms();
+    // Default window: from the START OF TODAY (UTC), minus an optional
+    // `lookback_days`, through `days_ahead`. With the default 0 look-back the
+    // window is today + upcoming only (the "Coming Up" rail — no already-aired
+    // episodes); the /calendar page passes lookback_days=1 so it leads with a
+    // "Yesterday" section. `air_date` is stored as midnight-UTC of the air day,
+    // so flooring `from` to a UTC day boundary includes everything airing that
+    // day. Explicit ?from/?to overrides (e.g. a "scroll back through the week"
+    // view).
+    let (from_ms, to_ms) = match (q.from, q.to) {
+        (Some(from), Some(to)) if to >= from => (from, to),
+        _ => {
+            let days_ahead = q.days.unwrap_or(CALENDAR_DEFAULT_DAYS_AHEAD).clamp(1, 365);
+            let lookback = q.lookback_days.unwrap_or(0).clamp(0, 30);
+            let day_start = now - now.rem_euclid(DAY_MS);
+            (day_start - lookback * DAY_MS, day_start + days_ahead * DAY_MS)
+        }
+    };
+    let limit = q.limit.unwrap_or(200).clamp(1, 500);
+    let acc = access(&state, &user).await?;
+    let effective = restrict_access(acc, q.library_ids);
+    let episodes = queries::list_upcoming_episodes(
+        &state.pool,
+        user.id,
+        effective.as_deref(),
+        from_ms,
+        to_ms,
+        limit,
+        // Honor the per-user kid-safe toggle, authoritative from the stored
+        // preference — same as trending/browse.
+        user.kids_safe,
+    )
+    .await?;
+    Ok(Json(CalendarResponse { episodes }))
+}
+
+/// Query for `GET /api/v1/episodes/recently-added`.
+#[derive(Debug, Deserialize)]
+pub struct RecentEpisodesQuery {
+    /// How far back to look, in days. Defaults to 30; clamped server-side.
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// Cap on returned rows. Defaults to 30; clamped server-side.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Visible-library filter, same shape as `ItemFilter::library_ids`.
+    #[serde(default, deserialize_with = "chimpflix_library::deserialize_csv_i64s")]
+    pub library_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentEpisodesResponse {
+    pub episodes: Vec<queries::RecentEpisode>,
+}
+
+const RECENT_EPISODES_DEFAULT_DAYS: i64 = 30;
+
+/// `GET /api/v1/episodes/recently-added` — shows that just gained a brand-new
+/// episode (a fresh episode of a series the user already had), surfaced as the
+/// home "New Episodes" rail. The complement to "Recently Added", which sorts by
+/// the show's first-acquisition `added_at` and so never resurfaces an ongoing
+/// series when a new episode lands. Same per-library visibility + kids-safe
+/// rules as every other browse surface.
+pub async fn recently_added_episodes(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<RecentEpisodesQuery>,
+) -> Result<Json<RecentEpisodesResponse>, ApiError> {
+    let now = chimpflix_common::now_ms();
+    let days = q.days.unwrap_or(RECENT_EPISODES_DEFAULT_DAYS).clamp(1, 365);
+    let since_ms = now - days * DAY_MS;
+    let limit = q.limit.unwrap_or(30).clamp(1, 200);
+    let acc = access(&state, &user).await?;
+    let effective = restrict_access(acc, q.library_ids);
+    let episodes = queries::list_recently_added_episodes(
+        &state.pool,
+        user.id,
+        effective.as_deref(),
+        since_ms,
+        limit,
+        user.kids_safe,
+    )
+    .await?;
+    Ok(Json(RecentEpisodesResponse { episodes }))
 }
 
 pub async fn get_one(
@@ -626,6 +792,17 @@ pub async fn apply_tmdb_poster(
         "jpg"
     };
 
+    // SECURITY: pipe through sanitize_image for the same protections that
+    // upload_image_impl applies — strips EXIF/XMP/IPTC metadata, rejects
+    // decompression-bomb images, and re-encodes to pixel-only output.
+    let target_format = match ext {
+        "png"  => image::ImageFormat::Png,
+        "webp" => image::ImageFormat::WebP,
+        _      => image::ImageFormat::Jpeg,
+    };
+    let (bytes, ext) = sanitize_image(&bytes, target_format)
+        .map_err(|e| ApiError::validation(format!("image sanitize failed: {e}")))?;
+
     let dir = state.data_dir.join(POSTER_DIR);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -636,22 +813,33 @@ pub async fn apply_tmdb_poster(
             let _ = tokio::fs::remove_file(&prev).await;
         }
     }
+    // Write to a `.tmp` sibling first; only promote to the final path once
+    // the DB row update succeeds, so a DB failure doesn't leave an orphaned
+    // file under the permanent path (mirrors upload_image_impl).
     let path = dir.join(format!("{id}.{ext}"));
-    let mut f = tokio::fs::File::create(&path)
+    let tmp_path = dir.join(format!("{id}.{ext}.tmp"));
+    let mut f = tokio::fs::File::create(&tmp_path)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     f.write_all(&bytes)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     f.flush().await.ok();
+    drop(f);
 
     let blob_url = format!(
         "/api/v1/items/{id}/poster/blob?v={}",
         chimpflix_common::now_ms()
     );
-    queries::replace_primary_image(&state.pool, id, "poster", "local", &blob_url)
+    if let Err(e) =
+        queries::replace_primary_image(&state.pool, id, "poster", "local", &blob_url).await
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(ApiError::Internal(e));
+    }
+    tokio::fs::rename(&tmp_path, &path)
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| ApiError::Internal(e.into()))?;
 
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
@@ -671,6 +859,11 @@ pub async fn patch_item(
         return Err(ApiError::Forbidden);
     }
     let acc = access(&state, &user).await?;
+    // Verify existence before mutating — apply_item_edit silently matches
+    // 0 rows for a non-existent id (consistent with patch_credits).
+    queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
+        .await?
+        .ok_or(ApiError::NotFound)?;
     queries::apply_item_edit(&state.pool, id, &edit).await?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?
@@ -968,10 +1161,10 @@ pub async fn report_issue(
             "message is too long (max {REPORT_ISSUE_MAX_BYTES} bytes)",
         )));
     }
-    // We deliberately don't run the access filter here — any authed user
-    // can report on any item they have a ratingKey for. The reporter's
-    // identity is stamped on the payload so admins can follow up; the
-    // notification body never trusts client-supplied subject lines.
+    // Access-filtered the same as every browse surface — a user can only
+    // report on items in libraries they can see. The reporter's identity is
+    // stamped on the payload so admins can follow up; the notification body
+    // never trusts client-supplied subject lines.
     let acc = access(&state, &user).await?;
     let detail = queries::get_item_detail(&state.pool, id, user.id, acc.as_deref())
         .await?

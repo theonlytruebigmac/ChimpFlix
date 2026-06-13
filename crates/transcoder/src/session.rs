@@ -783,13 +783,15 @@ pub struct TranscodeManager {
 struct Inner {
     cache_root: PathBuf,
     ffmpeg: FfmpegConfig,
-    /// Capabilities probed once at server startup (encoder list,
-    /// per-hwaccel decoder list). Used by [`Self::start`] to decide
-    /// whether to emit a `-hwaccel <name>` hint for the source
-    /// codec — only do so if the runtime probe confirmed this card
-    /// can actually decode the codec, otherwise software-decode and
-    /// just use the GPU for the encode side.
-    capabilities: Arc<crate::TranscoderCapabilities>,
+    /// Capabilities probed at server startup (encoder list, per-hwaccel
+    /// decoder list), refreshable at runtime via the admin "re-probe"
+    /// endpoint. Used by [`Self::start`] to decide whether to emit a
+    /// `-hwaccel <name>` hint for the source codec — only do so if the
+    /// probe confirmed this card can actually decode the codec,
+    /// otherwise software-decode and just use the GPU for the encode
+    /// side. Shared (same `Arc<SharedCapabilities>`) with
+    /// `AppState.transcoder_caps` so a re-probe updates both at once.
+    capabilities: Arc<crate::SharedCapabilities>,
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     /// Serialises the "check the operator's concurrent-session cap
     /// then start a new session" path so two requests racing under
@@ -805,7 +807,7 @@ impl TranscodeManager {
     pub fn new(
         cache_root: PathBuf,
         ffmpeg: FfmpegConfig,
-        capabilities: Arc<crate::TranscoderCapabilities>,
+        capabilities: Arc<crate::SharedCapabilities>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("create transcode cache dir {}", cache_root.display()))?;
@@ -832,9 +834,10 @@ impl TranscodeManager {
 
     /// Read accessor for the capability probe — callers (the session
     /// API in particular) need to know which encoders are actually
-    /// available before deciding whether to request HEVC.
+    /// available before deciding whether to request HEVC. Returns the
+    /// current snapshot, picking up any runtime re-probe.
     pub fn capabilities(&self) -> Arc<crate::TranscoderCapabilities> {
-        self.inner.capabilities.clone()
+        self.inner.capabilities.load()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -870,6 +873,13 @@ impl TranscodeManager {
         target_video_codec: VideoCodec,
         gpu_device: &str,
         loudness_target: Option<LoudnessTarget>,
+        // When true the operator has opted into burning text subtitles
+        // (SRT / ASS / SSA / mov_text) into the video instead of the
+        // default WebVTT-sidecar overlay. Picture subs (PGS / VobSub /
+        // DVB) always burn regardless — they never get a sidecar — so
+        // this flag only governs the text path. Default false keeps the
+        // sidecar fast-path (player overlays client-side).
+        burn_text_subtitles: bool,
     ) -> Result<Arc<Session>> {
         let id = generate_id();
         let session_dir = self.inner.cache_root.join(&id);
@@ -895,8 +905,13 @@ impl TranscodeManager {
         // sessions can't ABR because there's no encoder to retarget.
         // Fallback also has to be strictly smaller than the primary or
         // it adds no value.
+        //
+        // A text sub is a burn (not a sidecar) only when the operator
+        // opted into burn-in — otherwise it stays on the ABR-safe
+        // sidecar path. Picture subs are always a burn.
+        let subtitle_is_text = subtitle_codec.is_some_and(is_text_subtitle_codec);
         let subtitle_is_burn =
-            subtitle_index.is_some() && !subtitle_codec.is_some_and(is_text_subtitle_codec);
+            subtitle_index.is_some() && (!subtitle_is_text || burn_text_subtitles);
         let abr_eligible = matches!(video_treatment, VideoTreatment::Reencode) && !subtitle_is_burn;
         let resolved_fallback = if abr_eligible {
             fallback_variant.and_then(|(fh, fbps)| {
@@ -973,10 +988,15 @@ impl TranscodeManager {
         // light up NVDEC for it; a GTX 1050's probe won't list
         // `av1` and we silently fall back to software decode for
         // the same source. No card-model database needed.
+        //
+        // Snapshot the (possibly re-probed) capabilities once for the
+        // duration of this start so the decode-hint decision is made
+        // against a single consistent view.
+        let caps = self.inner.capabilities.load();
         let use_hwaccel_decode = match hwaccel.paired_decoder() {
             Some(name) => source_video_codec
                 .map(normalize_codec_for_decoder)
-                .is_some_and(|c| self.inner.capabilities.decoders.supports(name, &c)),
+                .is_some_and(|c| caps.decoders.supports(name, &c)),
             None => false,
         };
 
@@ -1025,7 +1045,12 @@ impl TranscodeManager {
         // tracks, so they still take the burn path.
         let start_seconds = (start_position_ms.max(0) as f64) / 1000.0;
         let webvtt_sidecar: Option<WebVttSidecar> = if let Some(si) = subtitle_index {
-            if matches!(subtitle_kind(subtitle_codec), SubtitleKind::Text) {
+            // When the operator opted into subtitle burn-in, text subs
+            // skip the sidecar entirely and fall through to the
+            // `subtitles=` burn path in `spawn_ffmpeg` (which keys off
+            // `using_sidecar_subtitle == false`). Default (flag off)
+            // keeps the sidecar so the player overlays client-side.
+            if matches!(subtitle_kind(subtitle_codec), SubtitleKind::Text) && !burn_text_subtitles {
                 let language = subtitle_language
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "und".to_string());
@@ -2149,6 +2174,15 @@ async fn spawn_ffmpeg(
                     // detailed exit code, its detail wins.
                     heartbeat_health
                         .mark_exited("no longer alive (heartbeat probe)", now_ms());
+                    // Now that ffmpeg is DEFINITIVELY gone, cap each
+                    // variant playlist with `#EXT-X-ENDLIST`. This is the
+                    // authoritative finalize point: the stderr-drain task
+                    // only finalizes when *it* reaped the child, so a
+                    // session whose stderr pipe closed early while ffmpeg
+                    // kept running relies on this path to close out the
+                    // playlist. finalize_playlists is idempotent, so an
+                    // overlap with the stderr-drain finalize is harmless.
+                    finalize_playlists(&session_dir_str).await;
                     break;
                 }
                 // Count segment files across all variant dirs.
@@ -2336,7 +2370,17 @@ async fn spawn_ffmpeg(
             // recover" — even though the encoder is actually done.
             // Idempotent: we only append if the marker isn't already
             // present, so a clean-exit playlist stays unchanged.
-            finalize_playlists(&session_dir_for_finalize).await;
+            //
+            // CRITICAL: only finalize when ffmpeg has DEFINITIVELY exited.
+            // The stderr pipe can drain while the encoder is still alive
+            // and appending segments ("still running"); writing ENDLIST
+            // into a live manifest makes HLS.js treat the stream as
+            // complete at that point and stop fetching — a false EOF mid-
+            // playback. In that case we leave finalize to the heartbeat
+            // monitor, which fires only after confirming the pid is gone.
+            if !exit_detail.starts_with("still running") {
+                finalize_playlists(&session_dir_for_finalize).await;
+            }
         });
     }
 
@@ -2586,25 +2630,66 @@ async fn extract_full_webvtt_to(
             .await
             .with_context(|| format!("create cache dir {}", parent.display()))?;
     }
+    // Write to a per-call temp file then atomically rename to `dest`.
+    // Two concurrent sessions targeting the same (input, si) would
+    // otherwise both run ffmpeg with `-y` writing to the identical
+    // path, producing interleaved / truncated WebVTT. With the
+    // temp-then-rename approach each writer owns its own file; the
+    // last rename wins, leaving a complete file from exactly one
+    // ffmpeg invocation.
+    let mut rand_buf = [0u8; 8];
+    let _ = fill_random(&mut rand_buf); // best-effort; all-zero suffix still avoids cross-call collisions in practice
+    let suffix = hex::encode(rand_buf);
+    // Append the temp marker rather than `with_extension`, which would
+    // REPLACE `.vtt` and leave `0.tmp.<hex>`. We pass `-f webvtt`
+    // explicitly below so ffmpeg never has to infer the muxer from the
+    // filename, but keeping `.vtt` in the temp name also keeps stray
+    // temp files self-describing and matches the final artifact.
+    let mut tmp_name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".tmp.{suffix}"));
+    let tmp_dest = dest.with_file_name(tmp_name);
+
     let status = Command::new(&cfg.ffmpeg)
         .args(["-y", "-loglevel", "error", "-nostdin"])
         .arg("-i")
         .arg(crate::safe_ffmpeg_input(input))
         .args(["-map", &format!("0:s:{si}")])
         .args(["-c:s", "webvtt"])
-        .arg(dest)
+        // Force the WebVTT muxer explicitly. The temp output path has a
+        // randomized suffix, so ffmpeg cannot infer the format from the
+        // extension — without this it dies with "Unable to find a
+        // suitable output format" (exit 1), which 404s every cache-miss
+        // subtitle sidecar.
+        .args(["-f", "webvtt"])
+        .arg(&tmp_dest)
         .status()
         .await
         .with_context(|| "spawn ffmpeg for webvtt extraction")?;
     if !status.success() {
+        // Clean up the temp file; ignore errors (it may not exist).
+        let _ = tokio::fs::remove_file(&tmp_dest).await;
         anyhow::bail!("ffmpeg webvtt extraction exited {:?}", status.code());
     }
-    if tokio::fs::metadata(dest).await.is_err() {
+    if tokio::fs::metadata(&tmp_dest).await.is_err() {
         anyhow::bail!(
             "webvtt extraction reported success but {} is missing",
-            dest.display()
+            tmp_dest.display()
         );
     }
+    // Atomic rename: replaces any concurrent writer's result with an
+    // equally valid complete file, so readers always see a whole VTT.
+    tokio::fs::rename(&tmp_dest, dest)
+        .await
+        .with_context(|| {
+            format!(
+                "rename {} → {}",
+                tmp_dest.display(),
+                dest.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -2728,26 +2813,180 @@ fn shift_webvtt_timestamps(body: &str, shift_seconds: f64) -> String {
 /// non-effect dialogue layer of the ASS source, but that requires
 /// understanding the source's layer/style hierarchy and isn't
 /// possible at the WebVTT level.
-fn strip_ass_overrides(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
+/// Clean the ASS leftovers that ffmpeg's WebVTT muxer leaves in cue
+/// bodies, so anime typesetting doesn't render as garbage:
+///
+///   * strip `{\...}` override blocks (positioning, colour, karaoke);
+///   * drop text emitted while ASS **drawing mode** is active — `{\p1}`
+///     (or higher) switches the renderer into vector-drawing and the
+///     "text" that follows is a path of `m`/`l`/`b` coordinates (used
+///     to redraw on-screen signs). The muxer keeps the brace blocks
+///     *and* the bare path, so without this the path leaks on screen as
+///     a wall of numbers like `m 7.48 42.16 l -0.06 19.99 b ...`;
+///   * remove cues left empty by the above so no blank cue box renders.
+///
+/// `\p0` and a bare `\p` reset drawing mode; `\pos(...)` / `\pbo` start
+/// with `\p` but must NOT be mistaken for it (they continue with a
+/// letter). Normal dialogue cues — which carry no `\p<digit>` tag — are
+/// only stripped of override blocks, exactly as before.
+///
+/// Public so the server can run the same pass over externally-fetched
+/// subtitles (OpenSubtitles can return ASS), keeping one source of
+/// truth for the sanitization rules.
+pub fn sanitize_ass_webvtt(body: &str) -> String {
+    // Operate per cue (cues are separated by blank lines) so an
+    // unclosed `{\p1}` can't bleed its drawing state into the following
+    // cue, and so a cue whose only content was a drawing path can be
+    // dropped whole. The leading `WEBVTT` header block passes through
+    // untouched.
+    let mut blocks: Vec<String> = Vec::new();
+    for (i, block) in split_into_blocks(body).into_iter().enumerate() {
+        if i == 0 && block.trim_start().starts_with("WEBVTT") {
+            blocks.push(block);
+            continue;
+        }
+        if let Some(cleaned) = clean_cue_block(&block) {
+            blocks.push(cleaned);
+        }
+        // else: the cue was drawing-only / empty → drop it entirely.
+    }
+    let mut out = blocks.join("\n\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Split a WebVTT body into blocks delimited by blank lines, discarding
+/// the blank separators. The first block is the header; the rest are
+/// cues. Rejoining the kept blocks with `\n\n` reconstructs a valid
+/// document.
+fn split_into_blocks(body: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                blocks.push(cur.join("\n"));
+                cur.clear();
+            }
+        } else {
+            cur.push(line);
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur.join("\n"));
+    }
+    blocks
+}
+
+/// Clean one cue block. Returns `None` when nothing readable survives
+/// (drawing-only or empty cue) so the caller drops it. Lines up to and
+/// including the `-->` timestamp line are preserved verbatim; only the
+/// text lines after it are sanitized.
+fn clean_cue_block(block: &str) -> Option<String> {
+    let lines: Vec<&str> = block.lines().collect();
+    let Some(ts_idx) = lines.iter().position(|l| l.contains("-->")) else {
+        // No timestamp line — not a cue we recognise; pass through.
+        return Some(block.to_string());
+    };
+
+    // Drawing mode is per-cue: reset at the start, then carried across
+    // this cue's (possibly multi-line, via `\N`) text.
+    let mut drawing = false;
+    let mut text: Vec<String> = lines[ts_idx + 1..]
+        .iter()
+        .map(|line| clean_cue_text_line(line, &mut drawing))
+        .collect();
+    // Trim trailing blank lines the cleaning may have produced.
+    while text.last().is_some_and(|l| l.trim().is_empty()) {
+        text.pop();
+    }
+    if text.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+
+    let mut out: Vec<String> = lines[..=ts_idx].iter().map(|s| s.to_string()).collect();
+    out.extend(text);
+    Some(out.join("\n"))
+}
+
+/// Strip `{\...}` override blocks from one cue-text line and drop any
+/// text while ASS drawing mode is active. `drawing` carries the mode
+/// across the lines of a multi-line cue.
+fn clean_cue_text_line(line: &str, drawing: &mut bool) -> String {
+    let mut out = String::with_capacity(line.len());
     let mut depth = 0u32;
-    for ch in body.chars() {
+    let mut block_buf = String::new();
+    for ch in line.chars() {
         match ch {
             '{' => {
                 depth = depth.saturating_add(1);
+                if depth == 1 {
+                    block_buf.clear();
+                }
             }
             '}' if depth > 0 => {
                 depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(level) = parse_drawing_level(&block_buf) {
+                        *drawing = level >= 1;
+                    }
+                }
             }
-            _ if depth == 0 => {
-                out.push(ch);
-            }
-            _ => {
-                // Inside an override block; drop.
-            }
+            _ if depth > 0 => block_buf.push(ch),
+            // Outside any override block: drop drawing-path text, keep
+            // real dialogue.
+            _ if *drawing => {}
+            _ => out.push(ch),
         }
     }
     out
+}
+
+/// Inspect an ASS override block for a drawing-mode tag (`\p<n>`).
+/// Returns `Some(n)` for the last such tag (n ≥ 1 = drawing on, 0 =
+/// off), or `None` when the block has no drawing tag at all (state
+/// unchanged). Crucially distinguishes `\p1` (drawing) from `\pos` /
+/// `\pbo` (position / baseline — `\p` followed by a letter), which must
+/// not toggle drawing mode.
+fn parse_drawing_level(block: &str) -> Option<u32> {
+    let bytes = block.as_bytes();
+    let mut result = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1].eq_ignore_ascii_case(&b'p') {
+            let after = i + 2;
+            match bytes.get(after) {
+                Some(d) if d.is_ascii_digit() => {
+                    let mut j = after;
+                    let mut n: u32 = 0;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        n = n.saturating_mul(10).saturating_add(u32::from(bytes[j] - b'0'));
+                        j += 1;
+                    }
+                    result = Some(n);
+                    i = j;
+                    continue;
+                }
+                // `\pos`, `\pbo`, … — a letter follows, so this isn't a
+                // drawing tag. Leave the running state untouched.
+                Some(d) if d.is_ascii_alphabetic() => {
+                    i = after;
+                    continue;
+                }
+                // Bare `\p` (followed by `\`, `}`, space, or end) resets
+                // drawing mode to level 0.
+                _ => {
+                    result = Some(0);
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    result
 }
 
 /// Insert (or replace) the HLS `X-TIMESTAMP-MAP` header right
@@ -2835,10 +3074,7 @@ async fn extract_webvtt_sidecar(
     offset_ms: i64,
     session_dir: &Path,
 ) -> Result<()> {
-    // The session dir is e.g. `$CACHE_ROOT/sessions/<session_id>`;
-    // walk up two levels to get the cache root. This works because
-    // TranscodeManager::start creates the session dir under
-    // `<cache_root>/<session_id>` consistently.
+    // session_dir is `<cache_root>/<session_id>`; one .parent() yields the cache root.
     let cache_root = session_dir.parent().unwrap_or(session_dir);
     // media_file_id isn't visible here; instead key the cache by
     // the input file path's canonical form (resolved symlinks +
@@ -2885,10 +3121,12 @@ async fn extract_webvtt_sidecar(
         raw_vtt
     };
 
-    // Drop ASS override codes the WebVTT muxer left in the cue
-    // bodies. Anime karaoke / typesetting cues otherwise render
-    // as a wall of "{\an5\c&HFFFFFF&\pos(...)\t(...)}" garbage.
-    let shifted = strip_ass_overrides(&shifted);
+    // Clean ASS leftovers the WebVTT muxer left in the cue bodies:
+    // override codes ("{\an5\c&HFFFFFF&\pos(...)}"), and — the worse
+    // offender — vector-drawing paths from sign typesetting ("{\p1}m
+    // 7.48 42.16 l ...{\p0}"), which otherwise render as a wall of
+    // numbers. Drawing-only cues are dropped entirely.
+    let shifted = sanitize_ass_webvtt(&shifted);
 
     // Inject an HLS X-TIMESTAMP-MAP header as belt-and-suspenders
     // alignment. Even with our cue shift, some HLS.js versions /
@@ -2933,36 +3171,37 @@ async fn extract_webvtt_sidecar(
     Ok(())
 }
 
-/// Filesystem-safe key for the subtitle cache directory. Strip
-/// directory separators and other special characters from the
-/// file path so the resulting string nests under
-/// `$CACHE_ROOT/subs/<key>/<si>.vtt` without trying to escape the
-/// cache root or create weird subdirectories.
+/// Filesystem-safe key for the subtitle cache directory. Produces a
+/// short sanitized prefix (for human debuggability) plus an FNV-1a hash
+/// of the FULL original path, so the result nests under
+/// `$CACHE_ROOT/subs/<key>/<si>.vtt` without escaping the cache root.
+///
+/// The hash is ALWAYS appended — not just for over-long paths. The
+/// sanitizing step collapses `/`, spaces, and every other special
+/// character to `_`, so two structurally different paths (e.g.
+/// `".../foo bar.mkv"` and `".../foo/bar.mkv"`) sanitize to the same
+/// string and would otherwise share a subtitle cache key, serving one
+/// file's subtitles for the other. Hashing the unsanitized path (which
+/// still contains the real separators) keeps the key unique.
 fn path_cache_key(input: &Path) -> String {
     let s = input.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+    // Sanitized, length-capped prefix purely for readability when
+    // eyeballing the cache dir; correctness comes from the hash below.
+    let mut prefix = String::with_capacity(s.len().min(160));
+    for ch in s.chars().take(160) {
         if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
-            out.push(ch);
+            prefix.push(ch);
         } else {
-            out.push('_');
+            prefix.push('_');
         }
     }
-    // Filesystem limits on filename length are usually 255 bytes;
-    // for very long paths (deep nesting, long titles) the safe
-    // upper bound is "fold the tail into a short hash". Crude but
-    // collision-safe for normal libraries.
-    if out.len() > 200 {
-        let head: String = out.chars().take(160).collect();
-        let mut h: u64 = 1469598103934665603;
-        for b in out.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(1099511628211);
-        }
-        format!("{head}_{h:016x}")
-    } else {
-        out
+    // FNV-1a over the full original path string (separators included).
+    let mut h: u64 = 1469598103934665603;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
     }
+    format!("{prefix}_{h:016x}")
 }
 
 /// Pull a single text-subtitle stream out of the source file into a
@@ -3119,9 +3358,9 @@ fn generate_id() -> String {
 
 fn fill_random(buf: &mut [u8]) -> Result<()> {
     use rand_core::{OsRng, RngCore};
-    let mut rng = OsRng;
-    rng.fill_bytes(buf);
-    Ok(())
+    // try_fill_bytes returns Err on OS-level RNG failure; fill_bytes
+    // would panic instead, making the Err branch in generate_id dead.
+    OsRng.try_fill_bytes(buf).map_err(|e| anyhow::anyhow!("OsRng: {e}"))
 }
 
 /// Map the codec name we get from ffprobe / DB columns to the
@@ -3178,7 +3417,81 @@ mod signal {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoudnessTarget, TonemapConfig, build_loudnorm_filter};
+    use super::{
+        LoudnessTarget, TonemapConfig, build_loudnorm_filter, parse_drawing_level,
+        sanitize_ass_webvtt,
+    };
+
+    #[test]
+    fn parse_drawing_level_distinguishes_p_from_pos() {
+        assert_eq!(parse_drawing_level("\\p1"), Some(1));
+        assert_eq!(parse_drawing_level("\\p0"), Some(0));
+        assert_eq!(parse_drawing_level("\\an7\\p1"), Some(1));
+        // \pos / \pbo are NOT drawing tags — must not toggle the mode.
+        assert_eq!(parse_drawing_level("\\pos(100,200)"), None);
+        assert_eq!(parse_drawing_level("\\pbo-5"), None);
+        assert_eq!(parse_drawing_level("\\an5\\c&HFFFFFF&"), None);
+        // Bare \p resets to 0; last tag wins.
+        assert_eq!(parse_drawing_level("\\p"), Some(0));
+        assert_eq!(parse_drawing_level("\\p1\\pos(0,0)\\p0"), Some(0));
+    }
+
+    #[test]
+    fn sanitize_strips_override_blocks_but_keeps_dialogue() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{\\an8}Hello there\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Hello there"), "{out:?}");
+        assert!(!out.contains("an8"), "override block leaked: {out:?}");
+        assert!(out.starts_with("WEBVTT"));
+    }
+
+    #[test]
+    fn sanitize_drops_drawing_path_cue_entirely() {
+        // The exact shape from the Café Terrace sign: a drawing event
+        // whose "text" is a vector path. The whole cue must vanish.
+        let vtt = "WEBVTT\n\n\
+            00:01:11.000 --> 00:01:14.000\n\
+            {\\p1}m 7.48 42.16 l -0.06 19.99 0.85 9.93 99.83 15.87 108.28 40.1{\\p0}\n\n\
+            00:01:11.000 --> 00:01:14.000\nOpening Soon\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Opening Soon"), "real sub dropped: {out:?}");
+        assert!(!out.contains("42.16"), "drawing path leaked: {out:?}");
+        assert!(!out.contains("\\p1"));
+        // Only the real cue's timestamp line should remain (one "-->").
+        assert_eq!(out.matches("-->").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn sanitize_drawing_without_close_does_not_eat_next_cue() {
+        // A `{\p1}` with no matching `{\p0}` — drawing mode must reset
+        // at the cue boundary so the following dialogue survives.
+        let vtt = "WEBVTT\n\n\
+            00:00:01.000 --> 00:00:02.000\n{\\p1}m 0 0 l 10 0 10 10\n\n\
+            00:00:03.000 --> 00:00:04.000\nReal dialogue here\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Real dialogue here"), "{out:?}");
+        assert!(!out.contains("l 10 0"), "{out:?}");
+        assert_eq!(out.matches("-->").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn sanitize_keeps_positioned_dialogue() {
+        // `\pos` text must survive — it's a normal positioned line, not
+        // a drawing.
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{\\pos(960,540)}Subtitle text\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Subtitle text"), "{out:?}");
+        assert!(!out.contains("pos"), "{out:?}");
+    }
+
+    #[test]
+    fn sanitize_leaves_plain_vtt_dialogue_intact() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nJust a line\n\n00:00:03.000 --> 00:00:04.000\nAnother line\n";
+        let out = sanitize_ass_webvtt(vtt);
+        assert!(out.contains("Just a line"));
+        assert!(out.contains("Another line"));
+        assert_eq!(out.matches("-->").count(), 2);
+    }
 
     #[test]
     fn loudnorm_filter_without_measurement_is_single_pass() {

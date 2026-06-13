@@ -24,7 +24,7 @@ pub fn safe_ffmpeg_input(path: &std::path::Path) -> String {
     format!("file:{}", path.display())
 }
 
-pub use capabilities::{TranscoderCapabilities, detect_capabilities};
+pub use capabilities::{SharedCapabilities, TranscoderCapabilities, detect_capabilities};
 pub use hwaccel::{EncoderPreset, HwAccel, VideoCodec};
 pub use probe::{
     Chapter, GopProbe, ProbeResult, ProbeStream, StreamKind, probe, probe_chapters, probe_gop,
@@ -34,7 +34,8 @@ pub use rlimit::apply_session_limits;
 pub use session::{
     AudioTreatment, ContainerFormat, HLS_SEGMENT_DURATION_S, LoudnessTarget, Session,
     SessionSnapshot, SubExtractionStatus, TonemapConfig, TranscodeManager, VideoTreatment,
-    WebVttSidecar, evict_text_subs_cache, is_text_subtitle_codec, scan_prewarm_text_subs,
+    WebVttSidecar, evict_text_subs_cache, is_text_subtitle_codec, sanitize_ass_webvtt,
+    scan_prewarm_text_subs,
 };
 
 #[derive(Debug, Clone)]

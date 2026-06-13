@@ -41,6 +41,11 @@ pub fn fingerprint(region: &AudioRegion, config: &Config) -> Fingerprint {
 ///
 /// Returns one magnitude vector per frame (length `fft_size / 2 + 1`).
 pub fn compute_stft(samples: &[f32], config: &Config) -> Vec<Vec<f32>> {
+    // Guard against division-by-zero (hop_size == 0) and NaN window
+    // coefficients (fft_size == 1 → denominator `size - 1` == 0 in hann_window).
+    if config.hop_size == 0 || config.fft_size < 2 {
+        return Vec::new();
+    }
     if samples.len() < config.fft_size {
         return Vec::new();
     }

@@ -165,6 +165,25 @@ pub async fn verify(
         .await
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::validation("no enrollment in progress — call /enroll first"))?;
+    // Guard: if 2FA is already verified, this endpoint must not be used again
+    // to silently rotate recovery codes. Callers should use the dedicated
+    // /auth/2fa/recovery/regenerate endpoint, which requires password re-entry.
+    if record.verified_at.is_some() {
+        return Err(ApiError::validation(
+            "2FA is already verified; use /auth/2fa/recovery/regenerate to rotate recovery codes",
+        ));
+    }
+
+    // Progressive lockout mirrors challenge_login so the 30-second TOTP
+    // window can't be brute-forced via the enrollment endpoint either.
+    let enroll_key = format!("2fa_enroll:{}", user.id);
+    if let Some(wait) = state.login_attempts.check(&enroll_key).await {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many failed 2FA attempts; try again in {}s",
+            wait.as_secs().max(1)
+        )));
+    }
+
     let secret = totp::decrypt_secret(
         &state.vault,
         &record.secret_enc,
@@ -172,8 +191,10 @@ pub async fn verify(
     )
     .map_err(ApiError::Internal)?;
     if !totp::verify_code(&secret, &input.code).map_err(ApiError::Internal)? {
+        state.login_attempts.record_failure(&enroll_key).await;
         return Err(ApiError::validation("invalid code"));
     }
+    state.login_attempts.record_success(&enroll_key).await;
 
     // Mark verified + replace recovery codes in one logical step.
     queries::mark_user_totp_verified(&state.pool, user.id)

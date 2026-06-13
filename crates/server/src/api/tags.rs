@@ -31,9 +31,19 @@ pub async fn list_all(
 
 pub async fn list_for_item(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<TagListResponse>, ApiError> {
+    // Resolve which libraries this user may access, then confirm the item
+    // is within one of them. Return 404 (not 403) to avoid leaking whether
+    // the item exists at all in a forbidden library.
+    let acc = queries::user_library_filter(&state.pool, user.id, user.role)
+        .await
+        .map_err(ApiError::Internal)?;
+    queries::get_item(&state.pool, id, user.id, acc.as_deref())
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
     let tags = queries::list_tags_for_item(&state.pool, id)
         .await
         .map_err(ApiError::Internal)?;

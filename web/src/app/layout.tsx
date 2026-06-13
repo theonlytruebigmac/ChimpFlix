@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
+import { CastDock } from "@/components/cast/CastDock";
 import { LiveRefresh } from "@/components/LiveRefresh";
 import { NavPrefetch } from "@/components/NavPrefetch";
 import { RouteFocusReset } from "@/components/RouteFocusReset";
@@ -76,6 +77,9 @@ export default async function RootLayout({
             instead of polling. No-ops gracefully when unauthenticated. */}
         <LiveRefresh />
         {children}
+        {/* App-wide cast surface: mini-controller + expanded controller +
+            the media-notification owner. No-ops until a session is live. */}
+        <CastDock />
       </body>
     </html>
   );

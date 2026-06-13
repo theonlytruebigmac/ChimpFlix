@@ -101,6 +101,21 @@ pub static REGISTRY: LazyLock<Vec<KindMetadata>> = LazyLock::new(|| {
             // at a time so two seasons don't dogpile CPU + disk.
             concurrency: 1,
         },
+        // ─── Content notifications (scan-completion triggered) ────
+        KindMetadata {
+            job_kind: "notify_new_content",
+            // Triggered by ScanEvent::Completed (see jobs::pipeline),
+            // not a cron sweep — no sweep_kind, like bootstrap_season_refs.
+            sweep_kind: None,
+            display_name: "New-content notifications",
+            mode: TaskMode::Automatic,
+            scope: TaskScope::Global,
+            gate_setting_key: None,
+            // Network-touching fan-out (bell rows + SMTP + Discord) but one
+            // job per scan, low volume. 2 lets a manual + scheduled scan of
+            // two libraries announce in parallel without dogpiling SMTP.
+            concurrency: 2,
+        },
         // ─── Periodic system tasks (registry surface only — no job_queue rows) ───
         KindMetadata {
             // Periodic kinds have no job_kind in the queue; they
@@ -226,6 +241,32 @@ mod tests {
                 "duplicate job_kind: {}",
                 k.job_kind
             );
+        }
+    }
+
+    /// Guard against a new entry's `sweep_kind` silently aliasing a
+    /// different entry's `job_kind`. `find_kind` returns the first
+    /// match, so a cross-entry collision would return wrong metadata
+    /// for gate checks, concurrency caps, and the admin display name.
+    #[test]
+    fn no_sweep_kind_collides_with_other_job_kind() {
+        let job_kinds: std::collections::HashSet<&str> =
+            all_kinds().iter().map(|k| k.job_kind).collect();
+        for k in all_kinds() {
+            if let Some(sweep) = k.sweep_kind {
+                // A sweep_kind equal to its own job_kind is fine
+                // (e.g. analyze_loudness uses the same string for both).
+                // A sweep_kind that matches a *different* entry's job_kind
+                // would cause find_kind to return the wrong entry.
+                if sweep != k.job_kind {
+                    assert!(
+                        !job_kinds.contains(sweep),
+                        "sweep_kind '{}' of entry '{}' collides with another entry's job_kind",
+                        sweep,
+                        k.job_kind
+                    );
+                }
+            }
         }
     }
 

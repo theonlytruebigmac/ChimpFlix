@@ -78,19 +78,29 @@ export function adaptSeason(s: SeasonSummary, show: Item): MediaItem {
 }
 
 export function adaptEpisode(ep: Episode, show: Item): MediaItem {
+  // Placeholder episodes (no downloaded file) have no episode still, so they
+  // fall back to the show poster — exactly how Trakt renders an unaired /
+  // undownloaded upcoming episode. We force the poster for placeholders even
+  // if a stray thumb were ever stored, so a placeholder never shows a still.
+  const hasFile = ep.has_file !== false;
+  const thumb = hasFile
+    ? (ep.thumb_path ?? show.poster_path ?? undefined)
+    : (show.poster_path ?? undefined);
   return {
     ratingKey: `e${ep.id}`,
     key: `/episodes/${ep.id}`,
     type: "episode",
     title: ep.title,
     summary: ep.summary ?? undefined,
-    thumb: ep.thumb_path ?? show.poster_path ?? undefined,
+    thumb,
     art: show.backdrop_path ?? undefined,
     duration: ep.duration_ms ?? undefined,
     parentTitle: `Season ${ep.season_number}`,
     grandparentTitle: show.title,
     grandparentRatingKey: String(show.id),
     index: ep.episode_number,
+    airDate: ep.air_date ?? undefined,
+    hasFile,
   };
 }
 

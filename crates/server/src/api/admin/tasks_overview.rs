@@ -392,8 +392,9 @@ pub struct SummaryResponse {
     /// Count of jobs that reached `status = 'succeeded'` with
     /// `finished_at >= now - 24h`.
     pub succeeded_24h: i64,
-    /// Count of jobs in dead/failed terminal state with
-    /// `finished_at >= now - 24h`.
+    /// Count of jobs that reached the terminal `dead` status (exhausted all
+    /// retry attempts) with `finished_at >= now - 24h`. Jobs in `failed`
+    /// status are still in retry backoff and are not counted here.
     pub failed_24h: i64,
     /// Next maintenance window opening (epoch ms). Computed from
     /// `server_settings.maintenance_window_start` + current time.
@@ -1409,7 +1410,15 @@ pub async fn run_kind_now(
     let row = find_kind_schedule_row(&state, &name).await?;
     scheduler::run_now(state.clone(), row.id)
         .await
-        .map_err(|e| ApiError::validation(format!("{e:#}")))?;
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            // "already running" is a conflict (409), not a client input error (400).
+            if msg.contains("already running") {
+                ApiError::Conflict(msg)
+            } else {
+                ApiError::validation(msg)
+            }
+        })?;
     audit_log(
         &state,
         NewAuditEntry {

@@ -42,6 +42,10 @@ interface Resolved {
   mediaFileId: number;
   title: string;
   subtitle?: string;
+  /// Cover art for the cast now-playing screen + mini/expanded
+  /// controller + OS media chip. Only absolute (TMDB) URLs reach the
+  /// cookieless Cast receiver; relative `/api/...` art is ignored there.
+  posterUrl?: string;
   itemId?: number;
   episodeId?: number;
   startPositionMs: number;
@@ -260,6 +264,7 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
   return {
     mediaFileId: file.id,
     title: detail.title,
+    posterUrl: plexImage(detail.poster_path ?? undefined, 300, 450) ?? undefined,
     itemId: detail.id,
     startPositionMs: detail.play_state?.position_ms ?? 0,
     durationMs: file.duration_ms ?? detail.duration_ms ?? undefined,
@@ -269,6 +274,15 @@ async function resolveMovie(detail: ItemDetail): Promise<Resolved | null> {
     markers: file.markers ?? [],
     versions: versionsFor(detail.files, external),
   };
+}
+
+/// A PLACEHOLDER episode (metadata-agent row with no downloaded file) can
+/// never be played, so it must never become the "Next" target or the first
+/// episode of a show. The backend's `has_file` defaults to true when absent
+/// (older responses / movies), so a missing flag is treated as playable —
+/// a missing flag never strips a real, downloaded episode from navigation.
+function episodeHasFile(e: { has_file?: boolean }): boolean {
+  return e.has_file !== false;
 }
 
 async function resolveEpisode(
@@ -288,7 +302,7 @@ async function resolveEpisode(
   } catch {
     seasonEpisodesRaw = undefined;
   }
-  const next = await findNextEpisode(episode, seasonEpisodesRaw);
+  const next = await findNextEpisode(episode, seasonEpisodesRaw, show.seasons);
   const seasonEpisodes: EpisodeSibling[] | undefined = seasonEpisodesRaw?.map(
     (e) => ({
       ratingKey: `e${e.id}`,
@@ -300,6 +314,8 @@ async function resolveEpisode(
       viewOffset: e.play_state?.max_position_ms,
       index: e.episode_number,
       parentTitle: `Season ${e.season_number}`,
+      // Placeholder (undownloaded) rows render non-playable in the picker.
+      hasFile: episodeHasFile(e),
     }),
   );
   const external = await externalSubtitlesApi
@@ -310,6 +326,7 @@ async function resolveEpisode(
     mediaFileId: file.id,
     title: show.title,
     subtitle: `S${episode.season_number} · E${episode.episode_number} · ${episode.title}`,
+    posterUrl: plexImage(episode.thumb_path ?? undefined, 480, 270) ?? undefined,
     episodeId: episode.id,
     startPositionMs: episode.play_state?.position_ms ?? 0,
     durationMs: file.duration_ms ?? episode.duration_ms ?? undefined,
@@ -337,27 +354,41 @@ async function resolveEpisode(
 /// Walks within the current season first, then falls back to the first
 /// episode of the next season. Returns null at the end of the series.
 /// Best-effort: any error swallows and the player just hides the button.
+/// `knownSeasons` is the season list already fetched by the caller (avoids
+/// a redundant itemsApi.get when the show was already loaded upstream).
 async function findNextEpisode(
   current: EpisodeDetail,
   seasonEpisodes: EpisodeListed[] | undefined,
+  knownSeasons?: SeasonSummary[],
 ): Promise<{ id: number; title: string; thumb?: string } | null> {
   try {
     if (seasonEpisodes) {
       const idx = seasonEpisodes.findIndex((e) => e.id === current.id);
-      if (idx >= 0 && idx + 1 < seasonEpisodes.length) {
-        const ep = seasonEpisodes[idx + 1];
-        return {
-          id: ep.id,
-          title: ep.title,
-          thumb: plexImage(ep.thumb_path ?? undefined, 480, 270) ?? undefined,
-        };
+      if (idx >= 0) {
+        // Skip placeholder (undownloaded) episodes — Next must target a
+        // playable file, not a row materialized only for the calendar /
+        // finale flag.
+        const ep = seasonEpisodes
+          .slice(idx + 1)
+          .find((e) => episodeHasFile(e));
+        if (ep) {
+          return {
+            id: ep.id,
+            title: ep.title,
+            thumb:
+              plexImage(ep.thumb_path ?? undefined, 480, 270) ?? undefined,
+          };
+        }
       }
     }
-    const show = await itemsApi.get(current.show_id);
-    const sIdx = show.seasons.findIndex((s) => s.id === current.season_id);
-    if (sIdx >= 0 && sIdx + 1 < show.seasons.length) {
-      const nextSeason = await seasonsApi.get(show.seasons[sIdx + 1].id);
-      const first = nextSeason.episodes[0];
+    // Use already-fetched seasons when available; fall back to an extra fetch.
+    const seasons = knownSeasons ?? (await itemsApi.get(current.show_id)).seasons;
+    const sIdx = seasons.findIndex((s) => s.id === current.season_id);
+    if (sIdx >= 0 && sIdx + 1 < seasons.length) {
+      const nextSeason = await seasonsApi.get(seasons[sIdx + 1].id);
+      // First DOWNLOADED episode of the next season — an undownloaded
+      // premiere placeholder must not become the Next target.
+      const first = nextSeason.episodes.find((e) => episodeHasFile(e));
       if (first) {
         return {
           id: first.id,
@@ -379,7 +410,9 @@ async function resolveShowFirstEpisode(
   const firstSeason = detail.seasons[0];
   if (!firstSeason) return null;
   const seasonDetail = await seasonsApi.get(firstSeason.id);
-  const firstEpisode = seasonDetail.episodes[0];
+  // First DOWNLOADED episode — never open the player on a placeholder
+  // (undownloaded) first episode, which has no file to stream.
+  const firstEpisode = seasonDetail.episodes.find((e) => episodeHasFile(e));
   if (!firstEpisode) return null;
   const episodeDetail = await episodesApi.get(firstEpisode.id);
   return resolveEpisode(episodeDetail, detail);
@@ -545,6 +578,7 @@ export default async function WatchPage({
     <ChimpFlixPlayer
       title={resolved.title}
       subtitle={resolved.subtitle}
+      posterUrl={resolved.posterUrl}
       mediaFileId={resolved.mediaFileId}
       durationMs={resolved.durationMs}
       startPositionMs={resolved.startPositionMs}
