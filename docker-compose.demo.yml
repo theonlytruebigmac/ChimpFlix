@@ -1,7 +1,8 @@
 # ChimpFlix demo stack — completely isolated from any production deployment.
 #
 # Uses ./data-demo/ (a separate SQLite database), ports 8081 (server) and
-# 3001 (web), and no media mount so it never touches your personal library.
+# 3001 (web), and only mounts empty demo media dirs under ./data-demo/media,
+# so it never touches your personal library.
 # See scripts/demo/setup.sh and docs/DEMO.md for the full walkthrough.
 #
 # Quick start:
@@ -26,9 +27,11 @@ services:
     container_name: chimpflix-demo-server
     restart: "no"
     env_file:
-      - path: ./.env.demo.local
-        required: false
+      # Base first, local override last — Compose applies env_file last-wins,
+      # so .env.demo.local values take precedence over .env.demo.
       - path: ./.env.demo
+        required: false
+      - path: ./.env.demo.local
         required: false
     environment:
       TZ: America/New_York
@@ -36,14 +39,15 @@ services:
       DATA_DIR: /data
       RUST_LOG: info,sqlx=warn
       # No TMDB key = no live artwork refreshes.
-      # Add TMDB_API_KEY to .env.demo.local to enable metadata refresh.
+      # Add TMDB_READ_TOKEN to .env.demo.local to enable metadata refresh.
     volumes:
       - ./data-demo:/data
-      # tmpfs mount so the library path health-check sees /media/* directories
+      # Bind mounts so the library path health-check sees /media/* directories
       # even though there are no real video files. The seed SQL plants
       # library paths under /media/movies, /media/shows, /media/anime.
-      # Demo has no real media files — library paths will be empty dirs
-      # inside the data volume. The server still starts correctly.
+      # These host dirs (./data-demo/media/*) stay empty — the demo is
+      # metadata-only — and the seed disables automatic scanning so the empty
+      # dirs are never scanned. The server still starts correctly.
       - ./data-demo/media/movies:/media/movies
       - ./data-demo/media/shows:/media/shows
       - ./data-demo/media/anime:/media/anime
@@ -81,9 +85,11 @@ services:
       server:
         condition: service_healthy
     env_file:
-      - path: ./.env.demo.local
-        required: false
+      # Base first, local override last — Compose applies env_file last-wins,
+      # so .env.demo.local values take precedence over .env.demo.
       - path: ./.env.demo
+        required: false
+      - path: ./.env.demo.local
         required: false
     environment:
       CHIMPFLIX_API_URL: http://server:8080

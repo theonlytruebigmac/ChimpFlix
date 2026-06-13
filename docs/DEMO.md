@@ -66,13 +66,16 @@ bash scripts/demo/setup.sh
 
 ## Enabling real TMDB artwork
 
-1. Create `./env.demo.local` (already gitignored):
+1. Create `./.env.demo.local` (already gitignored):
    ```
-   TMDB_API_KEY=your_api_key_here
+   TMDB_READ_TOKEN=your_tmdb_v4_read_access_token
    ```
+   This is the only metadata key read from the environment. TVDB, OMDb, and
+   MyAnimeList keys are entered in the running app under **Settings → Server →
+   Credentials**, not via env vars.
 2. Rebuild and restart:
    ```bash
-   docker compose -f docker-compose.demo.yml up -d --build
+   docker compose -p chimpflix-demo -f docker-compose.demo.yml up -d --build
    ```
 3. Open the demo UI → **Settings → Libraries** → trigger a metadata refresh
    on each library.
@@ -82,15 +85,14 @@ bash scripts/demo/setup.sh
 | Page | Path |
 |------|------|
 | Home (all rails) | `/` |
-| Movie detail | `/library/{id}` → click any movie |
-| Show detail + seasons | click a TV show |
+| Library browser | `/library/1` (Movies), `/library/2` (TV), `/library/3` (Anime) |
+| Title detail (movie/show) | open any library → click a title (opens a detail modal, deep-links as `/?title={ratingKey}`) |
 | Search | `/search` |
-| Library browser | `/library/1` (Movies) |
 | My List | `/my-list` |
 | Calendar | `/calendar` |
 | Admin dashboard | `/settings/admin` |
-| Library health | `/settings/admin/library-health` |
-| Job queue | `/settings/admin/jobs` |
+| Library health | `/settings/admin/maintenance` (Library health section) |
+| Job queue | `/settings/admin/tasks` |
 | Users admin | `/settings/admin/users` |
 
 ## Manual seed (if setup.sh fails)

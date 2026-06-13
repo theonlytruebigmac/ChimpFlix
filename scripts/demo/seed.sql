@@ -31,15 +31,21 @@ SET setup_completed = 1,
     updated_at      = CAST(strftime('%s', 'now') AS INTEGER) * 1000
 WHERE id = 1;
 
--- Set scan interval to 1 year and backdated last_scan_at so the scheduler
--- does NOT auto-scan on the next server start. Without this, the scanner
--- runs immediately, finds no real files at the demo paths, and marks all
--- seeded media_files rows as removed — making items invisible on the home page.
--- (A manual scan from Settings → Libraries will still work; it just won't
--- happen automatically during a demo session.)
-UPDATE libraries
-SET scan_interval_s = 31536000,
-    last_scan_at    = CAST(strftime('%s', 'now') AS INTEGER) * 1000;
+-- Disable BOTH automatic-scan triggers. The demo's /media/* paths are empty
+-- (no real video files), so ANY scan would soft-delete every seeded
+-- media_files row — and items with no active file are hidden from browse by
+-- the has_active_files_clause() filter, making the whole library vanish.
+--   periodic_scan_enabled = 0 → the hourly scheduler scan never runs
+--   scan_automatically    = 0 → filesystem-watch events never enqueue a scan
+-- (The per-library `scan_interval_s` column is NOT consulted by the scheduler
+-- — the effective cadence is the global `periodic_scan_frequency`, gated on
+-- `periodic_scan_enabled` — so disabling that setting is the correct knob.
+-- A manual scan from Settings → Libraries would still clear the files; that's
+-- an explicit operator action, not something that happens on its own.)
+UPDATE server_settings
+SET periodic_scan_enabled = 0,
+    scan_automatically    = 0
+WHERE id = 1;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Libraries

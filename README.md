@@ -100,7 +100,7 @@ any GPU.
 cargo run -p chimpflix-server
 # → listening on 0.0.0.0:8080
 # → curl http://127.0.0.1:8080/health
-#   { "status": "ok", "version": "0.1.0-dev", "uptime_s": 3 }
+#   { "status": "ok", "uptime_s": 3 }
 
 # Frontend (separate terminal)
 cd web
@@ -123,8 +123,11 @@ open http://localhost:3000
 [docker-compose.yml](docker-compose.yml) builds two images from the same
 multi-stage [docker/Dockerfile](docker/Dockerfile): `chimpflix-server` (the
 Rust binary + ffmpeg, on :8080) and `chimpflix-web` (the Next.js standalone
-build, on :3000). They share a compose network; only `:3000` is exposed
-to the host by default.
+build, on :3000). They share a compose network, and by default both `:3000`
+(web) and `:8080` (server) are bound to the host. If a reverse proxy on the
+same host reaches the container over the compose network, you can narrow the
+server bind to `127.0.0.1:8080:8080` or drop its `ports:` block — see the
+commented guidance in [docker-compose.yml](docker-compose.yml).
 
 ## Configuration
 
@@ -134,7 +137,7 @@ The backend reads a small set of environment variables:
 | --- | --- | --- |
 | `BIND_ADDR` | `0.0.0.0:8080` | Listening address. |
 | `DATA_DIR` | `./data` | Where `chimpflix.db` and caches live. |
-| `RUST_LOG` | `info,sqlx=warn` | `tracing-subscriber` filter. |
+| `RUST_LOG` | `info,sqlx=warn,tower_http=info,symphonia=warn` | `tracing-subscriber` filter. |
 | `CHIMPFLIX_CIRCUIT_BREAKER_THRESHOLD` | `3` | Optional. Consecutive rate-limit failures from an external provider (TMDB, OMDb, MyAnimeList, …) before its circuit opens and calls fast-fail. |
 | `CHIMPFLIX_CIRCUIT_BREAKER_OPEN_SECS` | `60` | Optional. How long a provider's circuit stays open before a probe is allowed. |
 
